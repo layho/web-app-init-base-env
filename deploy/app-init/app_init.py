@@ -117,6 +117,25 @@ def copy_foundation(source, target, repository, title, domain, port, label):
     (target / "README.md").write_text(f"# {title}\n\n应用基座。开发需求通过意见反馈登记。\n", encoding="utf-8")
 
 
+def sync_rollback_test_fix(root):
+    path = "tests/test_deploy_script.py"
+    if git(root, "rev-parse", "--abbrev-ref", "HEAD") != "main":
+        return
+    old = git(root, "rev-parse", "HEAD")
+    if not git(root, "ls-tree", old, "--", path):
+        return
+    if git(root, "rev-parse", f"{old}:{path}") != "82c7012bca039e0cc0a75ce10eecde4a257f04aa":
+        return
+    git(root, "fetch", "--quiet", "origin", "refs/heads/main")
+    new = git(root, "rev-parse", "FETCH_HEAD")
+    if git(root, "diff", "--name-only", old, new) == path and (
+        git(root, "rev-parse", f"{new}:{path}") == git(SOURCE, "rev-parse", f"HEAD:{path}")
+    ):
+        need(not git(root, "status", "--porcelain", "--", path), "回滚测试文件有本地修改，无法自动同步")
+        git(root, "merge", "--ff-only", new)
+        print(f"已同步部署回滚测试修复，应用 SHA：{new}", flush=True)
+
+
 def seed(source, remote, target, repository, title, domain, port, label, *, github_login=False):
     refs = git(source, "ls-remote", remote, github_login=github_login)
     if refs:
@@ -485,7 +504,7 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        print("app-init | PostgreSQL 启动修复版（LC_ALL=C）", flush=True)
+        print("app-init | 修复版 R2（PostgreSQL LC_ALL=C + 部署回滚测试隔离）", flush=True)
         print(f"运行基座 SHA：{git(SOURCE, 'rev-parse', 'HEAD')}", flush=True)
         need(args.seed_only or (sys.platform == "darwin" and os.getuid() != 0), "完整初始化请用 macOS 的普通管理员账户运行")
         if not args.seed_only:
@@ -541,6 +560,7 @@ def main():
             else:
                 if remote == https_remote:
                     configure_service_git(root, repo_name, token, os.environ.get("APP_INIT_PROXY"))
+                sync_rollback_test_fix(root)
                 deploy(root, meta, password, username, token, config)
         return 0
     except (RuntimeError, OSError, ValueError, KeyError, EOFError, subprocess.SubprocessError) as error:
