@@ -1,5 +1,6 @@
 """Create an application from the shared foundation and install it on macOS."""
 import argparse
+from email.parser import BytesHeaderParser
 from contextlib import contextmanager
 from getpass import getpass
 import hashlib
@@ -331,19 +332,21 @@ def wait_for(description, check, timeout=120, *, error_log=None):
     print(f"正在验证{description}（最长 {timeout} 秒）…", flush=True)
     end = time.monotonic() + timeout
     next_update = time.monotonic() + 15
+    last_error = ""
     while time.monotonic() < end:
         try:
             if check():
                 print(f"通过：{description}", flush=True)
                 return
-        except (OSError, RuntimeError, ValueError):
-            pass
+            last_error = ""
+        except (OSError, RuntimeError, ValueError) as exc:
+            last_error = f"（{exc}）"
         if time.monotonic() >= next_update:
-            print(f"仍在等待{description}…", flush=True)
+            print(f"仍在等待{description}{last_error}…", flush=True)
             next_update = time.monotonic() + 15
         time.sleep(2)
     detail = f"；请运行 tail -n 40 {shlex.quote(str(error_log))}" if error_log else "，请检查应用目录下的 logs"
-    raise RuntimeError(f"{description}未通过{detail}")
+    raise RuntimeError(f"{description}未通过{last_error}{detail}")
 
 
 def version_matches(origin, sha):
@@ -351,17 +354,45 @@ def version_matches(origin, sha):
     return version.get("running_sha") == sha
 
 
+def public_request(method, url, *, data=None, headers=None):
+    # Use the Mac's curl TLS stack. Keep credentials out of process arguments.
+    with TemporaryDirectory() as directory:
+        head = Path(directory) / "response-headers"
+        outgoing = Path(directory) / "request-headers"
+        fields = {"Content-Type": "application/json", **(headers or {})}
+        need(all("\r" not in v and "\n" not in v for v in fields.values()), "请求头格式异常")
+        outgoing.write_text("".join(f"{k}: {v}\n" for k, v in fields.items()))
+        cmd = ["/usr/bin/curl", "--disable", "--silent", "--proto", "=https", "--max-time", "15",
+               "--dump-header", str(head), "--header", "@" + str(outgoing), "--request", method]
+        if data is not None:
+            cmd += ["--data-binary", "@-"]
+        response = subprocess.run([*cmd, url], input=json.dumps(data).encode() if data is not None else b"",
+                                  capture_output=True)
+        need(response.returncode == 0, f"{url} 连接失败，curl 错误码 {response.returncode}")
+        block = head.read_bytes().replace(b"\r\n", b"\n").strip().split(b"\n\n")[-1]
+        status, _, raw_headers = block.partition(b"\n")
+        code = int(status.split()[1])
+        need(200 <= code < 300, f"{url} 返回 HTTP {code}")
+        try:
+            return json.loads(response.stdout), BytesHeaderParser().parsebytes(raw_headers)
+        except (ValueError, UnicodeError):
+            raise RuntimeError(f"{url} 返回内容无法解析为 JSON") from None
+
+
 def verify_login(origin, username, password):
     from http.cookies import SimpleCookie
 
     headers = {"Origin": origin}
-    result, response_headers = request("POST", f"{origin}/api/login",
+    result, response_headers = public_request("POST", f"{origin}/api/login",
                                        data={"username": username, "password": password}, headers=headers)
     need(result.get("authenticated") is True, "公网登录未通过")
-    cookies = SimpleCookie(response_headers.get("Set-Cookie", ""))
+    cookies = SimpleCookie()
+    for value in response_headers.get_all("Set-Cookie", []):
+        cookies.load(value)
+    cookies = {key: cookie for key, cookie in cookies.items() if key == "webapp_session"}
     need(cookies and all(cookie["secure"] and cookie["httponly"] for cookie in cookies.values()), "公网 Cookie 属性不正确")
     headers["Cookie"] = "; ".join(f"{name}={cookie.value}" for name, cookie in cookies.items())
-    session, _ = request("GET", f"{origin}/api/session", headers=headers)
+    session, _ = public_request("GET", f"{origin}/api/session", headers=headers)
     need(session.get("username") == username, "公网会话恢复未通过")
     headers["X-CSRF-Token"] = session["csrf_token"]
     return headers
@@ -372,7 +403,7 @@ def verify_feedback(root, origin, headers, repository):
     if receipt.exists():
         feedback_id = int(receipt.read_text(encoding="utf-8"))
     else:
-        result, _ = request("POST", f"{origin}/api/v1/feedback", headers=headers, data={
+        result, _ = public_request("POST", f"{origin}/api/v1/feedback", headers=headers, data={
             "category": "acceptance", "message": "应用初始化验收：检查 GitHub Issues 同步。",
         })
         feedback_id = result["id"]
@@ -382,7 +413,7 @@ def verify_feedback(root, origin, headers, repository):
 
     def check():
         nonlocal synced
-        records, _ = request("GET", f"{origin}/api/v1/feedback", headers=headers)
+        records, _ = public_request("GET", f"{origin}/api/v1/feedback", headers=headers)
         for record in records:
             if record["id"] == feedback_id and record["status"] == "synced":
                 synced = record["github_issue_number"]
@@ -463,13 +494,25 @@ def deploy(root, meta, password, username, token, config):
     install_job(root, f"{label}.updater", ["/bin/bash", manager, "update"], interval=300, watch=signal)
     install_job(root, f"{label}.feedback", ["/bin/bash", manager, "feedback"], interval=60)
     map_domain(config, domain, port, apply=True)
+    verify_public(root, domain, sha, username, password, repository)
+
+
+def verify_public(root, domain, sha, username, password, repository):
     origin = f"https://{domain}"
-    wait_for("公网 SHA 核对", lambda: version_matches(origin, sha))
+
+    def check_sha():
+        version, _ = public_request("GET", f"{origin}/api/version")
+        actual = version.get("running_sha") if isinstance(version, dict) else None
+        observed = actual if isinstance(actual, str) and re.fullmatch("[a-f0-9]{40}", actual) else "缺少有效 SHA"
+        need(observed == sha, f"期望 {sha}，公网返回 {observed}")
+        return True
+
+    wait_for("公网 SHA 核对", check_sha)
     headers = verify_login(origin, username, password)
     try:
         issue = verify_feedback(root, origin, headers, repository)
     finally:
-        request("POST", f"{origin}/api/logout", data={}, headers=headers)
+        public_request("POST", f"{origin}/api/logout", data={}, headers=headers)
     print(f"PASS {origin} 登录、会话与运行 SHA {sha}；反馈验收 {issue}", flush=True)
 
 
@@ -504,7 +547,7 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        print("app-init | 修复版 R2（PostgreSQL LC_ALL=C + 部署回滚测试隔离）", flush=True)
+        print("app-init | 修复版 R3（支持单独补验公网）", flush=True)
         print(f"运行基座 SHA：{git(SOURCE, 'rev-parse', 'HEAD')}", flush=True)
         need(args.seed_only or (sys.platform == "darwin" and os.getuid() != 0), "完整初始化请用 macOS 的普通管理员账户运行")
         if not args.seed_only:
@@ -529,6 +572,15 @@ def main():
         label = "com.appinit." + hashlib.sha256(repo_name.lower().encode()).hexdigest()[:12]
         title = repo_name.split("/")[1]
         apps.mkdir(parents=True, exist_ok=True)
+        if not args.seed_only and (root / "frontend/dist/index.html").is_file():
+            if input("已有构建，仅补验公网登录和反馈？[Y/n]：").strip().lower() in ("", "y", "yes"):
+                meta = json.loads((root / ".app-init.json").read_text())
+                need(meta["repository"] == repo_name and meta["domain"] == domain, "输入与现有应用不一致")
+                username = input("已有管理员用户名：").strip()
+                password = getpass("已有管理员密码（隐藏输入）：")
+                with initialization_lock(apps / ".init-lock"):
+                    verify_public(root, domain, git(root, "rev-parse", "HEAD"), username, password, repo_name)
+                return 0
         config = None
         if not args.seed_only:
             config_path = Path.home() / ".config" / "app-init" / "cloudflare.json"
