@@ -136,7 +136,17 @@ grep -q "$(printf '\tupdate_ok\t%s' "$new")" logs/operations.tsv
 def test_web_startup_checks_schema_and_assets_before_running_uvicorn(tmp_path):
     script = SCRIPT.read_text()
     serve_function = script[script.index("serve() {"):script.index("agents() {")]
-    commands = serve_function + """
+    setup = r"""
+mkdir -p .venv/bin
+cat > .venv/bin/python <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x .venv/bin/python
+ROOT="$PWD"
+PORT=18080
+"""
+    commands = serve_function + setup + """
 git() { printf 'test-sha\n'; }
 record_operation() { :; }
 load_env() { :; }
@@ -148,7 +158,7 @@ serve
     assert blocked.returncode == 8
     assert blocked.stdout.strip() == "schema-checked"
 
-    missing = serve_function + """
+    missing = serve_function + setup + """
 git() { printf 'test-sha\n'; }
 record_operation() { :; }
 load_env() { :; }
@@ -195,3 +205,30 @@ test ! -s calls
 '''
     result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_web_port_conflict_blocks_before_schema_and_uvicorn(tmp_path):
+    script = SCRIPT.read_text()
+    serve_function = script[script.index("serve() {"):script.index("agents() {")]
+    program = serve_function + r"""
+mkdir -p .venv/bin
+cat > .venv/bin/python <<'SH'
+#!/bin/sh
+exit 9
+SH
+chmod +x .venv/bin/python
+ROOT="$PWD"
+PORT=18080
+git() { printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'; }
+record_operation() { printf '%s\\n' "$1" >> records; }
+load_env() { :; }
+check_schema() { echo 'schema-should-not-run'; }
+log() { printf '%s\\n' "$1"; }
+set -e
+serve
+"""
+    result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Port preflight blocked" in result.stdout
+    assert "schema-should-not-run" not in result.stdout
+    assert "port_conflict" in (tmp_path / "records").read_text()
