@@ -79,10 +79,10 @@ def copy_foundation(source, target, repository, title, domain, port, label):
         ".gitignore", "requirements.txt", "app/__init__.py", "app/auth.py", "app/db.py",
         "app/development_tasks.py", "app/main.py", "app/models.py", "app/operations.py",
         "migrations/002_admin_sessions.sql", "migrations/003_feedback.sql",
-        "scripts/apply_migrations.py", "scripts/hash_admin_password.py", "scripts/sync_feedback.py",
+        "scripts/apply_migrations.py", "scripts/check_port.py", "scripts/hash_admin_password.py", "scripts/sync_feedback.py",
         "scripts/sync_development_tasks.py", "deploy/macmini/manage.sh", "deploy/macmini/acceptance.py",
         "deploy/macmini/acceptance.sh", "deploy/macmini/release.py", "tests/test_auth.py",
-        "tests/test_deploy_script.py", "tests/test_development_tasks.py", "tests/test_feedback.py",
+        "tests/test_deploy_script.py", "tests/test_development_tasks.py", "tests/test_check_port.py", "tests/test_feedback.py",
         "tests/test_feedback_issue_body.py",
     ]
     paths += [path.relative_to(source).as_posix() for path in sorted((source / "frontend/src").rglob("*")) if path.is_file()]
@@ -426,6 +426,10 @@ def verify_feedback(root, origin, headers, repository):
 
 def deploy(root, meta, password, username, token, config):
     port, label, domain = meta["port"], meta["label"], meta["domain"]
+    guard = subprocess.run([sys.executable, root / "scripts/check_port.py", "--root", root,
+                            "--port", str(port)], capture_output=True, text=True)
+    need(guard.returncode == 0, f"Web 端口预检未通过：{guard.stderr.strip() or guard.stdout.strip()}")
+    print(guard.stdout.strip(), flush=True)
     need(git(root, "branch", "--show-current") == "main", "本地应用必须位于 main 分支")
     need(not git(root, "status", "--porcelain", "--untracked-files=no"), "本地应用含未提交的修改")
     postgres = pg_bin()
