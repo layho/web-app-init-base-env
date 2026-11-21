@@ -80,7 +80,7 @@ def test_pid_file_rejects_symlink(tmp_path):
 def test_identity_requires_matching_working_directory_and_command(tmp_path, monkeypatch):
     def fake(*args):
         if args[0] == "lsof":
-            return subprocess.CompletedProcess(args, 0, f"p4123\\nfcwd\\nn{tmp_path}\\n", "")
+            return subprocess.CompletedProcess(args, 0, f"p4123\nfcwd\nn{tmp_path}\n", "")
         return subprocess.CompletedProcess(
             args, 0,
             ".venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 18500 --workers 1", "",
