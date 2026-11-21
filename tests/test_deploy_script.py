@@ -219,11 +219,11 @@ SH
 chmod +x .venv/bin/python
 ROOT="$PWD"
 PORT=18080
-git() { printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'; }
-record_operation() { printf '%s\\n' "$1" >> records; }
+git() { printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'; }
+record_operation() { printf '%s\n' "$1" >> records; }
 load_env() { :; }
 check_schema() { echo 'schema-should-not-run'; }
-log() { printf '%s\\n' "$1"; }
+log() { printf '%s\n' "$1"; }
 set -e
 serve
 """
