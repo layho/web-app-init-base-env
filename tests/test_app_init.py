@@ -166,3 +166,29 @@ def test_db_job_repairs_only_known_legacy_plist(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="不同内容"):
         install()
     assert all(args[0] != "sudo" for args in calls)
+
+
+def test_public_sha_failure_reports_expected_and_observed(tmp_path, monkeypatch):
+    expected, observed = "1" * 40, "2" * 40
+    monkeypatch.setattr(app_init, "public_request", lambda *args: ({"running_sha": observed}, {}))
+    clock = iter([0, 0, 0, 130, 130, 130])
+    monkeypatch.setattr(app_init.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(app_init.time, "sleep", lambda _: None)
+    with pytest.raises(RuntimeError, match=f"期望 {expected}，公网返回 {observed}"):
+        app_init.verify_public(tmp_path, "app.example.com", expected, "user", "secret", "example/app")
+
+
+def test_public_login_handles_extra_edge_cookie(monkeypatch):
+    from email.message import Message
+
+    def request(method, url, **kwargs):
+        if method == "POST":
+            headers = Message()
+            headers.add_header("Set-Cookie", "edge=other; Secure")
+            headers.add_header("Set-Cookie", "webapp_session=test; Secure; HttpOnly; Path=/api")
+            return {"authenticated": True}, headers
+        assert kwargs["headers"]["Cookie"] == "webapp_session=test"
+        return {"username": "admin", "csrf_token": "csrf"}, {}
+
+    monkeypatch.setattr(app_init, "public_request", request)
+    assert app_init.verify_login("https://app.example.com", "admin", "password")["X-CSRF-Token"] == "csrf"
