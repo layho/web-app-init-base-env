@@ -1,5 +1,7 @@
 # macOS 应用初始化
 
+首次运行前先按[凭证准备清单](../../README.md#使用前准备)准备账号、令牌和三个 Cloudflare ID。
+
 将独立入口 `bootstrap.sh` 保存为 `~/bin/app-init`，之后只需运行：
 
 ```bash
@@ -40,7 +42,9 @@ Cloudflare API Token 需能读取和更新指定的 Tunnel 配置及该 Zone 的
 单独配置。自动合并使用具有合并权限的 GitHub CLI 登录。
 初始化会校验域名冲突和本机 SHA 后添加指定域名的 DNS 与回源规则。
 
-应用目录为 `~/Applications/app-init/owner--repo`。每个应用包含独立 PostgreSQL 数据目录、
+公开基座会下载到临时目录。终端当前目录可用于启动脚本；持久化的应用目录为 `~/Applications/app-init/owner--repo`。数据库启动检查超时时，查看该应用目录的 `logs/*.db.err` 中 PostgreSQL 的具体错误。
+
+每个应用包含独立 PostgreSQL 数据目录、
 本机端口和开机启动任务。更新器每五分钟检查 main，同时响应应用内的手动更新按钮。
 脚本以公网 HTTPS 登录、会话恢复、运行 SHA 和真实反馈同步通过作为完成条件。
 

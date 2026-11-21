@@ -297,16 +297,23 @@ def install_job(root, label, args, *, interval=None, keepalive=False, watch=None
     subprocess.run(["sudo", "launchctl", "bootstrap", "system", plist], check=True)
 
 
-def wait_for(description, check, timeout=120):
+def wait_for(description, check, timeout=120, *, error_log=None):
+    print(f"正在验证{description}（最长 {timeout} 秒）…", flush=True)
     end = time.monotonic() + timeout
+    next_update = time.monotonic() + 15
     while time.monotonic() < end:
         try:
             if check():
+                print(f"通过：{description}", flush=True)
                 return
         except (OSError, RuntimeError, ValueError):
             pass
+        if time.monotonic() >= next_update:
+            print(f"仍在等待{description}…", flush=True)
+            next_update = time.monotonic() + 15
         time.sleep(2)
-    raise RuntimeError(f"{description}未通过，请检查应用目录下的 logs")
+    detail = f"；请运行 tail -n 40 {shlex.quote(str(error_log))}" if error_log else "，请检查应用目录下的 logs"
+    raise RuntimeError(f"{description}未通过{detail}")
 
 
 def version_matches(origin, sha):
@@ -390,10 +397,11 @@ def deploy(root, meta, password, username, token, config):
         'umask 077; mkdir -p "$1" && exec "$2" -D "$3" -h "" -k "$1"',
         "app-init-postgres", socket_dir, postgres / "postgres", cluster,
     ]
+    print("正在注册数据库系统服务。如出现 sudo 的 Password:，请输入当前 Mac 管理员的登录密码。", flush=True)
     install_job(root, f"{label}.db", start_db, keepalive=True)
     wait_for("数据库启动", lambda: subprocess.run(
         [postgres / "pg_isready", "-h", socket_dir, "-U", "app_owner", "-d", "postgres"], capture_output=True,
-    ).returncode == 0)
+    ).returncode == 0, error_log=logs / f"{label}.db.err")
 
     if not (root / ".env").exists():
         salt = os.urandom(16)
@@ -476,6 +484,7 @@ def main():
         https_remote = f"https://github.com/{repo_name}.git"
         apps = Path.home() / "Applications" / "app-init"
         root = apps / repo_name.replace("/", "--")
+        print(f"应用安装目录：{root}", flush=True)
         if root.exists():
             remote = git(root, "remote", "get-url", "origin")
             need(remote in (ssh_remote, https_remote), "本地应用仓库不匹配")
