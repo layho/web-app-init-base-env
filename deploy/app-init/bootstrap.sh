@@ -55,4 +55,5 @@ git -C "$work" -c credential.helper= fetch --quiet --depth=1 --no-tags origin "r
   fail "无法下载公开基座 $foundation，请检查网络后重试。"
 git -C "$work" checkout --quiet --detach FETCH_HEAD
 printf '已拉取基座 %s\n' "$(git -C "$work" rev-parse HEAD)"
-bash "$work/deploy/app-init/app-init" --install-deps --github-https
+# Let the initializer prefer the existing SSH setup instead of forcing HTTPS login.
+bash "$work/deploy/app-init/app-init" --install-deps
