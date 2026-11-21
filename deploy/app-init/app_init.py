@@ -262,8 +262,11 @@ def check_dependencies(install):
         check_dependencies(install=False)
 
 
+LAUNCH_DAEMONS = Path("/Library/LaunchDaemons")
+
+
 def install_job(root, label, args, *, interval=None, keepalive=False, watch=None):
-    plist = Path("/Library/LaunchDaemons") / f"{label}.plist"
+    plist = LAUNCH_DAEMONS / f"{label}.plist"
     payload = {
         "Label": label, "ProgramArguments": [str(arg) for arg in args],
         "UserName": pwd.getpwuid(os.getuid()).pw_name, "WorkingDirectory": str(root), "RunAtLoad": True,
@@ -282,13 +285,21 @@ def install_job(root, label, args, *, interval=None, keepalive=False, watch=None
         payload["StartInterval"] = interval
     if watch:
         payload["WatchPaths"] = [str(watch)]
+    legacy = plistlib.dumps(payload)
+    if label.endswith(".db"):
+        payload["EnvironmentVariables"]["LC_ALL"] = "C"
     expected = plistlib.dumps(payload)
+    write_plist = True
     if plist.exists():
-        need(plist.read_bytes() == expected, f"已存在不同内容的服务配置：{plist.name}")
+        current = plist.read_bytes()
+        need(current in (legacy, expected), f"已存在不同内容的服务配置：{plist.name}")
+        write_plist = current != expected
         active = subprocess.run(["launchctl", "print", f"system/{label}"], capture_output=True)
         if active.returncode == 0:
-            return
-    else:
+            if not write_plist:
+                return
+            subprocess.run(["sudo", "launchctl", "bootout", f"system/{label}"], check=True)
+    if write_plist:
         with TemporaryDirectory() as directory:
             temporary = Path(directory) / "job.plist"
             temporary.write_bytes(expected)

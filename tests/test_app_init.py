@@ -134,3 +134,35 @@ def test_cloudflare_mapping_preserves_routes_and_rejects_conflicts(monkeypatch):
     with pytest.raises(RuntimeError, match="其他回源"):
         app_init.map_domain(config, "other.example.com", 18123, apply=True)
     assert [method for method, _, _ in calls] == ["GET", "GET"]
+
+
+def test_db_job_repairs_only_known_legacy_plist(tmp_path, monkeypatch):
+    import plistlib
+
+    monkeypatch.setattr(app_init, "LAUNCH_DAEMONS", tmp_path)
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["sudo", "install"]:
+            Path(args[-1]).write_bytes(Path(args[-2]).read_bytes())
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(app_init.subprocess, "run", run)
+    label = "com.appinit.test.db"
+    path = tmp_path / (label + ".plist")
+    def install():
+        app_init.install_job(tmp_path, label, ["postgres"], keepalive=True)
+    install()
+    payload = plistlib.loads(path.read_bytes())
+    assert payload["EnvironmentVariables"].pop("LC_ALL") == "C"
+    path.write_bytes(plistlib.dumps(payload))
+    calls.clear()
+    install()
+    assert [args[2] for args in calls if args[:2] == ["sudo", "launchctl"]] == ["bootout", "bootstrap"]
+    calls.clear()
+    install()
+    assert all(args[0] != "sudo" for args in calls)
+    payload["UserName"] = "another-user"
+    path.write_bytes(plistlib.dumps(payload))
+    with pytest.raises(RuntimeError, match="不同内容"):
+        install()
+    assert all(args[0] != "sudo" for args in calls)
