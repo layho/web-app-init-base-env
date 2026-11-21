@@ -54,6 +54,8 @@ if ! build; then exit 42; fi
 def test_update_restores_git_and_assets_when_health_fails(tmp_path):
     program = r'''
 set -euo pipefail
+# This fixture simulates LaunchAgent restarts with the launchctl stub below.
+unset APP_INIT_SYSTEM_SERVICE
 git init -q -b main remote
 git -C remote config user.name 'App tests'
 git -C remote config user.email webapp-tests@example.invalid
