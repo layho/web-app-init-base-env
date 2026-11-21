@@ -96,7 +96,7 @@ def test_lsof_inspection_failure_is_not_treated_as_free(monkeypatch):
         guard, "_command",
         lambda *args: subprocess.CompletedProcess(args, 1, "", "permission denied"),
     )
-    with pytest.raises(RuntimeError, match="无法确定监听进程"):
+    with pytest.raises(RuntimeError, match="未能确定监听进程"):
         guard._listener_pids(18500)
 
 
