@@ -1,0 +1,52 @@
+"""Refresh the development task snapshot independently of feedback writes."""
+from datetime import datetime, timezone
+import json
+import os
+from tempfile import NamedTemporaryFile
+from urllib.error import URLError
+from urllib.parse import urlencode
+
+from app import development_tasks
+from scripts.sync_feedback import REPO, github
+
+
+def sync() -> None:
+    cache = development_tasks.CACHE_PATH
+    now = datetime.now(timezone.utc)
+    previous = development_tasks.snapshot()
+    if previous["synced_at"] and now - datetime.fromisoformat(previous["synced_at"]) < development_tasks.REFRESH_INTERVAL:
+        return
+
+    tasks = []
+    page = 1
+    page_size = 100
+    while True:
+        query = urlencode({"state": "all", "per_page": page_size, "page": page, "sort": "updated"})
+        issues = github("GET", f"/repos/{REPO}/issues?{query}")
+        if not isinstance(issues, list):
+            raise ValueError("Unexpected issue page")
+        for issue in issues:
+            task = development_tasks.parse_issue(issue, REPO)
+            if task:
+                tasks.append(task)
+        if len(issues) < page_size:
+            break
+        page += 1
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache.parent, delete=False) as temp:
+        try:
+            json.dump({"synced_at": datetime.now(timezone.utc).isoformat(), "tasks": tasks}, temp, ensure_ascii=False)
+            temp.close()
+            os.replace(temp.name, cache)
+        finally:
+            if os.path.exists(temp.name):
+                os.unlink(temp.name)
+
+
+if __name__ == "__main__":
+    try:
+        sync()
+    except (OSError, URLError, ValueError, TypeError, KeyError):
+        print("Development task sync failed; last snapshot retained")
+        raise SystemExit(1) from None

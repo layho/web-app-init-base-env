@@ -1,0 +1,54 @@
+{
+  "name": "Web App Foundation",
+  "summary": "应用基座已初始化。可在意见反馈登记需求。",
+  "architecture": [
+    {
+      "layer": "浏览器",
+      "technology": "React、TypeScript、Ant Design",
+      "role": "左侧导航与右侧工作区。登录后访问工作台、开发任务、意见反馈和运维页面。"
+    },
+    {
+      "layer": "应用接口",
+      "technology": "FastAPI",
+      "role": "与前端同源服务。使用服务端会话和安全 Cookie，写操作校验 CSRF。"
+    },
+    {
+      "layer": "数据",
+      "technology": "PostgreSQL",
+      "role": "存储登录会话和反馈。迁移版本独立检查，状态缺失时暂停更新。"
+    },
+    {
+      "layer": "部署与同步",
+      "technology": "Mac、launchd、GitHub Issues",
+      "role": "部署任务构建、测试并核对运行 SHA。后台同步反馈和开发任务，浏览器不接触 GitHub 凭据。"
+    },
+    {
+      "layer": "公网入口",
+      "technology": "Cloudflare Tunnel、HTTPS",
+      "role": "将应用域名转发到 Mac 的本地服务。正式域名及运行 SHA 以发布验收记录为准。"
+    }
+  ],
+  "workflow": [
+    {
+      "title": "登记需求",
+      "description": "在意见反馈提交业务场景、预期结果和约束，GitHub Issue 保留需求记录。"
+    },
+    {
+      "title": "拆解与开发",
+      "description": "确定接口、数据边界和验收清单。实际开始工作后在开发任务标记为开发中，并关联提交或 PR。"
+    },
+    {
+      "title": "测试与验收",
+      "description": "运行自动化回归和前端构建。涉及主机或公网的变更，在 Mac 或对应环境验证后记录结果。"
+    },
+    {
+      "title": "合并与发布",
+      "description": "通过验收后合入 main。发布时核对运行 SHA 和健康检查，失败时尝试恢复上一版。"
+    },
+    {
+      "title": "回访与进度更新",
+      "description": "在 Issue 更新结果和后续事项。应用同步开发进度，更新记录和系统日志展示实际发布事件。"
+    }
+  ],
+  "tasks": []
+}

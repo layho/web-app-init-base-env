@@ -1,0 +1,38 @@
+#!/bin/bash
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+entry="$0"
+while test -L "$entry"; do
+  target="$(readlink "$entry")"
+  case "$target" in
+    /*) entry="$target" ;;
+    *) entry="$(dirname "$entry")/$target" ;;
+  esac
+done
+script_dir="$(cd "$(dirname "$entry")" && pwd -P)"
+find_python() {
+  local candidate
+  for candidate in python3.12 python3.13 python3.14 python3.11 python3.10 python3; do
+    if "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  return 1
+}
+
+if ! python="$(find_python)"; then
+  for argument in "$@"; do
+    if [[ "$argument" == --install-deps && "$(uname -s)" == Darwin && "$EUID" != 0 ]]; then
+      command -v brew >/dev/null || { echo '请先安装 Homebrew，然后重试。' >&2; exit 1; }
+      brew install python@3.12
+      python="$(find_python)"
+      break
+    fi
+  done
+fi
+if [[ -n "$python" ]]; then
+  exec "$python" "$script_dir/app_init.py" "$@"
+fi
+echo '需要 Python 3.10+，可使用 brew install python@3.12' >&2
+exit 1
