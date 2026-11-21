@@ -95,6 +95,11 @@ serve() {
   else
     export APP_UPDATER_TARGET="gui/$(id -u)/$UPDATER"
   fi
+  if ! .venv/bin/python scripts/check_port.py --root "$ROOT" --port "$PORT"; then
+    record_operation port_conflict "$APP_RUNNING_SHA"
+    log "Port preflight blocked web startup; no other process was stopped"
+    return 1
+  fi
   check_schema || { local rc=$?; record_operation schema_check_failed "$APP_RUNNING_SHA"; return "$rc"; }
   if ! test -s frontend/dist/index.html; then
     record_operation frontend_missing "$APP_RUNNING_SHA"
