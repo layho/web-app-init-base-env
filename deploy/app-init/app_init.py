@@ -485,6 +485,8 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     try:
+        print("app-init | PostgreSQL 启动修复版（LC_ALL=C）", flush=True)
+        print(f"运行基座 SHA：{git(SOURCE, 'rev-parse', 'HEAD')}", flush=True)
         need(args.seed_only or (sys.platform == "darwin" and os.getuid() != 0), "完整初始化请用 macOS 的普通管理员账户运行")
         if not args.seed_only:
             check_dependencies(args.install_deps)
