@@ -39,6 +39,8 @@ def fixture():
             return files
         if path.endswith("/commits/" + HEAD + "/statuses"):
             return status
+        if path.endswith("/git/commits/" + HEAD):
+            return {"parents": [{"sha": BASE}]}
         if path.endswith("/git/commits/" + MERGE):
             return {"parents": [{"sha": BASE}, {"sha": HEAD}]}
         if path.endswith("/branches/main"):
@@ -77,6 +79,15 @@ class PromotionTests(unittest.TestCase):
             self.assertIsNone(m.promotion_gate(REPO, 9, BASE, TARGET))
             files.pop()
             pr["body"] = pr["body"].replace('"blocked": false', '"blocked": true')
+            self.assertIsNone(m.promotion_gate(REPO, 9, BASE, TARGET))
+
+    def test_manually_modified_generated_branch_blocks(self):
+        pr, _, _, api = fixture()
+        def altered(path, **kw):
+            if path.endswith("/git/commits/" + HEAD):
+                return {"parents": [{"sha": "f" * 40}]}
+            return api(path, **kw)
+        with patch.object(m, "api", side_effect=altered):
             self.assertIsNone(m.promotion_gate(REPO, 9, BASE, TARGET))
 
     def test_draft_or_missing_status_never_promotes(self):
