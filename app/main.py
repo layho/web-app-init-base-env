@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import auth, development_tasks, feedback_progress, foundation_version, operations, pr_tracking, release_acceptance
+from . import auth, development_tasks, feedback_progress, foundation_version, operations, pr_tracking, release_acceptance, pr_draft_controls
 from .db import get_db
 from .models import UserFeedback
 
@@ -132,6 +132,25 @@ def list_development_tasks(response: Response):
     if pr_tracking.enabled():
         result["pr_tracking"] = pr_tracking.snapshot()
     return result
+
+
+class DraftReleaseIn(BaseModel):
+    number: int = Field(ge=1, le=1000000)
+    head: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+@app.post("/api/v1/pr-drafts/release")
+def release_draft_pr(req: DraftReleaseIn, request: Request, response: Response,
+                     db: Session = Depends(get_db)):
+    # Admin session + CSRF + same-origin are mandatory; service API tokens
+    # must never authorize GitHub PR mutations.
+    auth.authorize_session(request, db)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return pr_draft_controls.release(req.number, req.head)
+    except (pr_draft_controls.DraftReleaseError, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(409, str(exc) if isinstance(exc, pr_draft_controls.DraftReleaseError)
+                            else "PR 状态已变化，请刷新后重试") from None
 
 
 @app.get("/api/v1/system-logs", dependencies=[Depends(authorize)])
