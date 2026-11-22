@@ -84,9 +84,8 @@ def release(number, expected_head):
     pr, ancestor = validate(number, expected_head)
     # Confirm that the GitHub credentials act as the repo owner, rather than
     # letting a low-privilege integration silently produce ineffectual approval.
-    identity = github("/../../user") if False else None
-    # The REST helper deliberately scopes only this repository; review author
-    # identity is checked by the existing merge coordinator at execution time.
+    # The merge coordinator will independently check owner authorship of the
+    # review comment and exact current HEAD/base/MacCI before any merge.
     marker = REVIEW_MARKER + json.dumps({
         "schema": 1, "head": expected_head, "decision": "approved",
         "requires_ancestor": ancestor,
