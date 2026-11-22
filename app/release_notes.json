@@ -1,5 +1,26 @@
 [
   {
+    "version": "0.1.19",
+    "title": "Panel 基座升级自动合并闭环",
+    "summary": "对已授权的 Panel 应用打通基座升级 PR 的精确 MacCI 测试、自动安全合并与现有 Mac mini 部署闭环，并提供独立调度器安全升级入口。",
+    "changes": [
+      "仅对 layho/macmini-office-app-panel 启用严格校验的自动升级 PR 合并；其他应用维持现有草稿 PR 与人工审查策略。",
+      "要求 OWNER 发起的 PR、正式基座 main 的准确目标 SHA、Panel 当前 main 的准确基线、三方差异无冲突以及实际修改文件符合生成计划。",
+      "必须检查可信 MacCI 对精确 HEAD/base/merge 的成功回执；提交变化、测试失败、额外业务文件或 GitHub 异常时自动停止。",
+      "增加独立调度器安全更新入口 --apply --upgrade，沿用原凭据/LaunchAgent/注册信息并保留备份；不直接触碰 Panel 业务数据库、域名及生产服务。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 执行新增升级自动合并的正向、失败、冲突、跨仓库和来源 SHA 校验回归测试。",
+      "检查宿主独立调度器的安全升级预检查，核对新模块是否成功安装在运行时，保留原 token 与注册。",
+      "核对 Panel 基座升级 PR 的合并 MacCI 回执、应用 main 合并 SHA、自动部署回执和 panel.layho.com 实际运行 SHA。",
+      "在 base.layho.com 精确候选网页验收后，正式发布基座 main，再启用宿主升级。"
+    ],
+    "validation_note": "GitHub 代码提交/preview 合并不会升级 Mac mini 独立调度器。必须验证运行时版本及真实下游应用公网部署后才能声明闭环已生效。",
+    "reference_url": "https://github.com/layho/macmini-office-app-panel/pull/18"
+  },
+  {
     "version": "0.1.18",
     "title": "app-init 默认安装目录与基座升级自动登记",
     "summary": "将新应用默认安装到 ~/Projects/app-init/owner--repo，初始化或复验时自动登记基座升级调度器，保护已有应用路径和手动注册配置。",
