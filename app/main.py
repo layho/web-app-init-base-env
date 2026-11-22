@@ -50,6 +50,15 @@ class RenameWorkspaceIn(BaseModel):
     reference_name: str = Field(min_length=1, max_length=80)
 
 
+@app.get("/api/branding")
+def public_branding(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return admin_settings.public()
+    except (OSError, ValueError):
+        raise HTTPException(503, "应用名称暂不可用") from None
+
+
 @app.get("/api/v1/account/settings", dependencies=[Depends(authorize)])
 def account_settings(response: Response):
     response.headers["Cache-Control"] = "no-store"
