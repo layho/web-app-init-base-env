@@ -6,9 +6,10 @@ import secrets
 import time
 from datetime import timedelta
 from fastapi import HTTPException, Request, Response
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 from .models import AdminSession, utcnow
+from . import admin_settings
 
 COOKIE_NAME = "webapp_session"
 TTL_HOURS = 12
@@ -52,7 +53,7 @@ def login(request: Request, response: Response, db: Session, username: str, pass
     if len(_failures) >= 10:
         raise HTTPException(429, "Too many unsuccessful login attempts; retry later")
     expected_user = os.getenv("APP_ADMIN_USERNAME", "admin")
-    encoded = os.getenv("APP_ADMIN_PASSWORD_HASH", "")
+    encoded = admin_settings.read()["password_hash"] or os.getenv("APP_ADMIN_PASSWORD_HASH", "")
     if not encoded:
         raise HTTPException(503, "Admin password hash not configured")
     user_ok = hmac.compare_digest(username.encode(), expected_user.encode())
@@ -123,3 +124,27 @@ def logout(request: Request, response: Response, db: Session):
         db.commit()
     response.delete_cookie(COOKIE_NAME, path="/api", secure=os.getenv("APP_COOKIE_SECURE", "true").lower()=="true", httponly=True, samesite="strict")
     return {"ok": True}
+
+
+def change_password(request: Request, db: Session, old_password: str, new_password: str):
+    """Change shared admin credential and revoke all sessions after persisting.
+
+    The initial environment password remains bootstrap-only once overridden.
+    """
+    authorize_session(request, db)
+    if len(new_password) < 12 or len(new_password) > 256:
+        raise HTTPException(422, "新密码长度须为 12–256 个字符")
+    current = admin_settings.read()
+    encoded = current["password_hash"] or os.getenv("APP_ADMIN_PASSWORD_HASH", "")
+    if not encoded or not check_password(old_password, encoded):
+        raise HTTPException(403, "当前密码错误")
+    if hmac.compare_digest(old_password, new_password):
+        raise HTTPException(422, "新密码不能与当前密码相同")
+    current["password_hash"] = hash_password(new_password)
+    try:
+        admin_settings.save(current)
+    except (OSError, ValueError):
+        raise HTTPException(503, "密码保存失败，旧密码保持有效") from None
+    db.execute(delete(AdminSession))
+    db.commit()
+    return {"changed": True, "sessions_revoked": True}
