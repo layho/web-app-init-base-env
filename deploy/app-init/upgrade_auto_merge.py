@@ -16,7 +16,7 @@ MAX_BODY = 180_000
 
 
 def api(path, *, method="GET", payload=None):
-    if not re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:pulls/[1-9][0-9]*(?:/files|/merge)?|commits/[0-9a-f]{40}/statuses|git/commits/[0-9a-f]{40}|branches/main)", path):
+    if not re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:pulls/[1-9][0-9]*(?:/files|/merge)?|commits/[0-9a-f]{40}/statuses|git/commits/[0-9a-f]{40}|branches/main|compare/[0-9a-f]{40}\\.\\.\\.[0-9a-f]{40})", path):
         raise ValueError("Unsupported auto-merge endpoint")
     data = None if payload is None else json.dumps(payload).encode()
     token = upgrade.read_token()
@@ -31,6 +31,27 @@ def api(path, *, method="GET", payload=None):
             return json.loads(result)
     except (HTTPError, URLError, OSError, UnicodeError, json.JSONDecodeError):
         raise ValueError("GitHub auto-merge API unavailable") from None
+
+
+
+def official_foundation_target(target_sha):
+    """A pending upgrade may safely complete after foundation main advances.
+
+    Only trusted immutable ancestors of current official main are eligible.
+    This prevents an older in-flight PR from blocking all later releases.
+    """
+    if not isinstance(target_sha, str) or not upgrade.SHA.fullmatch(target_sha):
+        return False
+    latest = upgrade.remote_ref(upgrade.SOURCE_URL, "refs/heads/main")
+    if latest == target_sha:
+        return True
+    if not isinstance(latest, str) or not upgrade.SHA.fullmatch(latest):
+        return False
+    comparison = api("/repos/" + upgrade.FOUNDATION + "/compare/" + target_sha + "..." + latest)
+    return (isinstance(comparison, dict)
+            and comparison.get("status") == "ahead"
+            and (comparison.get("merge_base_commit") or {}).get("sha") == target_sha)
+
 
 
 def promotion_gate(repo, number, app_sha, foundation_sha):
@@ -102,13 +123,15 @@ def promote(repo, row, app_sha, target_sha):
     number = row.get("number")
     if type(number) is not int or number <= 0:
         return False
+    if not official_foundation_target(target_sha):
+        return False
     head = promotion_gate(repo, number, app_sha, target_sha)
     if head is None:
         return False
     prefix = "/repos/" + repo
     # A new main commit or source release invalidates this authorization.
     if (api(prefix + "/branches/main")["commit"]["sha"] != app_sha
-            or upgrade.remote_ref(upgrade.SOURCE_URL, "refs/heads/main") != target_sha
+            or not official_foundation_target(target_sha)
             or promotion_gate(repo, number, app_sha, target_sha) != head):
         return False
     # Draft PR requires explicit transition to ready. Fail closed if unavailable.
