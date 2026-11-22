@@ -90,9 +90,10 @@ class MergeTests(unittest.TestCase):
         api.side_effect=[candidate,{"commit":{"sha":B}},{"parents":[{"sha":D},{"sha":H}]}]
         self.assertIsNone(m.authorization("fake",7))
 
+    @patch.object(m,"preview_frozen",return_value=False)
     @patch.object(m,"git")
     @patch.object(m,"authorization",return_value=None)
-    def test_no_review_no_push(self,auth,git):
+    def test_no_review_no_push(self,auth,git,frozen):
         self.assertFalse(m.merge_one("fake",7))
         git.assert_not_called()
 
