@@ -72,5 +72,14 @@ class SchedulerTests(unittest.TestCase):
                 with s.lock("tick.lock"):
                     pass
 
+    def test_if_absent_preserves_manual_mode(self):
+        s.register(REPO, "observe")
+        s.register(REPO, "create", if_absent=True)
+        self.assertEqual(s.registry()["apps"][REPO]["mode"], "observe")
+
+    def test_if_absent_registers_new_app(self):
+        s.register(REPO, "create", if_absent=True)
+        self.assertEqual(s.registry()["apps"][REPO]["mode"], "create")
+
 if __name__ == "__main__":
     unittest.main()
