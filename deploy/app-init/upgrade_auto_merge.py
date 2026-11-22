@@ -16,7 +16,7 @@ MAX_BODY = 180_000
 
 
 def api(path, *, method="GET", payload=None):
-    if not re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:pulls/[1-9][0-9]*(?:/files)?|commits/[0-9a-f]{40}/statuses|git/commits/[0-9a-f]{40}|branches/main)", path):
+    if not re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:pulls/[1-9][0-9]*(?:/files|/merge)?|commits/[0-9a-f]{40}/statuses|git/commits/[0-9a-f]{40}|branches/main)", path):
         raise ValueError("Unsupported auto-merge endpoint")
     data = None if payload is None else json.dumps(payload).encode()
     token = upgrade.read_token()
@@ -113,7 +113,7 @@ def promote(repo, row, app_sha, target_sha):
     pr = api(prefix + "/pulls/" + str(number))
     if pr.get("head", {}).get("sha") != head or pr.get("base", {}).get("sha") != app_sha or pr.get("draft"):
         return False
-    result = api(prefix + "/pulls/" + str(number), method="PUT",
+    result = api(prefix + "/pulls/" + str(number) + "/merge", method="PUT",
                  payload={"merge_method": "merge", "sha": head})
     return result.get("merged") is True
 
