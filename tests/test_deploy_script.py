@@ -34,7 +34,7 @@ def test_update_stops_build_when_npm_ci_fails(tmp_path):
     frontend.mkdir()
     (frontend / "package-lock.json").write_text("{}")
     script = SCRIPT.read_text()
-    build_function = script[script.index("build() {"):script.index("health() {")]
+    build_function = script[script.index("build() {"):script.index("health_once() {")]
     program = build_function + """
 node() { return 0; }
 npm() {
@@ -79,7 +79,12 @@ build() {
     printf candidate > frontend/dist.next/index.html
 }
 launchctl() { printf '%s\n' "$(git rev-parse HEAD)" >> restarts; }
+health_once() { return 1; }
 health() {
+    if test "$1" = "$old"; then
+      test "$(git rev-parse HEAD)" = "$old" && test "$(cat frontend/dist/index.html)" = previous
+      return
+    fi
     test "$1" = "$new" || return 2
     test "$(git rev-parse HEAD)" = "$new" || return 2
     test "$(cat frontend/dist/index.html)" = candidate || return 2
@@ -99,6 +104,7 @@ set -e
 test "$rc" = 1
 test -f health-checked
 grep -q $'\trollback\t' logs/operations.tsv
+grep -q "$(printf '\trollback_ok\t%s' "$old")" logs/operations.tsv
 if grep -q $'\tupdate_ok\t' logs/operations.tsv; then exit 2; fi
 test "$(git rev-parse HEAD)" = "$old"
 test "$(cat frontend/dist/index.html)" = previous
@@ -192,6 +198,97 @@ grep -q "tasks synced" calls
 APP_GITHUB_FEEDBACK_TOKEN=
 feedback
 test ! -s calls
+'''
+    result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_system_restart_uses_authoritative_job_and_bounded_shutdown(tmp_path):
+    script = SCRIPT.read_text()
+    restart = script[script.index("restart_web() {"):script.index("rollback() {")]
+    program = restart + r'''
+set -euo pipefail
+APP_INIT_SYSTEM_SERVICE=1
+ROOT=$PWD
+WEB=test.web
+PORT=25936
+mkdir logs
+printf '99999\n' > logs/web.pid
+log() { :; }
+sleep() { :; }
+launchctl() {
+    test "$*" = "print system/test.web" || return 71
+    case "$mode" in
+        waiting) printf 'state = waiting\n';;
+        replaced) if test -s signals; then printf 'pid = 43\n'; else printf 'pid = 42\n'; fi;;
+        *) printf 'state = running\n\tpid = 42\n';;
+    esac
+}
+ps() {
+    test "$2" = 42 || return 72
+    case "$4" in
+        uid=) id -u;;
+        lstart=) if test "$mode" = reused && test -s signals; then echo later; else echo original; fi;;
+        command=) if test "$mode" = unrelated; then echo unrelated; else echo 'uvicorn app.main:app --host 127.0.0.1 --port 25936 --workers 1'; fi;;
+        *) return 72;;
+    esac
+}
+lsof() { if test "$mode" = other_cwd; then printf 'n/tmp/other-app\n'; else printf 'n%s\n' "$ROOT"; fi; }
+kill() {
+    case "$*" in
+        "-TERM 42"|"-KILL 42") echo "$*" >> signals;;
+        "-0 42") return 0;;
+        *) return 73;;
+    esac
+}
+mode=stuck
+restart_web
+test "$(cat signals)" = "$(printf '%s\n%s' '-TERM 42' '-KILL 42')"
+: > signals
+mode=replaced
+restart_web
+test "$(cat signals)" = "-TERM 42"
+: > signals
+mode=reused
+restart_web
+test "$(cat signals)" = "-TERM 42"
+: > signals
+mode=waiting
+restart_web
+test ! -s signals
+mode=unrelated
+if restart_web; then exit 74; fi
+test ! -s signals
+mode=other_cwd
+if restart_web; then exit 75; fi
+test ! -s signals
+'''
+    result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_rollback_reports_unhealthy_previous_service(tmp_path):
+    script = SCRIPT.read_text()
+    rollback = script[script.index("rollback() {"):script.index("update() {")]
+    program = rollback + r'''
+set -euo pipefail
+WEB=test.web
+mkdir -p .venv/bin logs frontend/dist frontend/dist.previous
+printf previous > frontend/dist.previous/index.html
+printf candidate > frontend/dist/index.html
+printf '#!/bin/bash\nexit 0\n' > .venv/bin/python
+chmod +x .venv/bin/python
+git() { :; }
+log() { echo "$*"; }
+record_operation() { printf '%s %s\n' "$1" "$2" >> events; }
+health_once() { return 1; }
+restart_web() { return 1; }
+health() { return 1; }
+if rollback old bad; then exit 73; fi
+test "$(cat .webapp-failed-sha)" = bad
+test "$(cat frontend/dist/index.html)" = previous
+grep -q '^rollback_failed bad$' events
+! grep -q '^rollback_ok ' events
 '''
     result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

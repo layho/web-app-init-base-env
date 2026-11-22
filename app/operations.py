@@ -11,7 +11,7 @@ OPERATIONS_LOG = Path(__file__).resolve().parents[1] / "logs" / "operations.tsv"
 EVENT_CODES = {
     "startup_ok", "schema_check_failed", "frontend_missing",
     "install_ok", "install_failed", "update_ok", "update_blocked",
-    "rollback", "feedback_ok", "feedback_failed",
+    "rollback", "rollback_ok", "rollback_failed", "feedback_ok", "feedback_failed",
 }
 
 

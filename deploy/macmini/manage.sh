@@ -86,21 +86,23 @@ build() {
   (cd frontend && npm run build -- --outDir dist.next) || return 1
   test -s frontend/dist.next/index.html
 }
+health_once() {
+  local expected="$1"
+  curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/api/version" |
+  .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("running_sha")==sys.argv[1] else 1)' "$expected" 2>/dev/null &&
+  curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
+  .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" else 1)' 2>/dev/null &&
+  curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/" | grep -q '/assets/' &&
+  test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/v1/feedback")" = "401" &&
+  test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/session")" = "401"
+}
 health() {
   local expected="$1" i
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    # Validate exact JSON values rather than matching a SHA substring.
-    if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/version" |
-       .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("running_sha")==sys.argv[1] else 1)' "$expected" 2>/dev/null &&
-       curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
-       .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" else 1)' 2>/dev/null &&
-       curl -fsS --max-time 3 "http://127.0.0.1:$PORT/" | grep -q '/assets/' &&
-       test "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/v1/feedback")" = "401" &&
-       test "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/session")" = "401"; then
-      return 0
-    fi
+    if health_once "$expected"; then return 0; fi
     sleep 2
   done
+  log "Health check failed for $expected on port $PORT"
   return 1
 }
 serve() {
@@ -129,7 +131,7 @@ serve() {
   if test "${APP_INIT_SYSTEM_SERVICE:-}" = "1"; then
     printf '%s\n' "$$" > logs/web.pid
   fi
-  exec .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port "$PORT" --workers 1
+  exec .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port "$PORT" --workers 1 --timeout-graceful-shutdown 5
 }
 agents() {
   export APP_AGENT_ROOT="$ROOT" APP_AGENT_DIR="$AGENT_DIR" APP_AGENT_PREFIX="$LABEL_PREFIX"
@@ -225,33 +227,75 @@ restart_web() {
     launchctl kickstart -k "gui/$(id -u)/$WEB"
     return
   fi
-  local pid process
-  read -r pid < logs/web.pid || return 1
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-  process="$(ps -p "$pid" -o command=)" || return 1
-  [[ "$process" == *"uvicorn app.main:app --host 127.0.0.1 --port $PORT --workers 1"* ]] || return 1
-  if test "${TRACK_BRANCH:-main}" = preview; then
-    local cwd
-    cwd="$(lsof -nP -a -p "$pid" -d cwd -Fn | sed -n 's/^n//p')" || return 1
-    test "$cwd" = "$ROOT" || { log 'Preview PID working directory mismatch; refusing restart'; return 1; }
+  # Use the exact launchd job, never the stale web.pid file. Capture the
+  # original process identity so escalation cannot target a replacement.
+  local job pid process cwd started owner attempt observed
+  job="$(launchctl print "system/$WEB" 2>/dev/null)" || {
+    log "Web job is not accessible: system/$WEB"; return 1;
+  }
+  pid="$(printf '%s\n' "$job" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+  if test -z "$pid"; then
+    log "Web job has no PID; waiting for launchd KeepAlive"
+    return 0
   fi
-  kill -TERM "$pid"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  process="$(ps -p "$pid" -o command=)" || {
+    log 'Web process exited during restart; waiting for launchd'; return 0;
+  }
+  [[ "$process" == *"uvicorn app.main:app --host 127.0.0.1 --port $PORT --workers 1"* ]] || {
+    log 'Web job is starting or process identity differs; no signal sent'; return 1;
+  }
+  cwd="$(lsof -nP -a -p "$pid" -d cwd -Fn | sed -n 's/^n//p')" || return 1
+  test "$cwd" = "$ROOT" || {
+    log 'Web PID working directory mismatch; refusing signal'; return 1;
+  }
+  started="$(ps -p "$pid" -o lstart=)" || return 1
+  owner="$(ps -p "$pid" -o uid= | tr -d '[:space:]')" || return 1
+  test -n "$started" && test "$owner" = "$(id -u)" || return 1
+  kill -TERM "$pid" || { log 'Web signal failed; checking health'; return 1; }
+  # Existing versions may lack Uvicorn's graceful shutdown deadline. Give
+  # them a bounded grace period, then revalidate every identity attribute.
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    job="$(launchctl print "system/$WEB" 2>/dev/null)" || return 1
+    observed="$(printf '%s\n' "$job" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+    test "$observed" = "$pid" || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+  done
+  test "$(ps -p "$pid" -o lstart=)" = "$started" || return 0
+  test "$(ps -p "$pid" -o uid= | tr -d '[:space:]')" = "$owner" || return 1
+  test "$(ps -p "$pid" -o command=)" = "$process" || return 1
+  test "$(lsof -nP -a -p "$pid" -d cwd -Fn | sed -n 's/^n//p')" = "$ROOT" || return 1
+  job="$(launchctl print "system/$WEB" 2>/dev/null)" || return 1
+  observed="$(printf '%s\n' "$job" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+  test "$observed" = "$pid" || return 0
+  log "Graceful shutdown exceeded 10 seconds for verified $WEB; escalating to SIGKILL"
+  kill -KILL "$pid" || { log 'Escalation failed; checking health'; return 1; }
 }
 rollback() {
-  local old="$1" bad="$2"
+  local old="$1" bad="$2" restored=1
   if test "${3:-hold}" = "hold"; then
     printf '%s\n' "$bad" > .webapp-failed-sha
   fi
   if test -d frontend/dist.previous; then
-    rm -rf frontend/dist
-    mv frontend/dist.previous frontend/dist
+    rm -rf frontend/dist || restored=0
+    mv frontend/dist.previous frontend/dist || restored=0
   fi
-  rm -rf frontend/dist.next
-  git reset --hard "$old" || true
-  .venv/bin/python -m pip install -q -r requirements.txt || true
-  restart_web || true
+  rm -rf frontend/dist.next || restored=0
+  git reset --hard "$old" || restored=0
+  .venv/bin/python -m pip install -q -r requirements.txt || restored=0
   if test "${3:-hold}" = "hold"; then record_operation rollback "$bad"; fi
-  log "Rollback to $old; failed $bad"
+  # A failure before restart may leave the previous service healthy.
+  # Do not stop that process unnecessarily. Otherwise wait for launchd.
+  if test "$restored" = 1 && { health_once "$old" || { restart_web || log 'Rollback restart request failed'; health "$old"; }; }; then
+    record_operation rollback_ok "$old"
+    log "ROLLBACK_OK $old; held candidate $bad"
+    return 0
+  fi
+  printf '%s\n' "$bad" > .webapp-failed-sha
+  record_operation rollback_failed "$bad"
+  log "ROLLBACK_FAILED $old; inspect system/$WEB and health; manual recovery required"
+  return 1
 }
 update() {
   assert_main; load_env
@@ -288,9 +332,12 @@ update() {
   if ! test_app || ! build; then
     rollback "$old" "$new"; exit 1
   fi
-  if test -d frontend/dist; then mv frontend/dist frontend/dist.previous; fi
-  mv frontend/dist.next frontend/dist
-  if ! restart_web || ! health "$new"; then
+  if test -d frontend/dist; then
+    if ! mv frontend/dist frontend/dist.previous; then rollback "$old" "$new"; exit 1; fi
+  fi
+  if ! mv frontend/dist.next frontend/dist; then rollback "$old" "$new"; exit 1; fi
+  restart_web || log "Restart request failed; checking candidate service"
+  if ! health "$new"; then
     rollback "$old" "$new"; exit 1
   fi
   rm -rf frontend/dist.previous .webapp-failed-sha
