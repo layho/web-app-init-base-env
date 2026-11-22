@@ -54,80 +54,389 @@
   "development_loop": [
     {
       "id": "feedback",
-      "title": "网页提交意见反馈",
-      "actor": "用户",
-      "cadence": "按需提交 · 后台自动同步",
-      "description": "在基座验收站提交需求或问题，自动同步至 GitHub Issues。",
+      "title": "网页反馈转 GitHub Issue",
+      "actor": "用户 / 后台",
+      "cadence": "按需提交 · 同步",
+      "description": "反馈存入基座并同步到 GitHub Issue，记录真实需求、复现和验收标准。",
       "mode": "input"
     },
     {
-      "id": "development",
-      "title": "领取任务并开发",
+      "id": "triage",
+      "title": "领取 Issue 与约束边界",
       "actor": "ChatGPT",
-      "cadence": "每小时检查",
-      "description": "认领 Issue，明确验收要求，修改代码并补充测试。",
+      "cadence": "已有定时任务每小时巡检",
+      "description": "按真实 Issue / PR / SHA 去重，明确前后端、权限、数据库及应用数据边界，避免重复开发。",
       "mode": "automatic"
     },
     {
-      "id": "pr",
-      "title": "提交 PR 并完成预审查授权",
-      "actor": "ChatGPT",
-      "cadence": "开发完成后",
-      "description": "提交独立分支、关联 Issue，审查准确 HEAD、记录前置依赖并解除草稿；测试未完成也无需等待第二次 ChatGPT 确认。",
+      "id": "implementation",
+      "title": "独立分支开发与可执行回归",
+      "actor": "ChatGPT / 开发执行者",
+      "cadence": "任务实际执行时",
+      "description": "提交最小可审查 PR，补 pytest、构建、脚本和失败场景测试；未运行的测试不称通过。",
       "mode": "automatic"
     },
     {
-      "id": "test",
-      "title": "MacCI 隔离自动化测试",
+      "id": "review",
+      "title": "预审查并授权准确 HEAD",
+      "actor": "ChatGPT",
+      "cadence": "提交候选后",
+      "description": "审查差异、依赖祖先及风险，在 PR 标记准确 HEAD 授权；新提交会使旧测试失效。",
+      "mode": "automatic"
+    },
+    {
+      "id": "macci",
+      "title": "MacCI 隔离测试精确候选",
       "actor": "Mac mini",
       "cadence": "每分钟检查",
-      "description": "核对 head/base SHA，测试合并候选的后端与前端构建。",
+      "description": "测试 head/base/merge 精确候选，验证后端、前端和测试脚本，回写不可混用的 SHA 证据。",
       "mode": "automatic",
-      "failure": "测试未通过 → 返回开发修复；禁止合并。"
+      "failure": "pytest/构建失败禁止合并；GitHub merge ref 暂不可用按有限次数重试。"
     },
     {
-      "id": "result",
-      "title": "GitHub 回传测试结果",
-      "actor": "MacCI / GitHub",
-      "cadence": "测试结束后",
-      "description": "回写测试状态及 head、base、merge SHA 对应证据。",
+      "id": "merge-preview",
+      "title": "本机自动合并到 preview",
+      "actor": "Mac mini",
+      "cadence": "每分钟检查",
+      "description": "核验最新 MacCI 状态、父提交、tree 和授权标记，非强制合入经过测试的候选。",
+      "mode": "automatic",
+      "failure": "基线变化必须重新测试，冲突时停止合并并反馈。"
+    },
+    {
+      "id": "preview-deploy",
+      "title": "preview 自动更新与健康验证",
+      "actor": "Mac mini",
+      "cadence": "每五分钟检查 · 可手动请求",
+      "description": "拉取 preview，执行编译和依赖/数据库检查、重启健康、版本及回滚核验，形成真实更新回执。",
+      "mode": "automatic",
+      "failure": "更新锁、失败 SHA、端口冲突或回滚异常不得被静默忽略。"
+    },
+    {
+      "id": "web-accept",
+      "title": "网页体验并点击「验收通过」",
+      "actor": "用户",
+      "cadence": "发布唯一人工确认",
+      "description": "确认功能和公网候选 SHA，与 GitHub 验收单及 MacCI 已测试版本一一对应。",
+      "mode": "manual",
+      "failure": "验收不通过继续反馈，不推进正式 main。"
+    },
+    {
+      "id": "publish-main",
+      "title": "自动发布正式 main",
+      "actor": "Mac mini",
+      "cadence": "每分钟检查",
+      "description": "验证验收单、精确候选、历史基线和发布回执，非强制推进 main 并写回发布记录。",
+      "mode": "automatic",
+      "failure": "权限、祖先或证据异常时停止发布。"
+    },
+    {
+      "id": "upgrade-scheduler",
+      "title": "下游独立基座升级 PR",
+      "actor": "Mac mini",
+      "cadence": "每五分钟检查",
+      "description": "只消费正式 main；可信应用来源才自动生成草稿 PR，观察模式不自动升级。",
+      "mode": "automatic",
+      "failure": "三方差异冲突或旧来源不能复现时保持待审。"
+    },
+    {
+      "id": "app-test-deploy",
+      "title": "应用独立测试、合并和部署",
+      "actor": "应用 MacCI / 更新器",
+      "cadence": "应用各自闭环",
+      "description": "保留业务文件、配置、数据库和端口；在应用仓库测试升级候选并核验公网真实运行 SHA。",
+      "mode": "automatic",
+      "failure": "基座已发布不等于所有应用已经升级。"
+    },
+    {
+      "id": "feedback-loop",
+      "title": "回访与继续开发",
+      "actor": "用户 / ChatGPT",
+      "cadence": "每次验收后",
+      "description": "记录 Issue 结果、失败诊断及后续任务；下轮从反馈开始。",
+      "mode": "input"
+    }
+  ],
+  "operating_guide": {
+    "scope": "foundation",
+    "title": "公共基座操作指南",
+    "summary": "以当前正式 main、Mac mini 已安装服务和公网运行 SHA 为准。基座研发走 preview → 网页验收 → main；普通应用独立升级，不共享数据库或部署端口。",
+    "cautions": [
+      "GitHub 发布不等于 Mac mini 已部署；合并状态、MacCI 测试、运行 SHA 与网页验收必须分别核实。",
+      "不要手动清理更新锁、失败 SHA、私有 Token、LaunchDaemon 或应用数据库以强行推进发布。",
+      "app-init 当前持久化默认路径为 ~/Applications/app-init/owner--repo；不要误认为会安装到当前工作目录或 ~/repo。"
+    ],
+    "sections": [
+      {
+        "id": "before",
+        "title": "01 · 初始化前检查",
+        "summary": "先确认 GitHub、Cloudflare、宿主服务和端口，再启动安装器。",
+        "steps": [
+          {
+            "title": "使用正式基座 main",
+            "detail": "使用已正式发布的基座来源，检查 GitHub 仓库是否为空；现有有提交的仓库不是重新生成空基座的目标。",
+            "check": "记录来源完整 SHA、目标仓库、域名、旧服务及目标回源。"
+          },
+          {
+            "title": "检查现有宿主服务",
+            "detail": "通过 SSH 检查现有 launchd 标签、项目实际目录和监听端口；不要只凭仓库名推断服务安装位置。",
+            "check": "确认不会与已有 Web、更新器、PostgreSQL 或反馈同步任务重复运行。"
+          },
+          {
+            "title": "核对 Cloudflare 回源",
+            "detail": "域名/DNS 与 GitHub 仓库独立；当前 app-init 遇到同域名已有不同端口的 Tunnel 规则会拒绝初始化。",
+            "check": "保留已有映射，待新服务在独立端口通过验证后，再受控切换 Cloudflare 回源。",
+            "caution": "不要为了通过检查提前删除已有域名记录或直接覆盖旧回源。"
+          }
+        ]
+      },
+      {
+        "id": "initialize",
+        "title": "02 · 初始化应用",
+        "summary": "Mac mini 使用现有 SSH 与已安装工具；不重复配置 Token、Python 或 MacCI。",
+        "steps": [
+          {
+            "title": "启动 app-init",
+            "detail": "普通 macOS 管理员账户运行 ~/bin/app-init；本地开发者可从固定正式 SHA 的基座副本运行 bash deploy/app-init/app-init（SSH 模式）。",
+            "check": "确认 GitHub 仓库、域名和安装路径均与预期一致。",
+            "caution": "公开 bootstrap 当前可能调用 GitHub CLI 网页认证；该方式不可用时不要反复重试，先使用已有 SSH 的内部入口。"
+          },
+          {
+            "title": "生成和安装",
+            "detail": "空仓库首次初始化生成独立应用、基座来源登记、登录、反馈、开发任务、更新记录和基座版本页签。",
+            "check": "核查 .app-init.json 的来源 SHA、应用配置和 GitHub main；不把 preview 当成正式来源。"
+          },
+          {
+            "title": "核验公网登录",
+            "detail": "完成本机启动、前端构建、HTTPS 登录、刷新后会话、反馈同步与 /api/version 完整 SHA 检查。",
+            "check": "公网服务的真实运行 SHA 与当前应用 main 及预期版本一致。"
+          }
+        ]
+      },
+      {
+        "id": "develop",
+        "title": "03 · 开发与发布",
+        "summary": "网页反馈→GitHub Issue→独立 PR→MacCI→验收，不用 GitHub Actions。",
+        "steps": [
+          {
+            "title": "提交反馈和开发任务",
+            "detail": "从网页提交需求并同步到 GitHub Issues；在开发任务中查看负责人、进度、回执和关联 PR。",
+            "check": "关联 Issue、精确 HEAD SHA 和可执行验收条件。"
+          },
+          {
+            "title": "MacCI 测试及 preview",
+            "detail": "MacCI 每分钟检查准确 HEAD/base/merge；预审查授权且测试通过后，由本机自动合并 preview。",
+            "check": "测试记录与最新候选父提交、tree 一致；测试失败绝不合并。"
+          },
+          {
+            "title": "检查并更新",
+            "detail": "验收站更新器每五分钟拉取 preview；按钮仅提交检查请求，实际状态看更新回执与日志。",
+            "check": "看见 DEPLOY_OK、实际运行 SHA、HTTP 健康与更新日志，而非仅看“请求已提交”。"
+          },
+          {
+            "title": "网页验收正式发布",
+            "detail": "在 base.layho.com 体验候选并点击「验收通过」，本机主发布器核验回执后将准确候选非强制发布到 main。",
+            "check": "GitHub main SHA、验收 Issue 和运行候选 SHA 三者一致。"
+          }
+        ]
+      },
+      {
+        "id": "downstream",
+        "title": "04 · 应用升级与故障恢复",
+        "summary": "正式 main 发布后，下游应用独立升级，不覆盖业务代码。",
+        "steps": [
+          {
+            "title": "调度器检查正式基座",
+            "detail": "Mac mini 独立升级调度器每五分钟只检查正式 main，为来源可信且登记 create 的应用创建独立草稿 PR。",
+            "check": "在应用「基座版本」查看登记模式、最近心跳、目标 SHA 与 PR；observe 不自动提交。"
+          },
+          {
+            "title": "应用单独测试部署",
+            "detail": "保留应用配置、业务文件、端口和数据；三方差异有冲突时暂停，独立 MacCI 测试后再合并应用 main。",
+            "check": "确认应用公网 /api/version 的 SHA 与应用 main 一致；基座版本号与应用版本号彼此独立。"
+          },
+          {
+            "title": "故障时按证据恢复",
+            "detail": "从系统日志、更新回执和本机 health 确定网络、锁、构建、端口、回滚或运行 SHA 差异。",
+            "check": "有实际 rollback_ok 才声称恢复；rollback_failed 需排查服务，不能跳过失败保护。"
+          }
+        ]
+      },
+      {
+        "id": "rebuild",
+        "title": "05 · 删除仓库并重新初始化",
+        "summary": "适用于尚未形成业务资产的旧应用，例如当前准备重建的 TI Hunter。",
+        "steps": [
+          {
+            "title": "备份与停用旧自动化",
+            "detail": "删除 GitHub 仓库之前，保留必要的 Issues/代码备份，核对并停用针对旧仓库的定时开发任务、更新器和自动升级登记。",
+            "check": "旧仓库的历史提交、PR 和反馈不会因使用同名新仓库自动恢复。",
+            "caution": "不要让旧本地 Git 分支或旧更新服务对同名新仓库自动拉取、推送或覆盖。"
+          },
+          {
+            "title": "保留旧回源直到新服务就绪",
+            "detail": "仓库删除不会自动更改 Cloudflare DNS/Tunnel；先确认旧 8018 服务、Web label、旧安装目录，准备隔离安装。",
+            "check": "新服务独立端口自检与 HTTPS 切换计划均就绪。",
+            "caution": "当前 app-init 新端口在 18000 以上；直接用旧 hunter.layho.com 初始化会因已有不同端口回源而受阻。"
+          },
+          {
+            "title": "受控切换而非盲目重装",
+            "detail": "先在独立域名或受控测试入口验收新应用，再停旧服务并更新 hunter.layho.com 的 Tunnel 回源到新端口。",
+            "check": "公网登录/刷新/反馈/API SHA 通过，旧服务不再占用目标端口。"
+          },
+          {
+            "title": "清理只在验收后",
+            "detail": "在新服务及独立升级调度正常运行后，人工确认是否归档或清理旧 LaunchAgent 和目录。",
+            "check": "没有遗留旧定时任务或复用旧数据库。",
+            "caution": "不删除正在使用的 .env、数据库、Cloudflare 路由或本机凭据。"
+          }
+        ]
+      }
+    ]
+  },
+  "application_guide": {
+    "scope": "application",
+    "title": "应用操作指南",
+    "summary": "应用独立于公共基座正式发布；自动升级调度器仅创建草稿 PR，不会跳过测试或直接覆盖当前业务。",
+    "cautions": [
+      "当前 app-init 将应用默认安装到 ~/Applications/app-init/owner--repo；如需其他目录，必须先核对真实实现，不要凭当前终端目录判断。",
+      "GitHub 仓库删除不会停止 Mac mini 旧服务或改变 Cloudflare 隧道回源；同域名不同端口会触发冲突保护。"
+    ],
+    "sections": [
+      {
+        "id": "start",
+        "title": "01 · 初始化与上线",
+        "summary": "先核对仓库、域名、回源与宿主运行状态。",
+        "steps": [
+          {
+            "title": "新建空仓库并初始化",
+            "detail": "运行 ~/bin/app-init 或已授权的正式基座内部入口；空仓库第一次初始化自动生成应用基座。",
+            "check": "确认 .app-init.json 中来源完整 SHA 和应用域名/端口。"
+          },
+          {
+            "title": "验收服务",
+            "detail": "检查本机服务、HTTPS 登录、刷新会话、反馈与 /api/version。",
+            "check": "公网运行 SHA 对应实际应用 main。"
+          }
+        ]
+      },
+      {
+        "id": "feedback",
+        "title": "02 · 反馈开发与发布",
+        "summary": "使用应用内部页面形成独立的 Issue、PR 和测试闭环。",
+        "steps": [
+          {
+            "title": "提交需求",
+            "detail": "在意见反馈中明确场景和验收标准，由后台同步 GitHub Issue。",
+            "check": "开发任务与 PR 标记真实进度，不能将需求同步等同于已交付。"
+          },
+          {
+            "title": "审查并测试 PR",
+            "detail": "独立分支开发与 MacCI 精确 HEAD/base/merge 测试，失败不合并。",
+            "check": "通过后合并应用 main，等待本机更新器部署。"
+          },
+          {
+            "title": "验证实际部署",
+            "detail": "「检查并更新」仅请求更新，结合日志、健康检查及公网 /api/version 确认。",
+            "check": "运行 SHA 与目标应用 main 一致；错误时保留保护锁与失败记录。"
+          }
+        ]
+      },
+      {
+        "id": "foundation",
+        "title": "03 · 升级共享基座",
+        "summary": "下游只消费公共基座正式 main，不消费 preview。",
+        "steps": [
+          {
+            "title": "查询基座版本",
+            "detail": "项目信息 → 基座版本：查看当前来源、正式版本、调度器检查和目标 SHA。",
+            "check": "无真实来源或回执过期时应显示未知/观察模式。"
+          },
+          {
+            "title": "升级草稿 PR",
+            "detail": "已登记 create 的应用由 Mac mini 每五分钟检查并生成独立 PR，保留业务代码；observe 需要先确认来源。",
+            "check": "独立测试、冲突审查与公网验收后才算完成升级。"
+          }
+        ]
+      },
+      {
+        "id": "restore",
+        "title": "04 · 重建及恢复",
+        "summary": "已有旧服务、同名仓库或旧域名时，不直接覆盖生产。",
+        "steps": [
+          {
+            "title": "备份并隔离",
+            "detail": "保留历史代码/Issues 和旧运行配置，停用可能对同名新仓库自动写入的任务。",
+            "check": "旧 Web/更新器/数据与新环境分离。"
+          },
+          {
+            "title": "保留映射并在验收后切换",
+            "detail": "Cloudflare Tunnel 不随 GitHub 仓库删除而改变；如果新端口不同，必须受控修改旧域名回源。",
+            "check": "新 HTTP/HTTPS 登录与 SHA 完成验证后再结束旧服务。"
+          }
+        ]
+      }
+    ]
+  },
+  "app_development_loop": [
+    {
+      "id": "feedback",
+      "title": "网页意见反馈同步 Issue",
+      "actor": "用户 / 应用",
+      "cadence": "按需提交 · 后台同步",
+      "description": "需求留在应用自己 GitHub 仓库，明确业务预期和验收条件。",
+      "mode": "input"
+    },
+    {
+      "id": "develop",
+      "title": "领取任务、开发与预审查",
+      "actor": "开发任务",
+      "cadence": "按现有开发任务计划",
+      "description": "在独立分支开发，维护测试、文档、PR HEAD 和安全边界；正式业务数据库不作测试目标。",
       "mode": "automatic"
     },
     {
-      "id": "preview",
-      "title": "自动合入 preview",
+      "id": "macci",
+      "title": "MacCI 精确候选测试",
       "actor": "Mac mini",
       "cadence": "每分钟检查",
-      "description": "核验已审查 HEAD、前置祖先、实际 preview 基线、最新 MacCI 测试及候选父提交；非强制推送准确测试候选。",
+      "description": "测试最新应用 PR 的 head/base/merge，并回传 pytest 与构建证据。",
       "mode": "automatic",
-      "failure": "等待依赖或新基线测试 → 自动继续；冲突或测试失败 → 返回开发修复。"
+      "failure": "任何代码测试失败不自动合并。"
+    },
+    {
+      "id": "merge",
+      "title": "审查后合并应用 main",
+      "actor": "受信任审查者",
+      "cadence": "准确候选通过后",
+      "description": "核对回归、冲突与数据影响，仅合入已经测试的提交。",
+      "mode": "automatic",
+      "failure": "未受权或基线变化则暂停。"
     },
     {
       "id": "deploy",
-      "title": "自动部署验收版本",
+      "title": "本机更新与公网验证",
       "actor": "Mac mini",
-      "cadence": "每五分钟检查",
-      "description": "拉取 preview，检查端口、构建及健康状态，核对公网运行 SHA。",
+      "cadence": "每五分钟检查 · 可手动请求",
+      "description": "拉取应用 main，执行构建、服务健康和运行 SHA 核验。",
       "mode": "automatic",
-      "failure": "部署失败 → 保留或尝试恢复上一版本，排查原因。"
+      "failure": "回滚健康不通过或运行 SHA 不一致时不声称已部署。"
     },
     {
-      "id": "accept",
-      "title": "网页点击「验收通过」",
+      "id": "confirm",
+      "title": "用户体验并继续反馈",
       "actor": "用户",
-      "cadence": "唯一人工发布验收环节",
-      "description": "体验当前候选功能并确认准确的运行 SHA，提交正式发布请求。",
-      "mode": "manual",
-      "failure": "验收不通过 → 提交新反馈，重新进入开发闭环。"
+      "cadence": "功能上线后",
+      "description": "登录应用完成真实场景验收，反馈进入下一轮 Issue。",
+      "mode": "manual"
     },
     {
-      "id": "publish",
-      "title": "自动正式发布 main",
-      "actor": "Mac mini",
-      "cadence": "每分钟检查",
-      "description": "同时核验网页验收本机回执和 GitHub 发布单、精确候选 SHA 与测试树、main 基线；非强制发布已确认提交并回写关闭发布单。",
+      "id": "base-upgrade",
+      "title": "正式基座升级候选",
+      "actor": "独立升级调度器",
+      "cadence": "每五分钟检查",
+      "description": "只追踪基座正式 main，为可验证来源的应用创建单独草稿 PR；observe 仅观察。",
       "mode": "automatic",
-      "failure": "凭据、分支保护或基线异常 → 停止发布并报告。"
+      "failure": "冲突或来源未知时暂停，不覆盖业务代码。"
     }
   ]
 }

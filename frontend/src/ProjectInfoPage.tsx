@@ -6,6 +6,28 @@ type WorkflowStage = { title: string; description: string }
 type LoopStage = { id: string; title: string; actor: string; cadence: string; description: string; mode: 'input' | 'automatic' | 'manual'; failure?: string }
 type TaskModule = { module: string; scope: string; acceptance: string; issue: number }
 
+type GuideStep = { title: string; detail: string; check?: string; caution?: string }
+type GuideSection = { id: string; title: string; summary: string; steps: GuideStep[] }
+type OperatingGuide = { scope: 'foundation' | 'application'; title: string; summary: string; cautions: string[]; sections: GuideSection[] }
+
+function OperatingGuidePage({ guide }: { guide: OperatingGuide }) {
+  return <Flex vertical gap="middle">
+    <Alert type="info" showIcon message={guide.title} description={guide.summary} />
+    {guide.cautions.map((warning, index) => <Alert key={index} type="warning" showIcon message={warning} />)}
+    {guide.sections.map(section => <Card key={section.id} size="small" title={section.title}>
+      <Typography.Paragraph type="secondary">{section.summary}</Typography.Paragraph>
+      <List dataSource={section.steps} renderItem={(step, index) => <List.Item key={step.title}>
+        <Flex vertical gap={6} style={{ width: '100%' }}>
+          <Typography.Text strong>{index + 1}. {step.title}</Typography.Text>
+          <Typography.Paragraph style={{ marginBottom: 0 }}>{step.detail}</Typography.Paragraph>
+          {step.check && <Typography.Text type="secondary">验收依据：{step.check}</Typography.Text>}
+          {step.caution && <Alert type="warning" showIcon message={step.caution} />}
+        </Flex>
+      </List.Item>} />
+    </Card>)}
+  </Flex>
+}
+
 type VersionRef = { version: string; sha: string }
 type FoundationVersion = {
   repository: string
@@ -29,6 +51,7 @@ export type ProjectInfo = {
   architecture: ArchitectureLayer[]
   workflow: WorkflowStage[]
   development_loop?: LoopStage[]
+  operating_guide?: OperatingGuide
   tasks: TaskModule[]
 }
 
@@ -136,6 +159,11 @@ export function ProjectInfoPage({ data, loading, issueBase, onOpenTasks, onRefre
           </List.Item>
         )} />,
       },
+      ...(data.operating_guide?.sections?.length ? [{
+        key: 'operating-guide',
+        label: '操作指南',
+        children: <OperatingGuidePage guide={data.operating_guide} />,
+      }] : []),
       ...(data.development_loop?.length ? [{
         key: 'development-loop',
         label: '开发闭环',

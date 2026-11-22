@@ -123,8 +123,12 @@ def copy_foundation(source, target, repository, title, domain, port, label):
         file.write_text(content, encoding="utf-8")
     project = json.loads((source / "app/project_info.json").read_text(encoding="utf-8"))
     project.update(name=title, summary="应用基座已初始化。可在意见反馈登记需求。", tasks=[])
-    # The foundation preview/main release flow is not a downstream app workflow.
-    project.pop("development_loop", None)
+    # Keep the distinct app workflow. The foundation's preview → acceptance
+    # → main publication flow must never be presented as an app deployment flow.
+    project["development_loop"] = project.pop("app_development_loop", [])
+    project["operating_guide"] = project.pop("application_guide", {})
+    need(project["operating_guide"].get("scope") == "application",
+         "Downstream application guide is missing or has wrong scope")
     (target / "app/project_info.json").write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     notes = [{"version": "0.1.0", "title": "应用初始化", "changes": ["创建登录、工作台和应用基座。"],
               "validation": "验证登录、运行版本、自动更新和反馈同步。"}]

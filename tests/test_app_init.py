@@ -107,7 +107,12 @@ def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path, monkeypatch)
     assert not (repo / ".env").exists()
     assert not (repo / "app/ti_client.py").exists()
     assert "class Product" not in (repo / "app/models.py").read_text()
-    assert json.loads((repo / "app/project_info.json").read_text())["tasks"] == []
+    info = json.loads((repo / "app/project_info.json").read_text())
+    assert info["tasks"] == []
+    assert info["operating_guide"]["scope"] == "application"
+    assert info["development_loop"] and all(stage["id"] != "publish-main" for stage in info["development_loop"])
+    assert "GitHub 仓库删除不会停止" in " ".join(info["operating_guide"]["cautions"])
+    assert "基座正式发布" not in info["operating_guide"]["title"]
     assert "example/demo-app" in (repo / "scripts/sync_feedback.py").read_text()
     assert (repo / "deploy/macmini/release.py").exists()
     assert app_init.seed(SOURCE, str(remote), tmp_path / "second", *args) == meta
