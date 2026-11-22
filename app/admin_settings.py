@@ -3,6 +3,7 @@
 No database migration and no .env rewrite. Password hash is never exposed by APIs.
 """
 import json
+import errno
 import os
 from pathlib import Path
 import re
@@ -31,7 +32,12 @@ def read():
         if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid()
                 or parent.st_mode & 0o022):
             raise ValueError("Unsafe settings parent")
-        fd = os.open(SETTINGS, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            fd = os.open(SETTINGS, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError("Unsafe settings symlink") from None
+            raise
         with os.fdopen(fd, encoding="utf-8") as stream:
             st = os.fstat(stream.fileno())
             if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
