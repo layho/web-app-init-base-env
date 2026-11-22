@@ -17,6 +17,7 @@ type DeployStatus = { state: string; event: {at: string; code: string; sha: stri
 const deployLabels: Record<string, string> = { request_waiting: "已登记请求，等待更新器领取", request_unacknowledged: "更新器未确认请求，请检查服务或锁", update_started: "更新器已开始检查", update_candidate: "已取得目标提交", update_dependencies: "检查依赖", update_test_build: "测试及构建中", update_restarting: "服务重启及健康验证中", update_ok: "本机部署成功", update_no_change: "已检查，无新提交", update_held: "目标提交被失败保护拦截", update_preflight_failed: "更新前置条件失败", update_fetch_failed: "拉取失败", update_dependencies_failed: "依赖检查失败", update_schema_failed: "数据库结构检查失败", update_test_build_failed: "测试或构建失败", update_restart_failed: "重启或健康检查失败", update_interrupted: "更新进程未完成", running_sha_mismatch: "运行版本与更新记录不一致", unknown: "尚无更新器回执" }
 
 type AppBranding = { workspace_name: string; reference_name: string }
+type UpdateCheck = { state: 'available' | 'current' | 'unavailable'; branch: string; running_sha?: string; remote_sha?: string; reason?: string }
 type RunningVersion = { version: string; running_sha: string; manual_update_available: boolean }
 type Session = { username: string; csrf_token: string }
 type FeedbackInput = { category: string; message: string }
@@ -91,6 +92,9 @@ function App() {
   const [runningVersion, setRunningVersion] = useState<RunningVersion | null>(null)
   const [versionUnavailable, setVersionUnavailable] = useState(false)
   const [requestingUpdate, setRequestingUpdate] = useState(false)
+  const [checkingUpdate, setCheckingUpdate] = useState(false)
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheck | null>(null)
+  const [deployConfirm, setDeployConfirm] = useState(false)
   const [deployStatus, setDeployStatus] = useState<DeployStatus | null>(null)
   const [page, setPage] = useState<Page>('workspace')
   const [records, setRecords] = useState<Feedback[]>([])
@@ -166,13 +170,39 @@ function App() {
     return () => { active = false; window.clearInterval(timer) }
   }, [signedIn])
 
+  async function checkUpdate() {
+    if (!session || checkingUpdate) return
+    setCheckingUpdate(true)
+    setUpdateCheck(null)
+    try {
+      const result = await api<UpdateCheck>('/api/v1/deploy/check')
+      setUpdateCheck(result)
+      setNotice(result.state === 'unavailable'
+        ? { type: 'error', text: result.reason || '无法检查远程版本' }
+        : { type: 'success', text: result.state === 'available'
+          ? `检测到 ${result.branch} 新提交：${result.remote_sha?.slice(0, 12)}，可选择立即部署。`
+          : `当前已是 ${result.branch} 最新提交。` })
+    } catch (error) {
+      showError(error)
+    } finally {
+      setCheckingUpdate(false)
+    }
+  }
+
   async function requestUpdate() {
     if (!session || requestingUpdate) return
+    if (updateCheck?.state !== 'available' || updateCheck.running_sha !== runningVersion?.running_sha) {
+      setDeployConfirm(false)
+      setNotice({type:'error',text:'检查结果已失效，请重新检查版本'})
+      return
+    }
+    setDeployConfirm(false)
     setRequestingUpdate(true)
     setNotice(null)
     try {
       await api('/api/v1/deploy/update', { method: 'POST' }, session.csrf_token)
-      setNotice({ type: 'success', text: '更新请求已登记，尚未确认执行；请查看下方实时更新状态。' })
+      setUpdateCheck(null)
+      setNotice({ type: 'success', text: '部署请求已登记，等待本机更新器回执。' })
       setDeployStatus(await api<DeployStatus>('/api/v1/deploy/status'))
     } catch (error) {
       showError(error)
@@ -345,14 +375,13 @@ function App() {
             v{runningVersion.version}{runningVersion.running_sha !== 'unknown' && ` · ${runningVersion.running_sha.slice(0, 8)}`}
           </Tag>
         ) : <Tag>{versionUnavailable ? '版本暂不可用' : '读取版本中…'}</Tag>}
-        <Button
-          icon={<CloudDownloadOutlined />}
-          onClick={() => void requestUpdate()}
+        <Button onClick={() => void checkUpdate()} loading={checkingUpdate}
+          disabled={busy || versionUnavailable || !runningVersion}>检查更新</Button>
+        <Button type="primary" icon={<CloudDownloadOutlined />} onClick={() => setDeployConfirm(true)}
           loading={requestingUpdate}
-          disabled={busy || versionUnavailable || !runningVersion?.manual_update_available}
-        >
-          检查并更新
-        </Button>
+          disabled={busy || versionUnavailable || !runningVersion?.manual_update_available ||
+            updateCheck?.state !== 'available' || updateCheck.running_sha !== runningVersion?.running_sha ||
+            Boolean(deployStatus?.locked)}>立即部署</Button>
       </>}
     >
       {basePreview && <Alert type="warning" showIcon message="基座候选版本验收环境；反馈将同步到公开 GitHub 仓库，请勿填写敏感信息。" style={{ marginBottom: 16 }} />}
@@ -362,6 +391,13 @@ function App() {
         type={deployStatus.rollback_failed || /failed|held|unacknowledged|interrupted|mismatch/.test(deployStatus.state) ? 'warning' : deployStatus.state === 'update_ok' || deployStatus.state === 'update_no_change' ? 'success' : 'info'}
         message={deployStatus.rollback_failed ? '回滚后服务恢复未确认，请查看系统日志' : (deployLabels[deployStatus.state] || '更新状态待核实')}
         description={deployStatus.event ? (new Date(deployStatus.event.at).toLocaleString() + ' · ' + deployStatus.event.sha.slice(0, 8) + (deployStatus.locked ? ' · 更新锁占用' : '')) : '等待本机更新器回执'} />}
+      <Modal title="确认立即部署" open={deployConfirm} onCancel={() => setDeployConfirm(false)}
+        onOk={() => void requestUpdate()} okText="确认部署" confirmLoading={requestingUpdate}
+        okButtonProps={{ disabled: requestingUpdate || updateCheck?.state !== 'available' ||
+          updateCheck.running_sha !== runningVersion?.running_sha }}>
+        <Typography.Paragraph>即将请求 Mac mini 更新器部署当前应用最新 {updateCheck?.branch} 提交，可能执行测试、构建和重启。五分钟自动更新机制不受影响。</Typography.Paragraph>
+        <Typography.Paragraph>目标 SHA：<Typography.Text code>{updateCheck?.remote_sha}</Typography.Text></Typography.Paragraph>
+      </Modal>
       <Modal title="系统设置" open={settingsOpen} footer={null} onCancel={() => setSettingsOpen(false)} destroyOnHidden>
         <Space style={{marginBottom:16}}>
           <Button type={settingsTab === 'branding' ? 'primary' : 'default'} onClick={() => setSettingsTab('branding')}>名称设置</Button>

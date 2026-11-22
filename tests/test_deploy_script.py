@@ -325,3 +325,29 @@ test ! -d "$LOCK"
 '''
     result = subprocess.run(["bash","-c",program],cwd=tmp_path,capture_output=True,text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+def test_read_only_update_check_does_not_deploy(monkeypatch):
+    from app import operations
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setenv("APP_BASE_PREVIEW", "1")
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout="b" * 40 + "\trefs/heads/preview\n")
+    monkeypatch.setattr(operations.subprocess, "run", fake_run)
+    result = operations.check_available_update("a" * 40)
+    assert result["state"] == "available"
+    assert result["remote_sha"] == "b" * 40
+    assert len(calls) == 1
+    assert "ls-remote" in calls[0]
+    assert not any(word in calls[0] for word in ("fetch", "kickstart", "push"))
+
+
+def test_read_only_update_check_unavailable_on_bad_git_response(monkeypatch):
+    from app import operations
+    from types import SimpleNamespace
+    monkeypatch.delenv("APP_BASE_PREVIEW", raising=False)
+    monkeypatch.setattr(operations.subprocess, "run", lambda *a, **k:
+                        SimpleNamespace(stdout="bad-sha\trefs/heads/main\n"))
+    assert operations.check_available_update("a" * 40)["state"] == "unavailable"
+    assert operations.check_available_update("unknown")["state"] == "unavailable"
