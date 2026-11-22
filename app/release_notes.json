@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.1.8",
+    "title": "基座升级 · 正式来源验证和升级 PR",
+    "summary": "基于已正式发布的 main 核验来源，生成独立应用升级草稿 PR。",
+    "changes": [
+      "正式 main 第一父历史来源验证；旧应用必须完整重现初始化提交。",
+      "通过临时 Git 仓库和独立索引生成升级提交，保留业务代码；冲突或主机脚本变更停止自动生成。",
+      "以目标完整 SHA 去重，复用已有 PR，禁止直接修改应用 main。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行 tests/test_upgrade_pr.py 的来源、旧应用重现、提交隔离和去重测试。",
+      "核对同一目标 SHA 不重复创建升级 PR；main 基线变更后停止。"
+    ],
+    "validation_note": "本版提供命令行协调器；尚未接入定时调用及存量应用冲突处理。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.7",
     "title": "基座升级 · 三方差异规划",
     "summary": "引入只读升级规划器，为后续自动升级 PR 提供可审查差异。",
