@@ -8,7 +8,7 @@ export type ReleaseHistory = {
   running_sha: string
   releases: ReleaseNote[]
   deployments: Operation[]
-  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown'; issue?: number | null }
+  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown'; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string }
 }
 export type SystemLogs = { events: Operation[] }
 
@@ -74,14 +74,18 @@ export function ReleasePage({ data, loading, onRefresh, onAccept }: RefreshProps
   const [confirm, setConfirm] = useState<{sha: string; version: string} | null>(null)
   const [acceptError, setAcceptError] = useState<string | null>(null)
   const acceptance = data?.acceptance
-  const canAccept = Boolean(acceptance?.enabled && acceptance.state === 'not_requested' && data && /^[0-9a-f]{40}$/.test(data.running_sha) && data.releases[0]?.acceptance_required && data.releases[0]?.version === data.version)
+  const canAccept = Boolean(acceptance?.enabled && acceptance.state === 'not_requested' && acceptance.ready === true && data && /^[0-9a-f]{40}$/.test(data.running_sha) && data.releases[0]?.acceptance_required && data.releases[0]?.version === data.version)
   function requestAcceptance() {
     if (!data || !canAccept) return
     setAcceptError(null)
     setConfirm({ sha: data.running_sha, version: data.version })
   }
   async function confirmAcceptance() {
-    if (!confirm || accepting) return
+    if (!confirm || accepting || !canAccept || data?.running_sha !== confirm.sha || data?.version !== confirm.version) {
+      setConfirm(null)
+      setAcceptError('运行版本或候选状态已变化，请刷新后重新验收')
+      return
+    }
     setAccepting(true)
     setAcceptError(null)
     try {
@@ -99,20 +103,23 @@ export function ReleasePage({ data, loading, onRefresh, onAccept }: RefreshProps
     if (acceptance.state === 'queued') return <Tag color="processing">验收已提交 · 等待发布 main</Tag>
     if (acceptance.state === 'blocked') return <Tag color="error">发布受阻，请查看验收任务</Tag>
     if (acceptance.state === 'unknown') return <Tag color="warning">发布状态待刷新</Tag>
-    return canAccept ? <Button type="primary" onClick={requestAcceptance} disabled={accepting || loading}>验收通过</Button> : null
+    if (!canAccept) return <Button disabled title={acceptance.reason || '候选未就绪'}>验收暂不可用</Button>
+    return <Button type="primary" onClick={requestAcceptance} disabled={accepting || loading}>验收通过</Button>
   }
   const selected = data?.releases.find(release => release.version === selectedVersion)
-  const pending = data?.releases.filter(release => release.acceptance_required && release.acceptance_status === 'pending').length ?? 0
+  const awaitingAcceptance = Boolean(data?.releases[0]?.acceptance_required && acceptance?.state === 'not_requested' && acceptance.ready)
   return <Flex vertical gap="middle">
-    <Card title="当前运行版本" extra={<Space wrap>{pending > 0 && acceptance?.state !== 'published' && <Tag color="warning">待验收版本 {pending}</Tag>}{acceptanceAction()}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
+    <Card title="当前运行版本" extra={<Space wrap>{awaitingAcceptance && <Tag color="warning">待验收 v{data?.version}</Tag>}{acceptanceAction()}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
       {data ? <Flex wrap gap="small" align="center">
         <Tag color="blue">{data.version}</Tag>
         <Typography.Text copyable code style={{ overflowWrap: 'anywhere' }}>{data.running_sha === 'unknown' ? '未上报 Git SHA' : data.running_sha}</Typography.Text>
       </Flex> : <Typography.Text type="secondary">暂无版本信息</Typography.Text>}
     </Card>
-    <Alert type="info" showIcon message="代码已提交不等于线上已验收" description={acceptance?.enabled ? '体验当前版本后点击「验收通过」，系统将提交绑定当前运行 SHA 的正式发布请求；发布完成前不会显示已发布。' : '请核对当前运行版本和 Git SHA，以实际验证结果为准。'} />
+    {acceptance?.enabled && acceptance.state === 'not_requested' && !canAccept ?
+      <Alert type="warning" showIcon message="当前候选尚不可验收" description={acceptance.reason || '正在核对 preview 和本机部署，请刷新后重试。'} /> :
+      <Alert type="info" showIcon message="代码已提交不等于线上已验收" description={acceptance?.enabled ? '仅在最新 preview 与运行 SHA 和部署记录一致时允许验收。' : '请核对当前运行版本和 Git SHA，以实际验证结果为准。'} />}
     {acceptance?.issue && <Typography.Link href={`https://github.com/layho/web-app-init-base-env/issues/${acceptance.issue}`} target="_blank" rel="noopener noreferrer">查看正式发布任务 #{acceptance.issue}</Typography.Link>}
-    <Modal title="确认验收并正式发布" open={confirm !== null} onCancel={() => { if (!accepting) setConfirm(null) }} onOk={() => void confirmAcceptance()} okText="验收通过，提交发布" cancelText="取消" confirmLoading={accepting} closable={!accepting} maskClosable={!accepting} cancelButtonProps={{ disabled: accepting }}>
+    <Modal title="确认验收并正式发布" open={confirm !== null} onCancel={() => { if (!accepting) setConfirm(null) }} onOk={() => void confirmAcceptance()} okText="验收通过，提交发布" cancelText="取消" confirmLoading={accepting} okButtonProps={{ disabled: !canAccept || loading }} closable={!accepting} maskClosable={!accepting} cancelButtonProps={{ disabled: accepting }}>
       <Typography.Paragraph>确认已体验以下候选版本，授权将该版本发布至正式 main 分支。系统会再次核验测试结果和分支 SHA。</Typography.Paragraph>
       <Typography.Paragraph strong>v{confirm?.version}</Typography.Paragraph>
       <Typography.Paragraph code style={{ overflowWrap: 'anywhere' }}>{confirm?.sha}</Typography.Paragraph>
