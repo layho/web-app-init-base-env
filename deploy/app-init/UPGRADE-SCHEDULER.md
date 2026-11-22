@@ -43,3 +43,12 @@ SHA="$(git rev-parse HEAD)"
 ```
 
 The upgrade checks SSH and REST access and runs the regression tests, preserves LaunchAgent, token and registry, takes an owner-only backup, and replaces runtime modules while holding the scheduler tick lock. If runtime or launchd configuration is unsafe or altered, the upgrade stops instead of overwriting it. Verify the active on-disk scheduler modules and next read-only status before treating it as active. GitHub merges do not deploy this standalone host runtime automatically.
+
+
+## Automatic Panel upgrade queue recovery
+
+The approved Panel scheduler handles **one pending foundation-upgrade PR at a time**. A previously generated upgrade need not match the newest official foundation main: the scheduler verifies that the PR's pinned target is either that official SHA or a verified immutable ancestor (GitHub compare merge-base). It then requires the PR's original generator parent, unchanged safe file scope, OWNER author, exact latest MacCI success for the current Panel main and PR head, and fresh unmodified GitHub refs before changing Draft state or merging. On success, the next 5-minute tick plans a new PR for the latest official foundation.
+
+If MacCI fails/is missing, app main moves, the PR has been manually amended, the target diverged, multiple pending PRs exist, or GitHub is unavailable, the scheduler **does not** merge or deploy. It records a non-success status with the PR URL. No token, raw stderr or sensitive business data is logged. A special-case PR requiring review cannot be auto-merged without new verifiable evidence.
+
+The installed Mac mini scheduler uses a **copied runtime**, independent of the GitHub repository. After a reviewed foundation main release, the first host upgrade must be performed using the documented safe installer check and `--apply --upgrade`; do not claim a GitHub merge alone activates these changes. The existing application updater then handles ordinary Panel deployment after any successful PR merge, and actual running SHA still needs to be verified.
