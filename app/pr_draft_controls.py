@@ -82,8 +82,9 @@ def validate(number, expected_head):
             or base.get("ref") != "preview" or (base.get("repo") or {}).get("full_name") != REPO
             or (head.get("repo") or {}).get("full_name") != REPO or head.get("sha") != expected_head):
         raise DraftReleaseError("PR 已变化、不是 OWNER 的基座 preview 草稿或已解除 Draft")
-    if pr.get("mergeable") is not True or pr.get("mergeable_state") != "clean":
-        raise DraftReleaseError("PR 尚不可安全合并，请先解决冲突或等待 GitHub 计算")
+    # Releasing a Draft is an owner workflow decision, not a merge.
+    # Conflicts and pending merge calculations remain blocked by MacCI and
+    # the preview coordinator; do not prevent the owner from unpausing work.
     # A deliberate owner gesture establishes reviewed HEAD + ancestor. On a new
     # preview base MacCI must rerun: stale statuses cannot be reused.
     if github("/branches/main")["commit"]["sha"] != main or github("/branches/preview")["commit"]["sha"] != preview:
@@ -107,5 +108,8 @@ def release(number, expected_head):
     # Recheck after any write, so a moved ref never authorizes draft removal.
     validate(number, expected_head)
     mark_ready(pr.get("node_id"))
+    conflict = pr.get("mergeable") is False or pr.get("mergeable_state") == "dirty"
     return {"released": True, "number": number, "head": expected_head,
-            "message": "已解除 Draft，等待新基线 MacCI 测试及自动合并"}
+            "merge_blocked": conflict,
+            "message": "已解除 Draft，但当前存在冲突，需修复后才能进入测试与自动合并" if conflict
+                       else "已解除 Draft，等待新基线 MacCI 测试及自动合并"}
