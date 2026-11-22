@@ -72,12 +72,22 @@ def list_feedback(response: Response, db: Session = Depends(get_db)):
 def release_notes(response: Response):
     response.headers["Cache-Control"] = "no-store"
     notes_file = Path(__file__).with_name("release_notes.json")
+    releases = json.loads(notes_file.read_text(encoding="utf-8"))
+    running_sha = os.getenv("APP_RUNNING_SHA", "unknown")
+    deployments = operations.recent_operations(operations.OPERATIONS_LOG, deployments_only=True)
+    acceptance = release_acceptance.state(running_sha)
+    # Fail closed if the browser has an outdated preview or GitHub cannot be reached.
+    readiness = release_acceptance.acceptance_readiness(
+        running_sha, app.version, releases[0]["version"], deployments
+    ) if acceptance.get("enabled") and acceptance.get("state") == "not_requested" else {
+        "ready": False, "reason": "当前状态不允许提交验收"
+    }
     return {
         "version": app.version,
-        "running_sha": os.getenv("APP_RUNNING_SHA", "unknown"),
-        "releases": json.loads(notes_file.read_text(encoding="utf-8")),
-        "deployments": operations.recent_operations(operations.OPERATIONS_LOG, deployments_only=True),
-        "acceptance": release_acceptance.state(os.getenv("APP_RUNNING_SHA", "unknown")),
+        "running_sha": running_sha,
+        "releases": releases,
+        "deployments": deployments,
+        "acceptance": {**acceptance, **readiness},
     }
 
 

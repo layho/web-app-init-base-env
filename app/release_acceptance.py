@@ -131,6 +131,24 @@ def state(sha):
         return {"enabled": True, "state": "unknown"}
 
 
+def acceptance_readiness(running_sha, version, latest_version, deployments):
+    """Read-only UI gate; unknown GitHub state must not enable acceptance."""
+    result = {"ready": False, "reason": "正在核对候选版本与发布状态"}
+    if not enabled() or not valid_sha(running_sha):
+        return {**result, "reason": "当前环境未启用验收或缺少有效运行 SHA"}
+    if version != latest_version:
+        return {**result, "reason": "运行版本与最新版本记录不一致"}
+    if not deployments or deployments[0].get("sha") != running_sha or deployments[0].get("code") not in {"install_ok", "update_ok"}:
+        return {**result, "reason": "当前运行提交尚无对应的本机成功部署回执"}
+    try:
+        candidate = ref("preview")
+    except (AcceptanceError, KeyError, TypeError, OSError):
+        return {**result, "reason": "无法确认 GitHub 最新 preview，验收已锁定，请刷新重试"}
+    if candidate != running_sha:
+        return {**result, "reason": "preview 已更新，当前页面仍是旧版，请等待自动部署后刷新", "preview_sha": candidate}
+    return {"ready": True, "reason": "", "preview_sha": candidate}
+
+
 def find_issue(title, payload):
     # On a lost POST response, reuse the exact owner-created issue instead of
     # emitting a second release authorization for the same running candidate.
