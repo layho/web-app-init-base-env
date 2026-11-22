@@ -261,3 +261,29 @@ def test_deploy_status_does_not_claim_success_for_different_running_sha(monkeypa
     log.write_text(stamp + "\tupdate_ok\t" + "a"*40 + "\n")
     assert operations.deploy_status("b"*40)["state"] == "running_sha_mismatch"
     assert operations.deploy_status("a"*40)["state"] == "update_ok"
+
+
+def test_draft_release_requires_admin_session_csrf_and_base_preview(client, monkeypatch):
+    from app import pr_draft_controls
+    payload = {"number": 54, "head": "a" * 40}
+    calls = []
+    monkeypatch.setattr(pr_draft_controls, "release", lambda n, h: calls.append((n, h)) or {"released": True})
+    endpoint = "/api/v1/pr-drafts/release"
+    origin = {"Origin": "https://webapp.example"}
+    assert client.post(endpoint, json=payload, headers=origin).status_code == 401
+    csrf = client.post("/api/login", json={
+        "username": "admin", "password": "A-very-strong-passphrase-123"
+    }, headers=origin).json()["csrf_token"]
+    assert client.post(endpoint, json=payload, headers=origin).status_code == 403
+    assert client.post(endpoint, json=payload, headers={
+        "Origin": "https://evil.example", "X-CSRF-Token": csrf
+    }).status_code == 403
+    assert not calls
+    response = client.post(endpoint, json=payload, headers={
+        **origin, "X-CSRF-Token": csrf
+    })
+    assert response.status_code == 200
+    assert calls == [(54, "a" * 40)]
+    assert client.post(endpoint, json={"number": -1, "head": "not-a-sha"}, headers={
+        **origin, "X-CSRF-Token": csrf
+    }).status_code == 422
