@@ -292,3 +292,36 @@ grep -q '^rollback_failed bad$' events
 '''
     result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_update_reports_no_change_and_fetch_failure(tmp_path):
+    script = SCRIPT.read_text()
+    functions = script[script.index("record_operation() {"):script.index('case "$1" in')]
+    program = functions + r'''
+set -euo pipefail
+ROOT=$PWD
+LOCK=$ROOT/.webapp-deploy.lock
+mkdir logs
+sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+assert_main() { :; }
+load_env() { :; }
+git() {
+    if test "$1" = rev-parse; then echo "$sha"; return 0; fi
+    if test "$1" = fetch; then return "$fetch_rc"; fi
+    return 99
+}
+fetch_rc=0
+(update)
+grep -q "$(printf '\tupdate_no_change\t%s' "$sha")" logs/operations.tsv
+test ! -d "$LOCK"
+fetch_rc=7
+set +e
+(set -e; update)
+rc=$?
+set -e
+test "$rc" = 7
+grep -q "$(printf '\tupdate_fetch_failed\t%s' "$sha")" logs/operations.tsv
+test ! -d "$LOCK"
+'''
+    result = subprocess.run(["bash","-c",program],cwd=tmp_path,capture_output=True,text=True)
+    assert result.returncode == 0, result.stdout + result.stderr

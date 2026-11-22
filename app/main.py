@@ -130,6 +130,12 @@ def system_logs(response: Response):
     return {"events": operations.recent_operations(operations.OPERATIONS_LOG)}
 
 
+@app.get("/api/v1/deploy/status", dependencies=[Depends(authorize)])
+def deployment_status(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return operations.deploy_status(os.getenv("APP_RUNNING_SHA", "unknown"))
+
+
 @app.post("/api/v1/deploy/update", status_code=202)
 def trigger_update(request: Request, response: Response, db: Session = Depends(get_db)):
     auth.authorize_session(request, db)

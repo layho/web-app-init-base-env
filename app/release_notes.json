@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.1.14",
+    "title": "更新执行回执与进度追踪",
+    "summary": "区分已提交、已合并、更新请求、真实执行与本机部署成功，避免静默等待。",
+    "changes": [
+      "更新器记录检查、目标 SHA、依赖、构建、重启与失败原因；无更新及失败 SHA 拦截也有回执。",
+      "登录后自动查询本机更新回执，明确未领取请求、锁占用、运行 SHA 不一致以及回滚失败。",
+      "不自动清理保护锁或跳过失败 SHA，不修改服务或数据库。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证点击检查并更新后可观察实际回执；无新版本、拉取失败与运行 SHA 不一致时不误报更新成功。",
+      "在 Mac mini 检查 WatchPaths 触发与五分钟定时服务实际运行。"
+    ],
+    "validation_note": "新代码需部署后生效；当前现场未领取或失败原因需从现有宿主日志核实。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/41"
+  },
+  {
     "version": "0.1.13",
     "title": "基座版本查询可靠性",
     "summary": "修复下游版本页签查询失败及刷新只读取缓存的问题。",

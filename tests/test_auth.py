@@ -223,3 +223,32 @@ def test_release_acceptance_requires_admin_session_csrf_origin_and_current_versi
     assert response.status_code == 200
     assert response.json()["state"] == "queued"
     assert calls == [(sha, app.version, True)]
+
+
+def test_deploy_status_requires_login_and_reports_unacknowledged(client, monkeypatch, tmp_path):
+    import os
+    import time
+    from app import operations
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(operations, "OPERATIONS_LOG", logs / "operations.tsv")
+    signal = logs / "update-request"
+    signal.write_bytes(b"1")
+    os.utime(signal, (time.time()-120, time.time()-120))
+    path = "/api/v1/deploy/status"
+    assert client.get(path).status_code == 401
+    assert client.post("/api/login", json={
+        "username": "admin", "password": "A-very-strong-passphrase-123",
+    }, headers={"Origin":"https://webapp.example"}).status_code == 200
+    assert client.get(path).json()["state"] == "request_unacknowledged"
+
+
+def test_deploy_status_does_not_claim_success_for_different_running_sha(monkeypatch, tmp_path):
+    from app import operations
+    from datetime import datetime, timezone
+    log = tmp_path / "operations.tsv"
+    monkeypatch.setattr(operations, "OPERATIONS_LOG", log)
+    stamp = datetime.now(timezone.utc).isoformat()
+    log.write_text(stamp + "\tupdate_ok\t" + "a"*40 + "\n")
+    assert operations.deploy_status("b"*40)["state"] == "running_sha_mismatch"
+    assert operations.deploy_status("a"*40)["state"] == "update_ok"
