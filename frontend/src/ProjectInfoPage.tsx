@@ -82,6 +82,9 @@ function DevelopmentLoop({ stages }: { stages: LoopStage[] }) {
 
 const schedulerLabels: Record<string, string> = {
   current: '已检查：基座一致', upgrade_pending: '升级 PR 待处理', draft_created: '升级 PR 已创建',
+  upgrade_merged: '升级 PR 已合并，下一轮检查最新版本',
+  upgrade_waiting_verification: '等待 MacCI 或安全校验，禁止合并',
+  upgrade_review_required: '升级异常，需自动修复任务审查',
   waiting_adoption: '观察模式，待兼容迁移', blocked: '升级受阻，需审查冲突',
   closed_pr: '关联 PR 已关闭', no_main: '应用 main 不可访问', error: '本轮调度检查失败',
   awaiting_first_check: '已登记，等待首次检查', unavailable: '调度器未登记',
