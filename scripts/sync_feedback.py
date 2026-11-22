@@ -3,6 +3,7 @@ import json, os, urllib.request, urllib.parse, urllib.error
 from datetime import timedelta, timezone
 from sqlalchemy import select
 from app.db import SessionLocal
+from app import feedback_progress
 from app.models import UserFeedback, utcnow
 
 REPO = "layho/web-app-init-base-env" if os.getenv("APP_PREVIEW_FEEDBACK") == "1" else "example/web-app"
@@ -78,5 +79,51 @@ def main():
                 return 1
     return 0
 
+def refresh_progress():
+    """Pull trusted issue milestones independently from the outbound queue."""
+    if not TOKEN:
+        return 0
+    cache = feedback_progress.load_cache()
+    now = utcnow()
+    with SessionLocal() as db:
+        rows = db.scalars(select(UserFeedback).where(UserFeedback.github_issue_number.is_not(None))
+                          .order_by(UserFeedback.id.desc()).limit(100)).all()
+        linked = [(row.id, row.github_issue_number) for row in rows]
+    # Prioritize the oldest or never refreshed entries, at most 15 each run.
+    def checked_at(link):
+        entry = feedback_progress.current_entry(cache, *link)
+        return feedback_progress.parse_time(entry.get("checked_at")) or now - timedelta(days=36500)
+    due = [link for link in linked if now - checked_at(link) >= feedback_progress.REFRESH_INTERVAL]
+    failed = False
+    for feedback_id, issue_number in sorted(due, key=checked_at)[:15]:
+        try:
+            comments = []
+            page = 1
+            while True:
+                batch = github("GET", f"/repos/{REPO}/issues/{issue_number}/comments?per_page=100&page={page}")
+                if not isinstance(batch, list):
+                    raise ValueError("Unexpected GitHub comments response")
+                comments.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+                if page > 50:
+                    raise ValueError("Feedback comments exceed refresh limit")
+            cache[str(issue_number)] = {
+                "feedback_id": feedback_id,
+                "checked_at": utcnow().isoformat(),
+                **feedback_progress.progress_from_comments(comments),
+            }
+        except (urllib.error.URLError, ValueError, KeyError) as exc:
+            failed = True
+            print(f"Feedback progress refresh failed for issue {issue_number}: {type(exc).__name__}", flush=True)
+    # Retain only entries tied to the currently visible feedback records.
+    cache = {str(number): cache[str(number)] for _, number in linked if str(number) in cache}
+    feedback_progress.save_cache(cache)
+    return 1 if failed else 0
+
+
 if __name__=="__main__":
-    raise SystemExit(main())
+    outbound = main()
+    inbound = refresh_progress()
+    raise SystemExit(outbound or inbound)
