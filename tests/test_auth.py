@@ -363,3 +363,15 @@ def test_private_settings_rejects_symlink(monkeypatch, tmp_path):
     import pytest
     with pytest.raises(ValueError):
         admin_settings.read()
+
+
+def test_branding_default_and_control_characters(monkeypatch, tmp_path):
+    from app import admin_settings
+    monkeypatch.setattr(admin_settings, "SETTINGS", tmp_path / "brand.json")
+    monkeypatch.setenv("APP_BASE_PREVIEW", "1")
+    assert admin_settings.public()["reference_name"] == "基座验收中心"
+    import pytest
+    with pytest.raises(ValueError):
+        admin_settings.validate_name("Title\nInjected")
+    with pytest.raises(ValueError):
+        admin_settings.validate_name(" ")
