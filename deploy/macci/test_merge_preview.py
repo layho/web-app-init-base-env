@@ -48,6 +48,17 @@ class MergeTests(unittest.TestCase):
         self.assertFalse(m.tested([{**s,"state":"pending"},s],H,B,C))
         self.assertFalse(m.tested([{**s,"creator":{"login":"stranger"}}],H,B,C))
 
+    @patch.object(m,"all_pages",return_value=[comment()])
+    @patch.object(m,"api")
+    def test_actual_preview_over_stale_pr_base(self,api,pages):
+        candidate=pr()
+        candidate["base"]["sha"]=D
+        api.side_effect=[candidate,{"commit":{"sha":B}},
+                         {"parents":[{"sha":B},{"sha":H}]},[success()],{"commit":{"sha":B}}]
+        self.assertEqual(m.authorization("fake",7),(H,B,C,B))
+        api.side_effect=[candidate,{"commit":{"sha":B}},{"parents":[{"sha":D},{"sha":H}]}]
+        self.assertIsNone(m.authorization("fake",7))
+
     @patch.object(m,"git")
     @patch.object(m,"authorization",return_value=None)
     def test_no_review_no_push(self,auth,git):

@@ -103,7 +103,13 @@ def authorization(token, number):
     pr = api(token, f"/pulls/{number}")
     if not eligible(pr):
         return None
-    head, base, merge = pr["head"]["sha"], pr["base"]["sha"], pr["merge_commit_sha"]
+    head, merge = pr["head"]["sha"], pr["merge_commit_sha"]
+    base = api(token, "/branches/preview")["commit"]["sha"]
+    if not valid(base):
+        return None
+    commit = api(token, "/git/commits/" + merge)
+    if [p["sha"] for p in commit["parents"]] != [base, head]:
+        return None
     required = review(all_pages(token, f"/issues/{number}/comments"), head)
     if not required:
         return None
