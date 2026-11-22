@@ -14,7 +14,8 @@ from . import auth, development_tasks, feedback_progress, operations
 from .db import get_db
 from .models import UserFeedback
 
-app = FastAPI(title="Web App Foundation", version="0.1.0", docs_url="/docs" if os.getenv("APP_ENABLE_DOCS") == "true" else None, openapi_url="/openapi.json" if os.getenv("APP_ENABLE_DOCS") == "true" else None)
+RELEASE_NOTES = Path(__file__).with_name("release_notes.json")
+app = FastAPI(title="Web App Foundation", version=json.loads(RELEASE_NOTES.read_text(encoding="utf-8"))[0]["version"], docs_url="/docs" if os.getenv("APP_ENABLE_DOCS") == "true" else None, openapi_url="/openapi.json" if os.getenv("APP_ENABLE_DOCS") == "true" else None)
 
 
 def authorize(request: Request, db: Session = Depends(get_db)):
