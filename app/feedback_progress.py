@@ -60,6 +60,9 @@ def progress_from_comments(comments):
         if not isinstance(body, str) or not isinstance(number, int):
             continue
         lines = [line for line in body.splitlines() if line.startswith(MARKER)]
+        if not lines and body.startswith("[APP-CLAIM] "):
+            events.append((created, number, {"status": "claimed", "reply": body[len("[APP-CLAIM] "):]}))
+            continue
         if len(lines) != 1 or len(lines[0]) > 10000:
             continue
         try:
