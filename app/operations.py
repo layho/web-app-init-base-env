@@ -54,6 +54,29 @@ def updater_target() -> str | None:
     return target if re.fullmatch(allowed, target) else None
 
 
+def check_available_update(running_sha: str) -> dict:
+    """Read-only remote ref query. Never fetch, create update signals or deploy."""
+    root = Path(__file__).resolve().parents[1]
+    branch = "preview" if os.getenv("APP_BASE_PREVIEW") == "1" else "main"
+    if not re.fullmatch(r"[0-9a-f]{40}", running_sha):
+        return {"state": "unavailable", "branch": branch, "reason": "运行 SHA 不可用"}
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"],
+            capture_output=True, text=True, timeout=10, check=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
+        lines = result.stdout.strip().splitlines()
+        if len(lines) != 1:
+            raise ValueError("Invalid remote response")
+        sha, ref = lines[0].split()
+        if ref != f"refs/heads/{branch}" or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise ValueError("Invalid remote SHA")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {"state": "unavailable", "branch": branch, "reason": "无法读取远程版本，请检查网络或仓库凭据"}
+    return {"state": "available" if sha != running_sha else "current",
+            "branch": branch, "running_sha": running_sha, "remote_sha": sha}
+
+
 def request_update(target: str):
     if target == "local-signal":
         with (OPERATIONS_LOG.parent / "update-request").open("ab") as signal:
