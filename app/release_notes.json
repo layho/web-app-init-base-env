@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.1.2",
+    "title": "网页验收与正式发布",
+    "summary": "在更新记录确认当前运行的完整候选版本，无需回到聊天确认。",
+    "changes": [
+      "当前运行候选版本增加「验收通过」按钮及二次确认。",
+      "绑定候选 SHA、main 基线、MacCI 测试结果，回传独立发布任务。",
+      "区分等待发布、发布受阻和已发布 main；拒绝陈旧候选、未通过测试及未成功部署的候选。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "先体验当前候选包含的反馈详情、开发状态同步和更新记录。",
+      "确认当前运行 SHA，点击「验收通过」并确认正式发布。",
+      "查看发布任务及状态；仅当 main 已实际包含该候选时显示已发布。"
+    ],
+    "validation_note": "当前验收授权覆盖整个正在运行的候选版本（包括前版累积变更）；不自动发布后续未验收代码。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/13"
+  },
+  {
     "version": "0.1.1",
     "title": "反馈详情与开发进度回传（候选）",
     "summary": "按基座验收中心反馈 #1 优化意见反馈和更新记录。",

@@ -18,6 +18,7 @@ if test -f "$ROOT/.base-preview.env"; then
   LABEL_PREFIX="com.layho.basepreview"
   PORT="$BASE_PREVIEW_PORT"
   TRACK_BRANCH=preview
+  export APP_BASE_PREVIEW=1
   EXPECTED_ORIGIN="https://base.layho.com"
   export VITE_BASE_PREVIEW=1
 fi

@@ -187,3 +187,39 @@ def test_system_service_update_signals_only_local_updater(monkeypatch, tmp_path)
     assert target == "local-signal"
     operations.request_update(target)
     assert (tmp_path / "update-request").read_bytes() == b"1"
+
+
+def test_release_acceptance_requires_admin_session_csrf_origin_and_current_version(client, monkeypatch, tmp_path):
+    import json
+    import app.main as api_main
+    from app import release_acceptance, operations
+
+    path = "/api/v1/releases/accept"
+    sha = "b" * 40
+    payload = {"sha": sha, "version": app.version}
+    origin = {"Origin": "https://webapp.example"}
+    assert client.post(path, json=payload, headers=origin).status_code == 401
+    monkeypatch.setenv("APP_API_TOKEN", "service-only-test")
+    assert client.post(path, json=payload, headers={**origin, "Authorization": "Bearer service-only-test"}).status_code == 401
+    monkeypatch.setattr(release_acceptance, "enabled", lambda: True)
+    notes = tmp_path / "release_notes.json"
+    notes.write_text(json.dumps([{"version": app.version, "acceptance_required": True}]))
+    monkeypatch.setattr(api_main, "RELEASE_NOTES", notes)
+    monkeypatch.setattr(operations, "recent_operations", lambda *args, **kwargs: [{"sha": sha}])
+    calls = []
+    def submit(candidate, version, deployed):
+        calls.append((candidate, version, deployed))
+        return {"enabled": True, "state": "queued", "issue": 91}
+    monkeypatch.setattr(release_acceptance, "submit", submit)
+    login = client.post("/api/login", json={"username": "admin", "password": "A-very-strong-passphrase-123"}, headers=origin)
+    assert login.status_code == 200
+    assert client.post(path, json=payload, headers=origin).status_code == 403
+    headers = {**origin, "X-CSRF-Token": login.json()["csrf_token"]}
+    assert client.post(path, json=payload, headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+    assert client.post(path, json=payload, headers={"X-CSRF-Token": headers["X-CSRF-Token"]}).status_code == 403
+    assert client.post(path, json={**payload, "version": "old"}, headers=headers).status_code == 409
+    assert not calls
+    response = client.post(path, json=payload, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["state"] == "queued"
+    assert calls == [(sha, app.version, True)]

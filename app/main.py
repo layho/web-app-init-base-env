@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import auth, development_tasks, feedback_progress, operations
+from . import auth, development_tasks, feedback_progress, operations, release_acceptance
 from .db import get_db
 from .models import UserFeedback
 
@@ -77,7 +77,33 @@ def release_notes(response: Response):
         "running_sha": os.getenv("APP_RUNNING_SHA", "unknown"),
         "releases": json.loads(notes_file.read_text(encoding="utf-8")),
         "deployments": operations.recent_operations(operations.OPERATIONS_LOG, deployments_only=True),
+        "acceptance": release_acceptance.state(os.getenv("APP_RUNNING_SHA", "unknown")),
     }
+
+
+class ReleaseAcceptanceIn(BaseModel):
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    version: str = Field(min_length=1, max_length=40)
+
+
+@app.post("/api/v1/releases/accept")
+def accept_release(req: ReleaseAcceptanceIn, request: Request, response: Response, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    if request.headers.get("origin") != os.getenv("APP_PUBLIC_ORIGIN") or not request.headers.get("origin"):
+        raise HTTPException(403, "请在基座验收站确认发布")
+    if not release_acceptance.enabled():
+        raise HTTPException(403, "仅基座验收站允许发起正式发布")
+    response.headers["Cache-Control"] = "no-store"
+    notes = json.loads(RELEASE_NOTES.read_text(encoding="utf-8"))
+    if req.version != app.version or notes[0]["version"] != req.version or not notes[0].get("acceptance_required"):
+        raise HTTPException(409, "当前版本不匹配或无需验收")
+    deployments = operations.recent_operations(operations.OPERATIONS_LOG, deployments_only=True)
+    deployed = bool(deployments and deployments[0]["sha"] == req.sha)
+    try:
+        return release_acceptance.submit(req.sha, req.version, deployed)
+    except (release_acceptance.AcceptanceError, KeyError, TypeError, OSError) as exc:
+        message = str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else "验收请求失败，请检查本机发布日志"
+        raise HTTPException(409, message) from None
 
 
 @app.get("/api/v1/project-info", dependencies=[Depends(authorize)])
