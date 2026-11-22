@@ -4,6 +4,7 @@ No main publishing, arbitrary repository/branch arguments, or forced push.
 The GitHub owner records exact-head code review before tests finish.
 """
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -99,6 +100,45 @@ def all_pages(token, path):
     raise ValueError("GitHub pagination limit exceeded")
 
 
+def release_version(token, sha):
+    """Read version from the exact immutable commit, never a moving ref."""
+    if not valid(sha):
+        raise ValueError("Invalid release commit")
+    response = api(token, "/contents/app/release_notes.json?ref=" + sha)
+    if not isinstance(response, dict) or response.get("encoding") != "base64":
+        raise ValueError("Invalid release notes response")
+    encoded = response.get("content")
+    if not isinstance(encoded, str) or len(encoded) > 700_000:
+        raise ValueError("Invalid release notes length")
+    notes = json.loads(base64.b64decode(encoded, validate=False))
+    if not isinstance(notes, list) or not notes or not isinstance(notes[0], dict):
+        raise ValueError("Invalid release notes")
+    version = notes[0].get("version")
+    if not isinstance(version, str) or not re.fullmatch(r"\\d+\\.\\d+\\.\\d+", version):
+        raise ValueError("Invalid release version")
+    return tuple(map(int, version.split(".")))
+
+
+def preview_frozen(token):
+    """Freeze when preview's release version is newer than official main.
+
+    Fail closed on inconsistent or unreachable refs / release metadata.
+    Automatic unfreeze occurs only after main reaches the candidate version.
+    """
+    preview = api(token, "/branches/preview")["commit"]["sha"]
+    main = api(token, "/branches/main")["commit"]["sha"]
+    if not valid(preview) or not valid(main):
+        raise ValueError("Invalid branch SHA")
+    preview_version = release_version(token, preview)
+    main_version = release_version(token, main)
+    if preview_version < main_version:
+        raise ValueError("Preview release version older than main")
+    if preview_version > main_version:
+        print(f"Preview frozen for candidate v{'.'.join(map(str, preview_version))}; main is v{'.'.join(map(str, main_version))}", flush=True)
+        return True
+    return False
+
+
 def authorization(token, number):
     pr = api(token, f"/pulls/{number}")
     if not eligible(pr):
@@ -141,6 +181,8 @@ def verify_candidate(folder, base, head, candidate, required):
 
 
 def merge_one(token, number, dry_run=False):
+    if preview_frozen(token):
+        return False
     gate = authorization(token, number)
     if gate is None:
         return False
@@ -157,6 +199,9 @@ def merge_one(token, number, dry_run=False):
             return False
         if authorization(token, number) != gate:
             print(f"PR #{number}: gate changed; no push", flush=True)
+            return False
+        if preview_frozen(token):
+            print(f"PR #{number}: preview entered acceptance freeze; no push", flush=True)
             return False
         if dry_run:
             print(f"PR #{number}: dry run verified {merge}; no push", flush=True)
@@ -198,6 +243,8 @@ def main():
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                return 0
+            if preview_frozen(token):
                 return 0
             prs = all_pages(token, "/pulls?state=open&base=preview&sort=created&direction=asc")
             for pr in prs:
