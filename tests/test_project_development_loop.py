@@ -10,7 +10,9 @@ def test_development_loop_documents_order_and_cadence():
     assert [s["id"] for s in stages] == ["feedback", "development", "pr", "test", "result", "preview", "deploy", "accept", "publish"]
     assert [s["id"] for s in stages if s["mode"] == "manual"] == ["accept"]
     assert "每分钟" in stages[3]["cadence"]
-    assert "每小时" in stages[5]["cadence"]
+    assert "每分钟" in stages[5]["cadence"]
+    assert stages[5]["actor"] == "Mac mini"
+    assert "每分钟" in stages[8]["cadence"] and stages[8]["actor"] == "Mac mini"
     assert "每五分钟" in stages[6]["cadence"]
     assert all(s.get("failure") for s in stages if s["id"] in {"test", "preview", "deploy", "accept", "publish"})
 

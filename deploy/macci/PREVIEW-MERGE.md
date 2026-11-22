@@ -1,0 +1,11 @@
+# MacCI preview coordinator
+
+Base-only separate host LaunchAgent, every 60 seconds. No Docker access required. Reuse existing private MacCI token for GitHub reads and existing SSH for git push (no token expansion). The host SSH identity must have preview write access; GitHub branch protection still applies. Never give credentials to build/test containers. Protect main at GitHub too: SSH credentials are not inherently branch scoped. This code never targets main.
+
+Review before handing off: on a same-repository PR targeting preview, review the final full head before marking ready; record a single-line owner PR comment:
+
+`[BASE_PREVIEW_REVIEW] {"schema":1,"head":"<40 hex reviewed PR head>","decision":"approved","requires_ancestor":"<40 hex reviewed base or latest prerequisite head>"}`
+
+The prerequisite must already be an ancestor of current preview. A new head needs new review. Revocation: same fields with decision revoked. Do not mark ready until reviewed. Latest matching owner comment wins; ordinary feedback never grants merge authority. MacCI must report latest trusted success for exact head, current base and GitHub merge candidate. The coordinator independently fetches and verifies the candidate's two parents, checks prerequisite ancestry, rechecks gate, then pushes the exact tested merge commit non-force to preview. GitHub should recognize incorporated PR commits; verify actual PR status and report if it remains open. A new base requires a new test for later PRs. Main remains human-acceptance gated and is out of scope.
+
+After this code has passed CI and been approved, install once over SSH from the reviewed branch checkout: bash deploy/macci/install-preview-merge.sh. Existing test LaunchAgent remains untouched. View ~/.local/share/macmini-pr-tests/preview-merge.log. Manual dry-run: python3 ~/.local/share/macmini-pr-tests/merge_preview.py --dry-run. To immediately trigger installed service use launchctl kickstart gui/$(id -u)/com.layho.macci-preview-merge (no -k; never interrupt running work). No automatic self-update of privileged host code; update explicitly after review and test. If branch policy rejects direct pushes, stop and redesign with GitHub-approved merge route; never bypass protection or force push.

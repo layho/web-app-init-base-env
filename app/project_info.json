@@ -70,10 +70,10 @@
     },
     {
       "id": "pr",
-      "title": "提交 PR",
+      "title": "提交 PR 并完成预审查授权",
       "actor": "ChatGPT",
       "cadence": "开发完成后",
-      "description": "提交独立开发分支，关联原 Issue，等待测试。",
+      "description": "提交独立分支、关联 Issue，审查准确 HEAD、记录前置依赖并解除草稿；测试未完成也无需等待第二次 ChatGPT 确认。",
       "mode": "automatic"
     },
     {
@@ -95,12 +95,12 @@
     },
     {
       "id": "preview",
-      "title": "审查并合入 preview",
-      "actor": "ChatGPT",
-      "cadence": "每小时检查",
-      "description": "审查代码，验证最新成功回执及测试树一致性，合并候选版本。",
+      "title": "自动合入 preview",
+      "actor": "Mac mini",
+      "cadence": "每分钟检查",
+      "description": "核验已审查 HEAD、前置祖先、实际 preview 基线、最新 MacCI 测试及候选父提交；非强制推送准确测试候选。",
       "mode": "automatic",
-      "failure": "基线变更或审查不通过 → 重新测试或修复。"
+      "failure": "等待依赖或新基线测试 → 自动继续；冲突或测试失败 → 返回开发修复。"
     },
     {
       "id": "deploy",
@@ -122,10 +122,10 @@
     },
     {
       "id": "publish",
-      "title": "正式发布 main",
-      "actor": "ChatGPT",
-      "cadence": "每小时检查",
-      "description": "核验验收授权、测试证据和 main 基线，仅发布已确认的候选 SHA，并回写发布结果。",
+      "title": "自动正式发布 main",
+      "actor": "Mac mini",
+      "cadence": "每分钟检查",
+      "description": "同时核验网页验收本机回执和 GitHub 发布单、精确候选 SHA 与测试树、main 基线；非强制发布已确认提交并回写关闭发布单。",
       "mode": "automatic",
       "failure": "凭据、分支保护或基线异常 → 停止发布并报告。"
     }
