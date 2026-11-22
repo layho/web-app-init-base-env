@@ -24,3 +24,22 @@ Panel create mode requires merged, valid provenance and a valid dedicated GitHub
 ## Re-enrollment from app-init
 
 After successful installation or re-verification, `app-init` registers the app in an already installed scheduler using `--mode create --if-absent`. Existing manual registrations (including `observe`) are never overwritten. When the scheduler is missing or registration fails, deployment remains independent and prints a warning. An installed scheduler and active launchd job must be verified separately. Creating a draft PR does not bypass testing, review or release gates.
+
+
+## Panel trusted automatic upgrade (opt-in pilot)
+
+For the explicitly authorized `layho/macmini-office-app-panel`, a registered `create` scheduler also examines its pending `base-upgrade/<official-main-SHA>` PR. It **does not** auto-merge non-Panel repositories. To promote, the scheduler must verify all of the following at execution time: OWNER-created PR in the app repository, exact current main base and official foundation SHA, matching and safe three-way planned file set (no conflict or manual review), latest trusted `macmini/isolated-tests-v1` success for that exact head/base/merge, and unchanged PR and refs after rechecking. It then marks the draft ready and merges using the expected head SHA. A missing token scope, failed MacCI, stale ref, unexpected file, blocked plan, or API error leaves the draft for manual review. No GitHub Actions or direct application data access is used.
+
+The Panel web deployment remains owned by its existing Mac mini five-minute updater, independent from the upgrade scheduler. GitHub merge alone is **not** proof of a successful rollout; verify application main, running SHA, and website before claiming completion.
+
+### Existing host scheduler must be upgraded separately
+
+After the scheduler changes have passed MacCI, preview acceptance and **official main** publication, use a clean exact-main checkout and the existing dedicated admin account, without sudo:
+
+```bash
+SHA="$(git rev-parse HEAD)"
+./deploy/app-init/install-upgrade-scheduler.sh --sha "$SHA" --check-repo layho/macmini-office-app-panel
+./deploy/app-init/install-upgrade-scheduler.sh --sha "$SHA" --check-repo layho/macmini-office-app-panel --apply --upgrade
+```
+
+The upgrade checks SSH and REST access and runs the regression tests, preserves LaunchAgent, token and registry, takes an owner-only backup, and replaces runtime modules while holding the scheduler tick lock. If runtime or launchd configuration is unsafe or altered, the upgrade stops instead of overwriting it. Verify the active on-disk scheduler modules and next read-only status before treating it as active. GitHub merges do not deploy this standalone host runtime automatically.

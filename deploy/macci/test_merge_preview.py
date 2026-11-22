@@ -1,5 +1,6 @@
 """Gate tests for the local coordinator; never touch live GitHub."""
 import json
+import base64
 import unittest
 from unittest.mock import patch
 import merge_preview as m
@@ -22,6 +23,36 @@ def success():
             "description":f"base={B} merge={C} passed"}
 
 class MergeTests(unittest.TestCase):
+    def test_freeze_when_preview_release_is_ahead_of_main(self):
+        def api(token, path):
+            if path == "/branches/preview":
+                return {"commit": {"sha": C}}
+            if path == "/branches/main":
+                return {"commit": {"sha": B}}
+            if path.startswith("/contents/app/release_notes.json?ref="):
+                version = "0.1.18" if path.endswith(C) else "0.1.17"
+                return {"encoding": "base64", "content": base64.b64encode(
+                    json.dumps([{"version": version}]).encode()).decode()}
+            raise AssertionError(path)
+        with patch.object(m, "api", side_effect=api):
+            self.assertTrue(m.preview_frozen("fake"))
+
+    def test_unfreeze_after_main_catches_up(self):
+        with patch.object(m, "api") as api:
+            def data(token, path):
+                if path.startswith("/branches/"):
+                    return {"commit": {"sha": C if path.endswith("preview") else B}}
+                return {"encoding": "base64", "content": base64.b64encode(
+                    b'[{"version":"0.1.18"}]').decode()}
+            api.side_effect = data
+            self.assertFalse(m.preview_frozen("fake"))
+
+    def test_freeze_fails_closed_on_unreachable_release_data(self):
+        with patch.object(m, "api", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                m.preview_frozen("fake")
+
+
     def test_scope(self):
         p=pr()
         self.assertTrue(m.eligible(p))
@@ -59,17 +90,19 @@ class MergeTests(unittest.TestCase):
         api.side_effect=[candidate,{"commit":{"sha":B}},{"parents":[{"sha":D},{"sha":H}]}]
         self.assertIsNone(m.authorization("fake",7))
 
+    @patch.object(m,"preview_frozen",return_value=False)
     @patch.object(m,"git")
     @patch.object(m,"authorization",return_value=None)
-    def test_no_review_no_push(self,auth,git):
+    def test_no_review_no_push(self,auth,git,frozen):
         self.assertFalse(m.merge_one("fake",7))
         git.assert_not_called()
 
+    @patch.object(m,"preview_frozen",return_value=False)
     @patch.object(m,"api")
     @patch.object(m,"verify_candidate")
     @patch.object(m,"git")
     @patch.object(m,"authorization",return_value=(H,B,C,B))
-    def test_exact_nonforce_preview_push(self,auth,git,verify,api):
+    def test_exact_nonforce_preview_push(self,auth,git,verify,api,frozen):
         api.side_effect=[{"commit":{"sha":C}},{"merged":True}]
         self.assertTrue(m.merge_one("fake",7))
         pushes=[call.args[1:] for call in git.call_args_list if call.args[1]=="push"]
@@ -78,9 +111,27 @@ class MergeTests(unittest.TestCase):
         self.assertFalse(m.merge_one("fake",7,True))
         self.assertFalse(any(call.args[1]=="push" for call in git.call_args_list))
     
+    @patch.object(m,"preview_frozen",return_value=False)
     @patch.object(m,"verify_candidate")
     @patch.object(m,"git")
     @patch.object(m,"authorization",side_effect=[(H,B,C,B),None])
-    def test_changed_gate_no_push(self,auth,git,verify):
+    def test_changed_gate_no_push(self,auth,git,verify,frozen):
         self.assertFalse(m.merge_one("fake",7))
         self.assertFalse(any(call.args[1]=="push" for call in git.call_args_list))
+    
+    @patch.object(m,"api")
+    @patch.object(m,"verify_candidate")
+    @patch.object(m,"git")
+    @patch.object(m,"authorization",return_value=(H,B,C,B))
+    @patch.object(m,"preview_frozen",side_effect=[False,True])
+    def test_freeze_appears_during_merge_no_push(self,frozen,auth,git,verify,api):
+        self.assertFalse(m.merge_one("fake",7))
+        self.assertFalse(any(call.args[1] == "push" for call in git.call_args_list))
+
+    @patch.object(m,"git")
+    @patch.object(m,"authorization")
+    @patch.object(m,"preview_frozen",return_value=True)
+    def test_frozen_candidate_never_calls_authorization_or_git(self,frozen,auth,git):
+        self.assertFalse(m.merge_one("fake",7))
+        auth.assert_not_called()
+        git.assert_not_called()

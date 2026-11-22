@@ -1,5 +1,68 @@
 [
   {
+    "version": "0.1.21",
+    "title": "管理员密码与应用名称设置",
+    "summary": "新增管理员自助修改密码、工作台名称及引用名称；引用名称同步浏览器页面 Title，不修改域名、仓库标识和运行端口。",
+    "changes": [
+      "系统设置新增修改密码：必须输入原密码、新密码及确认，后台重新验证当前密码，使用 PBKDF2 哈希持久化，完成后撤销已有登录会话。",
+      "系统设置可分别修改工作台侧栏名称和应用引用名称；后者同步登录界面标题和浏览器 document.title，页面切换后即时更新。",
+      "配置写入应用自身非 Git 跟踪目录下的私有 0600 文件，部署时不改写 .env 或数据库结构；保存失败保留旧设置。",
+      "所有修改必须由管理员会话、同源 Origin 和 CSRF 认证授权；无凭证、错误旧密码、名称无效、配置文件为符号链接时拒绝。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 执行密码更新、跨会话撤销、名称持久化、CSRF、安全文件权限及前端构建测试。",
+      "公网登录后在系统设置修改两个名称，刷新并切换导航，检查浏览器 Title 和工作台名称一致；原域名与仓库标识不变。",
+      "使用旧密码登录应失败，新密码成功；原有会话失效；重新部署后配置不丢失。",
+      "验收 preview 实际 SHA 后，经网页验收授权正式发布 main。"
+    ],
+    "validation_note": "账户设置只修改当前安装实例，不改 Github 仓库名称或 Cloudflare 域名；不得将 MacCI 通过等同于生产环境已部署。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
+    "version": "0.1.20",
+    "title": "PR 解除 Draft 操作与自动合并交接",
+    "summary": "基座验收中心的 PR 追踪页面新增管理员确认解除 Draft；通过负责人精确 SHA 审查授权，将后续测试与合并交回 MacCI 和 preview 协调器。",
+    "changes": [
+      "仅对基座 preview 仓库的 OWNER Draft PR 展示“解除 Draft”，操作需登录管理员会话、同源校验、CSRF 令牌和二次确认。",
+      "解除前复核正式 main 与 preview 一致、网页运行 SHA、PR 原始 HEAD SHA、仓库归属、OWNER 身份与可合并状态，不允许验收冻结期操作。",
+      "管理员操作记录绑定精确 HEAD 和当前 preview 祖先的审查授权；解除 Draft 本身不直接合并、不跳过 MacCI，新测试回执及协调器精确合并检查仍为必要条件。",
+      "补充跨仓库、SHA 变化、待验收冻结、状态已变化、无效登录与权限错误的安全回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 测试 PR #54/#57 的旧版候选与新基线处理，确保解除 Draft 不立即强制合并。",
+      "在 base.layho.com 登录后检查 PR 表格操作按钮、确认弹窗及失败原因；未登录或基座冻结期间必须禁止解除。",
+      "验证解除 Draft 后 MacCI 对当前 HEAD/base/merge 重新测试成功，取得 owner 评论授权后才由 coordinator 自动合并。",
+      "确认 preview 公网运行 SHA，网页验收后通过原有 main 正式发布流程。"
+    ],
+    "validation_note": "解除 Draft 仅解除草稿阻塞，不代表测试、合并、部署完成；依赖现有 Mac mini 测试与自动合并服务。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/54"
+  },
+  {
+    "version": "0.1.19",
+    "title": "Panel 基座升级自动合并闭环",
+    "summary": "对已授权的 Panel 应用打通基座升级 PR 的精确 MacCI 测试、自动安全合并与现有 Mac mini 部署闭环，并提供独立调度器安全升级入口。",
+    "changes": [
+      "仅对 layho/macmini-office-app-panel 启用严格校验的自动升级 PR 合并；其他应用维持现有草稿 PR 与人工审查策略。",
+      "要求 OWNER 发起的 PR、正式基座 main 的准确目标 SHA、Panel 当前 main 的准确基线、三方差异无冲突以及实际修改文件符合生成计划。",
+      "必须检查可信 MacCI 对精确 HEAD/base/merge 的成功回执；提交变化、测试失败、额外业务文件或 GitHub 异常时自动停止。",
+      "增加独立调度器安全更新入口 --apply --upgrade，沿用原凭据/LaunchAgent/注册信息并保留备份；不直接触碰 Panel 业务数据库、域名及生产服务。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 执行新增升级自动合并的正向、失败、冲突、跨仓库和来源 SHA 校验回归测试。",
+      "检查宿主独立调度器的安全升级预检查，核对新模块是否成功安装在运行时，保留原 token 与注册。",
+      "核对 Panel 基座升级 PR 的合并 MacCI 回执、应用 main 合并 SHA、自动部署回执和 panel.layho.com 实际运行 SHA。",
+      "在 base.layho.com 精确候选网页验收后，正式发布基座 main，再启用宿主升级。"
+    ],
+    "validation_note": "GitHub 代码提交/preview 合并不会升级 Mac mini 独立调度器。必须验证运行时版本及真实下游应用公网部署后才能声明闭环已生效。",
+    "reference_url": "https://github.com/layho/macmini-office-app-panel/pull/18"
+  },
+  {
     "version": "0.1.18",
     "title": "app-init 默认安装目录与基座升级自动登记",
     "summary": "将新应用默认安装到 ~/Projects/app-init/owner--repo，初始化或复验时自动登记基座升级调度器，保护已有应用路径和手动注册配置。",
@@ -7,16 +70,18 @@
       "新建应用默认位于 ~/Projects/app-init/owner--repo；已安装在旧位置的应用继续沿用旧位置，不做迁移；同时发现两处安装时拒绝继续。",
       "app-init 在成功安装与现有应用复验后补登记基座升级调度器；原有 observe/create 注册不覆盖。",
       "兼容已安装的旧版调度器命令接口；未安装调度器时只提示警告，不阻塞应用部署。",
-      "新增默认路径、旧安装兼容、重复路径冲突及调度器登记回归测试；不变更已有 Panel 服务、Cloudflare 或生产数据库。"
+      "新增默认路径、旧安装兼容、重复路径冲突及调度器登记回归测试；不变更已有 Panel 服务、Cloudflare 或生产数据库。",
+      "基座验收候选冻结：preview 版本高于正式 main 时，本机 preview 合并协调器阻止后续普通 PR 推送；正式发布后自动解冻，并在推送前重复核对。"
     ],
     "acceptance_required": true,
     "acceptance_status": "pending",
     "validation_steps": [
       "确认 MacCI 对精确 PR HEAD/base/merge 完成回归测试及前端构建。",
       "preview 实际运行 SHA 与候选一致；验证更新记录显示 V0.1.18，并检查默认路径、旧目录保护及调度器登记逻辑。",
-      "用户通过 base.layho.com 页面进行网页验收后，由既有 Mac mini 发布器发布 main；检查正式 SHA。"
+      "用户通过 base.layho.com 页面进行网页验收后，由既有 Mac mini 发布器发布 main；检查正式 SHA。",
+      "验证 Mac mini 已升级 preview 合并协调器运行时；在 main 仍为旧版本时检查冻结日志和 #54 保留 Draft，确认不会继续改写待验收候选。"
     ],
-    "validation_note": "本次为 #49、#50 的功能合并发布记录。两项代码已在 preview，但本版本记录仍需要独立 MacCI 测试、preview 部署及网页验收；不能把本 PR 提交当作发布成功。",
+    "validation_note": "候选冻结依赖 Mac mini 安装经过审查的新协调器；仅合并 GitHub PR 不代表宿主运行时已升级。公网 SHA、MacCI 与网页验收仍需核对。",
     "reference_url": "https://github.com/layho/web-app-init-base-env/pull/50"
   },
   {

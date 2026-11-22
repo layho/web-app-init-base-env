@@ -326,7 +326,6 @@ test ! -d "$LOCK"
     result = subprocess.run(["bash","-c",program],cwd=tmp_path,capture_output=True,text=True)
     assert result.returncode == 0, result.stdout + result.stderr
 
-
 def test_read_only_update_check_does_not_deploy(monkeypatch):
     from app import operations
     from types import SimpleNamespace

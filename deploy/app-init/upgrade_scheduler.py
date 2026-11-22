@@ -1,6 +1,8 @@
 """Independent host scheduler for approved downstream repositories.
 
-Only creates draft upgrade PRs. Never merges, deploys or touches a running app.
+Creates draft upgrade PRs. Only explicitly approved Panel upgrades may be
+promoted after exact MacCI success and independent safety verification. Never
+deploys or touches installed application files, domains, databases or services.
 """
 import argparse
 from contextlib import contextmanager
@@ -17,6 +19,7 @@ import sys
 from tempfile import NamedTemporaryFile
 
 import upgrade_pr as upgrade
+import upgrade_auto_merge as auto_merge
 
 ROOT = Path.home() / ".local/share/macmini-foundation-upgrades"
 INTERVAL = 300
@@ -134,6 +137,11 @@ def tick_app(repo, entry, target, force=False):
         pending = open_upgrades(repo)
         if pending:
             row = pending[0]
+            # Panel alone is approved for exact-test automated promotion.
+            # Any failed/unknown gate leaves the PR intact for human inspection.
+            if repo in auto_merge.APPROVED_REPOS and auto_merge.promote(repo, row, app_sha, target):
+                return record(repo, mode, target, app_sha, "upgrade_pending",
+                              pr_url=safe_url(repo, row.get("url")), merged_now=True)
             return record(repo, mode, target, app_sha, "upgrade_pending",
                           pr_url=safe_url(repo, row.get("url")))
         previous = read_json(status_path(repo), {})
