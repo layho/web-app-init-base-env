@@ -102,13 +102,7 @@ def status_path(repo):
 
 
 def open_upgrades(repo):
-    output = upgrade.run(["gh", "pr", "list", "--repo", repo, "--base", "main",
-                          "--state", "open", "--limit", "1000",
-                          "--json", "number,url,headRefName,headRepositoryOwner,baseRefName"])
-    rows = json.loads(output)
-    if not isinstance(rows, list) or len(rows) >= 1000:
-        raise ValueError("PR list incomplete")
-    return [p for p in rows if p.get("headRefName", "").startswith("base-upgrade/")]
+    return [p for p in upgrade.pull_rows(repo) if p.get("headRefName", "").startswith("base-upgrade/")]
 
 
 def safe_url(repo, value):

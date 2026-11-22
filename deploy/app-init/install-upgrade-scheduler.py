@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One-time installation of a reviewed scheduler, without root or new credentials."""
 import argparse
+import getpass
 import os
 from pathlib import Path
 import plistlib
@@ -28,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sha", required=True, help="exact accepted foundation main SHA")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--check-repo", required=True, help="downstream repo for API/SSH preflight")
     args = parser.parse_args()
     os.umask(0o077)
     if not upgrade.SHA.fullmatch(args.sha):
@@ -41,9 +43,28 @@ def main():
     os.environ["PATH"] = PATH
     os.environ["GH_PROMPT_DISABLED"] = "1"
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
-    if not shutil.which("gh"):
-        raise SystemExit("Existing authenticated GitHub CLI required")
-    run("gh", "auth", "status", "--hostname", "github.com")
+    if not scheduler.repository_valid(args.check_repo):
+        raise SystemExit("Invalid downstream repository")
+    os.environ["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    try:
+        if not upgrade.remote_ref("git@github.com:" + args.check_repo + ".git", "refs/heads/main"):
+            raise ValueError("No downstream main")
+        print("SSH repository access passed", flush=True)
+        try:
+            token = upgrade.read_token()
+            existing_token = True
+        except FileNotFoundError:
+            token = getpass.getpass("Paste dedicated GitHub PR token (hidden): ").strip()
+            existing_token = False
+        if not upgrade.valid_token(token):
+            raise ValueError("Invalid token format")
+        identity = upgrade.github("/user", token=token)
+        if not isinstance(identity, dict) or not identity.get("login"):
+            raise ValueError("GitHub identity unavailable")
+        upgrade.pull_rows(args.check_repo, token=token)
+        print("GitHub REST token and downstream PR read access passed (PR write is verified by actual creation)", flush=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise SystemExit("Preflight failed: " + (str(exc) if type(exc) is ValueError else type(exc).__name__)) from None
     run(sys.executable, "-B", str(HERE.parents[1] / "tests/test_upgrade_scheduler.py"))
     domain = "gui/" + str(os.getuid())
     run("launchctl", "print", domain)
@@ -53,6 +74,13 @@ def main():
     scheduler.private_root()
     with scheduler.lock("tick.lock"):
         root = scheduler.ROOT
+        if not existing_token:
+            fd = os.open(upgrade.TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as f:
+                f.write(token + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        del token
         runtime = root / "runtime"
         plist = Path.home() / "Library/LaunchAgents" / (scheduler.LABEL + ".plist")
         job = {"Label": scheduler.LABEL, "ProgramArguments": [sys.executable, str(runtime/"upgrade_scheduler.py"), "tick"],
