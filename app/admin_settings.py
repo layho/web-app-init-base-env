@@ -10,7 +10,7 @@ import stat
 from tempfile import NamedTemporaryFile
 
 SETTINGS = Path(__file__).resolve().parents[1] / "logs" / "admin-settings.json"
-TITLE = re.compile(r"[^\\x00-\\x1f\\x7f]{1,80}\\Z")
+TITLE = re.compile(r"[^\x00-\x1f\x7f]{1,80}\Z")
 
 
 def initial():
