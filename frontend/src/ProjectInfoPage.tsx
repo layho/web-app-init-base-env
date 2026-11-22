@@ -111,6 +111,10 @@ function FoundationVersionPanel({ info, loading, onRefresh }: { info?: Foundatio
       { key: 'auto', label: '自动升级模式', children: info?.scheduler ? schedulerMode[info.scheduler.mode] : info?.role === 'foundation' ? '不适用（基座本身）' : '调度器状态不可用' },
       ...(info?.scheduler ? [
         { key: 'scheduler-state', label: '调度器最近结果', children: schedulerLabels[info.scheduler.state] || '未知状态' },
+        { key: 'blocked-files', label: '升级冲突文件',
+          children: info.scheduler.blocked_files?.length
+            ? info.scheduler.blocked_files.map(item => item.path + '（' + (item.action === 'conflict' ? '内容冲突' : '需要审查') + '）').join('；')
+            : '无已确认冲突文件清单' },
         { key: 'scheduler-checked', label: '调度器最近检查', children: info.scheduler.checked_at ? new Date(info.scheduler.checked_at).toLocaleString() : '尚未取得' },
         { key: 'scheduler-target', label: '调度器目标 SHA', children: info.scheduler.target_sha ? <Typography.Text copyable>{info.scheduler.target_sha}</Typography.Text> : '未取得' },
         { key: 'scheduler-pr', label: '升级 PR', children: info.scheduler.pr_url ? <Typography.Link href={info.scheduler.pr_url} target="_blank" rel="noopener noreferrer">{info.scheduler.pr_url.split('/').pop()} 号升级 PR（打开）</Typography.Link> : '当前无关联 PR' },
