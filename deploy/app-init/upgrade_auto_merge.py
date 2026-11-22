@@ -50,6 +50,11 @@ def promotion_gate(repo, number, app_sha, foundation_sha):
         return None
     if head.get("ref") != "base-upgrade/" + foundation_sha:
         return None
+    # The scheduler creates exactly one commit on the observed app main.
+    # Any manual follow-up commit (even if tests pass) requires human review.
+    source = api(prefix + "/git/commits/" + head["sha"])
+    if [parent.get("sha") for parent in source.get("parents", [])] != [app_sha]:
+        return None
     body = pr.get("body")
     if not isinstance(body, str) or len(body) > MAX_BODY or "\n\n" not in body:
         return None
