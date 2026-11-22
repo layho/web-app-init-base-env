@@ -81,9 +81,6 @@ class SchedulerTests(unittest.TestCase):
         s.register(REPO, "create", if_absent=True)
         self.assertEqual(s.registry()["apps"][REPO]["mode"], "create")
 
-if __name__ == "__main__":
-    unittest.main()
-
 
     def test_panel_verified_pending_pr_can_promote(self):
         panel = "layho/macmini-office-app-panel"
@@ -103,3 +100,6 @@ if __name__ == "__main__":
              patch.object(s.auto_merge,"promote") as promote:
             s.tick_app(REPO,{"mode":"create"},B)
             promote.assert_not_called()
+
+if __name__ == "__main__":
+    unittest.main()
