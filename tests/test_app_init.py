@@ -83,7 +83,9 @@ def test_https_service_credential_is_private_and_scoped(tmp_path):
     assert fill("example/other.git").returncode != 0
 
 
-def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path):
+def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path, monkeypatch):
+    source_version = {"schema": 1, "repository": "layho/web-app-init-base-env", "sha": "a" * 40, "version": "0.1.5"}
+    monkeypatch.setattr(app_init, "foundation_provenance", lambda source: source_version)
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
     repository = "example/demo-app"
@@ -91,7 +93,13 @@ def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path):
     args = (repository, "demo-app", domain, 18123, "com.appinit.demo")
     repo = tmp_path / "first"
     meta = app_init.seed(SOURCE, str(remote), repo, *args)
-    assert meta == {"repository": repository, "domain": domain, "port": 18123, "label": "com.appinit.demo"}
+    assert meta["repository"] == repository
+    assert meta["domain"] == domain
+    assert meta["port"] == 18123
+    assert meta["label"] == "com.appinit.demo"
+    assert meta["foundation"] == source_version
+    assert (repo / "app/foundation_version.py").is_file()
+    assert "基座版本" in (repo / "frontend/src/ProjectInfoPage.tsx").read_text()
     initial = app_init.git(repo, "rev-parse", "HEAD")
     assert "hash_password" in (repo / "app/auth.py").read_text()
     assert not (repo / ".env").exists()

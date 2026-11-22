@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.1.5",
+    "title": "app-init · 基座版本登记",
+    "summary": "新应用自动记录基座来源，并内置基座版本页签。",
+    "changes": [
+      "app-init 保存基座版本与不可变 SHA；应用自身版本独立。",
+      "项目信息内置基座版本页签，以正式 main 为比较来源；旧应用缺少来源时显示待登记。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "初始化测试仓库，核对基座元数据与源代码 SHA。",
+      "打开项目信息 → 基座版本，核对当前版本及最新正式版本。",
+      "确认旧应用不会被自动登记为最新版本，断网时显示未知或缓存。"
+    ],
+    "validation_note": "本次仅实现初始化登记与版本查询，自动升级 PR 执行器仍待接入。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.4",
     "title": "开发任务 · 测试与发布追踪",
     "summary": "直接查看真实 MacCI 测试回执、耗时、安全日志摘要、合并与部署证据。",

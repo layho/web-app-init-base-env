@@ -74,16 +74,30 @@ def configure_service_git(root, repository, token, proxy):
         git(root, "config", "--local", "http.proxy", proxy)
 
 
+def foundation_provenance(source):
+    """Record the immutable source of the newly generated application."""
+    sha = git(source, "rev-parse", "HEAD")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("Invalid foundation commit SHA")
+    if git(source, "status", "--porcelain", "--untracked-files=normal"):
+        raise ValueError("Foundation checkout is not clean")
+    version = json.loads((source / "app/release_notes.json").read_text(encoding="utf-8"))[0]["version"]
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", version):
+        raise ValueError("Invalid foundation version")
+    return {"schema": 1, "repository": "layho/web-app-init-base-env", "sha": sha, "version": version}
+
+
 def copy_foundation(source, target, repository, title, domain, port, label):
+    foundation = foundation_provenance(source)
     paths = [
         ".gitignore", "requirements.txt", "app/__init__.py", "app/auth.py", "app/db.py",
-        "app/development_tasks.py", "app/feedback_progress.py", "app/pr_tracking.py", "app/release_acceptance.py", "app/main.py", "app/models.py", "app/operations.py",
+        "app/development_tasks.py", "app/foundation_version.py", "app/feedback_progress.py", "app/pr_tracking.py", "app/release_acceptance.py", "app/main.py", "app/models.py", "app/operations.py",
         "migrations/002_admin_sessions.sql", "migrations/003_feedback.sql",
         "scripts/apply_migrations.py", "scripts/hash_admin_password.py", "scripts/sync_feedback.py",
         "scripts/sync_development_tasks.py", "deploy/macmini/manage.sh", "deploy/macmini/acceptance.py",
         "deploy/macmini/acceptance.sh", "deploy/macmini/release.py", "tests/test_auth.py",
         "tests/test_deploy_script.py", "tests/test_development_tasks.py", "tests/test_feedback.py",
-        "tests/test_feedback_issue_body.py", "tests/test_feedback_progress.py", "tests/test_release_acceptance.py",
+        "tests/test_feedback_issue_body.py", "tests/test_foundation_version.py", "tests/test_feedback_progress.py", "tests/test_release_acceptance.py",
     ]
     paths += [path.relative_to(source).as_posix() for path in sorted((source / "frontend/src").rglob("*")) if path.is_file()]
     paths += [f"frontend/{path}" for path in ("index.html", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts")]
@@ -116,6 +130,7 @@ def copy_foundation(source, target, repository, title, domain, port, label):
     (target / "app/release_notes.json").write_text(json.dumps(notes, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (target / ".app-init.json").write_text(json.dumps({
         "repository": repository, "domain": domain, "port": port, "label": label,
+        "title": title, "foundation": foundation,
     }, indent=2) + "\n", encoding="utf-8")
     (target / "README.md").write_text(f"# {title}\n\n应用基座。开发需求通过意见反馈登记。\n", encoding="utf-8")
 

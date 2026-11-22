@@ -1,4 +1,4 @@
-import { Alert, Button, Card, Flex, List, Skeleton, Table, Tabs, Tag, Typography, theme } from 'antd'
+import { Alert, Button, Card, Descriptions, Flex, List, Skeleton, Table, Tabs, Tag, Typography, theme } from 'antd'
 import { ArrowDownOutlined } from '@ant-design/icons'
 
 type ArchitectureLayer = { layer: string; technology: string; role: string }
@@ -6,7 +6,20 @@ type WorkflowStage = { title: string; description: string }
 type LoopStage = { id: string; title: string; actor: string; cadence: string; description: string; mode: 'input' | 'automatic' | 'manual'; failure?: string }
 type TaskModule = { module: string; scope: string; acceptance: string; issue: number }
 
+type VersionRef = { version: string; sha: string }
+type FoundationVersion = {
+  repository: string
+  role: 'foundation' | 'application'
+  current: VersionRef | null
+  latest: VersionRef | null
+  checked_at: string | null
+  stale: boolean
+  status: 'unregistered' | 'unknown' | 'current' | 'different'
+  auto_upgrade_enabled: boolean
+}
+
 export type ProjectInfo = {
+  foundation_version?: FoundationVersion
   name: string
   summary: string
   architecture: ArchitectureLayer[]
@@ -40,11 +53,35 @@ function DevelopmentLoop({ stages }: { stages: LoopStage[] }) {
   </Flex>
 }
 
-export function ProjectInfoPage({ data, loading, issueBase, onOpenTasks }: {
+function FoundationVersionPanel({ info, loading, onRefresh }: { info?: FoundationVersion; loading: boolean; onRefresh: () => void }) {
+  const renderVersion = (ref: VersionRef | null | undefined) => ref
+    ? <Flex vertical gap={4}><Typography.Text strong>v{ref.version}</Typography.Text><Typography.Text copyable style={{ wordBreak: 'break-all' }}>{ref.sha}</Typography.Text></Flex>
+    : <Typography.Text type="secondary">未登记或未取得</Typography.Text>
+  const label = info?.status === 'current' ? '基座已一致'
+    : info?.status === 'different' ? '基座版本 / SHA 不同，待核对升级'
+    : info?.status === 'unknown' ? '正式版本暂未核实' : '基座来源待登记'
+  return <Flex vertical gap="middle">
+    <Alert showIcon type={info?.status === 'current' ? 'success' : 'info'} message={label}
+      description="应用自身版本与基座版本独立。正式基座来源固定为 main，preview 不作为下游升级目标。" />
+    <Descriptions bordered column={1} size="small" items={[
+      { key: 'source', label: '基座仓库', children: <Typography.Link href="https://github.com/layho/web-app-init-base-env" target="_blank" rel="noreferrer">layho/web-app-init-base-env</Typography.Link> },
+      { key: 'current', label: info?.role === 'foundation' ? '当前运行基座' : '当前应用基座', children: renderVersion(info?.current) },
+      { key: 'latest', label: '最新正式基座', children: renderVersion(info?.latest) },
+      { key: 'checked', label: '最近成功检查', children: info?.checked_at ? new Date(info.checked_at).toLocaleString() : '尚未取得' },
+      { key: 'auto', label: '自动升级 PR', children: info?.auto_upgrade_enabled ? '已启用' : '待接入' },
+    ]} />
+    {info?.stale && <Alert type="warning" showIcon message="未取得实时正式版本；已有数据仅供参考。" />}
+    <div><Button loading={loading} onClick={onRefresh}>刷新版本状态</Button></div>
+    <Typography.Text type="secondary">正式版本检查缓存五分钟。升级须经过独立 PR、应用回归测试及验收，不直接覆盖业务代码。</Typography.Text>
+  </Flex>
+}
+
+export function ProjectInfoPage({ data, loading, issueBase, onOpenTasks, onRefresh }: {
   data: ProjectInfo | null
   loading: boolean
   issueBase: string
   onOpenTasks: () => void
+  onRefresh: () => void
 }) {
   if (!data) return loading ? <Card><Skeleton active /></Card> : null
 
@@ -81,6 +118,11 @@ export function ProjectInfoPage({ data, loading, issueBase, onOpenTasks }: {
         label: '开发闭环',
         children: <DevelopmentLoop stages={data.development_loop} />,
       }] : []),
+      {
+        key: 'foundation-version',
+        label: '基座版本',
+        children: <FoundationVersionPanel info={data.foundation_version} loading={loading} onRefresh={onRefresh} />,
+      },
       {
         key: 'breakdown',
         label: '任务拆解',
