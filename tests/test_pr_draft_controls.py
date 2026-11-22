@@ -100,3 +100,36 @@ def test_non_owner_review_token_does_not_unlock(github, monkeypatch):
     monkeypatch.setattr(d, "github", mismatched)
     with pytest.raises(d.DraftReleaseError, match="OWNER"):
         d.release(54, H)
+
+
+def test_mark_ready_uses_dedicated_pull_request_token(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "issues-only-token")
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "owner-pull-request-token")
+    captured = []
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            captured.append((request.headers, request.data))
+            class Resp:
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+                def read(self, *args): return b'{"data":{"markPullRequestReadyForReview":{"pullRequest":{"isDraft":false}}}}'
+            return Resp()
+    monkeypatch.setattr(d, "build_opener", lambda *args: FakeOpener())
+    assert d.mark_ready("PR_abc123")
+    assert captured[0][0]["Authorization"] == "Bearer owner-pull-request-token"
+    assert b"markPullRequestReadyForReview" in captured[0][1]
+
+
+def test_graphql_permission_denial_does_not_claim_success(monkeypatch):
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "test-only")
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            class Resp:
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+                def read(self, *args): return b'{"errors":[{"message":"Resource not accessible by personal access token"}]}'
+            return Resp()
+    monkeypatch.setattr(d, "build_opener", lambda *args: FakeOpener())
+    with pytest.raises(d.DraftReleaseError, match="Pull requests"):
+        d.mark_ready("PR_abc123")
