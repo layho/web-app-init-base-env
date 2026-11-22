@@ -7,7 +7,8 @@
       "系统设置新增修改密码：必须输入原密码、新密码及确认，后台重新验证当前密码，使用 PBKDF2 哈希持久化，完成后撤销已有登录会话。",
       "系统设置可分别修改工作台侧栏名称和应用引用名称；后者同步登录界面标题和浏览器 document.title，页面切换后即时更新。",
       "配置写入应用自身非 Git 跟踪目录下的私有 0600 文件，部署时不改写 .env 或数据库结构；保存失败保留旧设置。",
-      "所有修改必须由管理员会话、同源 Origin 和 CSRF 认证授权；无凭证、错误旧密码、名称无效、配置文件为符号链接时拒绝。"
+      "所有修改必须由管理员会话、同源 Origin 和 CSRF 认证授权；无凭证、错误旧密码、名称无效、配置文件为符号链接时拒绝。",
+      "修复网页解除 Draft 的 GitHub GraphQL 拒绝提示：支持独立 APP_GITHUB_PR_TOKEN（OWNER、Pull requests 写权限）；无授权时明确拒绝，不会错误声称合并。"
     ],
     "acceptance_required": true,
     "acceptance_status": "pending",
@@ -15,7 +16,8 @@
       "MacCI 执行密码更新、跨会话撤销、名称持久化、CSRF、安全文件权限及前端构建测试。",
       "公网登录后在系统设置修改两个名称，刷新并切换导航，检查浏览器 Title 和工作台名称一致；原域名与仓库标识不变。",
       "使用旧密码登录应失败，新密码成功；原有会话失效；重新部署后配置不丢失。",
-      "验收 preview 实际 SHA 后，经网页验收授权正式发布 main。"
+      "验收 preview 实际 SHA 后，经网页验收授权正式发布 main。",
+      "使用 GitHub 具有 Pull requests 写入权限的 OWNER Token 验证网页解除 Draft，检查仅解除草稿，随后由 MacCI 在最新基线测试后自动合并。"
     ],
     "validation_note": "账户设置只修改当前安装实例，不改 Github 仓库名称或 Cloudflare 域名；不得将 MacCI 通过等同于生产环境已部署。",
     "reference_url": "https://github.com/layho/web-app-init-base-env"
