@@ -7,16 +7,18 @@
       "新建应用默认位于 ~/Projects/app-init/owner--repo；已安装在旧位置的应用继续沿用旧位置，不做迁移；同时发现两处安装时拒绝继续。",
       "app-init 在成功安装与现有应用复验后补登记基座升级调度器；原有 observe/create 注册不覆盖。",
       "兼容已安装的旧版调度器命令接口；未安装调度器时只提示警告，不阻塞应用部署。",
-      "新增默认路径、旧安装兼容、重复路径冲突及调度器登记回归测试；不变更已有 Panel 服务、Cloudflare 或生产数据库。"
+      "新增默认路径、旧安装兼容、重复路径冲突及调度器登记回归测试；不变更已有 Panel 服务、Cloudflare 或生产数据库。",
+      "基座验收候选冻结：preview 版本高于正式 main 时，本机 preview 合并协调器阻止后续普通 PR 推送；正式发布后自动解冻，并在推送前重复核对。"
     ],
     "acceptance_required": true,
     "acceptance_status": "pending",
     "validation_steps": [
       "确认 MacCI 对精确 PR HEAD/base/merge 完成回归测试及前端构建。",
       "preview 实际运行 SHA 与候选一致；验证更新记录显示 V0.1.18，并检查默认路径、旧目录保护及调度器登记逻辑。",
-      "用户通过 base.layho.com 页面进行网页验收后，由既有 Mac mini 发布器发布 main；检查正式 SHA。"
+      "用户通过 base.layho.com 页面进行网页验收后，由既有 Mac mini 发布器发布 main；检查正式 SHA。",
+      "验证 Mac mini 已升级 preview 合并协调器运行时；在 main 仍为旧版本时检查冻结日志和 #54 保留 Draft，确认不会继续改写待验收候选。"
     ],
-    "validation_note": "本次为 #49、#50 的功能合并发布记录。两项代码已在 preview，但本版本记录仍需要独立 MacCI 测试、preview 部署及网页验收；不能把本 PR 提交当作发布成功。",
+    "validation_note": "候选冻结依赖 Mac mini 安装经过审查的新协调器；仅合并 GitHub PR 不代表宿主运行时已升级。公网 SHA、MacCI 与网页验收仍需核对。",
     "reference_url": "https://github.com/layho/web-app-init-base-env/pull/50"
   },
   {
