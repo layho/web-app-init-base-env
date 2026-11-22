@@ -14,6 +14,8 @@ TITLE = re.compile(r"[^\x00-\x1f\x7f]{1,80}\Z")
 
 
 def initial():
+    if os.getenv("APP_BASE_PREVIEW") == "1":
+        return "基座验收中心"
     path = Path(__file__).with_name("project_info.json")
     try:
         info = json.loads(path.read_text(encoding="utf-8"))
