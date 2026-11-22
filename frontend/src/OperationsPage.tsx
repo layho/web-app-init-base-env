@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, List, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, List, Modal, Space, Table, Tag, Typography } from 'antd'
 
 type Operation = { at: string; code: string; sha: string }
 type ReleaseNote = { version: string; title: string; changes: string[]; validation?: string; date?: string; summary?: string; acceptance_required?: boolean; acceptance_status?: string; validation_steps?: string[]; validation_note?: string; reference_url?: string }
@@ -8,6 +8,7 @@ export type ReleaseHistory = {
   running_sha: string
   releases: ReleaseNote[]
   deployments: Operation[]
+  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown'; issue?: number | null }
 }
 export type SystemLogs = { events: Operation[] }
 
@@ -59,23 +60,61 @@ function safeReference(value?: string) {
   } catch { return undefined }
 }
 
-export function ReleasePage({ data, loading, onRefresh }: RefreshProps & { data: ReleaseHistory | null }) {
+export function ReleasePage({ data, loading, onRefresh, onAccept }: RefreshProps & { data: ReleaseHistory | null; onAccept: (sha: string, version: string) => Promise<void> }) {
   const [selectedVersion, setSelectedVersion] = useState<string | null>(null)
   const [deployment, setDeployment] = useState<Operation | null>(null)
+  const [accepting, setAccepting] = useState(false)
+  const [confirm, setConfirm] = useState<{sha: string; version: string} | null>(null)
+  const [acceptError, setAcceptError] = useState<string | null>(null)
+  const acceptance = data?.acceptance
+  const canAccept = Boolean(acceptance?.enabled && acceptance.state === 'not_requested' && data && /^[0-9a-f]{40}$/.test(data.running_sha) && data.releases[0]?.acceptance_required && data.releases[0]?.version === data.version)
+  function requestAcceptance() {
+    if (!data || !canAccept) return
+    setAcceptError(null)
+    setConfirm({ sha: data.running_sha, version: data.version })
+  }
+  async function confirmAcceptance() {
+    if (!confirm || accepting) return
+    setAccepting(true)
+    setAcceptError(null)
+    try {
+      await onAccept(confirm.sha, confirm.version)
+      setConfirm(null)
+    } catch (error) {
+      setAcceptError(error instanceof Error ? error.message : '验收提交失败，请重试')
+    } finally {
+      setAccepting(false)
+    }
+  }
+  function acceptanceAction() {
+    if (!acceptance?.enabled) return null
+    if (acceptance.state === 'published') return <Tag color="success">验收通过 · 已发布 main</Tag>
+    if (acceptance.state === 'queued') return <Tag color="processing">验收已提交 · 等待发布 main</Tag>
+    if (acceptance.state === 'blocked') return <Tag color="error">发布受阻，请查看验收任务</Tag>
+    if (acceptance.state === 'unknown') return <Tag color="warning">发布状态待刷新</Tag>
+    return canAccept ? <Button type="primary" onClick={requestAcceptance} disabled={accepting || loading}>验收通过</Button> : null
+  }
   const selected = data?.releases.find(release => release.version === selectedVersion)
   const pending = data?.releases.filter(release => release.acceptance_required && release.acceptance_status === 'pending').length ?? 0
   return <Flex vertical gap="middle">
-    <Card title="当前运行版本" extra={<Space wrap>{pending > 0 && <Tag color="warning">待验收版本 {pending}</Tag>}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
+    <Card title="当前运行版本" extra={<Space wrap>{pending > 0 && acceptance?.state !== 'published' && <Tag color="warning">待验收版本 {pending}</Tag>}{acceptanceAction()}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
       {data ? <Flex wrap gap="small" align="center">
         <Tag color="blue">{data.version}</Tag>
         <Typography.Text copyable code style={{ overflowWrap: 'anywhere' }}>{data.running_sha === 'unknown' ? '未上报 Git SHA' : data.running_sha}</Typography.Text>
       </Flex> : <Typography.Text type="secondary">暂无版本信息</Typography.Text>}
     </Card>
-    <Alert type="info" showIcon message="代码已提交不等于线上已验收" description="请核对当前运行版本和 Git SHA，以实际验证结果为准。" />
+    <Alert type="info" showIcon message="代码已提交不等于线上已验收" description={acceptance?.enabled ? '体验当前版本后点击「验收通过」，系统将提交绑定当前运行 SHA 的正式发布请求；发布完成前不会显示已发布。' : '请核对当前运行版本和 Git SHA，以实际验证结果为准。'} />
+    {acceptance?.issue && <Typography.Link href={`https://github.com/layho/web-app-init-base-env/issues/${acceptance.issue}`} target="_blank" rel="noopener noreferrer">查看正式发布任务 #{acceptance.issue}</Typography.Link>}
+    <Modal title="确认验收并正式发布" open={confirm !== null} onCancel={() => { if (!accepting) setConfirm(null) }} onOk={() => void confirmAcceptance()} okText="验收通过，提交发布" cancelText="取消" confirmLoading={accepting} closable={!accepting} maskClosable={!accepting} cancelButtonProps={{ disabled: accepting }}>
+      <Typography.Paragraph>确认已体验以下候选版本，授权将该版本发布至正式 main 分支。系统会再次核验测试结果和分支 SHA。</Typography.Paragraph>
+      <Typography.Paragraph strong>v{confirm?.version}</Typography.Paragraph>
+      <Typography.Paragraph code style={{ overflowWrap: 'anywhere' }}>{confirm?.sha}</Typography.Paragraph>
+      {acceptError && <Alert type="error" showIcon message={acceptError} />}
+    </Modal>
     {data?.releases.length ? data.releases.map(release =>
       <Card key={release.version}
         title={<Space wrap><Typography.Text strong>v{release.version}</Typography.Text><span>{release.title}</span></Space>}
-        extra={<Space wrap><Typography.Text type="secondary">{release.date || '日期未记录'}</Typography.Text>{acceptanceTag(release)}<Button type="link" onClick={() => setSelectedVersion(release.version)}>详情</Button></Space>}>
+        extra={<Space wrap><Typography.Text type="secondary">{release.date || '日期未记录'}</Typography.Text>{release.version === data?.version && acceptance?.state === 'published' ? <Tag color="success">已验收</Tag> : acceptanceTag(release)}{release.version === data?.version ? acceptanceAction() : null}<Button type="link" onClick={() => setSelectedVersion(release.version)}>详情</Button></Space>}>
         {release.summary && <Typography.Paragraph type="secondary">{release.summary}</Typography.Paragraph>}
         <List size="small" dataSource={release.changes ?? []} renderItem={change =>
           <List.Item><Typography.Text style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{change}</Typography.Text></List.Item>} />
@@ -96,8 +135,9 @@ export function ReleasePage({ data, loading, onRefresh }: RefreshProps & { data:
         <Descriptions bordered size="small" column={1} items={[
           { key: 'version', label: '版本号', children: selected.version },
           { key: 'date', label: '发布日期', children: selected.date || '未记录' },
-          { key: 'acceptance', label: '验收状态', children: acceptanceTag(selected) },
+          { key: 'acceptance', label: '验收状态', children: selected.version === data?.version && acceptance?.state === 'published' ? <Tag color="success">已验收</Tag> : acceptanceTag(selected) },
         ]} />
+        {selected.version === data?.version && acceptanceAction()}
         {selected.summary && <Card size="small" title="版本摘要"><Typography.Paragraph style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{selected.summary}</Typography.Paragraph></Card>}
         <Card size="small" title="更新内容"><List size="small" dataSource={selected.changes ?? []} renderItem={change => <List.Item><Typography.Text style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{change}</Typography.Text></List.Item>} /></Card>
         <Card size="small" title="测试与验收">
