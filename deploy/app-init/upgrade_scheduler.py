@@ -179,8 +179,19 @@ def tick_app(repo, entry, target, force=False):
             url = safe_url(repo, result.get("url"))
         if state not in {"current", "blocked", "draft_created", "upgrade_pending", "closed_pr"}:
             raise ValueError("Unexpected coordinator result")
-        count = sum(d.get("action") in {"review", "conflict"} for d in result.get("changes", []))
-        return record(repo, mode, target, app_sha, state, pr_url=url, review_count=count,
+        flagged = []
+        for change in result.get("changes", []):
+            if not isinstance(change, dict) or change.get("action") not in {"review", "conflict"}:
+                continue
+            path, action = change.get("path"), change["action"]
+            # The planner only reports tracked code paths. Do not expose
+            # file content, token paths or arbitrary untrusted text.
+            if (isinstance(path, str) and upgrade.planner.managed(path)
+                    and len(path) <= 180 and len(flagged) < 100):
+                flagged.append({"path": path, "action": action,
+                                "reason": str(change.get("reason", ""))[:120]})
+        return record(repo, mode, target, app_sha, state, pr_url=url, review_count=len(flagged),
+                      blocked_files=flagged if state == "blocked" else [],
                       legacy_base=entry.get("legacy_base"))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         # Never log raw subprocess stderr or credentials; retry transient errors.
