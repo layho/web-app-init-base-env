@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.1.16",
+    "title": "MacCI 合并引用短暂不可用自动重试",
+    "summary": "消除 GitHub PR 新建时 merge ref 尚未就绪导致的测试卡死。",
+    "changes": [
+      "准确候选 merge ref 的拉取进行最多三次限时重试，不改动实际 HEAD/base。",
+      "同一 HEAD/base/merge 首次 fetch-failed 在下一轮自动重试，三次失败后停止无限重试。",
+      "真正的 pytest、编译或前端失败依旧作为终态，不绕过测试门槛。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 完整回归验证合并引用重试和有限次数停止。",
+      "用已有 upgrade-runtime.py 在 Mac mini 安全更新 MacCI 本地脚本，保留原 token 与启动配置。"
+    ],
+    "validation_note": "旧安装的 MacCI 脚本不会随基座 main 自动更新，须验证后安全升级已安装运行时。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/28"
+  },
+  {
     "version": "0.1.15",
     "title": "各应用自动升级调度状态展示",
     "summary": "app-init 生成的应用默认具备基座版本、调度器登记和检查回执页面。",
