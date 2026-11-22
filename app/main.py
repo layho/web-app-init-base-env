@@ -60,7 +60,9 @@ def submit_feedback(req: FeedbackIn, db: Session = Depends(get_db)):
 def list_feedback(db: Session = Depends(get_db)):
     rows = db.scalars(select(UserFeedback).order_by(UserFeedback.id.desc()).limit(100)).all()
     return [{"id": x.id, "category": x.category, "message": x.message, "status": x.status,
-             "github_issue_number": x.github_issue_number} for x in rows]
+             "github_issue_number": x.github_issue_number,
+             "created_at": x.created_at.isoformat() if x.created_at else None,
+             "synced_at": x.synced_at.isoformat() if x.synced_at else None} for x in rows]
 
 @app.get("/api/release-notes", dependencies=[Depends(authorize)])
 def release_notes(response: Response):
