@@ -59,7 +59,7 @@ def checked_time(value):
 def snapshot(app_root):
     result = {"registered": False, "mode": "unregistered", "state": "unavailable",
               "checked_at": None, "stale": True, "pr_url": None,
-              "target_sha": None, "app_sha": None, "review_count": None}
+              "target_sha": None, "app_sha": None, "review_count": None, "blocked_files": []}
     try:
         meta = json.loads((app_root / ".app-init.json").read_text(encoding="utf-8"))
         repo = meta["repository"]
@@ -87,8 +87,16 @@ def snapshot(app_root):
             r"https://github\.com/" + re.escape(repo) + r"/pull/[1-9]\d*", raw_url)):
         raw_url = None
     review = status.get("review_count")
+    files = []
+    for entry in status.get("blocked_files", []) if isinstance(status.get("blocked_files"), list) else []:
+        if not isinstance(entry, dict) or len(files) >= 100:
+            break
+        path, action = entry.get("path"), entry.get("action")
+        if (isinstance(path, str) and len(path) <= 180 and not path.startswith("/")
+                and ".." not in Path(path).parts and action in {"conflict", "review"}):
+            files.append({"path": path, "action": action})
     result.update(state=status["state"], checked_at=checked, stale=stale,
                   pr_url=raw_url, target_sha=safe_sha(status.get("target_sha")),
-                  app_sha=safe_sha(status.get("app_sha")),
+                  app_sha=safe_sha(status.get("app_sha")), blocked_files=files if status["state"] == "blocked" else [],
                   review_count=review if type(review) is int and 0 <= review <= 1000 else None)
     return result
