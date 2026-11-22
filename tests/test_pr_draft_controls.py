@@ -28,7 +28,7 @@ def github(monkeypatch):
             return pr
         if path == "/issues/54/comments":
             comments.append(payload["body"])
-            return {"id": 3}
+            return {"id": 3, "user": {"login": "layho"}}
         raise AssertionError(path)
     monkeypatch.setattr(d, "github", mock_api)
     monkeypatch.setattr(d, "mark_ready", lambda node: True)
@@ -88,3 +88,15 @@ def test_stale_head_never_writes(github):
     with pytest.raises(d.DraftReleaseError):
         d.release(54, B)
     assert not comments
+
+def test_non_owner_review_token_does_not_unlock(github, monkeypatch):
+    _, _, comments = github
+    original = d.github
+    def mismatched(path, payload=None):
+        if path.endswith("/comments"):
+            comments.append(payload["body"])
+            return {"id": 5, "user": {"login": "other"}}
+        return original(path, payload)
+    monkeypatch.setattr(d, "github", mismatched)
+    with pytest.raises(d.DraftReleaseError, match="OWNER"):
+        d.release(54, H)
