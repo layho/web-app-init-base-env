@@ -50,5 +50,84 @@
       "description": "在 Issue 更新结果和后续事项。应用同步开发进度，更新记录和系统日志展示实际发布事件。"
     }
   ],
-  "tasks": []
+  "tasks": [],
+  "development_loop": [
+    {
+      "id": "feedback",
+      "title": "网页提交意见反馈",
+      "actor": "用户",
+      "cadence": "按需提交 · 后台自动同步",
+      "description": "在基座验收站提交需求或问题，自动同步至 GitHub Issues。",
+      "mode": "input"
+    },
+    {
+      "id": "development",
+      "title": "领取任务并开发",
+      "actor": "ChatGPT",
+      "cadence": "每小时检查",
+      "description": "认领 Issue，明确验收要求，修改代码并补充测试。",
+      "mode": "automatic"
+    },
+    {
+      "id": "pr",
+      "title": "提交 PR",
+      "actor": "ChatGPT",
+      "cadence": "开发完成后",
+      "description": "提交独立开发分支，关联原 Issue，等待测试。",
+      "mode": "automatic"
+    },
+    {
+      "id": "test",
+      "title": "MacCI 隔离自动化测试",
+      "actor": "Mac mini",
+      "cadence": "每分钟检查",
+      "description": "核对 head/base SHA，测试合并候选的后端与前端构建。",
+      "mode": "automatic",
+      "failure": "测试未通过 → 返回开发修复；禁止合并。"
+    },
+    {
+      "id": "result",
+      "title": "GitHub 回传测试结果",
+      "actor": "MacCI / GitHub",
+      "cadence": "测试结束后",
+      "description": "回写测试状态及 head、base、merge SHA 对应证据。",
+      "mode": "automatic"
+    },
+    {
+      "id": "preview",
+      "title": "审查并合入 preview",
+      "actor": "ChatGPT",
+      "cadence": "每小时检查",
+      "description": "审查代码，验证最新成功回执及测试树一致性，合并候选版本。",
+      "mode": "automatic",
+      "failure": "基线变更或审查不通过 → 重新测试或修复。"
+    },
+    {
+      "id": "deploy",
+      "title": "自动部署验收版本",
+      "actor": "Mac mini",
+      "cadence": "每五分钟检查",
+      "description": "拉取 preview，检查端口、构建及健康状态，核对公网运行 SHA。",
+      "mode": "automatic",
+      "failure": "部署失败 → 保留或尝试恢复上一版本，排查原因。"
+    },
+    {
+      "id": "accept",
+      "title": "网页点击「验收通过」",
+      "actor": "用户",
+      "cadence": "唯一人工发布验收环节",
+      "description": "体验当前候选功能并确认准确的运行 SHA，提交正式发布请求。",
+      "mode": "manual",
+      "failure": "验收不通过 → 提交新反馈，重新进入开发闭环。"
+    },
+    {
+      "id": "publish",
+      "title": "正式发布 main",
+      "actor": "ChatGPT",
+      "cadence": "每小时检查",
+      "description": "核验验收授权、测试证据和 main 基线，仅发布已确认的候选 SHA，并回写发布结果。",
+      "mode": "automatic",
+      "failure": "凭据、分支保护或基线异常 → 停止发布并报告。"
+    }
+  ]
 }
