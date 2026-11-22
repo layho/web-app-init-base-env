@@ -327,7 +327,14 @@ function App() {
       ) : page === 'project' ? (
         <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} />
       ) : page === 'tasks' ? (
-        <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'} onRefresh={() => void loadOperations('tasks')} />
+        <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'}
+          onRefresh={() => void loadOperations('tasks')}
+          onReleaseDraft={async (number, head) => {
+            if (!session) throw new Error('请先登录')
+            await api('/api/v1/pr-drafts/release', { method: 'POST', body: JSON.stringify({ number, head }) }, session.csrf_token)
+            setNotice({ type: 'success', text: `PR #${number} 已解除 Draft，等待当前基线 MacCI 验证及自动合并。` })
+            await loadOperations('tasks')
+          }} />
       ) : page === 'releases' ? (
         <ReleasePage data={releaseHistory} loading={loadingOperations === 'releases'} onRefresh={() => void loadOperations('releases')}
           onAccept={async (sha, version) => {

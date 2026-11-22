@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Table, Tabs, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Table, Tabs, Tag, Typography } from 'antd'
 
 type DevelopmentTask = {
   number: number
@@ -28,8 +28,8 @@ function formatDate(value: string | null) {
 }
 
 const ciLabels: Record<string, string> = { success: '通过', pending: '测试中', failure: '失败', error: '失效 / 异常', unknown: '待测试 / 未记录' }
-const mergeLabels: Record<string, string> = { merged: '已合并', draft: '草稿', open: '待合并', closed: '已关闭' }
-const deployLabels: Record<string, string> = { running: '当前运行', deployed: '曾成功部署', failed: '部署失败 / 回退', unverified: '待核验', not_merged: '待合并' }
+const mergeLabels: Record<string, string> = { merged: '已合并', draft: '已暂停 · 等待解除', open: '待合并', closed: '已关闭' }
+const deployLabels: Record<string, string> = { running: '当前运行', deployed: '曾成功部署', failed: '部署失败 / 回退', unverified: '待核验', not_merged: '尚未合并' }
 const phaseLabels: Record<string, string> = { pending: '正在测试', passed: '后端测试、编译及前端构建通过', 'setup-failed': '环境准备失败', 'fetch-failed': '候选代码拉取失败', 'context-failed': '构建上下文失败', 'dependencies-failed': '依赖安装 / 镜像构建失败', 'pytest-failed': '后端测试失败', 'compile-failed': 'Python 编译失败', 'frontend-failed': '前端构建失败', 'test-failed': '容器测试失败', 'ref-changed': '分支已变更，回执无效' }
 function duration(seconds?: number | null) { return seconds == null ? '未记录' : seconds < 60 ? seconds + '秒' : Math.floor(seconds / 60) + '分' + seconds % 60 + '秒' }
 function passRate(row: PRRecord) {
@@ -40,9 +40,28 @@ function passRate(row: PRRecord) {
   return n > 0 ? (100 * p / n).toFixed(1) + '%' : '未记录'
 }
 function ciTag(state: string) { return <Tag color={state === 'success' ? 'success' : state === 'pending' ? 'processing' : state === 'failure' || state === 'error' ? 'error' : 'default'}>{ciLabels[state] ?? '未记录'}</Tag> }
-function PRTrackingPage({data}: {data: PRTracking}) {
+function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraft: (number: number, head: string) => Promise<void>}) {
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null)
+  const [releaseNumber, setReleaseNumber] = useState<number | null>(null)
+  const [releasing, setReleasing] = useState(false)
+  const [releaseError, setReleaseError] = useState<string | null>(null)
+  const [releasedNumbers, setReleasedNumbers] = useState<number[]>([])
   const selected = data.prs.find(row => row.number === selectedNumber)
+  const proposed = data.prs.find(row => row.number === releaseNumber)
+  async function approveDraft() {
+    if (!proposed || releasing || data.stale || proposed.merge_state !== 'draft') return
+    setReleasing(true)
+    setReleaseError(null)
+    try {
+      await onReleaseDraft(proposed.number, proposed.head)
+      setReleasedNumbers(items => [...items, proposed.number])
+      setReleaseNumber(null)
+    } catch (error) {
+      setReleaseError(error instanceof Error ? error.message : '解除 Draft 失败')
+    } finally {
+      setReleasing(false)
+    }
+  }
   return <Flex vertical gap="middle">
     <Alert showIcon type={data.stale ? 'warning' : 'info'} message={data.stale ? '同步延迟或尚未同步，保留上次成功记录。' : 'GitHub 测试回执与本机部署记录'} description="每五分钟尝试同步。测试时间以 GitHub 回执为准；日志仅展示安全计数和阶段，未采集信息不推算。仅显示基座 preview PR。" />
     <Typography.Text type="secondary">最近同步：{formatDate(data.synced_at)}</Typography.Text>
@@ -54,9 +73,23 @@ function PRTrackingPage({data}: {data: PRTracking}) {
       {title: '耗时', width: 95, render: (_,row) => duration(row.test.duration_seconds)},
       {title: '通过率', width: 95, render: (_,row) => passRate(row)},
       {title: '合并', width: 90, render: (_,row) => <Tag color={row.merge_state === 'merged' ? 'success' : 'default'}>{mergeLabels[row.merge_state]}</Tag>},
+      {title: '操作', width: 126, render: (_,row) => row.merge_state === 'draft' ?
+        releasedNumbers.includes(row.number) ? <Tag color="processing">已解除 · 待同步</Tag> :
+        <Button size="small" disabled={data.stale} title={data.stale ? '同步已过期，请刷新' : '确认后交由 MacCI 自动处理'}
+          onClick={() => { setReleaseError(null); setReleaseNumber(row.number) }}>解除 Draft</Button> : '—'},
       {title: '部署', width: 125, render: (_,row) => <Tag color={row.deployment.state === 'running' || row.deployment.state === 'deployed' ? 'success' : row.deployment.state === 'failed' ? 'error' : 'default'}>{deployLabels[row.deployment.state]}</Tag>},
       {title: '详情', width: 70, render: (_,row) => <Button type="link" onClick={() => setSelectedNumber(row.number)}>查看</Button>},
     ]}/>
+    <Modal title="确认解除 Draft，进入自动合并流程" open={releaseNumber !== null}
+      onCancel={() => { if (!releasing) setReleaseNumber(null) }}
+      onOk={() => void approveDraft()} okText="解除 Draft"
+      confirmLoading={releasing}
+      okButtonProps={{ disabled: !proposed || data.stale || proposed.merge_state !== 'draft' }}>
+      <Typography.Paragraph>此操作仅解除 PR 草稿并记录当前 HEAD 的负责人审查授权，不会直接合并或部署。之后仍须 MacCI 针对最新 preview 基线重新测试，通过全部合并门禁才会自动合并。</Typography.Paragraph>
+      <Typography.Paragraph strong>PR #{proposed?.number} · {proposed?.title}</Typography.Paragraph>
+      <Typography.Text code copyable style={{overflowWrap:'anywhere'}}>{proposed?.head}</Typography.Text>
+      {releaseError && <Alert type="error" showIcon message={releaseError} style={{marginTop:12}} />}
+    </Modal>
     <Drawer title={selected ? 'PR #' + selected.number + ' · 测试与发布详情' : '测试详情'} open={selectedNumber !== null} onClose={() => setSelectedNumber(null)} width="min(680px, 100vw)">
       {selected ? <Flex vertical gap="middle"><Typography.Text strong>{selected.title}</Typography.Text>
         <Descriptions bordered size="small" column={1} items={[
@@ -82,10 +115,11 @@ function PRTrackingPage({data}: {data: PRTracking}) {
   </Flex>
 }
 
-export function DevelopmentTasksPage({ data, loading, onRefresh }: {
+export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft }: {
   data: TaskSnapshot | null
   loading: boolean
   onRefresh: () => void
+  onReleaseDraft: (number: number, head: string) => Promise<void>
 }) {
   const tasks = <Flex vertical gap="middle">
       {data?.stale && <Alert type="warning" showIcon message={
@@ -114,6 +148,6 @@ export function DevelopmentTasksPage({ data, loading, onRefresh }: {
       />
     </Flex>
   return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading}>刷新列表</Button>}>
-    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking}/>}]} /> : tasks}
+    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft}/>}]} /> : tasks}
   </Card>
 }

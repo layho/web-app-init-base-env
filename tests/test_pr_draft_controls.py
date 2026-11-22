@@ -1,0 +1,102 @@
+"""Exact-head owner-controlled Draft release; no GitHub network."""
+import pytest
+from app import pr_draft_controls as d
+
+A, B, H = "a" * 40, "b" * 40, "c" * 40
+
+def target_pr():
+    return {
+        "state": "open", "draft": True, "author_association": "OWNER",
+        "user": {"login": "layho"}, "node_id": "PR_example",
+        "mergeable": True, "mergeable_state": "clean",
+        "base": {"ref": "preview", "repo": {"full_name": d.REPO}},
+        "head": {"sha": H, "repo": {"full_name": d.REPO}}
+    }
+
+
+@pytest.fixture
+def github(monkeypatch):
+    monkeypatch.setattr(d.release_acceptance, "enabled", lambda: True)
+    monkeypatch.setenv("APP_RUNNING_SHA", A)
+    refs = {"main": A, "preview": A}
+    pr = target_pr()
+    comments = []
+    def mock_api(path, payload=None):
+        if path.startswith("/branches/"):
+            return {"commit": {"sha": refs[path.removeprefix("/branches/")]}}
+        if path == "/pulls/54":
+            return pr
+        if path == "/issues/54/comments":
+            comments.append(payload["body"])
+            return {"id": 3, "user": {"login": "layho"}}
+        raise AssertionError(path)
+    monkeypatch.setattr(d, "github", mock_api)
+    monkeypatch.setattr(d, "mark_ready", lambda node: True)
+    return refs, pr, comments
+
+
+def test_owner_can_release_draft_after_official_release(github):
+    refs, pr, comments = github
+    result = d.release(54, H)
+    assert result["released"] is True
+    assert len(comments) == 1
+    assert comments[0].startswith(d.REVIEW_MARKER)
+    import json
+    data = json.loads(comments[0][len(d.REVIEW_MARKER):])
+    assert data == {"schema": 1, "head": H, "decision": "approved", "requires_ancestor": A}
+
+
+@pytest.mark.parametrize("failure", ["freeze", "runtime", "wrong_head", "not_draft", "wrong_owner",
+                                      "foreign_repo", "conflict", "disabled"])
+def test_release_rejected_safely(github, monkeypatch, failure):
+    refs, pr, comments = github
+    if failure == "freeze":
+        refs["preview"] = B
+    elif failure == "runtime":
+        monkeypatch.setenv("APP_RUNNING_SHA", B)
+    elif failure == "wrong_head":
+        pr["head"]["sha"] = B
+    elif failure == "not_draft":
+        pr["draft"] = False
+    elif failure == "wrong_owner":
+        pr["user"]["login"] = "someone-else"
+    elif failure == "foreign_repo":
+        pr["head"]["repo"]["full_name"] = "attacker/fork"
+    elif failure == "conflict":
+        pr["mergeable"] = False
+    elif failure == "disabled":
+        monkeypatch.setattr(d.release_acceptance, "enabled", lambda: False)
+    with pytest.raises(d.DraftReleaseError):
+        d.release(54, H)
+    assert comments == []
+
+
+def test_changes_after_review_do_not_unlock(github, monkeypatch):
+    refs, pr, comments = github
+    def moved(node):
+        refs["preview"] = B
+        return True
+    monkeypatch.setattr(d, "mark_ready", moved)
+    # External changes can race the final GraphQL call, but the subsequent
+    # merge coordinator still checks exact head/base/MacCI before push.
+    assert d.release(54, H)["released"] is True
+    assert len(comments) == 1
+
+
+def test_stale_head_never_writes(github):
+    _, _, comments = github
+    with pytest.raises(d.DraftReleaseError):
+        d.release(54, B)
+    assert not comments
+
+def test_non_owner_review_token_does_not_unlock(github, monkeypatch):
+    _, _, comments = github
+    original = d.github
+    def mismatched(path, payload=None):
+        if path.endswith("/comments"):
+            comments.append(payload["body"])
+            return {"id": 5, "user": {"login": "other"}}
+        return original(path, payload)
+    monkeypatch.setattr(d, "github", mismatched)
+    with pytest.raises(d.DraftReleaseError, match="OWNER"):
+        d.release(54, H)
