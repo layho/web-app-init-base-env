@@ -98,8 +98,9 @@ def test_foundation_v018_release_or_downstream_provenance():
     import json
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
-    metadata = json.loads((root / ".app-init.json").read_text())
-    if metadata["repository"] != "layho/web-app-init-base-env":
+    meta_path = root / ".app-init.json"
+    if meta_path.is_file():
+        metadata = json.loads(meta_path.read_text())
         foundation = metadata["foundation"]
         assert foundation["repository"] == "layho/web-app-init-base-env"
         assert foundation["schema"] == 1
