@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.1.13",
+    "title": "基座版本查询可靠性",
+    "summary": "修复下游版本页签查询失败及刷新只读取缓存的问题。",
+    "changes": [
+      "GitHub API 失败时回退到 Git main 查询和固定 SHA 版本记录，不使用 preview。",
+      "手动刷新绕过五分钟缓存，10秒防抖，展示查询来源和脱敏失败原因。",
+      "新增 API 失败回退、强制刷新和拒绝 preview 回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "检查基座版本查询和手动刷新。",
+      "确认最新正式版本仍取自 main，失败时保留原缓存并明确提示。"
+    ],
+    "validation_note": "待实际 MacCI 回执及公网验证。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.12",
     "title": "基座升级调度器 · SSH 与 REST Token 独立认证",
     "summary": "去除设备码登录及 GitHub CLI 依赖，面向纯 SSH 无人值守环境。",
