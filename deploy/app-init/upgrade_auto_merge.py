@@ -69,9 +69,10 @@ def promotion_gate(repo, number, app_sha, foundation_sha):
                 return None
             expected.add(change["path"])
         files = api(prefix + "/pulls/" + str(number) + "/files")
-        if (not isinstance(files, list) or len(files) > 100 or len(files) != len(expected)
+        if (not isinstance(files, list) or len(files) > 100 or not len(expected) <= len(files) <= len(expected) + 1
                 or any(item.get("status") not in {"added", "modified"} for item in files)
-                or {item["filename"] for item in files} != expected):
+                or not expected.issubset({item["filename"] for item in files})
+                or not {item["filename"] for item in files}.issubset(expected | {"app/project_info.json"})):
             return None
     except (TypeError, ValueError, KeyError, IndexError):
         return None
