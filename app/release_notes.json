@@ -1,5 +1,25 @@
 [
   {
+    "version": "0.1.22",
+    "title": "解除 Draft 凭据权限与错误提示修复",
+    "summary": "独立配置 PR 写入凭据，明确区分 Issue 审查评论成功与 GitHub GraphQL 解除 Draft 被拒绝。",
+    "changes": [
+      "解除 Draft 的 GraphQL mutation 优先使用 APP_GITHUB_PR_TOKEN，可与仅有 Issues 写入权限的反馈同步 Token 分离。",
+      "未经 GitHub PR 写入权限授权时返回明确错误，不把已写入审查评论误报为已解除 Draft。",
+      "新增专用 Token 选择及 GraphQL 权限拒绝的安全回归测试；旧版精确 SHA、冻结及 MacCI 合并保护不变。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "取得 MacCI 对精确 HEAD/base/merge 的成功回执。",
+      "在 Mac mini 为基座验收站设置 OWNER 的 Pull requests: Read and write Token（不在网页输入/显示）。",
+      "公网操作解除 Draft，核实 PR Draft→Ready 后最新 preview 的 MacCI 重测及自动合并。",
+      "核对运行 SHA 和网页验收后才正式发布 main。"
+    ],
+    "validation_note": "仅代码改动不授予 GitHub Token 权限；安装实例需由授权管理员配置 APP_GITHUB_PR_TOKEN，且 V0.1.21 未正式发布前此 PR 应保持 Draft。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/57"
+  },
+  {
     "version": "0.1.21",
     "title": "管理员密码与应用名称设置",
     "summary": "新增管理员自助修改密码、工作台名称及引用名称；引用名称同步浏览器页面 Title，不修改域名、仓库标识和运行端口。",
