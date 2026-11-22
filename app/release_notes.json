@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.1.1",
+    "title": "反馈详情与开发进度回传（候选）",
+    "summary": "按基座验收中心反馈 #1 优化意见反馈和更新记录。",
+    "changes": [
+      "意见反馈支持完整详情，显示同步、认领、开发开始、结束、提交时间及整体状态。",
+      "后台从受信任的 GitHub 评论读取开发状态、回复及关联 PR/SHA；旧记录保留，不能推断的时间显示未记录。",
+      "更新记录使用卡片样式，展示更新说明、验收步骤、版本及实际部署 SHA。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "登录验收站，打开已同步的反馈 #1，核对真实领取时间、开发状态、回复及关联 PR。",
+      "刷新反馈状态，确认旧反馈原文可完整显示，未发生重复同步。",
+      "进入更新记录，查看版本详情、验收步骤和完整运行 SHA。"
+    ],
+    "validation_note": "此版本为候选版本，需完成全量测试、前端构建及 Mac 实机验收；尚未正式发布。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/13"
+  },
+  {
     "version": "0.1.0",
     "title": "应用初始化",
     "changes": [
