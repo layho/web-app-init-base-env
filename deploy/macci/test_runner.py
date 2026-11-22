@@ -57,6 +57,35 @@ class RunnerTests(unittest.TestCase):
         status.update(state='error', description=runner.description(BASE, MERGE, 'ref-changed'))
         self.assertFalse(runner.completed([status], BASE, MERGE))
 
+    def test_fetch_failure_retries_at_most_three_per_exact_candidate(self):
+        def status(state='failure', result='fetch-failed', merge=MERGE):
+            return {'context': runner.CONTEXT, 'state': state,
+                    'description': runner.description(BASE, merge, result)}
+        failure = status()
+        self.assertFalse(runner.completed([failure], BASE, MERGE))
+        self.assertFalse(runner.completed([failure, failure], BASE, MERGE))
+        self.assertTrue(runner.completed([failure, failure, failure], BASE, MERGE))
+        self.assertFalse(runner.completed([failure] * 3, BASE, 'd' * 40))
+        self.assertTrue(runner.completed([status(result='pytest-failed')], BASE, MERGE))
+        self.assertTrue(runner.completed([status('success', 'passed')], BASE, MERGE))
+        self.assertFalse(runner.completed([status('pending'), status('success', 'passed')], BASE, MERGE))
+
+    def test_merge_ref_fetch_retries_only_transport_failure(self):
+        import io
+        err = subprocess.CalledProcessError(128, ['git', 'fetch'])
+        with patch.object(runner, 'run', side_effect=[err, None]) as mocked, \
+             patch.object(runner.time, 'sleep') as sleeper:
+            runner.fetch_merge_ref(Path('/tmp/readonly.git'), REPO, 14, io.StringIO(), {'GIT_TERMINAL_PROMPT': '0'})
+            self.assertEqual(mocked.call_count, 2)
+            self.assertEqual(sleeper.call_args.args, (2,))
+            args = mocked.call_args.args[0]
+            self.assertEqual(args[-1], 'refs/pull/14/merge')
+        with patch.object(runner, 'run', side_effect=err) as mocked, \
+             patch.object(runner.time, 'sleep'):
+            with self.assertRaises(subprocess.CalledProcessError):
+                runner.fetch_merge_ref(Path('/tmp/readonly.git'), REPO, 14, io.StringIO(), {})
+            self.assertEqual(mocked.call_count, 3)
+
     def test_real_git_archive(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)/'repo'; root.mkdir()

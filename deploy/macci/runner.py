@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import tarfile
+import time
 from tempfile import TemporaryDirectory
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 import uuid
@@ -87,13 +88,27 @@ def description(base, merge=None, result='pending'):
 
 
 def completed(statuses, base, merge=None):
-    for status in statuses:
-        if status.get('context') == CONTEXT:
-            return (status.get('state') in {'success', 'failure', 'error'}
-                    and status.get('description', '').startswith('base=' + base + ' ')
-                    and (merge is None or status.get('description', '').startswith(f'base={base} merge={merge} '))
-                    and not status.get('description', '').endswith(' ref-changed'))
-    return False
+    """Never let one temporary merge-ref fetch failure permanently block a PR.
+
+    All other failures remain terminal; exact candidate and base match are
+    mandatory. Three recorded fetch failures bound retry work per candidate.
+    """
+    prefix = f'base={base} merge={merge} ' if merge is not None else f'base={base} '
+    matching = [s for s in statuses if s.get('context') == CONTEXT
+                and s.get('description', '').startswith(prefix)]
+    if not matching:
+        return False
+    latest = matching[0]
+    if latest.get('state') not in {'success', 'failure', 'error'}:
+        return False
+    detail = latest.get('description', '')
+    if detail.endswith(' ref-changed'):
+        return False
+    if detail.endswith(' fetch-failed') and latest.get('state') == 'failure':
+        attempts = sum(s.get('state') == 'failure' and
+                       s.get('description', '').endswith(' fetch-failed') for s in matching)
+        return attempts >= 3
+    return True
 
 
 def verify_parents(output, head, base):
@@ -106,6 +121,21 @@ def verify_parents(output, head, base):
 def run(args, log, timeout=300, **kwargs):
     print('+', ' '.join(args), file=log, flush=True)
     return subprocess.run(args, check=True, timeout=timeout, stdout=log, stderr=log, **kwargs)
+
+
+def fetch_merge_ref(gitdir, repo, number, log, env):
+    """Retry only the exact GitHub merge ref; never substitute another SHA."""
+    command = ['git', '-C', str(gitdir), 'fetch', '--no-tags', '--depth=2',
+               f'git@github.com:{repo}.git', f'refs/pull/{number}/merge']
+    for attempt in range(3):
+        try:
+            run(command, log, timeout=120, env=env)
+            return
+        except subprocess.CalledProcessError:
+            if attempt == 2:
+                raise
+            print('Merge ref fetch unavailable; bounded retry', attempt + 1, file=log, flush=True)
+            time.sleep(2 * (attempt + 1))
 
 
 def make_context(gitdir, merge, path):
@@ -153,8 +183,7 @@ def test_candidate(repo, pr, log):
                 phase = 'fetch'
                 run(['git', 'init', '--bare', str(gitdir)], log)
                 env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes'}
-                run(['git', '-C', str(gitdir), 'fetch', '--no-tags', '--depth=2',
-                     f'git@github.com:{repo}.git', f'refs/pull/{pr["number"]}/merge'], log, env=env)
+                fetch_merge_ref(gitdir, repo, pr["number"], log, env)
                 parents = subprocess.check_output(['git', '-C', str(gitdir), 'show', '-s', '--format=%H %P', 'FETCH_HEAD'], text=True, timeout=30)
                 merge = verify_parents(parents, head, base)
                 if merge != pr['merge_commit_sha']:
