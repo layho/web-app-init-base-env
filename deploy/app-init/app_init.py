@@ -426,16 +426,18 @@ def verify_feedback(root, origin, headers, repository):
 
 def deploy(root, meta, password, username, token, config):
     port, label, domain = meta["port"], meta["label"], meta["domain"]
-    need(git(root, "branch", "--show-current") == "main", "本地应用必须位于 main 分支")
+    track = meta.get("track", "main")
+    need(track in ("main", "preview"), "不支持的部署分支")
+    need(git(root, "branch", "--show-current") == track, f"本地应用必须位于 {track} 分支")
     need(not git(root, "status", "--porcelain", "--untracked-files=no"), "本地应用含未提交的修改")
     postgres = pg_bin()
     env = {**os.environ, "APP_INIT_SYSTEM_SERVICE": "1", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
            "GIT_TERMINAL_PROMPT": "0"}
     env.pop("SSH_AUTH_SOCK", None)
-    access = subprocess.run(["git", "-C", root, "ls-remote", "origin", "refs/heads/main"],
+    access = subprocess.run(["git", "-C", root, "ls-remote", "origin", f"refs/heads/{track}"],
                             env=env, capture_output=True, text=True)
     need(access.returncode == 0 and access.stdout,
-         "后台无法拉取 main，请检查仓库读权限和代理。HTTPS 模式的仓库令牌需要 Contents 读取权限")
+         f"后台无法拉取 {track}，请检查仓库读权限和代理。HTTPS 模式的仓库令牌需要 Contents 读取权限")
     map_domain(config, domain, port)
     repository = meta["repository"]
     request("GET", f"https://api.github.com/repos/{repository}/issues?per_page=1", token=token)
