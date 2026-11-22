@@ -1,5 +1,26 @@
 [
   {
+    "version": "0.1.20",
+    "title": "PR 解除 Draft 操作与自动合并交接",
+    "summary": "基座验收中心的 PR 追踪页面新增管理员确认解除 Draft；通过负责人精确 SHA 审查授权，将后续测试与合并交回 MacCI 和 preview 协调器。",
+    "changes": [
+      "仅对基座 preview 仓库的 OWNER Draft PR 展示“解除 Draft”，操作需登录管理员会话、同源校验、CSRF 令牌和二次确认。",
+      "解除前复核正式 main 与 preview 一致、网页运行 SHA、PR 原始 HEAD SHA、仓库归属、OWNER 身份与可合并状态，不允许验收冻结期操作。",
+      "管理员操作记录绑定精确 HEAD 和当前 preview 祖先的审查授权；解除 Draft 本身不直接合并、不跳过 MacCI，新测试回执及协调器精确合并检查仍为必要条件。",
+      "补充跨仓库、SHA 变化、待验收冻结、状态已变化、无效登录与权限错误的安全回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 测试 PR #54/#57 的旧版候选与新基线处理，确保解除 Draft 不立即强制合并。",
+      "在 base.layho.com 登录后检查 PR 表格操作按钮、确认弹窗及失败原因；未登录或基座冻结期间必须禁止解除。",
+      "验证解除 Draft 后 MacCI 对当前 HEAD/base/merge 重新测试成功，取得 owner 评论授权后才由 coordinator 自动合并。",
+      "确认 preview 公网运行 SHA，网页验收后通过原有 main 正式发布流程。"
+    ],
+    "validation_note": "解除 Draft 仅解除草稿阻塞，不代表测试、合并、部署完成；依赖现有 Mac mini 测试与自动合并服务。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/54"
+  },
+  {
     "version": "0.1.19",
     "title": "Panel 基座升级自动合并闭环",
     "summary": "对已授权的 Panel 应用打通基座升级 PR 的精确 MacCI 测试、自动安全合并与现有 Mac mini 部署闭环，并提供独立调度器安全升级入口。",
