@@ -6,6 +6,21 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
 cd "$ROOT"
 LABEL_PREFIX="com.example.webapp"
 PORT=18080
+TRACK_BRANCH=main
+EXPECTED_ORIGIN="https://app.example.com"
+# Dedicated foundation preview configuration is local, never committed.
+if test -f "$ROOT/.base-preview.env"; then
+  test ! -L "$ROOT/.base-preview.env" && test -O "$ROOT/.base-preview.env" || exit 2
+  test "$(stat -f '%Lp' "$ROOT/.base-preview.env")" = 600 || exit 2
+  source "$ROOT/.base-preview.env"
+  [[ "${BASE_PREVIEW_PORT:-}" =~ ^[0-9]{5}$ ]] &&
+    test "$BASE_PREVIEW_PORT" -ge 18000 && test "$BASE_PREVIEW_PORT" -lt 29000 || exit 2
+  LABEL_PREFIX="com.layho.basepreview"
+  PORT="$BASE_PREVIEW_PORT"
+  TRACK_BRANCH=preview
+  EXPECTED_ORIGIN="https://base.layho.com"
+  export VITE_BASE_PREVIEW=1
+fi
 AGENT_DIR="$HOME/Library/LaunchAgents"
 if test -n "${APP_ACCEPTANCE_ID:-}"; then
   [[ "$APP_ACCEPTANCE_ID" =~ ^[a-zA-Z0-9_]+$ ]] || exit 2
@@ -40,14 +55,14 @@ load_env() {
   fi
   APP_ALLOW_BOOTSTRAP_LOCK="${APP_ALLOW_BOOTSTRAP_LOCK:-false}"
   APP_GITHUB_FEEDBACK_TOKEN="${APP_GITHUB_FEEDBACK_TOKEN:-}"
-  test "$APP_PUBLIC_ORIGIN" = "https://app.example.com" || { log 'Wrong origin'; exit 1; }
+  test "$APP_PUBLIC_ORIGIN" = "$EXPECTED_ORIGIN" || { log 'Wrong origin'; exit 1; }
   test "$APP_COOKIE_SECURE" = "true" || { log 'Secure cookie required'; exit 1; }
   test "$APP_ALLOW_LOCAL_DEV" = "false" || { log 'Dev mode forbidden'; exit 1; }
   test -n "$APP_ADMIN_PASSWORD_HASH" || { log 'Password hash missing'; exit 1; }
   case "$DATABASE_URL" in postgresql+psycopg://*) ;; *) log 'PostgreSQL required'; exit 1;; esac
 }
 assert_main() {
-  test "$(git branch --show-current)" = "main" || { log 'main branch required'; exit 1; }
+  test "$(git branch --show-current)" = "${TRACK_BRANCH:-main}" || { log "Required branch: ${TRACK_BRANCH:-main}"; exit 1; }
   test -z "$(git status --porcelain --untracked-files=no)" || { log 'Tracked file modifications'; exit 1; }
 }
 dependencies() {
@@ -100,6 +115,13 @@ serve() {
     record_operation frontend_missing "$APP_RUNNING_SHA"
     log 'Missing built frontend'
     return 1
+  fi
+  if test "${TRACK_BRANCH:-main}" = preview; then
+    if ! .venv/bin/python -c 'import socket,sys; s=socket.socket(); s.bind(("127.0.0.1",int(sys.argv[1]))); s.close()' "$PORT"; then
+      record_operation port_conflict "$APP_RUNNING_SHA"
+      log "Port $PORT unavailable; refusing preview startup"
+      return 1
+    fi
   fi
   record_operation startup_ok "$APP_RUNNING_SHA"
   log "Startup checks passed for $APP_RUNNING_SHA"
@@ -175,6 +197,9 @@ feedback() {
   # Task refresh must run even if feedback submission fails. Both use the
   # server-only GitHub token; without it, retain the previous task snapshot.
   if test -n "$APP_GITHUB_FEEDBACK_TOKEN"; then
+    if test "${TRACK_BRANCH:-main}" = preview; then
+      export APP_PREVIEW_FEEDBACK=1
+    fi
     result="$(.venv/bin/python -m scripts.sync_feedback)" || rc=$?
     if test -n "$result"; then printf '%s\n' "$result"; fi
     if test "$rc" -ne 0; then
@@ -228,8 +253,8 @@ update() {
   trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
   local old new
   old="$(git rev-parse HEAD)"
-  GIT_TERMINAL_PROMPT=0 git fetch --quiet origin main
-  new="$(git rev-parse origin/main)"
+  GIT_TERMINAL_PROMPT=0 git fetch --quiet origin "${TRACK_BRANCH:-main}"
+  new="$(git rev-parse "origin/${TRACK_BRANCH:-main}")"
   test "$old" != "$new" || exit 0
   if test -f .webapp-failed-sha && test "$(cat .webapp-failed-sha)" = "$new"; then
     log "Failed SHA held: $new"; exit 0
