@@ -5,7 +5,7 @@ from sqlalchemy import select
 from app.db import SessionLocal
 from app.models import UserFeedback, utcnow
 
-REPO = "example/web-app"
+REPO = "layho/web-app-init-base-env" if os.getenv("APP_PREVIEW_FEEDBACK") == "1" else "example/web-app"
 API = "https://api.github.com"
 TOKEN = os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "")
 def github(method, path, data=None):
@@ -16,9 +16,9 @@ def github(method, path, data=None):
                  "Content-Type":"application/json"})
     with urllib.request.urlopen(req,timeout=20) as resp:
         return json.load(resp)
-def issue_body(entry):
+def issue_body(entry, source="app.example.com"):
     """Construct readable Markdown, not escaped literal backslash-n sequences."""
-    return ("Source: app.example.com admin feedback\n"
+    return (f"Source: {source} admin feedback\n"
             f"Internal feedback ID: {entry.id}\n"
             f"Category: {entry.category}\n\n"
             f"{entry.message}\n\n"
@@ -62,7 +62,7 @@ def main():
                     operation = "create"
                     result=github("POST",f"/repos/{REPO}/issues",{
                       "title":f"{marker} {entry.category}",
-                      "body":issue_body(entry)
+                      "body":issue_body(entry, "base.layho.com" if os.getenv("APP_PREVIEW_FEEDBACK") == "1" else "app.example.com")
                     })
                 else:
                     result=exact
