@@ -94,13 +94,23 @@ def test_git_fallback_rejects_preview(monkeypatch):
         fv.fetch_latest_via_git()
 
 
-def test_release_v018_documents_app_init_install_and_enrollment():
+def test_foundation_v018_release_or_downstream_provenance():
     import json
     from pathlib import Path
-    notes = json.loads((Path(__file__).resolve().parents[1] / "app/release_notes.json").read_text())
-    assert notes[0]["version"] == "0.1.18"
-    assert len([item for item in notes if item["version"] == "0.1.18"]) == 1
-    entry = notes[0]
+    root = Path(__file__).resolve().parents[1]
+    metadata = json.loads((root / ".app-init.json").read_text())
+    if metadata["repository"] != "layho/web-app-init-base-env":
+        foundation = metadata["foundation"]
+        assert foundation["repository"] == "layho/web-app-init-base-env"
+        assert foundation["schema"] == 1
+        assert len(foundation["sha"]) == 40
+        assert foundation["version"]
+        return
+
+    notes = json.loads((root / "app/release_notes.json").read_text())
+    releases = [entry for entry in notes if entry["version"] == "0.1.18"]
+    assert len(releases) == 1
+    entry = releases[0]
     assert entry["acceptance_required"] is True
     assert entry["acceptance_status"] == "pending"
     assert "Projects/app-init" in json.dumps(entry, ensure_ascii=False)
