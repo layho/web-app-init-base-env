@@ -63,3 +63,25 @@ def test_stale_heartbeat_and_symlinks_are_not_trusted(tmp_path, monkeypatch):
     assert upgrade_status.snapshot(app)["state"] == "awaiting_first_check"
     (root / "registry.json").chmod(0o644)
     assert upgrade_status.snapshot(app)["mode"] == "unregistered"
+
+
+def test_blocked_files_reports_safe_paths_only(tmp_path, monkeypatch):
+    app, root = fixture(tmp_path, monkeypatch)
+    save(root / "registry.json", {"schema": 1, "apps": {
+        "example/demo-app": {"mode": "create", "legacy_base": None}}})
+    filename = "status-" + hashlib.sha256(b"example/demo-app").hexdigest() + ".json"
+    save(root / filename, {"schema": 1, "repository": "example/demo-app", "mode": "create",
+        "state": "blocked", "checked_at": datetime.now(timezone.utc).isoformat(),
+        "blocked_files": [
+            {"path": "app/main.py", "action": "conflict"},
+            {"path": "frontend/src/main.tsx", "action": "review"},
+            {"path": "/private/secret", "action": "conflict"},
+            {"path": "../outside.py", "action": "conflict"},
+            {"path": "app/token.env", "action": "unsafe"},
+        ]})
+    result = upgrade_status.snapshot(app)
+    assert result["blocked_files"] == [
+        {"path": "app/main.py", "action": "conflict"},
+        {"path": "frontend/src/main.tsx", "action": "review"},
+    ]
+    assert "/private" not in json.dumps(result)
