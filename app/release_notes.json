@@ -1,5 +1,25 @@
 [
   {
+    "version": "0.1.9",
+    "title": "基座升级 · Mac mini 定时调度",
+    "summary": "独立用户 LaunchAgent 每五分钟检查正式基座并为已登记的应用生成草稿 PR。",
+    "changes": [
+      "独立私有注册表、并发锁、逐应用状态与重复冲突去重；仅正式 main 目标。",
+      "同应用已有升级 PR 时不堆叠其他版本；网络错误重试，基线改变重新规划。",
+      "app-init 新应用部署后自动登记到已安装的调度器；旧应用先观察及兼容迁移。",
+      "一次性安装脚本验证正式 SHA 与本机测试，保留原 MacCI 服务，不自动合并部署。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行 tests/test_upgrade_scheduler.py；核对注册、并发、去重、错误重试及跨版本 PR 保护。",
+      "正式发布后在 Mac mini 安装独立调度器，登记 Panel，并以观察模式登记 TI Hunter、雄展爬虫。",
+      "核对实际本机定时日志、独立草稿 PR 及业务应用 main 不被调度器修改。"
+    ],
+    "validation_note": "本版代码不代表宿主已安装；需实机运行回执。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.8",
     "title": "基座升级 · 正式来源验证和升级 PR",
     "summary": "基于已正式发布的 main 核验来源，生成独立应用升级草稿 PR。",

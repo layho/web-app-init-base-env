@@ -193,6 +193,11 @@ def reuse_or_publish(app, repository, app_url, app_sha, target, commit, report):
         raise ValueError("Official foundation advanced; replan")
     if remote_ref(app_url, "refs/heads/main") != app_sha:
         raise ValueError("Application main advanced; replan")
+    # Avoid stacking different target upgrade PRs, including a new one created during planning.
+    open_rows = json.loads(run(["gh", "pr", "list", "--repo", repository, "--base", "main",
+                                "--state", "open", "--limit", "1000", "--json", "headRefName"]))
+    if not isinstance(open_rows, list) or len(open_rows) >= 1000 or any(p.get("headRefName", "").startswith("base-upgrade/") for p in open_rows):
+        raise ValueError("Another upgrade is pending or list incomplete")
     prior = remote_ref(app_url, full_ref)
     if prior is not None:
         # Recover a previously pushed branch when the PR creation was interrupted.
@@ -215,7 +220,7 @@ def reuse_or_publish(app, repository, app_url, app_sha, target, commit, report):
     return {"state": "draft_created", "url": result.decode().strip()}
 
 
-def coordinate(repository, legacy_base=None, create_pr=False):
+def coordinate(repository, legacy_base=None, create_pr=False, *, expected_target=None, expected_app=None):
     if not REPO.fullmatch(repository) or repository.lower() == FOUNDATION.lower():
         raise ValueError("Invalid downstream repository")
     app_url = "git@github.com:" + repository + ".git"
@@ -226,6 +231,8 @@ def coordinate(repository, legacy_base=None, create_pr=False):
         run(["git", "clone", "--no-checkout", "--single-branch", "--branch", "main", app_url, str(app)])
         app_sha = line(app, "rev-parse", "refs/remotes/origin/main")
         target_sha = line(source, "rev-parse", "refs/remotes/origin/main")
+        if (expected_target is not None and target_sha != expected_target) or (expected_app is not None and app_sha != expected_app):
+            raise ValueError("Pinned source or application changed; replan")
         meta = metadata(app, app_sha)
         registered = meta.get("foundation")
         if registered:

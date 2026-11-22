@@ -558,6 +558,24 @@ def find_port(start):
     raise RuntimeError("没有可用的应用端口")
 
 
+def enroll_foundation_scheduler(root, meta):
+    """Register an initialized app only with an already installed local scheduler."""
+    source = Path.home() / ".local/share/macmini-foundation-upgrades/runtime/upgrade_scheduler.py"
+    if not isinstance(meta.get("foundation"), dict) or not source.is_file() or source.is_symlink():
+        print("基座自动升级调度器未接入；保留现有应用，不影响部署。", flush=True)
+        return False
+    try:
+        if source.stat().st_uid != os.getuid() or source.stat().st_mode & 0o077:
+            raise RuntimeError("Unsafe scheduler runtime")
+        subprocess.run([sys.executable, str(source), "register", "--repo", meta["repository"], "--mode", "create"],
+                       check=True, timeout=30, cwd=root)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        print("基座调度登记未完成；可使用本机调度器补登记。", flush=True)
+        return False
+    print("已登记基座自动升级检查（仅创建草稿 PR）。", flush=True)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed-only", action="store_true", help="仅在 GitHub 初始化仓库")
@@ -612,7 +630,8 @@ def main():
             token = getpass(f"目标仓库 GitHub Token（{permissions}，隐藏输入）：").strip()
             need(re.fullmatch(r"[A-Za-z0-9_-]+", token), "仓库 Token 格式不正确")
         with initialization_lock(apps / ".init-lock"):
-            if not root.exists():
+            is_new_app = not root.exists()
+            if is_new_app:
                 github_login = remote == https_remote
                 refs = git(SOURCE, "ls-remote", remote, github_login=github_login)
                 port = find_port(18000 + int(label.rsplit(".", 1)[-1], 16) % 8000)
@@ -633,6 +652,8 @@ def main():
                     configure_service_git(root, repo_name, token, os.environ.get("APP_INIT_PROXY"))
                 sync_rollback_test_fix(root)
                 deploy(root, meta, password, username, token, config)
+                if is_new_app:
+                    enroll_foundation_scheduler(root, meta)
         return 0
     except (RuntimeError, OSError, ValueError, KeyError, EOFError, subprocess.SubprocessError) as error:
         print(f"初始化中止：{error}", file=sys.stderr)
