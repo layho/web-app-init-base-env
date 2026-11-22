@@ -17,7 +17,7 @@ import upgrade_scheduler as scheduler
 import upgrade_pr as upgrade
 
 HERE = Path(__file__).resolve().parent
-FILES = ("upgrade_scheduler.py", "upgrade_pr.py", "upgrade_plan.py")
+FILES = ("upgrade_scheduler.py", "upgrade_pr.py", "upgrade_plan.py", "upgrade_auto_merge.py")
 PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
