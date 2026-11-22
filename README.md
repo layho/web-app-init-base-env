@@ -33,3 +33,28 @@ bash ~/bin/app-init
 - 意见反馈入库与 GitHub Issues 同步
 - 运行版本和 Git SHA、更新记录、系统日志和手动更新
 - 独立 PostgreSQL、开机自检、五分钟更新、测试及发布失败回退
+
+
+## 基座自身独立验收站（Mac mini）
+
+**仅供基座候选版本使用。** 不要用 app-init 初始化本仓库，不要在正式应用目录执行覆盖安装。基座源代码与验收部署分别使用 main 和 preview 分支；preview 是候选通道，不是正式发布版本。
+
+首次部署（普通 Mac 用户，非 sudo；先审核、测试候选提交）：
+
+```bash
+cd ~
+git clone --branch preview --single-branch git@github.com:layho/web-app-init-base-env.git web-app-init-base-env-preview
+cd ~/web-app-init-base-env-preview
+bash deploy/base-preview.sh --install-deps
+```
+
+脚本复用 `~/.config/app-init/cloudflare.json`，在隐藏输入中读取管理员密码及基座仓库 Issues 读写 Token，自动选择并保存独立端口，使用独立 PostgreSQL 数据目录、Unix socket 和 com.layho.basepreview 服务标签。公网地址为 https://base.layho.com。遇到端口或路由冲突立即停止；不会自动终止其他进程或替换现有域名映射。
+
+部署完成后避免手动 git pull，五分钟更新器仅跟踪 origin/preview。已有验收站补验：
+
+```bash
+cd ~/web-app-init-base-env-preview
+bash deploy/base-preview.sh --verify
+```
+
+合并 main 前必须核对候选提交 SHA、完整自动化测试及真实 Mac/HTTPS 验收结果。preview 不推送至下游项目。基座仓库公开，站内反馈会同步到公开 Issues，请勿提交秘密或内部敏感数据。若部署中断，保留数据库及本机配置，先核对日志及端口再重试；禁止为迁就端口冲突而自动更改已配置端口。
