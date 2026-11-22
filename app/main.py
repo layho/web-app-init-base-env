@@ -107,11 +107,11 @@ def accept_release(req: ReleaseAcceptanceIn, request: Request, response: Respons
 
 
 @app.get("/api/v1/project-info", dependencies=[Depends(authorize)])
-def project_info(response: Response):
+def project_info(response: Response, refresh: bool = False):
     response.headers["Cache-Control"] = "no-store"
     info_file = Path(__file__).with_name("project_info.json")
     data = json.loads(info_file.read_text(encoding="utf-8"))
-    data["foundation_version"] = foundation_version.snapshot()
+    data["foundation_version"] = foundation_version.snapshot(force=refresh)
     return data
 
 

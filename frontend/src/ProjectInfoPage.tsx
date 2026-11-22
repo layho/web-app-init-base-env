@@ -14,6 +14,9 @@ type FoundationVersion = {
   latest: VersionRef | null
   checked_at: string | null
   stale: boolean
+  attempted_at?: string | null
+  source?: 'github_api' | 'git_raw' | null
+  error?: string | null
   status: 'unregistered' | 'unknown' | 'current' | 'different'
   auto_upgrade_enabled: boolean
 }
@@ -68,11 +71,14 @@ function FoundationVersionPanel({ info, loading, onRefresh }: { info?: Foundatio
       { key: 'current', label: info?.role === 'foundation' ? '当前运行基座' : '当前应用基座', children: renderVersion(info?.current) },
       { key: 'latest', label: '最新正式基座', children: renderVersion(info?.latest) },
       { key: 'checked', label: '最近成功检查', children: info?.checked_at ? new Date(info.checked_at).toLocaleString() : '尚未取得' },
+      { key: 'attempted', label: '最近尝试检查', children: info?.attempted_at ? new Date(info.attempted_at).toLocaleString() : '尚未尝试' },
+      { key: 'query-source', label: '最近成功查询方式', children: info?.source === 'git_raw' ? 'Git main + 固定提交版本记录' : info?.source === 'github_api' ? 'GitHub API' : '尚未取得' },
       { key: 'auto', label: '自动升级 PR', children: info?.auto_upgrade_enabled ? '已启用' : '待接入' },
     ]} />
-    {info?.stale && <Alert type="warning" showIcon message="未取得实时正式版本；已有数据仅供参考。" />}
+    {info?.stale && <Alert type="warning" showIcon message="未取得实时正式版本；已有数据仅供参考。"
+      description={info.error ? info.error.split('/').map(e => (({ api_access_or_rate_limit: 'API 权限或访问限额', http_error: 'HTTP 请求失败', timeout: '查询超时', network_error: '网络连接失败', git_error: 'Git 查询失败', invalid_response: '版本响应无效' } as Record<string, string>)[e] || '查询异常')).join('；备用通道：') : undefined} />}
     <div><Button loading={loading} onClick={onRefresh}>刷新版本状态</Button></div>
-    <Typography.Text type="secondary">正式版本检查缓存五分钟。升级须经过独立 PR、应用回归测试及验收，不直接覆盖业务代码。</Typography.Text>
+    <Typography.Text type="secondary">自动检查缓存五分钟；手动刷新重新查询（最短间隔10秒）。升级须经过独立 PR、应用回归测试及验收，不直接覆盖业务代码。</Typography.Text>
   </Flex>
 }
 

@@ -225,14 +225,14 @@ function App() {
     }
   }
 
-  async function loadOperations(key: 'releases' | 'logs' | 'tasks' | 'project') {
+  async function loadOperations(key: 'releases' | 'logs' | 'tasks' | 'project', refresh = false) {
     setLoadingOperations(key)
     setNotice(null)
     try {
       if (key === 'releases') setReleaseHistory(await api<ReleaseHistory>('/api/release-notes'))
       else if (key === 'logs') setSystemLogs(await api<SystemLogs>('/api/v1/system-logs'))
       else if (key === 'tasks') setDevelopmentTasks(await api<TaskSnapshot>('/api/v1/development-tasks'))
-      else setProjectInfo(await api<ProjectInfo>('/api/v1/project-info'))
+      else setProjectInfo(await api<ProjectInfo>(refresh ? '/api/v1/project-info?refresh=true' : '/api/v1/project-info'))
     } catch (error) {
       showError(error)
     } finally {
@@ -299,7 +299,7 @@ function App() {
           </Empty>
         </Card>
       ) : page === 'project' ? (
-        <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project')} />
+        <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} />
       ) : page === 'tasks' ? (
         <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'} onRefresh={() => void loadOperations('tasks')} />
       ) : page === 'releases' ? (
