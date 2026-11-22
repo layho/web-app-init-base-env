@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.1.7",
+    "title": "基座升级 · 三方差异规划",
+    "summary": "引入只读升级规划器，为后续自动升级 PR 提供可审查差异。",
+    "changes": [
+      "旧、新生成模板和应用 Git 快照三方合并，保留业务文件。",
+      "冲突、删除、迁移和主机脚本变更需审查；保护应用元数据、项目说明和版本记录。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "执行 tests/test_upgrade_plan.py，核对六项回归。",
+      "核对规划报告不写入应用工作区或数据，不输出文件内容。"
+    ],
+    "validation_note": "尚未接入正式来源验证与自动创建升级 PR；存量应用尚未升级。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.6",
     "title": "基座版本与 MacCI 闭环整合修复",
     "summary": "将待合并功能在当前 preview 基线上统一验证；修复测试依赖真实分支、宿主运行脚本独立维护以及开发闭环说明。",
