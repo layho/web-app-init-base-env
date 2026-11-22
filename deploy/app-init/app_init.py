@@ -572,7 +572,7 @@ def enroll_foundation_scheduler(root, meta):
     try:
         if source.stat().st_uid != os.getuid() or source.stat().st_mode & 0o077:
             raise RuntimeError("Unsafe scheduler runtime")
-        subprocess.run([sys.executable, str(source), "register", "--repo", meta["repository"], "--mode", "create"],
+        subprocess.run([sys.executable, str(source), "register", "--repo", meta["repository"], "--mode", "create", "--if-absent"],
                        check=True, timeout=30, cwd=root)
     except (OSError, RuntimeError, subprocess.SubprocessError):
         print("基座调度登记未完成；可使用本机调度器补登记。", flush=True)
@@ -622,6 +622,7 @@ def main():
                 password = getpass("已有管理员密码（隐藏输入）：")
                 with initialization_lock(apps / ".init-lock"):
                     verify_public(root, domain, git(root, "rev-parse", "HEAD"), username, password, repo_name)
+                    enroll_foundation_scheduler(root, meta)
                 return 0
         config = None
         if not args.seed_only:
@@ -657,8 +658,7 @@ def main():
                     configure_service_git(root, repo_name, token, os.environ.get("APP_INIT_PROXY"))
                 sync_rollback_test_fix(root)
                 deploy(root, meta, password, username, token, config)
-                if is_new_app:
-                    enroll_foundation_scheduler(root, meta)
+                enroll_foundation_scheduler(root, meta)
         return 0
     except (RuntimeError, OSError, ValueError, KeyError, EOFError, subprocess.SubprocessError) as error:
         print(f"初始化中止：{error}", file=sys.stderr)
