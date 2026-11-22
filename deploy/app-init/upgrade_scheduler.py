@@ -86,13 +86,15 @@ def registry():
     return data
 
 
-def register(repo, mode, legacy_base=None):
+def register(repo, mode, legacy_base=None, if_absent=False):
     if not repository_valid(repo) or mode not in MODES:
         raise ValueError("Invalid app registration")
     if legacy_base is not None and not upgrade.SHA.fullmatch(legacy_base):
         raise ValueError("Invalid legacy base")
     with lock("registry.lock"):
         data = registry()
+        if if_absent and repo in data["apps"]:
+            return
         data["apps"][repo] = {"mode": mode, "legacy_base": legacy_base}
         write_json(ROOT / "registry.json", data)
 
@@ -182,13 +184,14 @@ def main():
     r.add_argument("--repo", required=True)
     r.add_argument("--mode", choices=sorted(MODES), default="observe")
     r.add_argument("--legacy-base")
+    r.add_argument("--if-absent", action="store_true", help="Preserve an existing registration")
     t = sub.add_parser("tick")
     t.add_argument("--force", action="store_true")
     sub.add_parser("list")
     args = parser.parse_args()
     try:
         if args.command == "register":
-            register(args.repo, args.mode, args.legacy_base)
+            register(args.repo, args.mode, args.legacy_base, if_absent=args.if_absent)
         elif args.command == "tick":
             tick(args.force)
         else:
