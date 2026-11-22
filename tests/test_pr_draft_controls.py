@@ -47,7 +47,7 @@ def test_owner_can_release_draft_after_official_release(github):
 
 
 @pytest.mark.parametrize("failure", ["freeze", "runtime", "wrong_head", "not_draft", "wrong_owner",
-                                      "foreign_repo", "conflict", "disabled"])
+                                      "foreign_repo", "disabled"])
 def test_release_rejected_safely(github, monkeypatch, failure):
     refs, pr, comments = github
     if failure == "freeze":
@@ -62,8 +62,6 @@ def test_release_rejected_safely(github, monkeypatch, failure):
         pr["user"]["login"] = "someone-else"
     elif failure == "foreign_repo":
         pr["head"]["repo"]["full_name"] = "attacker/fork"
-    elif failure == "conflict":
-        pr["mergeable"] = False
     elif failure == "disabled":
         monkeypatch.setattr(d.release_acceptance, "enabled", lambda: False)
     with pytest.raises(d.DraftReleaseError):
@@ -133,3 +131,24 @@ def test_graphql_permission_denial_does_not_claim_success(monkeypatch):
     monkeypatch.setattr(d, "build_opener", lambda *args: FakeOpener())
     with pytest.raises(d.DraftReleaseError, match="Pull requests"):
         d.mark_ready("PR_abc123")
+
+
+def test_conflicted_pr_can_exit_draft_but_never_claim_merge(github):
+    refs, pr, comments = github
+    pr["mergeable"] = False
+    pr["mergeable_state"] = "dirty"
+    result = d.release(54, H)
+    assert result["released"] is True
+    assert result["merge_blocked"] is True
+    assert "冲突" in result["message"]
+    assert len(comments) == 1
+
+
+def test_unknown_mergeability_can_exit_draft(github):
+    _, pr, comments = github
+    pr["mergeable"] = None
+    pr["mergeable_state"] = "unknown"
+    result = d.release(54, H)
+    assert result["released"] is True
+    assert result["merge_blocked"] is False
+    assert len(comments) == 1
