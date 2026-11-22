@@ -92,3 +92,17 @@ def test_git_fallback_rejects_preview(monkeypatch):
     monkeypatch.setattr(fv.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="a"*40 + "\trefs/heads/preview\n"))
     with pytest.raises(ValueError):
         fv.fetch_latest_via_git()
+
+
+def test_release_v018_documents_app_init_install_and_enrollment():
+    import json
+    from pathlib import Path
+    notes = json.loads((Path(__file__).resolve().parents[1] / "app/release_notes.json").read_text())
+    assert notes[0]["version"] == "0.1.18"
+    assert len([item for item in notes if item["version"] == "0.1.18"]) == 1
+    entry = notes[0]
+    assert entry["acceptance_required"] is True
+    assert entry["acceptance_status"] == "pending"
+    assert "Projects/app-init" in json.dumps(entry, ensure_ascii=False)
+    assert "调度器" in json.dumps(entry, ensure_ascii=False)
+    assert len(entry["validation_steps"]) >= 2
