@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.1.11",
+    "title": "基座升级调度器 · Python 安装预检",
+    "summary": "兼容 Mac 默认 Python 较旧的环境，先选择已有 Python 3.10+ 再运行调度器安装。",
+    "changes": [
+      "版本检查移至模块导入前，避免旧解释器触发 bytes | None 类型错误。",
+      "新增安装入口，优先复用 Homebrew 或已有应用虚拟环境中的兼容 Python；不自动安装依赖，不修改现有服务。",
+      "登记命令统一使用调度器实际 Python 解释器。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "检查安装器的 Python 版本预检及 shell 语法测试。",
+      "在默认旧版 Python 的 Mac mini 上验证复用现有解释器安装。"
+    ],
+    "validation_note": "当前正式 v0.1.10 可直接使用已有 Python 3.10+ 执行安装器，无需等待本版本。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.10",
     "title": "部署可靠性 · Web 关闭超时与回滚恢复",
     "summary": "同步 Panel 实机验证的部署修复，避免旧进程阻塞更新后重启。",
