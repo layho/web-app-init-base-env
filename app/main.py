@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import auth, development_tasks, feedback_progress, operations, release_acceptance
+from . import auth, development_tasks, feedback_progress, operations, pr_tracking, release_acceptance
 from .db import get_db
 from .models import UserFeedback
 
@@ -116,7 +116,10 @@ def project_info(response: Response):
 @app.get("/api/v1/development-tasks", dependencies=[Depends(authorize)])
 def list_development_tasks(response: Response):
     response.headers["Cache-Control"] = "no-store"
-    return development_tasks.snapshot()
+    result = development_tasks.snapshot()
+    if pr_tracking.enabled():
+        result["pr_tracking"] = pr_tracking.snapshot()
+    return result
 
 
 @app.get("/api/v1/system-logs", dependencies=[Depends(authorize)])

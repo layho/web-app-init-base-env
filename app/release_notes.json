@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.1.4",
+    "title": "开发任务 · 测试与发布追踪",
+    "summary": "直接查看真实 MacCI 测试回执、耗时、安全日志摘要、合并与部署证据。",
+    "changes": [
+      "开发任务增加自动化测试与发布追踪页签，显示最近 50 个 PR 范围内的基座 preview PR。",
+      "开始/结束时间、耗时来自 GitHub 状态；通过率来自匹配 head/base 的本机 pytest 日志摘要。",
+      "显示 PR 合并状态和已记录的部署结果；不暴露原始日志、其他仓库及凭据。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "打开开发任务 → 测试与发布追踪，核对 PR #19 和后续 PR 的测试状态与时间。",
+      "打开测试详情，核对计数、测试阶段和提交 SHA；未采集信息显示未记录。",
+      "核对合并记录及当前运行 SHA，并确认同步失败时保留旧数据。"
+    ],
+    "validation_note": "以实际 GitHub 回执和 MacCI 安全摘要为准，不推断缺失数据；通过率不含跳过及预期失败用例。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/20"
+  },
+  {
     "version": "0.1.3",
     "title": "项目信息 · 开发闭环图",
     "summary": "将完整开发、测试、部署及验收发布流程纳入基座项目信息。",
