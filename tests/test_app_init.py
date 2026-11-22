@@ -241,3 +241,46 @@ def test_application_directory_rejects_duplicate_installations(tmp_path):
     preferred.mkdir(parents=True)
     with pytest.raises(RuntimeError, match="新旧两处应用目录"):
         app_init.application_directory(tmp_path, "example/demo")
+
+
+def test_enrollment_keeps_existing_scheduler_registration(tmp_path, monkeypatch):
+    script = tmp_path / ".local/share/macmini-foundation-upgrades/runtime/upgrade_scheduler.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# installed scheduler runtime")
+    script.chmod(0o600)
+    monkeypatch.setattr(app_init.Path, "home", lambda: tmp_path)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        assert args[2] == "list"
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps({
+            "schema": 1, "apps": {"example/demo": {"mode": "observe", "legacy_base": None}}
+        }))
+
+    monkeypatch.setattr(app_init.subprocess, "run", fake_run)
+    assert app_init.enroll_foundation_scheduler(tmp_path, {
+        "repository": "example/demo", "foundation": {"sha": "a" * 40}
+    })
+    assert len(calls) == 1
+
+
+def test_enrollment_registers_with_older_scheduler_cli(tmp_path, monkeypatch):
+    script = tmp_path / ".local/share/macmini-foundation-upgrades/runtime/upgrade_scheduler.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# installed scheduler runtime")
+    script.chmod(0o600)
+    monkeypatch.setattr(app_init.Path, "home", lambda: tmp_path)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if args[2] == "list":
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"schema": 1, "apps": {}}))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(app_init.subprocess, "run", fake_run)
+    assert app_init.enroll_foundation_scheduler(tmp_path, {
+        "repository": "example/demo", "foundation": {"sha": "a" * 40}
+    })
+    assert calls[1][2:] == ["register", "--repo", "example/demo", "--mode", "create"]
