@@ -16,3 +16,5 @@ logs/
 .webapp-failed-sha
 frontend/dist.next/
 frontend/dist.previous/
+
+.base-preview.env
