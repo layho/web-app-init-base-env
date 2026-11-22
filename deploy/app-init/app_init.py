@@ -77,13 +77,13 @@ def configure_service_git(root, repository, token, proxy):
 def copy_foundation(source, target, repository, title, domain, port, label):
     paths = [
         ".gitignore", "requirements.txt", "app/__init__.py", "app/auth.py", "app/db.py",
-        "app/development_tasks.py", "app/main.py", "app/models.py", "app/operations.py",
+        "app/development_tasks.py", "app/feedback_progress.py", "app/main.py", "app/models.py", "app/operations.py",
         "migrations/002_admin_sessions.sql", "migrations/003_feedback.sql",
         "scripts/apply_migrations.py", "scripts/hash_admin_password.py", "scripts/sync_feedback.py",
         "scripts/sync_development_tasks.py", "deploy/macmini/manage.sh", "deploy/macmini/acceptance.py",
         "deploy/macmini/acceptance.sh", "deploy/macmini/release.py", "tests/test_auth.py",
         "tests/test_deploy_script.py", "tests/test_development_tasks.py", "tests/test_feedback.py",
-        "tests/test_feedback_issue_body.py",
+        "tests/test_feedback_issue_body.py", "tests/test_feedback_progress.py",
     ]
     paths += [path.relative_to(source).as_posix() for path in sorted((source / "frontend/src").rglob("*")) if path.is_file()]
     paths += [f"frontend/{path}" for path in ("index.html", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts")]
