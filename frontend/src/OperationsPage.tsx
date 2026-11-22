@@ -21,6 +21,8 @@ const labels: Record<string, string> = {
   update_ok: '更新通过本机健康检查',
   update_blocked: '更新等待数据库迁移',
   rollback: '发布失败，已尝试回退',
+  rollback_ok: '回滚后服务已恢复',
+  rollback_failed: '回滚后服务未恢复',
   feedback_ok: '反馈已同步到 GitHub',
   feedback_failed: '反馈同步失败',
 }

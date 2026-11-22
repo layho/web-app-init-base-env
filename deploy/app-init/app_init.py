@@ -98,6 +98,7 @@ def copy_foundation(source, target, repository, title, domain, port, label):
         "deploy/macmini/acceptance.sh", "deploy/macmini/release.py", "tests/test_auth.py",
         "tests/test_deploy_script.py", "tests/test_development_tasks.py", "tests/test_feedback.py",
         "tests/test_feedback_issue_body.py", "tests/test_foundation_version.py", "tests/test_feedback_progress.py", "tests/test_release_acceptance.py",
+        "tests/test_uvicorn_shutdown.py",
     ]
     paths += [path.relative_to(source).as_posix() for path in sorted((source / "frontend/src").rglob("*")) if path.is_file()]
     paths += [f"frontend/{path}" for path in ("index.html", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts")]

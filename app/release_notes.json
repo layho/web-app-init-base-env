@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.1.10",
+    "title": "部署可靠性 · Web 关闭超时与回滚恢复",
+    "summary": "同步 Panel 实机验证的部署修复，避免旧进程阻塞更新后重启。",
+    "changes": [
+      "Uvicorn 优雅关闭限制 5 秒；旧进程先 TERM，10 秒后严格复核原 launchd job 及进程身份再执行 SIGKILL。",
+      "本机健康检查绕过代理，校验运行 SHA、前端与权限；回滚区分恢复成功和失败。",
+      "保留 preview 专用端口检查、分支及部署配置；真实 Uvicorn 长请求关闭回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行全量 MacCI 测试，包括真实 Uvicorn 长请求和部署控制流回归。",
+      "先安全切换基座旧 updater，再验证公网运行 SHA、回滚记录及自动更新。"
+    ],
+    "validation_note": "Panel 已在独立生产实例实机验证；基座尚待独立部署验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.9",
     "title": "基座升级 · Mac mini 定时调度",
     "summary": "独立用户 LaunchAgent 每五分钟检查正式基座并为已登记的应用生成草稿 PR。",
