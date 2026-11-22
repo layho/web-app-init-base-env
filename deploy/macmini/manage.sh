@@ -297,45 +297,73 @@ rollback() {
   log "ROLLBACK_FAILED $old; inspect system/$WEB and health; manual recovery required"
   return 1
 }
+finish_update() {
+  local rc="$1"
+  if test "$rc" != 0; then
+    record_operation "$UPDATE_FAILURE" "$UPDATE_SHA"
+  fi
+  rmdir "$LOCK" 2>/dev/null || true
+}
 update() {
-  assert_main; load_env
-  mkdir "$LOCK" 2>/dev/null || { log 'Update locked'; exit 0; }
-  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
   local old new
   old="$(git rev-parse HEAD)"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    record_operation update_locked "$old"
+    log 'Update locked'; exit 0
+  fi
+  UPDATE_SHA="$old"
+  UPDATE_FAILURE=update_preflight_failed
+  trap 'finish_update "$?"' EXIT
+  record_operation update_started "$old"
+  assert_main; load_env
+  UPDATE_FAILURE=update_fetch_failed
   GIT_TERMINAL_PROMPT=0 git fetch --quiet origin "${TRACK_BRANCH:-main}"
   new="$(git rev-parse "origin/${TRACK_BRANCH:-main}")"
-  test "$old" != "$new" || exit 0
+  UPDATE_SHA="$new"
+  if test "$old" = "$new"; then
+    record_operation update_no_change "$new"
+    log "Already at tracked branch SHA $new"; exit 0
+  fi
   if test -f .webapp-failed-sha && test "$(cat .webapp-failed-sha)" = "$new"; then
+    record_operation update_held "$new"
     log "Failed SHA held: $new"; exit 0
   fi
+  UPDATE_FAILURE=update_preflight_failed
   git merge-base --is-ancestor "$old" "$new" || { log 'Non-fast-forward blocked'; exit 1; }
   # Leave recoverable assets intact before any step can enter rollback.
   if test -e frontend/dist.previous; then
     log "Previous frontend backup exists; manual recovery required"
     exit 1
   fi
+  record_operation update_candidate "$new"
   git merge --ff-only "$new"
   # Never auto-migrate or pretend DB rollback is transactional.
   # Dependencies must be installed before importing the new migration checker.
+  UPDATE_FAILURE=update_dependencies_failed
+  record_operation update_dependencies "$new"
   if ! dependencies; then
     rollback "$old" "$new"; exit 1
   fi
   # Pending migration is an operational prerequisite, not a defective release.
   # Do not blacklist the SHA: after a reviewed manual migration the same SHA
   # must be eligible on the next update tick.
+  UPDATE_FAILURE=update_schema_failed
   if ! check_schema; then
     record_operation update_blocked "$new"
     log "Schema gate blocked $new; back up DB and apply reviewed migration manually"
     rollback "$old" "$new" retryable; exit 1
   fi
+  UPDATE_FAILURE=update_test_build_failed
+  record_operation update_test_build "$new"
   if ! test_app || ! build; then
     rollback "$old" "$new"; exit 1
   fi
+  UPDATE_FAILURE=update_restart_failed
   if test -d frontend/dist; then
     if ! mv frontend/dist frontend/dist.previous; then rollback "$old" "$new"; exit 1; fi
   fi
   if ! mv frontend/dist.next frontend/dist; then rollback "$old" "$new"; exit 1; fi
+  record_operation update_restarting "$new"
   restart_web || log "Restart request failed; checking candidate service"
   if ! health "$new"; then
     rollback "$old" "$new"; exit 1
