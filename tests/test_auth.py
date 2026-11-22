@@ -287,3 +287,79 @@ def test_draft_release_requires_admin_session_csrf_and_base_preview(client, monk
     assert client.post(endpoint, json={"number": -1, "head": "not-a-sha"}, headers={
         **origin, "X-CSRF-Token": csrf
     }).status_code == 422
+
+
+def test_runtime_branding_persists_and_updates_public_title_source(client, monkeypatch, tmp_path):
+    from app import admin_settings
+    store = tmp_path / "admin-settings.json"
+    monkeypatch.setattr(admin_settings, "SETTINGS", store)
+    initial = client.get("/api/branding")
+    assert initial.status_code == 200
+    assert initial.json()["reference_name"]
+    login = client.post("/api/login", json={
+        "username": "admin", "password": "A-very-strong-passphrase-123"
+    }, headers={"Origin": "https://webapp.example"})
+    csrf = login.json()["csrf_token"]
+    endpoint = "/api/v1/account/settings"
+    assert client.post(endpoint, json={
+        "workspace_name": "My Workspace", "reference_name": "Custom Title"
+    }).status_code == 403
+    headers = {"Origin": "https://webapp.example", "X-CSRF-Token": csrf}
+    response = client.post(endpoint, headers=headers, json={
+        "workspace_name": "My Workspace", "reference_name": "Custom Title"
+    })
+    assert response.status_code == 200, response.text
+    assert response.json() == {"workspace_name": "My Workspace", "reference_name": "Custom Title"}
+    assert client.get("/api/branding").json()["reference_name"] == "Custom Title"
+    assert client.get(endpoint).json()["workspace_name"] == "My Workspace"
+    assert store.stat().st_mode & 0o077 == 0
+    assert client.post(endpoint, headers=headers, json={
+        "workspace_name": " Bad", "reference_name": "Custom Title"
+    }).status_code == 422
+    assert client.get(endpoint).json()["workspace_name"] == "My Workspace"
+
+
+def test_password_change_revokes_sessions_and_uses_new_hash(client, monkeypatch, tmp_path):
+    from app import admin_settings
+    monkeypatch.setattr(admin_settings, "SETTINGS", tmp_path / "private.json")
+    origin = {"Origin": "https://webapp.example"}
+    first = client.post("/api/login", json={
+        "username": "admin", "password": "A-very-strong-passphrase-123"
+    }, headers=origin)
+    csrf = first.json()["csrf_token"]
+    endpoint = "/api/v1/account/password"
+    assert client.post(endpoint, json={
+        "current_password": "A-very-strong-passphrase-123", "new_password": "Different-strong-password-456"
+    }, headers=origin).status_code == 403
+    headers = {**origin, "X-CSRF-Token": csrf}
+    wrong = client.post(endpoint, headers=headers, json={
+        "current_password": "wrong", "new_password": "Different-strong-password-456"
+    })
+    assert wrong.status_code == 403
+    changed = client.post(endpoint, headers=headers, json={
+        "current_password": "A-very-strong-passphrase-123", "new_password": "Different-strong-password-456"
+    })
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["sessions_revoked"] is True
+    assert client.get("/api/session").status_code == 401
+    assert client.post("/api/login", json={
+        "username": "admin", "password": "A-very-strong-passphrase-123"
+    }, headers=origin).status_code == 401
+    assert client.post("/api/login", json={
+        "username": "admin", "password": "Different-strong-password-456"
+    }, headers=origin).status_code == 200
+    stored = admin_settings.read()
+    assert "Different-strong-password-456" not in str(stored)
+    assert stored["password_hash"].startswith("pbkdf2_sha256$")
+
+
+def test_private_settings_rejects_symlink(monkeypatch, tmp_path):
+    from app import admin_settings
+    actual = tmp_path / "real.json"
+    actual.write_text('{"schema":1}')
+    shortcut = tmp_path / "shortcut.json"
+    shortcut.symlink_to(actual)
+    monkeypatch.setattr(admin_settings, "SETTINGS", shortcut)
+    import pytest
+    with pytest.raises(ValueError):
+        admin_settings.read()
