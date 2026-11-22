@@ -16,7 +16,7 @@ MAX_BODY = 180_000
 
 
 def api(path, *, method="GET", payload=None):
-    if not re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:pulls/[1-9][0-9]*(?:/files|/merge)?|commits/[0-9a-f]{40}/statuses|git/commits/[0-9a-f]{40}|branches/main|compare/[0-9a-f]{40}\\.\\.\\.[0-9a-f]{40})", path):
+    if not re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:pulls/[1-9][0-9]*(?:/files|/merge)?|commits/[0-9a-f]{40}/statuses|git/commits/[0-9a-f]{40}|branches/main|compare/[0-9a-f]{40}\.\.\.[0-9a-f]{40})", path):
         raise ValueError("Unsupported auto-merge endpoint")
     data = None if payload is None else json.dumps(payload).encode()
     token = upgrade.read_token()
