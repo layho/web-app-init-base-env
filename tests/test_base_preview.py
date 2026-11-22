@@ -42,7 +42,17 @@ def test_port_collision_does_not_terminate_listener():
         with pytest.raises(RuntimeError, match="端口"):
             preview.check_free(port)
         assert listener.getsockname()[1] == port
-        assert listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        # macOS does not expose SO_ACCEPTCONN through getsockopt.
+        # Verify the original socket still accepts connections and transfers bytes.
+        listener.settimeout(2)
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(2)
+                client.sendall(b"x")
+                assert connection.recv(1) == b"x"
+                connection.sendall(b"y")
+                assert client.recv(1) == b"y"
 
 
 def test_preview_separate_from_normal_generated_app():
