@@ -299,7 +299,7 @@ function App() {
           </Empty>
         </Card>
       ) : page === 'project' ? (
-        <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} />
+        <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project')} />
       ) : page === 'tasks' ? (
         <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'} onRefresh={() => void loadOperations('tasks')} />
       ) : page === 'releases' ? (
