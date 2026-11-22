@@ -117,7 +117,7 @@ serve() {
     return 1
   fi
   if test "${TRACK_BRANCH:-main}" = preview; then
-    if ! .venv/bin/python -c 'import socket,sys; s=socket.socket(); s.bind(("127.0.0.1",int(sys.argv[1]))); s.close()' "$PORT"; then
+    if ! .venv/bin/python -c 'import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("127.0.0.1",int(sys.argv[1]))); s.close()' "$PORT"; then
       record_operation port_conflict "$APP_RUNNING_SHA"
       log "Port $PORT unavailable; refusing preview startup"
       return 1
@@ -229,6 +229,11 @@ restart_web() {
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   process="$(ps -p "$pid" -o command=)" || return 1
   [[ "$process" == *"uvicorn app.main:app --host 127.0.0.1 --port $PORT --workers 1"* ]] || return 1
+  if test "${TRACK_BRANCH:-main}" = preview; then
+    local cwd
+    cwd="$(lsof -nP -a -p "$pid" -d cwd -Fn | sed -n 's/^n//p')" || return 1
+    test "$cwd" = "$ROOT" || { log 'Preview PID working directory mismatch; refusing restart'; return 1; }
+  fi
   kill -TERM "$pid"
 }
 rollback() {
