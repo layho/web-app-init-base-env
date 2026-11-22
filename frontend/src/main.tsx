@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { AppstoreOutlined, CommentOutlined, HistoryOutlined, ProfileOutlined, CloudDownloadOutlined, UnorderedListOutlined, ProjectOutlined } from '@ant-design/icons'
-import { Alert, Button, Card, ConfigProvider, Empty, Form, Input, Layout, Select, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, ConfigProvider, Descriptions, Drawer, Empty, Form, Input, Layout, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import 'antd/dist/reset.css'
 import { ReleasePage, SystemLogPage } from './OperationsPage'
@@ -15,7 +15,7 @@ import { WorkspaceShell } from './WorkspaceShell'
 type RunningVersion = { version: string; running_sha: string; manual_update_available: boolean }
 type Session = { username: string; csrf_token: string }
 type FeedbackInput = { category: string; message: string }
-type Feedback = FeedbackInput & { id: number; status: string; github_issue_number: number | null }
+type Feedback = FeedbackInput & { id: number; status: string; github_issue_number: number | null; created_at?: string | null; synced_at?: string | null }
 
 const appName = "Web App Foundation"
 const navigation = [
@@ -58,6 +58,12 @@ function App() {
   const [requestingUpdate, setRequestingUpdate] = useState(false)
   const [page, setPage] = useState<Page>('workspace')
   const [records, setRecords] = useState<Feedback[]>([])
+  const [feedbackOpen, setFeedbackOpen] = useState(false)
+  const [selectedFeedbackId, setSelectedFeedbackId] = useState<number | null>(null)
+  const [feedbackLoading, setFeedbackLoading] = useState(false)
+  const selectedFeedback = records.find(row => row.id === selectedFeedbackId)
+  const feedbackLabels: Record<string, string> = { suggestion: '需求 / 建议', bug: '问题反馈', acceptance: '验收意见' }
+  const feedbackDate = (value?: string | null) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '未记录'
   const [releaseHistory, setReleaseHistory] = useState<ReleaseHistory | null>(null)
   const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(null)
   const [developmentTasks, setDevelopmentTasks] = useState<TaskSnapshot | null>(null)
@@ -120,6 +126,8 @@ function App() {
       setRunningVersion(null)
       setVersionUnavailable(false)
       setRecords([])
+      setSelectedFeedbackId(null)
+      setFeedbackOpen(false)
       setReleaseHistory(null)
       setSystemLogs(null)
       setDevelopmentTasks(null)
@@ -149,6 +157,8 @@ function App() {
       setRunningVersion(null)
       setVersionUnavailable(false)
       setRecords([])
+      setSelectedFeedbackId(null)
+      setFeedbackOpen(false)
       setReleaseHistory(null)
       setSystemLogs(null)
       setDevelopmentTasks(null)
@@ -162,10 +172,13 @@ function App() {
   }
 
   async function loadFeedback() {
+    setFeedbackLoading(true)
     try {
       setRecords(await api<Feedback[]>('/api/v1/feedback'))
     } catch (error) {
       showError(error)
+    } finally {
+      setFeedbackLoading(false)
     }
   }
 
@@ -177,6 +190,7 @@ function App() {
         '/api/v1/feedback', { method: 'POST', body: JSON.stringify(values) }, session?.csrf_token,
       )
       form.resetFields()
+      setFeedbackOpen(false)
       setNotice({ type: 'success', text: `反馈 #${result.id} 已保存，等待同步到 GitHub。` })
       await loadFeedback()
     } catch (error) {
@@ -203,6 +217,8 @@ function App() {
 
   function navigate(key: Page) {
     setPage(key)
+    setFeedbackOpen(false)
+    setSelectedFeedbackId(null)
     setNotice(null)
     if (key === 'feedback') void loadFeedback()
     if (key === 'releases' || key === 'logs' || key === 'tasks' || key === 'project') void loadOperations(key)
@@ -266,31 +282,58 @@ function App() {
         <SystemLogPage data={systemLogs} loading={loadingOperations === 'logs'} onRefresh={() => void loadOperations('logs')} />
       ) : (
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-          <Card>
+          <Card title="意见反馈" extra={<Space wrap>
+            <Button onClick={() => void loadFeedback()} loading={feedbackLoading}>刷新状态</Button>
+            <Button type="primary" onClick={() => setFeedbackOpen(true)}>提交反馈</Button>
+          </Space>}>
+            <Typography.Paragraph type="secondary">提交问题、改进建议及验收意见，并查看反馈原文与同步结果。</Typography.Paragraph>
+            <Table<Feedback> rowKey="id" size="small" dataSource={records} loading={feedbackLoading}
+              scroll={{ x: 760 }} pagination={{ pageSize: 15, showSizeChanger: true }} columns={[
+                { title: '编号', dataIndex: 'id', width: 80, render: (id: number) => '#' + id },
+                { title: '反馈内容', dataIndex: 'message', ellipsis: true, render: (message: string, row) =>
+                  <Button type="link" style={{ padding: 0, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', textAlign: 'left', display: 'block' }} onClick={() => setSelectedFeedbackId(row.id)}>{message}</Button> },
+                { title: '类别', dataIndex: 'category', width: 110, render: (category: string) => feedbackLabels[category] ?? category },
+                { title: '提交时间', dataIndex: 'created_at', width: 170, render: feedbackDate },
+                { title: '同步状态', key: 'status', width: 130, render: (_, row) =>
+                  row.status === 'synced' && row.github_issue_number ? <Tag color="success">GitHub #{row.github_issue_number}</Tag> : <Tag>待同步</Tag> },
+                { title: '操作', key: 'action', width: 75, render: (_, row) => <Button type="link" onClick={() => setSelectedFeedbackId(row.id)}>详情</Button> },
+              ]} />
+          </Card>
+          <Modal title="提交意见反馈" open={feedbackOpen} onCancel={() => { if (!busy) setFeedbackOpen(false) }} footer={null} width={640}>
             <Form form={form} layout="vertical" onFinish={submitFeedback} initialValues={{ category: 'suggestion' }}>
               <Form.Item name="category" label="类型" rules={[{ required: true }]}>
                 <Select options={[
                   { label: '需求 / 建议', value: 'suggestion' },
-                  { label: '问题', value: 'bug' },
+                  { label: '问题反馈', value: 'bug' },
                   { label: '验收意见', value: 'acceptance' },
                 ]} />
               </Form.Item>
-              <Form.Item name="message" label="内容" rules={[{ required: true, whitespace: true, min: 5, max: 2000 }]}>
-                <Input.TextArea rows={4} maxLength={2000} showCount placeholder="描述需求或问题，请勿填写密码或密钥" />
+              <Form.Item name="message" label="详细说明" rules={[{ required: true, whitespace: true, min: 5, max: 2000 }]}>
+                <Input.TextArea rows={6} maxLength={2000} showCount placeholder="描述操作步骤、实际结果与预期效果，请勿填写密码或密钥" />
               </Form.Item>
-              <Button type="primary" htmlType="submit" loading={busy}>提交反馈</Button>
+              <Space style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <Button disabled={busy} onClick={() => setFeedbackOpen(false)}>取消</Button>
+                <Button type="primary" htmlType="submit" loading={busy}>提交意见</Button>
+              </Space>
             </Form>
-          </Card>
-          <Card title="反馈记录" extra={<Button onClick={loadFeedback}>刷新状态</Button>}>
-            <Table rowKey="id" size="small" dataSource={records} columns={[
-              { title: '内容', dataIndex: 'message', ellipsis: true },
-              { title: '同步状态', key: 'status', render: (_, row) =>
-                row.status === 'synced' && row.github_issue_number
-                  ? <a href={`${githubIssues}/${row.github_issue_number}`} target="_blank" rel="noreferrer">GitHub #{row.github_issue_number}</a>
-                  : '待同步',
-              },
-            ]} />
-          </Card>
+          </Modal>
+          <Drawer width={620} title={selectedFeedback ? '反馈 #' + selectedFeedback.id : '反馈详情'}
+            open={selectedFeedbackId !== null} onClose={() => setSelectedFeedbackId(null)}
+            extra={<Button loading={feedbackLoading} onClick={() => void loadFeedback()}>刷新状态</Button>}>
+            {selectedFeedback ? <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+              <Descriptions bordered size="small" column={1} items={[
+                { key: 'category', label: '反馈类别', children: feedbackLabels[selectedFeedback.category] ?? selectedFeedback.category },
+                { key: 'created', label: '提交时间', children: feedbackDate(selectedFeedback.created_at) },
+                { key: 'synced', label: '同步时间', children: feedbackDate(selectedFeedback.synced_at) },
+                { key: 'status', label: '同步状态', children: selectedFeedback.status === 'synced' && selectedFeedback.github_issue_number ? <Tag color="success">已同步</Tag> : <Tag>待同步</Tag> },
+                { key: 'issue', label: 'GitHub Issue', children: selectedFeedback.github_issue_number
+                  ? <a href={githubIssues + '/' + selectedFeedback.github_issue_number} target="_blank" rel="noopener noreferrer">查看 Issue #{selectedFeedback.github_issue_number}</a>
+                  : '尚未同步' },
+              ]} />
+              <Card size="small" title="你的意见"><Typography.Paragraph style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginBottom: 0 }}>{selectedFeedback.message}</Typography.Paragraph></Card>
+              <Card size="small" title="开发处理结果"><Typography.Text type="secondary">当前基座尚未同步开发回复。已同步不代表已完成，请以关联 GitHub Issue 为准。</Typography.Text></Card>
+            </Space> : <Empty description="该反馈暂不在当前列表中，请刷新状态" />}
+          </Drawer>
         </Space>
       )}
     </WorkspaceShell>
