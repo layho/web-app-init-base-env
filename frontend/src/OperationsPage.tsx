@@ -72,16 +72,21 @@ export function ReleasePage({ data, loading, onRefresh }: RefreshProps & { data:
       </Flex> : <Typography.Text type="secondary">暂无版本信息</Typography.Text>}
     </Card>
     <Alert type="info" showIcon message="代码已提交不等于线上已验收" description="请核对当前运行版本和 Git SHA，以实际验证结果为准。" />
-    <Card title="版本更新记录">
-      <Table<ReleaseNote> rowKey="version" dataSource={data?.releases ?? []} loading={loading} size="small"
-        scroll={{ x: 650 }} pagination={{ pageSize: 15 }} columns={[
-          { title: '版本', dataIndex: 'version', width: 110, render: (version: string) => <Button type="link" onClick={() => setSelectedVersion(version)}>{version}</Button> },
-          { title: '更新内容', dataIndex: 'title', render: (title: string, row) => <Button type="link" style={{ padding: 0, whiteSpace: 'normal', height: 'auto', textAlign: 'left' }} onClick={() => setSelectedVersion(row.version)}>{title}</Button> },
-          { title: '发布日期', dataIndex: 'date', width: 130, render: (date?: string) => date || '未记录' },
-          { title: '验收状态', key: 'acceptance', width: 140, render: (_, row) => acceptanceTag(row) },
-          { title: '操作', key: 'action', width: 80, render: (_, row) => <Button type="link" onClick={() => setSelectedVersion(row.version)}>详情</Button> },
-        ]} />
-    </Card>
+    {data?.releases.length ? data.releases.map(release =>
+      <Card key={release.version}
+        title={<Space wrap><Typography.Text strong>v{release.version}</Typography.Text><span>{release.title}</span></Space>}
+        extra={<Space wrap><Typography.Text type="secondary">{release.date || '日期未记录'}</Typography.Text>{acceptanceTag(release)}<Button type="link" onClick={() => setSelectedVersion(release.version)}>详情</Button></Space>}>
+        {release.summary && <Typography.Paragraph type="secondary">{release.summary}</Typography.Paragraph>}
+        <List size="small" dataSource={release.changes ?? []} renderItem={change =>
+          <List.Item><Typography.Text style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{change}</Typography.Text></List.Item>} />
+        {release.validation_steps?.length ? <div style={{ marginTop: 12, padding: 12, border: '1px solid #f5d591', background: '#fffdf5', borderRadius: 8 }}>
+          <Typography.Text strong>验收步骤</Typography.Text>
+          <ol>{release.validation_steps.map((step, i) => <li key={i} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{step}</li>)}</ol>
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>{release.validation_note || release.validation}</Typography.Paragraph>
+        </div> : <Typography.Paragraph type="secondary" style={{ margin: '12px 0 0' }}>{release.validation_note || release.validation || '暂无验收说明'}</Typography.Paragraph>}
+        {safeReference(release.reference_url) && <Typography.Link href={safeReference(release.reference_url)} target="_blank" rel="noopener noreferrer">查看 GitHub 记录</Typography.Link>}
+      </Card>
+    ) : <Card><Empty description={loading ? '正在读取更新记录…' : '暂无更新记录'} /></Card>}
     <Card title="本机发布记录">
       <OperationTable records={data?.deployments ?? []} loading={loading} onDetails={setDeployment} />
     </Card>
