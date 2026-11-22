@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import auth, development_tasks, feedback_progress, foundation_version, operations, pr_tracking, release_acceptance, pr_draft_controls
+from . import admin_settings, auth, development_tasks, feedback_progress, foundation_version, operations, pr_tracking, release_acceptance, pr_draft_controls
 from .db import get_db
 from .models import UserFeedback
 
@@ -39,6 +39,55 @@ def current_session(request: Request, response: Response, db: Session = Depends(
 def logout(request: Request, response: Response, db: Session = Depends(get_db)):
     response.headers["Cache-Control"] = "no-store"
     return auth.logout(request, response, db)
+
+class ChangePasswordIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class RenameWorkspaceIn(BaseModel):
+    workspace_name: str = Field(min_length=1, max_length=80)
+    reference_name: str = Field(min_length=1, max_length=80)
+
+
+@app.get("/api/branding")
+def public_branding(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return admin_settings.public()
+    except (OSError, ValueError):
+        raise HTTPException(503, "应用名称暂不可用") from None
+
+
+@app.get("/api/v1/account/settings", dependencies=[Depends(authorize)])
+def account_settings(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return admin_settings.public()
+    except (OSError, ValueError):
+        raise HTTPException(503, "读取应用设置失败") from None
+
+
+@app.post("/api/v1/account/settings")
+def rename_workspace(req: RenameWorkspaceIn, request: Request, response: Response, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        names = {"workspace_name": admin_settings.validate_name(req.workspace_name),
+                 "reference_name": admin_settings.validate_name(req.reference_name)}
+        obj = admin_settings.read()
+        admin_settings.save({**obj, **names})
+        return names
+    except (OSError, ValueError) as exc:
+        raise HTTPException(422 if isinstance(exc, ValueError) else 503,
+                            str(exc) if isinstance(exc, ValueError) else "设置保存失败") from None
+
+
+@app.post("/api/v1/account/password")
+def update_password(req: ChangePasswordIn, request: Request, response: Response, db: Session = Depends(get_db)):
+    response.headers["Cache-Control"] = "no-store"
+    return auth.change_password(request, db, req.current_password, req.new_password)
+
 
 @app.get("/api/health")
 def health():
