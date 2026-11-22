@@ -32,7 +32,7 @@ class MergeTests(unittest.TestCase):
             if path.startswith("/contents/app/release_notes.json?ref="):
                 version = "0.1.18" if path.endswith(C) else "0.1.17"
                 return {"encoding": "base64", "content": base64.b64encode(
-                    json.dumps([{"version": version}]).encode()).decode()}
+                    json.dumps([{"version": version, "acceptance_required": True}]).encode()).decode()}
             raise AssertionError(path)
         with patch.object(m, "api", side_effect=api):
             self.assertTrue(m.preview_frozen("fake"))
@@ -41,10 +41,30 @@ class MergeTests(unittest.TestCase):
         with patch.object(m, "api") as api:
             def data(token, path):
                 if path.startswith("/branches/"):
-                    return {"commit": {"sha": C if path.endswith("preview") else B}}
+                    return {"commit": {"sha": C}}
                 return {"encoding": "base64", "content": base64.b64encode(
-                    b'[{"version":"0.1.18"}]').decode()}
+                    b'[{"version":"0.1.18","acceptance_required":true}]').decode()}
             api.side_effect = data
+            self.assertFalse(m.preview_frozen("fake"))
+
+    def test_amended_same_version_candidate_blocks_push_until_published(self):
+        old = {"version": "0.1.18", "acceptance_required": True, "changes": ["initial"]}
+        amended = {**old, "changes": ["initial", "freeze coordinator"]}
+        refs = {"main": B, "preview": C}
+
+        def api(token, path):
+            if path.startswith("/branches/"):
+                return {"commit": {"sha": refs[path.split("/")[-1]]}}
+            note = {B: old, C: amended}[path.split("?ref=")[1]]
+            content = base64.b64encode(json.dumps([note]).encode()).decode()
+            return {"encoding": "base64", "content": content}
+
+        with patch.object(m, "api", side_effect=api), patch.object(m, "git") as git:
+            self.assertFalse(m.merge_one("fake", 54))
+            git.assert_not_called()
+            amended["changes"] = old["changes"]
+            self.assertTrue(m.preview_frozen("fake"))
+            refs["main"] = C
             self.assertFalse(m.preview_frozen("fake"))
 
     def test_freeze_fails_closed_on_unreachable_release_data(self):

@@ -75,6 +75,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept }: RefreshProps
   const [acceptError, setAcceptError] = useState<string | null>(null)
   const acceptance = data?.acceptance
   const canAccept = Boolean(acceptance?.enabled && acceptance.state === 'not_requested' && acceptance.ready === true && data && /^[0-9a-f]{40}$/.test(data.running_sha) && data.releases[0]?.acceptance_required && data.releases[0]?.version === data.version)
+  const gateWarning = acceptance?.enabled && (Boolean(acceptance.reason) || (acceptance.state === 'not_requested' && !canAccept))
   function requestAcceptance() {
     if (!data || !canAccept) return
     setAcceptError(null)
@@ -103,7 +104,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept }: RefreshProps
     if (acceptance.state === 'queued') return <Tag color="processing">验收已提交 · 等待发布 main</Tag>
     if (acceptance.state === 'blocked') return <Tag color="error">发布受阻，请查看验收任务</Tag>
     if (acceptance.state === 'unknown') return <Tag color="warning">发布状态待刷新</Tag>
-    if (!canAccept) return <Button disabled title={acceptance.reason || '候选未就绪'}>验收暂不可用</Button>
+    if (!canAccept) return <Button disabled title={acceptance.reason || '候选未就绪'}>验收通过</Button>
     return <Button type="primary" onClick={requestAcceptance} disabled={accepting || loading}>验收通过</Button>
   }
   const selected = data?.releases.find(release => release.version === selectedVersion)
@@ -115,8 +116,8 @@ export function ReleasePage({ data, loading, onRefresh, onAccept }: RefreshProps
         <Typography.Text copyable code style={{ overflowWrap: 'anywhere' }}>{data.running_sha === 'unknown' ? '未上报 Git SHA' : data.running_sha}</Typography.Text>
       </Flex> : <Typography.Text type="secondary">暂无版本信息</Typography.Text>}
     </Card>
-    {acceptance?.enabled && acceptance.state === 'not_requested' && !canAccept ?
-      <Alert type="warning" showIcon message="当前候选尚不可验收" description={acceptance.reason || '正在核对 preview 和本机部署，请刷新后重试。'} /> :
+    {gateWarning ?
+      <Alert type="warning" showIcon message="当前页面暂不可验收" description={acceptance.reason || '正在核对 preview 和本机部署，请刷新后重试。'} /> :
       <Alert type="info" showIcon message="代码已提交不等于线上已验收" description={acceptance?.enabled ? '仅在最新 preview 与运行 SHA 和部署记录一致时允许验收。' : '请核对当前运行版本和 Git SHA，以实际验证结果为准。'} />}
     {acceptance?.issue && <Typography.Link href={`https://github.com/layho/web-app-init-base-env/issues/${acceptance.issue}`} target="_blank" rel="noopener noreferrer">查看正式发布任务 #{acceptance.issue}</Typography.Link>}
     <Modal title="确认验收并正式发布" open={confirm !== null} onCancel={() => { if (!accepting) setConfirm(null) }} onOk={() => void confirmAcceptance()} okText="验收通过，提交发布" cancelText="取消" confirmLoading={accepting} okButtonProps={{ disabled: !canAccept || loading }} closable={!accepting} maskClosable={!accepting} cancelButtonProps={{ disabled: accepting }}>

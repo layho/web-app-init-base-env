@@ -68,6 +68,15 @@ def list_feedback(response: Response, db: Session = Depends(get_db)):
              "synced_at": x.synced_at.isoformat() if x.synced_at else None,
              **feedback_progress.feedback_details(progress, x.id, x.github_issue_number)} for x in rows]
 
+def deployment_block_reason(sha):
+    status = operations.deploy_status(sha)
+    if status["locked"] or status["state"] in {"request_waiting", "request_unacknowledged"}:
+        return "部署请求尚未完成，请等待本机健康检查后刷新"
+    if status["rollback_failed"] or status["state"] not in {"update_ok", "update_no_change", "unknown"}:
+        return "更新器尚无有效完成回执，请检查系统日志并刷新"
+    return ""
+
+
 @app.get("/api/release-notes", dependencies=[Depends(authorize)])
 def release_notes(response: Response):
     response.headers["Cache-Control"] = "no-store"
@@ -79,15 +88,19 @@ def release_notes(response: Response):
     # Fail closed if the browser has an outdated preview or GitHub cannot be reached.
     readiness = release_acceptance.acceptance_readiness(
         running_sha, app.version, releases[0]["version"], deployments
-    ) if acceptance.get("enabled") and acceptance.get("state") == "not_requested" else {
+    ) if acceptance.get("enabled") else {
         "ready": False, "reason": "当前状态不允许提交验收"
     }
+    if acceptance.get("enabled"):
+        block_reason = deployment_block_reason(running_sha)
+        if block_reason:
+            readiness.update(ready=False, reason=block_reason)
     return {
         "version": app.version,
         "running_sha": running_sha,
         "releases": releases,
         "deployments": deployments,
-        "acceptance": {**acceptance, **readiness},
+        "acceptance": {**acceptance, **readiness, "ready": readiness["ready"] and acceptance.get("state") == "not_requested"},
     }
 
 
@@ -108,6 +121,9 @@ def accept_release(req: ReleaseAcceptanceIn, request: Request, response: Respons
     if req.version != app.version or notes[0]["version"] != req.version or not notes[0].get("acceptance_required"):
         raise HTTPException(409, "当前版本不匹配或无需验收")
     deployments = operations.recent_operations(operations.OPERATIONS_LOG, deployments_only=True)
+    block_reason = deployment_block_reason(req.sha)
+    if block_reason:
+        raise HTTPException(409, block_reason)
     deployed = bool(deployments and deployments[0]["sha"] == req.sha)
     try:
         return release_acceptance.submit(req.sha, req.version, deployed)
