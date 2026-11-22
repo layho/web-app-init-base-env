@@ -581,6 +581,18 @@ def enroll_foundation_scheduler(root, meta):
     return True
 
 
+def application_directory(home: Path, repo_name: str) -> Path:
+    slug = repo_name.replace("/", "--")
+    preferred = home / "Projects" / "app-init" / slug
+    legacy = home / "Applications" / "app-init" / slug
+    # Previously initialized apps keep their original location and launchd paths.
+    if legacy.exists() and not preferred.exists():
+        return legacy
+    if legacy.exists() and preferred.exists():
+        raise RuntimeError(f"发现新旧两处应用目录，请先人工核查：{preferred} / {legacy}")
+    return preferred
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed-only", action="store_true", help="仅在 GitHub 初始化仓库")
@@ -599,8 +611,8 @@ def main():
         repo_name = repo_name.lower()
         ssh_remote = f"git@github.com:{repo_name}.git"
         https_remote = f"https://github.com/{repo_name}.git"
-        apps = Path.home() / "Applications" / "app-init"
-        root = apps / repo_name.replace("/", "--")
+        root = application_directory(Path.home(), repo_name)
+        apps = root.parent
         print(f"应用安装目录：{root}", flush=True)
         if root.exists():
             remote = git(root, "remote", "get-url", "origin")

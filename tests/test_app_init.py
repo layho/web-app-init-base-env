@@ -222,3 +222,22 @@ def test_provenance_real_git_checkout(tmp_path):
     (root / "app/release_notes.json").write_text('[{"version":"0.1.7"}]')
     with pytest.raises(ValueError, match="checkout is not clean"):
         app_init.foundation_provenance(root)
+
+
+def test_application_directory_uses_projects_for_new_apps(tmp_path):
+    assert app_init.application_directory(tmp_path, "example/demo") == tmp_path / "Projects" / "app-init" / "example--demo"
+
+
+def test_application_directory_keeps_legacy_existing_install(tmp_path):
+    legacy = tmp_path / "Applications" / "app-init" / "example--demo"
+    legacy.mkdir(parents=True)
+    assert app_init.application_directory(tmp_path, "example/demo") == legacy
+
+
+def test_application_directory_rejects_duplicate_installations(tmp_path):
+    legacy = tmp_path / "Applications" / "app-init" / "example--demo"
+    preferred = tmp_path / "Projects" / "app-init" / "example--demo"
+    legacy.mkdir(parents=True)
+    preferred.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="新旧两处应用目录"):
+        app_init.application_directory(tmp_path, "example/demo")
