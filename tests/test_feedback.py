@@ -47,6 +47,8 @@ def test_feedback_requires_login_and_csrf(client):
     assert records.json()[0]["id"]==created.json()["id"]
     assert records.json()[0]["github_issue_number"] is None
     assert records.json()[0]["message"]==payload["message"]
+    assert records.json()[0]["created_at"]
+    assert records.json()[0]["synced_at"] is None
     assert client.post("/api/logout",headers=headers).status_code==200
     assert client.get("/api/v1/feedback").status_code==401
 
@@ -95,5 +97,7 @@ def test_feedback_worker_retries_and_reuses_existing_issue(client, monkeypatch):
     result = client.get("/api/v1/feedback").json()[0]
     assert result["status"] == "synced"
     assert result["github_issue_number"] == 42
+    assert result["created_at"]
+    assert result["synced_at"]
     sync_feedback.main()
     assert calls == ["GET", "POST", "GET", "GET"]
