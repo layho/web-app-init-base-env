@@ -16,6 +16,7 @@ import { WorkspaceShell } from './WorkspaceShell'
 type DeployStatus = { state: string; event: {at: string; code: string; sha: string} | null; locked: boolean; age_seconds: number | null; requested_at: string | null; running_sha: string; rollback_failed: boolean }
 const deployLabels: Record<string, string> = { request_waiting: "已登记请求，等待更新器领取", request_unacknowledged: "更新器未确认请求，请检查服务或锁", update_started: "更新器已开始检查", update_candidate: "已取得目标提交", update_dependencies: "检查依赖", update_test_build: "测试及构建中", update_restarting: "服务重启及健康验证中", update_ok: "本机部署成功", update_no_change: "已检查，无新提交", update_held: "目标提交被失败保护拦截", update_preflight_failed: "更新前置条件失败", update_fetch_failed: "拉取失败", update_dependencies_failed: "依赖检查失败", update_schema_failed: "数据库结构检查失败", update_test_build_failed: "测试或构建失败", update_restart_failed: "重启或健康检查失败", update_interrupted: "更新进程未完成", running_sha_mismatch: "运行版本与更新记录不一致", unknown: "尚无更新器回执" }
 
+type AppBranding = { workspace_name: string; reference_name: string }
 type RunningVersion = { version: string; running_sha: string; manual_update_available: boolean }
 type Session = { username: string; csrf_token: string }
 type FeedbackInput = { category: string; message: string }
@@ -79,6 +80,12 @@ async function api<T>(path: string, init: RequestInit = {}, csrf?: string): Prom
 
 function App() {
   const [session, setSession] = useState<Session | null>(null)
+  const [branding, setBranding] = useState<AppBranding>({ workspace_name: appName, reference_name: appName })
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsTab, setSettingsTab] = useState<'branding' | 'password'>('branding')
+  const [settingsSaving, setSettingsSaving] = useState(false)
+  const [brandingForm] = Form.useForm<AppBranding>()
+  const [passwordForm] = Form.useForm<{current_password: string; new_password: string; confirm_password: string}>()
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [runningVersion, setRunningVersion] = useState<RunningVersion | null>(null)
@@ -112,6 +119,14 @@ function App() {
   }, [])
 
   const signedIn = session !== null
+  useEffect(() => {
+    let active = true
+    api<AppBranding>('/api/branding').then(data => { if(active) setBranding(data) }).catch(() => {})
+    return () => { active = false }
+  }, [])
+  useEffect(() => {
+    document.title = `${navigation.find(item => item.key === page)?.label ?? '工作台'} · ${branding.reference_name}`
+  }, [branding.reference_name, page])
   useEffect(() => {
     if (!signedIn) return
     let active = true
@@ -194,6 +209,34 @@ function App() {
     }
   }
 
+  async function saveBranding(values: AppBranding) {
+    if (!session || settingsSaving) return
+    setSettingsSaving(true)
+    try {
+      const result = await api<AppBranding>('/api/v1/account/settings',
+        {method:'POST', body:JSON.stringify(values)}, session.csrf_token)
+      setBranding(result)
+      setSettingsOpen(false)
+      setNotice({type:'success',text:'工作台和引用名称已保存'})
+    } catch(error) { showError(error) }
+    finally { setSettingsSaving(false) }
+  }
+
+  async function changePassword(values: {current_password:string;new_password:string;confirm_password:string}) {
+    if (!session || settingsSaving) return
+    setSettingsSaving(true)
+    try {
+      await api('/api/v1/account/password',{method:'POST',body:JSON.stringify({
+        current_password:values.current_password,new_password:values.new_password
+      })},session.csrf_token)
+      passwordForm.resetFields()
+      setSettingsOpen(false)
+      setSession(null)
+      setNotice({type:'success',text:'密码已修改，所有会话均已失效，请用新密码重新登录'})
+    } catch(error) { showError(error) }
+    finally { setSettingsSaving(false) }
+  }
+
   async function logout() {
     setBusy(true)
     setNotice(null)
@@ -274,7 +317,7 @@ function App() {
   if (!session) return (
     <Layout style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#f3f7fa', padding: 20 }}>
       <Card style={{ width: '100%', maxWidth: 390 }}>
-        <Typography.Title level={3}>{appName}</Typography.Title>
+        <Typography.Title level={3}>{branding.reference_name}</Typography.Title>
         {notice && <Alert type={notice.type} showIcon message={notice.text} style={{ marginBottom: 16 }} />}
         <Form layout="vertical" initialValues={{ username: 'admin' }} onFinish={login}>
           <Form.Item name="username" label="管理员账号" rules={[{ required: true }]}><Input autoComplete="username" size="large" /></Form.Item>
@@ -287,7 +330,7 @@ function App() {
 
   return (
     <WorkspaceShell
-      appName={appName}
+      appName={branding.workspace_name}
       brandMark="应用"
       username={session.username}
       activePage={page}
@@ -296,6 +339,7 @@ function App() {
       onLogout={logout}
       logoutDisabled={busy}
       headerActions={<>
+        <Button size="small" onClick={() => { brandingForm.setFieldsValue(branding); setSettingsTab('branding'); setSettingsOpen(true) }}>系统设置</Button>
         {runningVersion && !versionUnavailable ? (
           <Tag color="blue" title={runningVersion.running_sha}>
             v{runningVersion.version}{runningVersion.running_sha !== 'unknown' && ` · ${runningVersion.running_sha.slice(0, 8)}`}
@@ -318,6 +362,26 @@ function App() {
         type={deployStatus.rollback_failed || /failed|held|unacknowledged|interrupted|mismatch/.test(deployStatus.state) ? 'warning' : deployStatus.state === 'update_ok' || deployStatus.state === 'update_no_change' ? 'success' : 'info'}
         message={deployStatus.rollback_failed ? '回滚后服务恢复未确认，请查看系统日志' : (deployLabels[deployStatus.state] || '更新状态待核实')}
         description={deployStatus.event ? (new Date(deployStatus.event.at).toLocaleString() + ' · ' + deployStatus.event.sha.slice(0, 8) + (deployStatus.locked ? ' · 更新锁占用' : '')) : '等待本机更新器回执'} />}
+      <Modal title="系统设置" open={settingsOpen} footer={null} onCancel={() => setSettingsOpen(false)} destroyOnHidden>
+        <Space style={{marginBottom:16}}>
+          <Button type={settingsTab === 'branding' ? 'primary' : 'default'} onClick={() => setSettingsTab('branding')}>名称设置</Button>
+          <Button type={settingsTab === 'password' ? 'primary' : 'default'} onClick={() => setSettingsTab('password')}>修改密码</Button>
+        </Space>
+        {settingsTab === 'branding' ? <Form form={brandingForm} layout="vertical" onFinish={saveBranding}>
+          <Form.Item name="workspace_name" label="工作台名称" rules={[{required:true,whitespace:true,max:80}]}><Input maxLength={80}/></Form.Item>
+          <Form.Item name="reference_name" label="引用名称（浏览器 Title）" rules={[{required:true,whitespace:true,max:80}]}><Input maxLength={80}/></Form.Item>
+          <Button type="primary" htmlType="submit" loading={settingsSaving}>保存</Button>
+        </Form> : <Form form={passwordForm} layout="vertical" onFinish={changePassword}>
+          <Form.Item name="current_password" label="当前密码" rules={[{required:true}]}><Input.Password autoComplete="current-password"/></Form.Item>
+          <Form.Item name="new_password" label="新密码（至少12位）" rules={[{required:true,min:12,max:256}]}><Input.Password autoComplete="new-password"/></Form.Item>
+          <Form.Item name="confirm_password" label="确认新密码" dependencies={['new_password']}
+            rules={[{required:true},({getFieldValue})=>({validator(_,value) {
+              return value === getFieldValue('new_password') ? Promise.resolve() : Promise.reject(new Error('两次密码不一致'))
+            }})]}><Input.Password autoComplete="new-password"/></Form.Item>
+          <Alert type="warning" showIcon message="修改成功后，所有设备需要重新登录" style={{marginBottom:12}}/>
+          <Button type="primary" htmlType="submit" loading={settingsSaving}>确认修改密码</Button>
+        </Form>}
+      </Modal>
       {page === 'workspace' ? (
         <Card>
           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="空应用，暂无业务模块">
