@@ -41,7 +41,7 @@ type FoundationVersion = {
   error?: string | null
   status: 'unregistered' | 'unknown' | 'current' | 'different'
   auto_upgrade_enabled: boolean
-  scheduler?: { registered: boolean; mode: 'create' | 'observe' | 'unregistered'; state: string; checked_at: string | null; stale: boolean; pr_url: string | null; target_sha: string | null; app_sha: string | null; review_count: number | null } | null
+  scheduler?: { registered: boolean; mode: 'create' | 'observe' | 'unregistered'; state: string; checked_at: string | null; stale: boolean; pr_url: string | null; target_sha: string | null; app_sha: string | null; review_count: number | null; blocked_files?: { path: string; action: 'conflict' | 'review' }[] } | null
 }
 
 export type ProjectInfo = {
