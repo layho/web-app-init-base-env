@@ -303,7 +303,11 @@ function App() {
       ) : page === 'tasks' ? (
         <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'} onRefresh={() => void loadOperations('tasks')} />
       ) : page === 'releases' ? (
-        <ReleasePage data={releaseHistory} loading={loadingOperations === 'releases'} onRefresh={() => void loadOperations('releases')} />
+        <ReleasePage data={releaseHistory} loading={loadingOperations === 'releases'} onRefresh={() => void loadOperations('releases')}
+          onAccept={async (sha, version) => {
+            await api('/api/v1/releases/accept', { method: 'POST', body: JSON.stringify({ sha, version }) }, session.csrf_token)
+            await loadOperations('releases')
+          }} />
       ) : page === 'logs' ? (
         <SystemLogPage data={systemLogs} loading={loadingOperations === 'logs'} onRefresh={() => void loadOperations('logs')} />
       ) : (
