@@ -1,5 +1,26 @@
 [
   {
+    "version": "0.1.23",
+    "title": "Panel 升级冲突诊断与自愈反馈",
+    "summary": "升级调度器将冲突文件清单与安全分类保存至只读回执，Panel 的基座版本页可直接显示文件路径，避免只有“需审查文件 3”的不透明阻塞。",
+    "changes": [
+      "调度器对三方升级规划的 review/conflict 决策记录经过路径安全过滤的文件名及原因，不读取或记录业务文件内容与密钥。",
+      "应用只读接口增加 blocked_files 安全清单；页面显示需修复的具体源文件，方便自动开发任务精确处理。",
+      "原有拒绝合并安全限制不变：冲突文件、人工改动、MacCI 未通过时不能生成或自动合并升级 PR。",
+      "补充调度器及只读回执的回归测试，过滤绝对路径、路径穿越及未知操作类型。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 在当前 preview 基线上运行前后端、调度器和安全回执测试。",
+      "通过网页验收正式发布后，使用安全安装器升级 Mac mini 的独立调度器运行时，重新执行 Panel 升级检查。",
+      "在 panel.layho.com 核对实际阻塞文件名及原因，逐个安全解决后再次触发规划和 MacCI。",
+      "核对 Panel .app-init.json 及公网实际运行 SHA，确保升级完成而不覆盖业务自定义代码。"
+    ],
+    "validation_note": "这项变更改善冲突定位，但不能在没有文件差异证据时擅自自动解决代码冲突。基座代码合并不能代替本机独立调度器安装或 Panel 的实际升级。",
+    "reference_url": "https://github.com/layho/macmini-office-app-panel"
+  },
+  {
     "version": "0.1.22",
     "title": "解除 Draft 凭据权限与错误提示修复",
     "summary": "独立配置 PR 写入凭据，明确区分 Issue 审查评论成功与 GitHub GraphQL 解除 Draft 被拒绝。",
