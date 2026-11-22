@@ -12,7 +12,7 @@ type DevelopmentTask = {
   note: string
 }
 
-type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
+type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
 type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[] }
 export type TaskSnapshot = { synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
@@ -72,7 +72,9 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
       {title: '测试结束', width: 165, render: (_,row) => formatDate(row.test.finished_at ?? null)},
       {title: '耗时', width: 95, render: (_,row) => duration(row.test.duration_seconds)},
       {title: '通过率', width: 95, render: (_,row) => passRate(row)},
-      {title: '合并', width: 90, render: (_,row) => <Tag color={row.merge_state === 'merged' ? 'success' : 'default'}>{mergeLabels[row.merge_state]}</Tag>},
+      {title: '合并', width: 122, render: (_,row) => row.merge_blocked ?
+        <Tag color="error" title="Draft 已解除，但与当前 preview 存在冲突，MacCI/自动合并将暂停">存在冲突 · 待修复</Tag> :
+        <Tag color={row.merge_state === 'merged' ? 'success' : 'default'}>{mergeLabels[row.merge_state]}</Tag>},
       {title: '操作', width: 126, render: (_,row) => row.merge_state === 'draft' ?
         releasedNumbers.includes(row.number) ? <Tag color="processing">已解除 · 待同步</Tag> :
         <Button size="small" disabled={data.stale} title={data.stale ? '同步已过期，请刷新' : '确认后交由 MacCI 自动处理'}

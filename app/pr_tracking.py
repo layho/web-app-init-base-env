@@ -134,6 +134,8 @@ def collect(github):
                      "url": "https://github.com/" + REPO + "/pull/" + str(number),
                      "head": head, "base": base, "test": test, "log": log,
                      "merge_state": "merged" if merged else "closed" if pr.get("state") == "closed" else "draft" if pr.get("draft") else "open",
+                     "merge_blocked": not merged and not pr.get("draft") and pr.get("mergeable") is False,
+                     "mergeability": pr.get("mergeable_state") if isinstance(pr.get("mergeable_state"), str) else "unknown",
                      "merged_at": pr.get("merged_at"), "merge_sha": merge if valid_sha(merge) else None})
     return rows
 

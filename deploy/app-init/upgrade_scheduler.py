@@ -136,14 +136,32 @@ def tick_app(repo, entry, target, force=False):
         # Any outstanding upgrade, even for an older target, prevents stacking.
         pending = open_upgrades(repo)
         if pending:
+            # Never silently select a random PR when several older upgrade
+            # candidates are open; this needs a human/agent review.
+            if len(pending) != 1:
+                return record(repo, mode, target, app_sha, "upgrade_review_required",
+                              reason="multiple_pending_upgrades", count=len(pending))
             row = pending[0]
-            # Panel alone is approved for exact-test automated promotion.
-            # Any failed/unknown gate leaves the PR intact for human inspection.
-            if repo in auto_merge.APPROVED_REPOS and auto_merge.promote(repo, row, app_sha, target):
-                return record(repo, mode, target, app_sha, "upgrade_pending",
-                              pr_url=safe_url(repo, row.get("url")), merged_now=True)
-            return record(repo, mode, target, app_sha, "upgrade_pending",
-                          pr_url=safe_url(repo, row.get("url")))
+            url = safe_url(repo, row.get("url"))
+            branch = row.get("headRefName", "")
+            match = re.fullmatch(r"base-upgrade/([0-9a-f]{40})", branch)
+            if repo not in auto_merge.APPROVED_REPOS:
+                return record(repo, mode, target, app_sha, "upgrade_pending", pr_url=url)
+            if not match or not isinstance(row.get("number"), int):
+                return record(repo, mode, target, app_sha, "upgrade_review_required",
+                              pr_url=url, reason="invalid_upgrade_branch")
+            pending_target = match.group(1)
+            if not auto_merge.official_foundation_target(pending_target):
+                return record(repo, mode, target, app_sha, "upgrade_review_required",
+                              pr_url=url, reason="unknown_or_nonancestor_target")
+            # Old source target must not block further versions: safely merge
+            # the exact previously tested candidate and re-check new main on
+            # the next scheduled tick before planning the latest version.
+            if auto_merge.promote(repo, row, app_sha, pending_target):
+                return record(repo, mode, target, app_sha, "upgrade_merged",
+                              pr_url=url, merged_now=True, promoted_target_sha=pending_target)
+            return record(repo, mode, target, app_sha, "upgrade_waiting_verification",
+                          pr_url=url, pending_target_sha=pending_target)
         previous = read_json(status_path(repo), {})
         if (not force and previous.get("state") in TERMINAL and previous.get("app_sha") == app_sha
                 and previous.get("target_sha") == target and previous.get("mode") == mode

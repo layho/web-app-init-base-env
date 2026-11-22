@@ -88,10 +88,55 @@ class SchedulerTests(unittest.TestCase):
                "headRefName": "base-upgrade/" + B}
         with patch.object(s.upgrade,"remote_ref",return_value=A), \
              patch.object(s,"open_upgrades",return_value=[row]), \
+             patch.object(s.auto_merge,"official_foundation_target",return_value=True), \
              patch.object(s.auto_merge,"promote",return_value=True) as promote:
             result = s.tick_app(panel,{"mode":"create"},B)
             self.assertTrue(result["merged_now"])
+            self.assertEqual(result["state"], "upgrade_merged")
             promote.assert_called_once_with(panel,row,A,B)
+
+    def test_panel_stale_ancestor_pr_finishes_then_next_tick_plans_latest(self):
+        panel = "layho/macmini-office-app-panel"
+        previous_target = "c" * 40
+        latest_target = B
+        row = {"number": 18, "url": "https://github.com/" + panel + "/pull/18",
+               "headRefName": "base-upgrade/" + previous_target}
+        with patch.object(s.upgrade, "remote_ref", return_value=A), \
+             patch.object(s, "open_upgrades", side_effect=[[row], []]), \
+             patch.object(s.auto_merge, "official_foundation_target", return_value=True), \
+             patch.object(s.auto_merge, "promote", return_value=True) as promote, \
+             patch.object(s.upgrade, "coordinate", return_value={
+                 "state": "draft_created", "url": "https://github.com/" + panel + "/pull/19"}) as create:
+            first = s.tick_app(panel, {"mode": "create"}, latest_target)
+            self.assertEqual(first["state"], "upgrade_merged")
+            self.assertEqual(first["promoted_target_sha"], previous_target)
+            promote.assert_called_once_with(panel, row, A, previous_target)
+            second = s.tick_app(panel, {"mode": "create"}, latest_target)
+            self.assertEqual(second["state"], "draft_created")
+            create.assert_called_once()
+
+    def test_stale_or_nonancestor_remains_paused_without_side_effects(self):
+        panel = "layho/macmini-office-app-panel"
+        row = {"number": 22, "url": "https://github.com/" + panel + "/pull/22",
+               "headRefName": "base-upgrade/" + "c" * 40}
+        with patch.object(s.upgrade, "remote_ref", return_value=A), \
+             patch.object(s, "open_upgrades", return_value=[row]), \
+             patch.object(s.auto_merge, "official_foundation_target", return_value=False), \
+             patch.object(s.auto_merge, "promote") as promote:
+            result = s.tick_app(panel, {"mode": "create"}, B)
+            self.assertEqual(result["state"], "upgrade_review_required")
+            self.assertEqual(result["reason"], "unknown_or_nonancestor_target")
+            promote.assert_not_called()
+
+    def test_ambiguous_upgrades_require_review(self):
+        panel = "layho/macmini-office-app-panel"
+        rows = [{"number": n, "headRefName": "base-upgrade/" + B} for n in (18, 19)]
+        with patch.object(s.upgrade, "remote_ref", return_value=A), \
+             patch.object(s, "open_upgrades", return_value=rows), \
+             patch.object(s.auto_merge, "promote") as promote:
+            result = s.tick_app(panel, {"mode": "create"}, B)
+            self.assertEqual(result["state"], "upgrade_review_required")
+            promote.assert_not_called()
 
     def test_other_apps_never_auto_merge(self):
         row = {"number": 8, "url": "https://github.com/example/app/pull/8"}
