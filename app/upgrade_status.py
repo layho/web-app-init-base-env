@@ -15,7 +15,7 @@ SCHED_ROOT = Path.home() / ".local/share/macmini-foundation-upgrades"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
 STATES = {"current", "blocked", "closed_pr", "waiting_adoption", "no_main", "upgrade_pending",
-          "draft_created", "error"}
+          "draft_created", "error", "upgrade_merged", "upgrade_waiting_verification", "upgrade_review_required"}
 MAX_AGE = 15 * 60
 
 
