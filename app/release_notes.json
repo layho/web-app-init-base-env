@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.1.12",
+    "title": "基座升级调度器 · SSH 与 REST Token 独立认证",
+    "summary": "去除设备码登录及 GitHub CLI 依赖，面向纯 SSH 无人值守环境。",
+    "changes": [
+      "Git 操作继续复用 SSH；PR 列表和草稿创建通过固定 GitHub REST API。",
+      "安装时先验证 SSH 和指定应用 API 读取权限；Token 隐藏输入、独立 0600 文件，不记录到启动参数或日志。",
+      "拒绝非固定 API 路径、重定向、跨仓库 PR 及不完整列表。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行 Token 文件安全、REST 查询范围与去依赖测试。",
+      "在真实 SSH 环境安装，核对每五分钟调度及 Panel 首次规划。"
+    ],
+    "validation_note": "PR 写权限仍需实际创建 PR 验证；不复用或扩大 MacCI 专用凭据。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.11",
     "title": "基座升级调度器 · Python 安装预检",
     "summary": "兼容 Mac 默认 Python 较旧的环境，先选择已有 Python 3.10+ 再运行调度器安装。",

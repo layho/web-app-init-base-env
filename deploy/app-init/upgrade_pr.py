@@ -9,6 +9,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import stat
+from urllib.parse import urlencode
+from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.error import HTTPError, URLError
 import sys
 from tempfile import TemporaryDirectory
 
@@ -174,11 +178,80 @@ def create_commit(app, app_sha, decisions, meta, target):
                    "-p", app_sha, "-m", "chore: upgrade foundation to " + target["sha"], env=env).decode().strip()
 
 
+TOKEN_FILE = Path.home() / ".local/share/macmini-foundation-upgrades/github-token"
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def valid_token(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_]{20,300}", value) is not None
+
+
+def read_token():
+    fd = os.open(TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "r", encoding="ascii") as f:
+        info = os.fstat(f.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_size > 512):
+            raise ValueError("Unsafe scheduler token file")
+        token = f.read().strip()
+    if not valid_token(token):
+        raise ValueError("Invalid scheduler token")
+    return token
+
+
+def github(path, *, query=None, payload=None, token=None):
+    if not (path == "/user" or re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls", path)):
+        raise ValueError("Unsupported GitHub API path")
+    token = read_token() if token is None else token
+    if not valid_token(token):
+        raise ValueError("Invalid scheduler token")
+    url = "https://api.github.com" + path
+    if query:
+        url += "?" + urlencode(query)
+    req = Request(url, data=json.dumps(payload).encode() if payload is not None else None,
+                  headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                           "User-Agent": "foundation-upgrade-scheduler", "Content-Type": "application/json"})
+    try:
+        with build_opener(NoRedirect()).open(req, timeout=20) as response:
+            return json.loads(response.read(8 * 1024 * 1024 + 1))
+    except HTTPError as exc:
+        raise ValueError("GitHub API returned HTTP " + str(exc.code)) from None
+    except (URLError, OSError, ValueError):
+        raise ValueError("GitHub API request failed") from None
+
+
+def pull_rows(repository, *, state="open", branch=None, token=None):
+    if not REPO.fullmatch(repository):
+        raise ValueError("Invalid PR repository")
+    query = {"base": "main", "state": state, "per_page": 100}
+    if branch:
+        query["head"] = repository.split("/")[0] + ":" + branch
+    rows = []
+    for page in range(1, 11):
+        data = github("/repos/" + repository + "/pulls",
+                      query={**query, "page": page}, token=token)
+        if not isinstance(data, list) or len(data) > 100:
+            raise ValueError("Invalid PR list")
+        for item in data:
+            head = item.get("head") or {}
+            repo = (head.get("repo") or {}).get("full_name")
+            if repo != repository or (branch and head.get("ref") != branch):
+                continue
+            rows.append({"number": item["number"],
+                         "state": "MERGED" if item.get("merged_at") else item["state"].upper(),
+                         "url": item["html_url"], "headRefName": head["ref"],
+                         "baseRefName": item["base"]["ref"]})
+        if len(data) < 100:
+            return rows
+    raise ValueError("PR list incomplete")
+
+
 def prs(repository, branch):
-    raw = run(["gh", "pr", "list", "--repo", repository, "--head", branch,
-               "--base", "main", "--state", "all", "--limit", "100",
-               "--json", "number,state,url,headRefName,baseRefName"])
-    return json.loads(raw)
+    return pull_rows(repository, state="all", branch=branch)
 
 
 def reuse_or_publish(app, repository, app_url, app_sha, target, commit, report):
@@ -194,10 +267,9 @@ def reuse_or_publish(app, repository, app_url, app_sha, target, commit, report):
     if remote_ref(app_url, "refs/heads/main") != app_sha:
         raise ValueError("Application main advanced; replan")
     # Avoid stacking different target upgrade PRs, including a new one created during planning.
-    open_rows = json.loads(run(["gh", "pr", "list", "--repo", repository, "--base", "main",
-                                "--state", "open", "--limit", "1000", "--json", "headRefName"]))
-    if not isinstance(open_rows, list) or len(open_rows) >= 1000 or any(p.get("headRefName", "").startswith("base-upgrade/") for p in open_rows):
-        raise ValueError("Another upgrade is pending or list incomplete")
+    open_rows = pull_rows(repository)
+    if any(p.get("headRefName", "").startswith("base-upgrade/") for p in open_rows):
+        raise ValueError("Another upgrade is pending")
     prior = remote_ref(app_url, full_ref)
     if prior is not None:
         # Recover a previously pushed branch when the PR creation was interrupted.
@@ -211,13 +283,15 @@ def reuse_or_publish(app, repository, app_url, app_sha, target, commit, report):
         git(app, "push", app_url, commit + ":" + full_ref)
     body = ("Foundation upgrade from verified official main. Draft only; requires app review and regression.\n\n"
             + json.dumps(report, ensure_ascii=False, indent=2))
-    with TemporaryDirectory() as tmp:
-        path = Path(tmp) / "body.md"
-        path.write_text(body, encoding="utf-8")
-        result = run(["gh", "pr", "create", "--repo", repository, "--base", "main",
-                      "--head", branch, "--draft", "--title",
-                      "chore: upgrade foundation v" + target["version"], "--body-file", str(path)])
-    return {"state": "draft_created", "url": result.decode().strip()}
+    result = github("/repos/" + repository + "/pulls", payload={
+        "title": "chore: upgrade foundation v" + target["version"],
+        "head": branch, "base": "main", "draft": True, "body": body,
+    })
+    url = result["html_url"]
+    if not re.fullmatch(r"https://github\.com/" + re.escape(repository) + r"/pull/[1-9]\d*", url):
+        raise ValueError("Invalid created PR URL")
+    return {"state": "draft_created", "url": url}
+
 
 
 def coordinate(repository, legacy_base=None, create_pr=False, *, expected_target=None, expected_app=None):
