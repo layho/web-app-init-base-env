@@ -50,7 +50,8 @@ class SchedulerTests(unittest.TestCase):
             entry={"mode":"create"}
             first=s.tick_app(REPO,entry,B)
             second=s.tick_app(REPO,entry,B)
-            self.assertEqual(first["review_count"],1)
+            self.assertEqual(first["review_count"],0)
+            self.assertEqual(first["blocked_files"], [])
             self.assertEqual(second["state"],"blocked")
             self.assertEqual(create.call_count,1)
             s.tick_app(REPO,entry,"c"*40)
@@ -65,6 +66,20 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(second["state"],"draft_created")
             self.assertIsNone(second["pr_url"])
             self.assertEqual(create.call_count,2)
+
+    def test_blocked_status_includes_only_safe_code_paths(self):
+        with patch.object(s.upgrade, "remote_ref", return_value=A), \
+             patch.object(s, "open_upgrades", return_value=[]), \
+             patch.object(s.upgrade, "coordinate", return_value={
+                 "state": "blocked", "changes": [
+                     {"path": "app/main.py", "action": "conflict", "reason": "overlap"},
+                     {"path": "/private/token", "action": "conflict", "reason": "unsafe"},
+                     {"path": "frontend/src/main.tsx", "action": "review", "reason": "review"},
+                 ]}):
+            result = s.tick_app(REPO, {"mode": "create"}, B)
+        self.assertEqual(result["review_count"], 2)
+        self.assertEqual([item["path"] for item in result["blocked_files"]],
+                         ["app/main.py", "frontend/src/main.tsx"])
 
     def test_nonblocking_scheduler_lock(self):
         with s.lock("tick.lock"):
