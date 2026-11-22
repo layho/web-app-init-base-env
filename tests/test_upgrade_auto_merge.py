@@ -90,13 +90,14 @@ class PromotionTests(unittest.TestCase):
         with patch.object(m, "api", side_effect=altered):
             self.assertIsNone(m.promotion_gate(REPO, 9, BASE, TARGET))
 
-    def test_draft_or_missing_status_never_promotes(self):
+    def test_missing_status_blocks_ready_or_draft(self):
         pr, _, statuses, api = fixture()
         with patch.object(m, "api", side_effect=api):
             pr["draft"] = False
+            self.assertEqual(m.promotion_gate(REPO, 9, BASE, TARGET), HEAD)
+            statuses.clear()
             self.assertIsNone(m.promotion_gate(REPO, 9, BASE, TARGET))
             pr["draft"] = True
-            statuses.clear()
             self.assertIsNone(m.promotion_gate(REPO, 9, BASE, TARGET))
 
     def test_promote_rechecks_gate_then_merges_exact_head(self):
@@ -142,6 +143,15 @@ class PromotionTests(unittest.TestCase):
              patch.object(m.upgrade, "remote_ref", return_value=latest), \
              patch.object(m, "graphql_ready", side_effect=lambda node: pr.update(draft=False) or True):
             self.assertTrue(m.promote(REPO, {"number": 9}, BASE, TARGET))
+
+    def test_already_ready_pr_recovers_after_interrupted_merge(self):
+        pr, _, _, api = fixture()
+        pr["draft"] = False
+        with patch.object(m, "api", side_effect=api), \
+             patch.object(m.upgrade, "remote_ref", return_value=TARGET), \
+             patch.object(m, "graphql_ready") as graphql:
+            self.assertTrue(m.promote(REPO, {"number": 9}, BASE, TARGET))
+            graphql.assert_not_called()
 
     def test_changed_source_never_marks_ready(self):
         _, _, _, api = fixture()
