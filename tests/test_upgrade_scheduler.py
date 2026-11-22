@@ -83,3 +83,23 @@ class SchedulerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+    def test_panel_verified_pending_pr_can_promote(self):
+        panel = "layho/macmini-office-app-panel"
+        row = {"number": 17, "url": "https://github.com/" + panel + "/pull/17",
+               "headRefName": "base-upgrade/" + B}
+        with patch.object(s.upgrade,"remote_ref",return_value=A), \
+             patch.object(s,"open_upgrades",return_value=[row]), \
+             patch.object(s.auto_merge,"promote",return_value=True) as promote:
+            result = s.tick_app(panel,{"mode":"create"},B)
+            self.assertTrue(result["merged_now"])
+            promote.assert_called_once_with(panel,row,A,B)
+
+    def test_other_apps_never_auto_merge(self):
+        row = {"number": 8, "url": "https://github.com/example/app/pull/8"}
+        with patch.object(s.upgrade,"remote_ref",return_value=A), \
+             patch.object(s,"open_upgrades",return_value=[row]), \
+             patch.object(s.auto_merge,"promote") as promote:
+            s.tick_app(REPO,{"mode":"create"},B)
+            promote.assert_not_called()
