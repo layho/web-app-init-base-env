@@ -1,5 +1,25 @@
 [
   {
+    "version": "0.1.17",
+    "title": "项目信息 · 操作指南与双闭环详细说明",
+    "summary": "将 app-init 初始化、域名回源、验收、故障恢复与仓库重建说明直接嵌入项目信息，区分公共基座和业务应用流程。",
+    "changes": [
+      "「操作指南」覆盖准备、初始化、开发验收、升级、故障恢复和旧仓库重建；强调 Cloudflare 规则独立且新端口与既有 8018 回源冲突时禁止静默覆盖。",
+      "扩展基座开发闭环至12个真实节点：预审查、MacCI、preview、实机部署、网页验收、main 发布、下游升级 PR 和最终公网核验。",
+      "app-init 新应用改用独立应用操作指南与应用开发闭环，不误展示基座 preview/main 发布链路。",
+      "补充项目信息认证返回与空仓库 seed 回归；不修改现有服务、域名映射或数据库。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验收站打开项目信息→操作指南和开发闭环，检查重建/隧道回源/人工验收说明、移动端显示。",
+      "app-init 空仓库隔离初始化验证应用指南与独立开发闭环，确认不会复制基座验收流程。",
+      "确认网页运行 SHA、MacCI 当前候选测试及正式版本发布回执。"
+    ],
+    "validation_note": "代码候选需 MacCI 精确测试、preview 实机部署及网页验收后才能进入 main。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/18"
+  },
+  {
     "version": "0.1.16",
     "title": "MacCI 合并引用短暂不可用自动重试",
     "summary": "消除 GitHub PR 新建时 merge ref 尚未就绪导致的测试卡死。",

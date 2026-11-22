@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -175,6 +177,13 @@ def test_project_info_exposes_versioned_design_to_signed_in_users(client):
     assert {"浏览器", "应用接口", "数据"} <= {row["layer"] for row in data["architecture"]}
     assert data["workflow"][0]["title"] == "登记需求"
     assert data["tasks"] == []
+    guide = data["operating_guide"]
+    assert guide["scope"] == "foundation"
+    assert len(guide["sections"]) >= 5
+    assert {"before", "initialize", "develop", "downstream", "rebuild"} <= {row["id"] for row in guide["sections"]}
+    assert {"web-accept", "publish-main", "upgrade-scheduler", "app-test-deploy"} <= {row["id"] for row in data["development_loop"]}
+    assert any("8018" in step["detail"] for section in guide["sections"] for step in section["steps"])
+    assert "app_development_loop" in json.loads((Path(__file__).resolve().parents[1] / "app/project_info.json").read_text())
     assert all(row["acceptance"] for row in data["tasks"])
 
 
