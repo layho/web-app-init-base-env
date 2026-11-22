@@ -32,7 +32,11 @@ def github(path, payload=None):
 def mark_ready(node_id):
     if not isinstance(node_id, str) or not re.fullmatch(r"PR_[A-Za-z0-9_]+", node_id):
         raise DraftReleaseError("PR 标识无效，不能解除 Draft")
-    token = os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "")
+    # Feedback tokens commonly grant Issues write but not Pull requests write.
+    # A dedicated owner PR token can be supplied independently.
+    token = os.getenv("APP_GITHUB_PR_TOKEN") or os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "")
+    if not token:
+        raise DraftReleaseError("未配置 GitHub PR 写入凭据，无法解除 Draft")
     data = json.dumps({
         "query": "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}",
         "variables": {"id": node_id},
@@ -45,10 +49,17 @@ def mark_ready(node_id):
     try:
         with build_opener(release_acceptance.NoRedirect()).open(request, timeout=10) as response:
             result = json.load(response)
-    except (HTTPError, URLError, OSError, ValueError):
-        raise DraftReleaseError("GitHub 未确认解除 Draft；请检查 Token 的 PR 写入权限") from None
-    if result.get("errors") or result.get("data", {}).get("markPullRequestReadyForReview", {}).get("pullRequest", {}).get("isDraft") is not False:
-        raise DraftReleaseError("GitHub 拒绝解除 Draft；未触发自动合并")
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            raise DraftReleaseError("解除 Draft 的 GitHub 凭据未获授权，请配置具有 Pull requests 写入权限的 OWNER Token") from None
+        raise DraftReleaseError("GitHub 返回 HTTP 错误，未解除 Draft") from None
+    except (URLError, OSError, ValueError):
+        raise DraftReleaseError("连接 GitHub GraphQL 失败，未解除 Draft") from None
+    if result.get("errors"):
+        # GitHub GraphQL returns errors as untrusted strings, never echo them.
+        raise DraftReleaseError("GitHub GraphQL 拒绝解除 Draft：请检查 OWNER Token 的 Pull requests 写入权限")
+    if result.get("data", {}).get("markPullRequestReadyForReview", {}).get("pullRequest", {}).get("isDraft") is not False:
+        raise DraftReleaseError("GitHub 未确认 Draft 状态变化，已安全停止")
     return True
 
 
