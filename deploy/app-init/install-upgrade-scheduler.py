@@ -8,6 +8,10 @@ import shutil
 import subprocess
 import sys
 
+# Check before importing modules that use Python 3.10 typing syntax.
+if sys.version_info < (3, 10):
+    raise SystemExit("Python 3.10+ required. Run deploy/app-init/install-upgrade-scheduler.sh to select a compatible installed interpreter.")
+
 import upgrade_scheduler as scheduler
 import upgrade_pr as upgrade
 
@@ -34,8 +38,6 @@ def main():
         raise SystemExit("Only current official main may install the scheduler")
     if sys.platform != "darwin" or os.getuid() == 0:
         raise SystemExit("Run as the existing Mac administrator user, without sudo")
-    if sys.version_info < (3, 10):
-        raise SystemExit("Python 3.10+ required")
     os.environ["PATH"] = PATH
     os.environ["GH_PROMPT_DISABLED"] = "1"
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
