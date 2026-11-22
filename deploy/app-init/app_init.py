@@ -572,8 +572,17 @@ def enroll_foundation_scheduler(root, meta):
     try:
         if source.stat().st_uid != os.getuid() or source.stat().st_mode & 0o077:
             raise RuntimeError("Unsafe scheduler runtime")
-        subprocess.run([sys.executable, str(source), "register", "--repo", meta["repository"], "--mode", "create", "--if-absent"],
-                       check=True, timeout=30, cwd=root)
+        # The installed scheduler may predate --if-absent. Inspect its existing
+        # registrations before writing so old manually chosen modes survive.
+        listing = subprocess.run([sys.executable, str(source), "list"],
+                                 check=True, timeout=30, cwd=root, capture_output=True, text=True)
+        state = json.loads(listing.stdout)
+        apps = state.get("apps")
+        if not isinstance(apps, dict):
+            raise RuntimeError("Invalid scheduler registry")
+        if meta["repository"] not in apps:
+            subprocess.run([sys.executable, str(source), "register", "--repo", meta["repository"], "--mode", "create"],
+                           check=True, timeout=30, cwd=root)
     except (OSError, RuntimeError, subprocess.SubprocessError):
         print("基座调度登记未完成；可使用本机调度器补登记。", flush=True)
         return False
