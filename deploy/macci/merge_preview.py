@@ -114,7 +114,7 @@ def release_version(token, sha):
     if not isinstance(notes, list) or not notes or not isinstance(notes[0], dict):
         raise ValueError("Invalid release notes")
     version = notes[0].get("version")
-    if not isinstance(version, str) or not re.fullmatch(r"\\d+\\.\\d+\\.\\d+", version):
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("Invalid release version")
     return tuple(map(int, version.split(".")))
 
