@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { AppstoreOutlined, CommentOutlined, HistoryOutlined, ProfileOutlined, CloudDownloadOutlined, UnorderedListOutlined, ProjectOutlined } from '@ant-design/icons'
@@ -17,7 +18,8 @@ type Session = { username: string; csrf_token: string }
 type FeedbackInput = { category: string; message: string }
 type Feedback = FeedbackInput & { id: number; status: string; github_issue_number: number | null }
 
-const appName = "Web App Foundation"
+const basePreview = import.meta.env.VITE_BASE_PREVIEW === "1"
+const appName = basePreview ? "基座验收中心" : "Web App Foundation"
 const navigation = [
   { key: 'workspace', label: '工作台', icon: <AppstoreOutlined /> },
   { key: 'project', label: '项目信息', icon: <ProjectOutlined /> },
@@ -28,7 +30,7 @@ const navigation = [
 ] as const
 
 type Page = (typeof navigation)[number]['key']
-const githubIssues = 'https://github.com/example/web-app/issues'
+const githubIssues = basePreview ? 'https://github.com/layho/web-app-init-base-env/issues' : 'https://github.com/example/web-app/issues'
 
 class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -249,6 +251,7 @@ function App() {
         </Button>
       </>}
     >
+      {basePreview && <Alert type="warning" showIcon message="基座候选版本验收环境；反馈将同步到公开 GitHub 仓库，请勿填写敏感信息。" style={{ marginBottom: 16 }} />}
       {notice && <Alert type={notice.type} showIcon message={notice.text} style={{ marginBottom: 16 }} />}
       {page === 'workspace' ? (
         <Card>
