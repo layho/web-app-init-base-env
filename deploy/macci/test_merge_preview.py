@@ -119,6 +119,15 @@ class MergeTests(unittest.TestCase):
         self.assertFalse(m.merge_one("fake",7))
         self.assertFalse(any(call.args[1]=="push" for call in git.call_args_list))
     
+    @patch.object(m,"api")
+    @patch.object(m,"verify_candidate")
+    @patch.object(m,"git")
+    @patch.object(m,"authorization",return_value=(H,B,C,B))
+    @patch.object(m,"preview_frozen",side_effect=[False,True])
+    def test_freeze_appears_during_merge_no_push(self,frozen,auth,git,verify,api):
+        self.assertFalse(m.merge_one("fake",7))
+        self.assertFalse(any(call.args[1] == "push" for call in git.call_args_list))
+
     @patch.object(m,"git")
     @patch.object(m,"authorization")
     @patch.object(m,"preview_frozen",return_value=True)
