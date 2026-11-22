@@ -28,8 +28,8 @@ function formatDate(value: string | null) {
 }
 
 const ciLabels: Record<string, string> = { success: '通过', pending: '测试中', failure: '失败', error: '失效 / 异常', unknown: '待测试 / 未记录' }
-const mergeLabels: Record<string, string> = { merged: '已合并', draft: '草稿', open: '待合并', closed: '已关闭' }
-const deployLabels: Record<string, string> = { running: '当前运行', deployed: '曾成功部署', failed: '部署失败 / 回退', unverified: '待核验', not_merged: '待合并' }
+const mergeLabels: Record<string, string> = { merged: '已合并', draft: '已暂停 · 等待解除', open: '待合并', closed: '已关闭' }
+const deployLabels: Record<string, string> = { running: '当前运行', deployed: '曾成功部署', failed: '部署失败 / 回退', unverified: '待核验', not_merged: '尚未合并' }
 const phaseLabels: Record<string, string> = { pending: '正在测试', passed: '后端测试、编译及前端构建通过', 'setup-failed': '环境准备失败', 'fetch-failed': '候选代码拉取失败', 'context-failed': '构建上下文失败', 'dependencies-failed': '依赖安装 / 镜像构建失败', 'pytest-failed': '后端测试失败', 'compile-failed': 'Python 编译失败', 'frontend-failed': '前端构建失败', 'test-failed': '容器测试失败', 'ref-changed': '分支已变更，回执无效' }
 function duration(seconds?: number | null) { return seconds == null ? '未记录' : seconds < 60 ? seconds + '秒' : Math.floor(seconds / 60) + '分' + seconds % 60 + '秒' }
 function passRate(row: PRRecord) {
@@ -45,6 +45,7 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
   const [releaseNumber, setReleaseNumber] = useState<number | null>(null)
   const [releasing, setReleasing] = useState(false)
   const [releaseError, setReleaseError] = useState<string | null>(null)
+  const [releasedNumbers, setReleasedNumbers] = useState<number[]>([])
   const selected = data.prs.find(row => row.number === selectedNumber)
   const proposed = data.prs.find(row => row.number === releaseNumber)
   async function approveDraft() {
@@ -53,6 +54,7 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
     setReleaseError(null)
     try {
       await onReleaseDraft(proposed.number, proposed.head)
+      setReleasedNumbers(items => [...items, proposed.number])
       setReleaseNumber(null)
     } catch (error) {
       setReleaseError(error instanceof Error ? error.message : '解除 Draft 失败')
@@ -72,7 +74,9 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
       {title: '通过率', width: 95, render: (_,row) => passRate(row)},
       {title: '合并', width: 90, render: (_,row) => <Tag color={row.merge_state === 'merged' ? 'success' : 'default'}>{mergeLabels[row.merge_state]}</Tag>},
       {title: '操作', width: 126, render: (_,row) => row.merge_state === 'draft' ?
-        <Button size="small" disabled={data.stale} onClick={() => { setReleaseError(null); setReleaseNumber(row.number) }}>解除 Draft</Button> : '—'},
+        releasedNumbers.includes(row.number) ? <Tag color="processing">已解除 · 待同步</Tag> :
+        <Button size="small" disabled={data.stale} title={data.stale ? '同步已过期，请刷新' : '确认后交由 MacCI 自动处理'}
+          onClick={() => { setReleaseError(null); setReleaseNumber(row.number) }}>解除 Draft</Button> : '—'},
       {title: '部署', width: 125, render: (_,row) => <Tag color={row.deployment.state === 'running' || row.deployment.state === 'deployed' ? 'success' : row.deployment.state === 'failed' ? 'error' : 'default'}>{deployLabels[row.deployment.state]}</Tag>},
       {title: '详情', width: 70, render: (_,row) => <Button type="link" onClick={() => setSelectedNumber(row.number)}>查看</Button>},
     ]}/>
