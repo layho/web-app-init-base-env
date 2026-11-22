@@ -19,6 +19,7 @@ type FoundationVersion = {
   error?: string | null
   status: 'unregistered' | 'unknown' | 'current' | 'different'
   auto_upgrade_enabled: boolean
+  scheduler?: { registered: boolean; mode: 'create' | 'observe' | 'unregistered'; state: string; checked_at: string | null; stale: boolean; pr_url: string | null; target_sha: string | null; app_sha: string | null; review_count: number | null } | null
 }
 
 export type ProjectInfo = {
@@ -56,6 +57,14 @@ function DevelopmentLoop({ stages }: { stages: LoopStage[] }) {
   </Flex>
 }
 
+const schedulerLabels: Record<string, string> = {
+  current: '已检查：基座一致', upgrade_pending: '升级 PR 待处理', draft_created: '升级 PR 已创建',
+  waiting_adoption: '观察模式，待兼容迁移', blocked: '升级受阻，需审查冲突',
+  closed_pr: '关联 PR 已关闭', no_main: '应用 main 不可访问', error: '本轮调度检查失败',
+  awaiting_first_check: '已登记，等待首次检查', unavailable: '调度器未登记',
+}
+const schedulerMode: Record<string, string> = { create: '自动创建升级 PR', observe: '仅观察（不会创建 PR）', unregistered: '未登记' }
+
 function FoundationVersionPanel({ info, loading, onRefresh }: { info?: FoundationVersion; loading: boolean; onRefresh: () => void }) {
   const renderVersion = (ref: VersionRef | null | undefined) => ref
     ? <Flex vertical gap={4}><Typography.Text strong>v{ref.version}</Typography.Text><Typography.Text copyable style={{ wordBreak: 'break-all' }}>{ref.sha}</Typography.Text></Flex>
@@ -73,12 +82,20 @@ function FoundationVersionPanel({ info, loading, onRefresh }: { info?: Foundatio
       { key: 'checked', label: '最近成功检查', children: info?.checked_at ? new Date(info.checked_at).toLocaleString() : '尚未取得' },
       { key: 'attempted', label: '最近尝试检查', children: info?.attempted_at ? new Date(info.attempted_at).toLocaleString() : '尚未尝试' },
       { key: 'query-source', label: '最近成功查询方式', children: info?.source === 'git_raw' ? 'Git main + 固定提交版本记录' : info?.source === 'github_api' ? 'GitHub API' : '尚未取得' },
-      { key: 'auto', label: '自动升级 PR', children: info?.auto_upgrade_enabled ? '已启用' : '待接入' },
+      { key: 'auto', label: '自动升级模式', children: info?.scheduler ? schedulerMode[info.scheduler.mode] : info?.role === 'foundation' ? '不适用（基座本身）' : '调度器状态不可用' },
+      ...(info?.scheduler ? [
+        { key: 'scheduler-state', label: '调度器最近结果', children: schedulerLabels[info.scheduler.state] || '未知状态' },
+        { key: 'scheduler-checked', label: '调度器最近检查', children: info.scheduler.checked_at ? new Date(info.scheduler.checked_at).toLocaleString() : '尚未取得' },
+        { key: 'scheduler-target', label: '调度器目标 SHA', children: info.scheduler.target_sha ? <Typography.Text copyable>{info.scheduler.target_sha}</Typography.Text> : '未取得' },
+        { key: 'scheduler-pr', label: '升级 PR', children: info.scheduler.pr_url ? <Typography.Link href={info.scheduler.pr_url} target="_blank" rel="noopener noreferrer">{info.scheduler.pr_url.split('/').pop()} 号升级 PR（打开）</Typography.Link> : '当前无关联 PR' },
+        ...(info.scheduler.review_count !== null ? [{ key: 'review-count', label: '需人工审查文件', children: info.scheduler.review_count }] : []),
+      ] : []),
     ]} />
+    {info?.scheduler?.registered && info.scheduler.stale && <Alert type="warning" showIcon message="调度器检查过期或尚未收到运行回执；不能确认自动升级正常运行。" />}
     {info?.stale && <Alert type="warning" showIcon message="未取得实时正式版本；已有数据仅供参考。"
       description={info.error ? info.error.split('/').map(e => (({ api_access_or_rate_limit: 'API 权限或访问限额', http_error: 'HTTP 请求失败', timeout: '查询超时', network_error: '网络连接失败', git_error: 'Git 查询失败', invalid_response: '版本响应无效' } as Record<string, string>)[e] || '查询异常')).join('；备用通道：') : undefined} />}
     <div><Button loading={loading} onClick={onRefresh}>刷新版本状态</Button></div>
-    <Typography.Text type="secondary">自动检查缓存五分钟；手动刷新重新查询（最短间隔10秒）。升级须经过独立 PR、应用回归测试及验收，不直接覆盖业务代码。</Typography.Text>
+    <Typography.Text type="secondary">自动检查缓存五分钟；手动刷新重新查询（最短间隔10秒）。调度器状态来自本机独立服务的只读回执，不等于 MacCI 测试或公网部署成功。升级仍须通过独立 PR、回归测试及验收。</Typography.Text>
   </Flex>
 }
 

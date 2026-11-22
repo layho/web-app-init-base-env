@@ -99,6 +99,8 @@ def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path, monkeypatch)
     assert meta["label"] == "com.appinit.demo"
     assert meta["foundation"] == source_version
     assert (repo / "app/foundation_version.py").is_file()
+    assert (repo / "app/upgrade_status.py").is_file()
+    assert (repo / "tests/test_upgrade_status.py").is_file()
     assert "基座版本" in (repo / "frontend/src/ProjectInfoPage.tsx").read_text()
     initial = app_init.git(repo, "rev-parse", "HEAD")
     assert "hash_password" in (repo / "app/auth.py").read_text()

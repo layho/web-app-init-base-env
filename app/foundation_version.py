@@ -11,6 +11,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from . import upgrade_status
+
 REPOSITORY = "layho/web-app-init-base-env"
 ROOT = Path(__file__).resolve().parents[1]
 API = f"https://api.github.com/repos/{REPOSITORY}"
@@ -141,5 +143,8 @@ def snapshot(force=False):
     latest = remote["latest"]
     status = ("unregistered" if current is None else "unknown" if remote["stale"] or latest is None
               else "current" if current == latest else "different")
+    scheduler = None if root_role else upgrade_status.snapshot(ROOT)
     return {"repository": REPOSITORY, "role": "foundation" if root_role else "application",
-            "current": current, **remote, "status": status, "auto_upgrade_enabled": False}
+            "current": current, **remote, "status": status,
+            "scheduler": scheduler,
+            "auto_upgrade_enabled": bool(scheduler and scheduler["mode"] == "create" and not scheduler["stale"])}
