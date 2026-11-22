@@ -146,6 +146,12 @@ def deployment_status(response: Response):
     return operations.deploy_status(os.getenv("APP_RUNNING_SHA", "unknown"))
 
 
+@app.get("/api/v1/deploy/check", dependencies=[Depends(authorize)])
+def check_deploy_update(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return operations.check_available_update(os.getenv("APP_RUNNING_SHA", "unknown"))
+
+
 @app.post("/api/v1/deploy/update", status_code=202)
 def trigger_update(request: Request, response: Response, db: Session = Depends(get_db)):
     auth.authorize_session(request, db)
