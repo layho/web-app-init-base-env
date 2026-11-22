@@ -60,7 +60,8 @@ def promotion_gate(repo, number, app_sha, foundation_sha):
         return None
     prefix = "/repos/" + repo
     pr = api(prefix + "/pulls/" + str(number))
-    if not isinstance(pr, dict) or pr.get("state") != "open" or pr.get("merged") or pr.get("draft") is not True:
+    if (not isinstance(pr, dict) or pr.get("state") != "open" or pr.get("merged")
+            or pr.get("draft") not in {True, False}):
         return None
     head, base = pr.get("head") or {}, pr.get("base") or {}
     if (pr.get("user", {}).get("login") != OWNER or pr.get("author_association") != "OWNER"
@@ -134,10 +135,14 @@ def promote(repo, row, app_sha, target_sha):
             or not official_foundation_target(target_sha)
             or promotion_gate(repo, number, app_sha, target_sha) != head):
         return False
-    # Draft PR requires explicit transition to ready. Fail closed if unavailable.
-    # Do not merge blindly: the saved candidate must remain unchanged.
-    ready = graphql_ready(api(prefix + "/pulls/" + str(number))["node_id"])
-    if not ready:
+    # Recover if a previous attempt already removed Draft but was interrupted
+    # before the expected-head merge. All exact provenance and MacCI checks
+    # above still apply to the ready PR on every tick.
+    preflight = api(prefix + "/pulls/" + str(number))
+    if preflight.get("draft") is True:
+        if not graphql_ready(preflight.get("node_id")):
+            return False
+    elif preflight.get("draft") is not False:
         return False
     pr = api(prefix + "/pulls/" + str(number))
     if pr.get("head", {}).get("sha") != head or pr.get("base", {}).get("sha") != app_sha or pr.get("draft"):
