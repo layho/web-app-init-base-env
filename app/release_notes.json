@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.1.15",
+    "title": "各应用自动升级调度状态展示",
+    "summary": "app-init 生成的应用默认具备基座版本、调度器登记和检查回执页面。",
+    "changes": [
+      "安全读取指定应用的独立调度器登记/状态，显示最近检查、目标 SHA 和 PR。",
+      "调度器已登记但没有运行回执或回执超过15分钟时明确标记过期。",
+      "不读取 Token、其他应用状态或操作部署和数据库。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "执行状态读取安全与过期测试。",
+      "验证新 app-init 生成的应用默认拥有该模块和页签。",
+      "基座 preview 验收后由本机流程发布 main。"
+    ],
+    "validation_note": "候选待 MacCI 回执，不能将代码提交等同于已部署。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
     "version": "0.1.14",
     "title": "更新执行回执与进度追踪",
     "summary": "区分已提交、已合并、更新请求、真实执行与本机部署成功，避免静默等待。",
