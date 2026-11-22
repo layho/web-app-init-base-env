@@ -90,7 +90,9 @@ def release(number, expected_head):
         "schema": 1, "head": expected_head, "decision": "approved",
         "requires_ancestor": ancestor,
     }, separators=(",", ":"), ensure_ascii=False)
-    github(f"/issues/{number}/comments", {"body": marker})
+    comment = github(f"/issues/{number}/comments", {"body": marker})
+    if (not isinstance(comment, dict) or (comment.get("user") or {}).get("login") != OWNER):
+        raise DraftReleaseError("审查评论不是仓库 OWNER 发布，保留 Draft，需检查 GitHub Token 身份")
     # Recheck after any write, so a moved ref never authorizes draft removal.
     validate(number, expected_head)
     mark_ready(pr.get("node_id"))
