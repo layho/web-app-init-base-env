@@ -96,3 +96,31 @@ def test_lost_local_receipt_reuses_owner_issue(github):
     result = acceptance.submit(RUNNING, "0.1.2", True)
     assert result["issue"] == 91
     assert len(github[2]) == 1
+
+
+def test_acceptance_readiness_blocks_newer_preview(github):
+    refs, _, _, _ = github
+    deployments = [{"code": "update_ok", "sha": RUNNING}]
+    assert acceptance.acceptance_readiness(RUNNING, "0.1.17", "0.1.17", deployments)["ready"]
+    refs["preview"] = HEAD
+    gate = acceptance.acceptance_readiness(RUNNING, "0.1.17", "0.1.17", deployments)
+    assert not gate["ready"]
+    assert gate["preview_sha"] == HEAD
+
+
+def test_acceptance_readiness_requires_successful_matching_deploy(github):
+    assert not acceptance.acceptance_readiness(RUNNING, "0.1.18", "0.1.18", [])["ready"]
+    assert not acceptance.acceptance_readiness(RUNNING, "0.1.18", "0.1.18", [
+        {"code": "update_failed", "sha": RUNNING}
+    ])["ready"]
+    assert not acceptance.acceptance_readiness(RUNNING, "0.1.17", "0.1.18", [
+        {"code": "update_ok", "sha": RUNNING}
+    ])["ready"]
+
+
+def test_acceptance_readiness_fails_closed_when_github_unreachable(github, monkeypatch):
+    monkeypatch.setattr(acceptance, "ref", lambda name: (_ for _ in ()).throw(acceptance.AcceptanceError("offline")))
+    gate = acceptance.acceptance_readiness(RUNNING, "0.1.18", "0.1.18", [
+        {"code": "update_ok", "sha": RUNNING}
+    ])
+    assert not gate["ready"]
