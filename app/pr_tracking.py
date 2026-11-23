@@ -148,6 +148,11 @@ def collect(github, repo=None, branch=None):
     prs = github("GET", prefix + "/pulls?state=all&sort=updated&direction=desc&per_page=50")
     if not isinstance(prs, list):
         raise ValueError("Invalid PR list")
+    # The PR's base.sha can be stale after preview/main advances. A pending
+    # test is valid only against the actual current target branch SHA.
+    latest_sha = github("GET", prefix + "/branches/" + branch)["commit"]["sha"]
+    if not valid_sha(latest_sha):
+        raise ValueError("Invalid current branch")
     rows = []
     for pr in prs:
         number = pr["number"]
@@ -156,6 +161,22 @@ def collect(github, repo=None, branch=None):
             continue
         if pr["base"]["ref"] != branch or (pr["head"].get("repo") or {}).get("full_name") != repo:
             continue
+        # GitHub's mergeable=dirty is the authoritative conflict gate.
+        # /pulls/N/files lists PR-changed files, not necessarily the exact
+        # conflicting hunks; label them as candidates, never as proven conflicts.
+        blocked = (pr.get("state") == "open" and pr.get("mergeable") is False
+                   and pr.get("mergeable_state") == "dirty")
+        candidates = []
+        file_total = pr.get("changed_files")
+        if blocked:
+            files = github("GET", prefix + "/pulls/" + str(number) + "/files?per_page=100")
+            if isinstance(files, list):
+                candidates = [f["filename"] for f in files
+                              if isinstance(f, dict) and isinstance(f.get("filename"), str)
+                              and len(f["filename"]) <= 180 and not f["filename"].startswith("/")
+                              and ".." not in Path(f["filename"]).parts][:100]
+        if pr.get("state") == "open":
+            base = latest_sha
         merged = bool(pr.get("merged_at"))
         merge = pr.get("merge_commit_sha") if merged else None
         if merged and valid_sha(merge):
@@ -172,7 +193,11 @@ def collect(github, repo=None, branch=None):
                      "url": "https://github.com/" + repo + "/pull/" + str(number),
                      "head": head, "base": base, "test": test, "log": log,
                      "merge_state": "merged" if merged else "closed" if pr.get("state") == "closed" else "draft" if pr.get("draft") else "open",
-                     "merge_blocked": not merged and not pr.get("draft") and pr.get("mergeable") is False,
+                     "merge_blocked": blocked,
+                     "conflict": {"blocked": blocked, "base_sha": latest_sha,
+                                  "candidate_files": candidates,
+                                  "file_scope": "PR 修改文件（非已确认的逐文件冲突）",
+                                  "reason": "GitHub 确认 PR 与目标分支存在合并冲突" if blocked else None},
                      "mergeability": pr.get("mergeable_state") if isinstance(pr.get("mergeable_state"), str) else "unknown",
                      "merged_at": pr.get("merged_at"), "merge_sha": merge if valid_sha(merge) else None})
     return rows
