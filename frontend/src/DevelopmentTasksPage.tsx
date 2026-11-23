@@ -46,10 +46,27 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
   const [releasing, setReleasing] = useState(false)
   const [releaseError, setReleaseError] = useState<string | null>(null)
   const [releasedNumbers, setReleasedNumbers] = useState<number[]>([])
+  const releaseOrdinal = (title: string) => {
+    const match = /\\bv(\\d+)\\.(\\d+)\\.(\\d+)\\b/i.exec(title)
+    return match ? match.slice(1).map(Number) : null
+  }
+  const hasEarlierUnmergedRelease = (row: PRRecord) => {
+    const target = releaseOrdinal(row.title)
+    if (!target) return false
+    return data.prs.some(other => {
+      if (other.number === row.number || other.merge_state === 'merged' || other.merge_state === 'closed') return false
+      const previous = releaseOrdinal(other.title)
+      if (!previous) return false
+      for (let i = 0; i < 3; i++) {
+        if (previous[i] !== target[i]) return previous[i] < target[i]
+      }
+      return false
+    })
+  }
   const selected = data.prs.find(row => row.number === selectedNumber)
   const proposed = data.prs.find(row => row.number === releaseNumber)
   async function approveDraft() {
-    if (!proposed || releasing || data.stale || proposed.merge_state !== 'draft') return
+    if (!proposed || releasing || data.stale || proposed.merge_state !== 'draft' || hasEarlierUnmergedRelease(proposed)) return
     setReleasing(true)
     setReleaseError(null)
     try {
@@ -77,7 +94,8 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
         <Tag color={row.merge_state === 'merged' ? 'success' : 'default'}>{mergeLabels[row.merge_state]}</Tag>},
       {title: '操作', width: 126, render: (_,row) => row.merge_state === 'draft' ?
         releasedNumbers.includes(row.number) ? <Tag color="processing">已解除 · 待同步</Tag> :
-        <Button size="small" disabled={data.stale} title={data.stale ? '同步已过期，请刷新' : '确认后交由 MacCI 自动处理'}
+        <Button size="small" disabled={data.stale || hasEarlierUnmergedRelease(row)}
+          title={data.stale ? '同步已过期，请刷新' : hasEarlierUnmergedRelease(row) ? '存在更早的未合并版本，须先完成前置版本' : '确认后交由 MacCI 自动处理'}
           onClick={() => { setReleaseError(null); setReleaseNumber(row.number) }}>解除 Draft</Button> : '—'},
       {title: '部署', width: 125, render: (_,row) => <Tag color={row.deployment.state === 'running' || row.deployment.state === 'deployed' ? 'success' : row.deployment.state === 'failed' ? 'error' : 'default'}>{deployLabels[row.deployment.state]}</Tag>},
       {title: '详情', width: 70, render: (_,row) => <Button type="link" onClick={() => setSelectedNumber(row.number)}>查看</Button>},
@@ -86,7 +104,10 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
       onCancel={() => { if (!releasing) setReleaseNumber(null) }}
       onOk={() => void approveDraft()} okText="解除 Draft"
       confirmLoading={releasing}
-      okButtonProps={{ disabled: !proposed || data.stale || proposed.merge_state !== 'draft' }}>
+      okButtonProps={{ disabled: !proposed || data.stale || proposed.merge_state !== 'draft' || hasEarlierUnmergedRelease(proposed) }}>
+      {proposed && hasEarlierUnmergedRelease(proposed) && <Alert type="warning" showIcon
+        message="前置版本尚未完成，当前禁止解除 Draft"
+        description="请先处理更早的版本 PR 和 MacCI 测试，避免候选版本乱序发布。" style={{marginBottom:12}}/>}
       <Typography.Paragraph>此操作仅解除 PR 草稿并记录当前 HEAD 的负责人审查授权，不会直接合并或部署。之后仍须 MacCI 针对最新 preview 基线重新测试，通过全部合并门禁才会自动合并。</Typography.Paragraph>
       <Typography.Paragraph strong>PR #{proposed?.number} · {proposed?.title}</Typography.Paragraph>
       <Typography.Text code copyable style={{overflowWrap:'anywhere'}}>{proposed?.head}</Typography.Text>
