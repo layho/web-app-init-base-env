@@ -204,6 +204,9 @@ def list_development_tasks(response: Response):
     result = development_tasks.snapshot()
     if pr_tracking.enabled():
         result["pr_tracking"] = pr_tracking.snapshot()
+        # Draft authority differs by repository, but the shared manual
+        # MacCI toolbar is available to explicitly allowlisted app workers.
+        result["pr_tracking"]["manual_actions_available"] = manual_pr_actions.configured()
         result["tasks"] = development_tasks.unified_tasks(
             result.get("tasks", []), result["pr_tracking"])
         result["unified"] = True
