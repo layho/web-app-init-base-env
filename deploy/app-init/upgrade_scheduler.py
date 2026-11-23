@@ -201,6 +201,19 @@ def tick_app(repo, entry, target, force=False):
 
 
 def tick(force=False):
+    # Explicitly opted-in installations may refresh the independently copied
+    # host runtime only from accepted official main. This runs BEFORE the
+    # scheduler's tick lock because the trusted installer acquires that lock.
+    # Its subprocess cannot circumvent the application PR safety gates.
+    updater = ROOT / "runtime" / "upgrade_runtime_auto.py"
+    if updater.is_file() and not updater.is_symlink():
+        try:
+            subprocess.run([sys.executable, "-B", str(updater)],
+                           check=False, timeout=360,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     # LaunchAgent must never ask for credentials or access an interactive terminal.
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
     os.environ["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
