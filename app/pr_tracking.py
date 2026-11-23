@@ -96,6 +96,23 @@ def evidence(statuses, base):
             "phase": match[3], "tested_merge": match[2] if valid_sha(match[2]) else None}
 
 
+def head_status_diagnostic(statuses):
+    """Describe latest GitHub MacCI signal separately from exact-base evidence.
+
+    A failure for this HEAD is worth displaying even if its base/merge
+    description is malformed or stale. It must NOT authorize a merge or be
+    treated as an exact verified test result.
+    """
+    rows = [(instant(item.get("created_at")), item) for item in statuses
+            if isinstance(item, dict) and item.get("context") == CONTEXT
+            and item.get("state") in {"pending", "success", "failure", "error"}
+            and instant(item.get("created_at")) is not None]
+    if not rows:
+        return {"state": "unknown", "at": None}
+    _, latest = max(rows, key=lambda pair: pair[0])
+    return {"state": latest["state"], "at": latest["created_at"]}
+
+
 def log_summary(number, head, base, test, repo=None):
     # Exact repository and filenames only. Read a bounded tail without following
     # symlinks, return enumerated stages/counts, never arbitrary log text.
@@ -212,6 +229,7 @@ def collect(github, repo=None, branch=None):
                      "owner": str((pr.get("user") or {}).get("login") or "未指定")[:100],
                      "linked_issues": explicit_issue_refs(pr.get("body")),
                      "head": head, "base": base, "test": test, "log": log,
+                     "head_status": head_status_diagnostic(statuses),
                      "merge_state": "merged" if merged else "closed" if pr.get("state") == "closed" else "draft" if pr.get("draft") else "open",
                      "merge_blocked": blocked,
                      "conflict": {"blocked": blocked, "base_sha": latest_sha,
