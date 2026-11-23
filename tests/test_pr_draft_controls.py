@@ -190,3 +190,46 @@ def test_non_release_prs_unaffected_by_version_gate(github, monkeypatch):
     pr["title"] = "fix: prevent old sha acceptance"
     monkeypatch.setattr(d, "published_version", lambda: None)
     assert d.release(54, H)["released"]
+
+
+def test_pr_rest_preflight_uses_dedicated_pr_token(monkeypatch):
+    import json
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "issues-only")
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "pr-write-token")
+    captured = []
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            captured.append(request)
+            class Resp:
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+                def read(self, *args): return b'{"commit":{"sha":"123"}}'
+            return Resp()
+    monkeypatch.setattr(d, "build_opener", lambda *args: FakeOpener())
+    assert d.github("/branches/preview") == {"commit": {"sha": "123"}}
+    assert captured[0].headers["Authorization"] == "Bearer pr-write-token"
+    assert captured[0].get_method() == "GET"
+    assert captured[0].full_url.endswith("/repos/layho/web-app-init-base-env/branches/preview")
+    d.github("/issues/90/comments", {"body": "safe review marker"})
+    assert captured[1].get_method() == "POST"
+    assert captured[1].headers["Authorization"] == "Bearer pr-write-token"
+
+
+def test_missing_pr_token_stops_rest_without_fallback(monkeypatch):
+    monkeypatch.delenv("APP_GITHUB_PR_TOKEN", raising=False)
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "issues-only")
+    calls = []
+    monkeypatch.setattr(d, "build_opener", lambda *args: calls.append(args))
+    with pytest.raises(d.DraftReleaseError, match="GH-PR-TOKEN-MISSING"):
+        d.github("/branches/preview")
+    assert calls == []
+
+
+def test_pr_rest_rejects_shared_token_and_unsafe_urls(monkeypatch):
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "same")
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "same")
+    with pytest.raises(d.DraftReleaseError, match="GH-PR-TOKEN-SHARED"):
+        d.github("/branches/preview")
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "dedicated")
+    with pytest.raises(d.DraftReleaseError, match="路径无效"):
+        d.github("https://attacker.invalid/steal")
