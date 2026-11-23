@@ -201,3 +201,83 @@ def test_protocol_comment_cannot_impersonate_upgraded_runner(tmp_path):
     assert m.runner_supports_lock_handoff(script) is True
     script.write_text("LOCK_HANDOFF_PROTOCOL = 0\n")
     assert m.runner_supports_lock_handoff(script) is False
+
+
+def _setup_panel(monkeypatch, *, draft=False, status="success"):
+    repo = "layho/macmini-office-app-panel"
+    monkeypatch.delenv("APP_BASE_PREVIEW", raising=False)
+    monkeypatch.setenv("APP_PUBLIC_ORIGIN", "https://office-panel.layho.com")
+    monkeypatch.setattr(m.pr_tracking, "target", lambda: (repo, "main"))
+    calls = []
+    def github(path):
+        calls.append(path)
+        if path == "/repos/" + repo + "/branches/main":
+            return {"commit": {"sha": BASE}}
+        if path == "/repos/" + repo + "/pulls/71":
+            return {"state": "open", "draft": draft, "mergeable": True,
+                    "mergeable_state": "clean",
+                    "head": {"sha": HEAD, "repo": {"full_name": repo}},
+                    "base": {"ref": "main"}, "merge_commit_sha": MERGE,
+                    "user": {"login": "layho"}}
+        if path == "/repos/" + repo + "/git/commits/" + MERGE:
+            return {"parents": [{"sha": BASE}, {"sha": HEAD}]}
+        if path == "/repos/" + repo + "/commits/" + HEAD + "/statuses?per_page=100":
+            return [{"context": m.CONTEXT, "state": status,
+                     "description": f"base={BASE} merge={MERGE} passed"}]
+        raise AssertionError(path)
+    monkeypatch.setattr(m.release_acceptance, "github", github)
+    return calls
+
+
+def test_panel_app_scoped_manual_test_preserves_exact_repo_and_head(monkeypatch, tmp_path):
+    calls = _setup_panel(monkeypatch)
+    assert m.configured()
+    monkeypatch.setattr(m, "ROOT", tmp_path)
+    monkeypatch.setattr(m, "TEST_RUNNER", tmp_path / "runner.py")
+    (tmp_path / "runner.py").write_text("LOCK_HANDOFF_PROTOCOL = 1\n")
+    monkeypatch.setattr(m, "trusted_runner", lambda path: None)
+    launched = []
+    monkeypatch.setattr(m.subprocess, "Popen",
+                        lambda args, **kw: launched.append(args) or SimpleNamespace(pid=1))
+    result = m.request_test(71, HEAD, BASE)
+    assert result["accepted"] is True
+    assert launched[0][3] == "layho/macmini-office-app-panel"
+    assert launched[0][4:7] == ["--pr", "71", "--force"]
+    assert all(x.startswith("/repos/layho/macmini-office-app-panel/") for x in calls)
+
+
+def test_panel_manual_merge_only_wakes_app_host_coordinator(monkeypatch):
+    calls = _setup_panel(monkeypatch)
+    commands = []
+    monkeypatch.setattr(m.subprocess, "run",
+                        lambda args, **kw: commands.append(args) or SimpleNamespace(returncode=0))
+    result = m.request_merge(71, HEAD, BASE)
+    assert result["accepted"] is True
+    assert commands == [["/bin/launchctl", "kickstart",
+                         f"gui/{os.getuid()}/{m.APP_MERGE_LABEL}"]]
+    assert all(x.startswith("/repos/layho/macmini-office-app-panel/") for x in calls)
+
+
+def test_panel_manual_merge_rejects_draft_or_unverified_macci(monkeypatch):
+    _setup_panel(monkeypatch, draft=True)
+    with pytest.raises(m.ManualActionError, match="草稿"):
+        m.request_merge(71, HEAD, BASE)
+    _setup_panel(monkeypatch, status="failure")
+    with pytest.raises(m.ManualActionError, match="MacCI"):
+        m.request_merge(71, HEAD, BASE)
+
+
+def test_other_app_and_untrusted_origin_never_access_github(monkeypatch):
+    monkeypatch.delenv("APP_BASE_PREVIEW", raising=False)
+    monkeypatch.setenv("APP_PUBLIC_ORIGIN", "https://office-panel.layho.com")
+    monkeypatch.setattr(m.pr_tracking, "target",
+                        lambda: ("layho/other-application", "main"))
+    assert not m.configured()
+    with pytest.raises(m.ManualActionError, match="授权"):
+        m.current_pr(71, HEAD, BASE)
+    monkeypatch.setenv("APP_BASE_PREVIEW", "1")
+    monkeypatch.setattr(m.pr_tracking, "target",
+                        lambda: ("layho/macmini-office-app-panel", "main"))
+    assert not m.configured()
+    with pytest.raises(m.ManualActionError, match="授权"):
+        m.current_pr(71, HEAD, BASE)
