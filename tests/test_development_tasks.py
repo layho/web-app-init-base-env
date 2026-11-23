@@ -131,3 +131,46 @@ def test_unified_tasks_handles_missing_or_partial_tracking():
     row = development_tasks.unified_tasks([], {"prs":[{"number":80,"title":"Partial PR"}]})[0]
     assert row["delivery_status"] == "等待测试"
     assert row["deployment_state"] == "unverified"
+
+
+def test_one_issue_can_have_multiple_prs_with_delivery_history():
+    issue = development_tasks.parse_issue({
+        **ISSUE, "body": ISSUE["body"] + "\\n## 关联 PR\\n- #81\\n- #82\\n",
+        "assignees": [{"login": "developer-a"}]}, "owner/repo")
+    prs = [
+        {"number":81, "title":"Frontend", "owner":"a", "test":{"state":"success"},
+         "merge_state":"merged","deployment":{"state":"deployed"}},
+        {"number":82, "title":"Backend", "owner":"b", "test":{"state":"pending"},
+         "merge_state":"open","deployment":{"state":"not_merged"}},
+    ]
+    result = development_tasks.unified_tasks([issue], {"prs":prs})
+    assert len(result) == 1
+    assert result[0]["pr_numbers"] == [81,82]
+    assert result[0]["owner"] == "developer-a"
+    assert result[0]["test_state"] == "pending"
+    assert result[0]["merge_state"] == "open"
+    assert len(result[0]["prs"]) == 2
+    assert result[0]["delivery_status"] == "代码开发与合并中"
+
+
+def test_pr_explicit_issue_reference_links_and_preserves_unrelated():
+    issue = development_tasks.parse_issue(ISSUE, "owner/repo")
+    prs = [
+        {"number":83,"title":"One", "linked_issues":[42], "test":{"state":"success"},
+         "merge_state":"merged","deployment":{"state":"unverified"}},
+        {"number":84,"title":"Other", "linked_issues":[99], "test":{"state":"success"},
+         "merge_state":"merged","deployment":{"state":"running"}},
+    ]
+    result = development_tasks.unified_tasks([issue], {"prs":prs})
+    assert len(result) == 2
+    assert result[0]["pr_numbers"] == [83]
+    assert result[1]["key"] == "pr-84"
+    assert result[1]["delivery_status"] == "当前版本运行中 · 待验收确认"
+
+
+def test_issue_body_pr_references_only_from_explicit_section():
+    issue = development_tasks.parse_issue({**ISSUE,
+      "body":"See #91\\n\\n## 关联 PR\\n- #92\\n- #92\\n\\n## Notes\\n#93",
+      "assignees":[]}, "owner/repo")
+    assert issue["linked_prs"] == [92]
+    assert issue["owner"] == "未指定"
