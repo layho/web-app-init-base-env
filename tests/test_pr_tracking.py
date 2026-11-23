@@ -34,3 +34,71 @@ def test_log_only_safe_exact_attempt(tmp_path, monkeypatch):
     other.write_text("secret")
     path.symlink_to(other)
     assert p.log_summary(19,H,B,test) is None
+
+
+def test_app_init_metadata_enables_generic_tracking(tmp_path, monkeypatch):
+    import json
+    repo = "layho/macmini-office-app-panel"
+    path = tmp_path / ".app-init.json"
+    path.write_text(json.dumps({"repository": repo, "domain": "panel.layho.com",
+                                "foundation": {"version": "0.1.23"}}))
+    monkeypatch.setattr(p, "METADATA", path)
+    monkeypatch.delenv("APP_BASE_PREVIEW", raising=False)
+    monkeypatch.setenv("APP_PUBLIC_ORIGIN", "https://panel.layho.com")
+    assert p.enabled()
+    assert p.target() == (repo, "main")
+    assert p.log_summary(5, H, B, {"state": "unknown"}, repo) is None
+    monkeypatch.setenv("APP_PUBLIC_ORIGIN", "https://other.layho.com")
+    assert not p.enabled()
+
+
+def test_base_preview_uses_preview_and_invalid_metadata_is_rejected(tmp_path, monkeypatch):
+    import json
+    path = tmp_path / ".app-init.json"
+    monkeypatch.setattr(p, "METADATA", path)
+    monkeypatch.setenv("APP_BASE_PREVIEW", "1")
+    monkeypatch.setenv("APP_PUBLIC_ORIGIN", "https://base.layho.com")
+    assert p.target() == (p.REPO, "preview")
+    monkeypatch.delenv("APP_BASE_PREVIEW")
+    path.write_text(json.dumps({"repository": "../other", "domain": "base.layho.com"}))
+    assert p.target() is None
+
+
+def test_collect_normal_app_prs_exact_main_without_cross_repo():
+    repo = "layho/macmini-office-app-panel"
+    calls = []
+    def github(method, path, data=None):
+        calls.append(path)
+        if "/pulls?" in path:
+            return [
+                {"number": 9, "title": "Panel fix", "state": "open",
+                 "base": {"ref": "main", "sha": B},
+                 "head": {"sha": H, "repo": {"full_name": repo}},
+                 "draft": False, "merged_at": None, "merge_commit_sha": None},
+                {"number": 10, "title": "Other branch", "state": "open",
+                 "base": {"ref": "preview", "sha": B},
+                 "head": {"sha": H, "repo": {"full_name": repo}},
+                 "draft": False, "merged_at": None, "merge_commit_sha": None},
+            ]
+        if path.endswith("/statuses?per_page=100"):
+            return [status("success", "2026-11-22T03:15:20Z")]
+        raise AssertionError(path)
+    rows = p.collect(github, repo, "main")
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://github.com/" + repo + "/pull/9"
+    assert rows[0]["test"]["state"] == "success"
+    assert all("/repos/" + repo + "/" in u for u in calls)
+
+
+def test_tracking_cache_never_leaks_another_application(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(p, "CACHE", tmp_path / "tracking.json")
+    monkeypatch.setattr(p, "METADATA", tmp_path / ".app-init.json")
+    monkeypatch.delenv("APP_BASE_PREVIEW", raising=False)
+    monkeypatch.setenv("APP_PUBLIC_ORIGIN", "https://panel.layho.com")
+    p.METADATA.write_text(json.dumps({"repository": "layho/macmini-office-app-panel",
+                                      "domain": "panel.layho.com"}))
+    p.CACHE.write_text(json.dumps({"synced_at": "2026-11-23T01:00:00+00:00",
+                                   "repository": "layho/another-app", "branch": "main",
+                                   "prs": [{"number": 1}]}))
+    assert p.snapshot()["prs"] == []
