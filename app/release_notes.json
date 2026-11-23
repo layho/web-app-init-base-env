@@ -1,5 +1,27 @@
 [
   {
+    "version": "0.1.30",
+    "title": "基座升级检测与 Office Panel 自动升级验收",
+    "summary": "正式提升基座版本号至 v0.1.30，使使用基座 v0.1.29 的 Office Panel 能检测到官方 main 上的新版本，并通过独立调度器生成、测试和安全审核升级 PR；本版不宣称调度器已经在 Mac mini 实机启用。",
+    "changes": [
+      "将官方基座版本从 v0.1.29 提升为 v0.1.30，并保留唯一可信的官方 main SHA 作为升级目标。",
+      "Office Panel 当前 .app-init.json 所登记的基座版本为 v0.1.29；新版本发布后检查版本检测、升级调度器状态和升级 PR。",
+      "自动升级仅接受真实来源证明及无冲突的升级计划；Draft、精确 MacCI、OWNER 安全审核、应用部署及公网运行 SHA 分阶段验证。",
+      "出现冲突、安装器未更新、没有调度器回执、MacCI 失败或 Panel main 发生改变时保持阻塞，不绕过保护。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对 v0.1.30 PR 最新 HEAD/base/merge 进行 pytest、Python 编译及前端构建。",
+      "在基座 preview 页面核对 v0.1.30 的运行 SHA 和变更说明，管理员验收通过后才发布官方 main。",
+      "核对 Office Panel 版本状态显示已登记 v0.1.29、最新官方 v0.1.30，并验证升级调度器为 create 模式且非 stale。",
+      "检查是否出现基于 v0.1.30 官方 main SHA 的 base-upgrade/<SHA> Draft PR；如计划被阻塞，记录准确原因，不伪称成功。",
+      "只有最新 Panel HEAD/base/merge MacCI success 且安全审查生效才能解除 Draft/合并，随后确认独立部署器和公网运行 SHA。"
+    ],
+    "validation_note": "当前变更只提升正式版本元数据。自动发现、创建升级 PR 与 Panel 部署由 Mac mini 独立调度器/更新器负责；必须根据真实日志和 GitHub PR 回执判断是否已执行。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
     "version": "0.1.29",
     "title": "统一任务关联与完整交付链路",
     "summary": "任务作为管理主体，明确关联多个 PR，自动归档无 Issue 的 PR，展示负责人、各阶段实际回执与完整历史，解决项目重建前的基座任务追踪缺口。",
