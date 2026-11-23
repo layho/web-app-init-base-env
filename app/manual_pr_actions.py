@@ -97,14 +97,17 @@ def request_test(number, head, base):
                      "--pr", str(number), "--force"],
                     stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                     start_new_session=True, close_fds=True,
-                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    env={key: value for key, value in os.environ.items()
+                         if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
+                                    "SSH_AUTH_SOCK", "DOCKER_HOST"}} |
+                        {"PYTHONDONTWRITEBYTECODE": "1"},
                 )
     except OSError:
         raise ManualActionError("本机测试程序启动失败，未受理此次操作") from None
     return {"accepted": True, "action": "test", "number": number,
             "head": head, "base": base, "candidate": merge,
             "requested_at": datetime.now(timezone.utc).isoformat(),
-            "message": "已启动指定 PR 的 MacCI 测试，最终结果以新测试回执为准"}
+            "message": "已向本机测试程序发起指定 PR 的执行请求，请刷新确认实际 MacCI 回执"}
 
 
 def latest_status(head):
