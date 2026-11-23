@@ -17,6 +17,7 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 import uuid
 
 ROOT = Path.home() / '.local/share/macmini-pr-tests'
+LOCK_HANDOFF_PROTOCOL = 1  # Supported by trusted web-side manual PR runner
 CONTEXT = 'macmini/isolated-tests-v1'
 REPOS = {
     'layho/web-app-init-base-env': {'preview'},
