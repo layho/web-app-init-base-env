@@ -23,8 +23,8 @@ def parse_issue(issue: dict, repository: str) -> dict | None:
     state = status[1] if status else "未记录开发状态"
     if issue.get("state") == "closed":
         state = "已完成" if issue.get("state_reason") == "completed" else "已关闭"
-    linked_section = re.search(r"^## 关联 PR[^\\n]*\\r?\\n([\\s\\S]*?)(?=^#{1,2} |\\Z)", body, re.MULTILINE)
-    linked = sorted({int(n) for n in re.findall(r"(?<![A-Za-z0-9])#([1-9][0-9]{0,6})\\b", linked_section[1])}) if linked_section else []
+    linked_section = re.search(r"^## 关联 PR[^\n]*\r?\n([\s\S]*?)(?=^#{1,2} |\Z)", body, re.MULTILINE)
+    linked = sorted({int(n) for n in re.findall(r"(?<![A-Za-z0-9])#([1-9][0-9]{0,6})\b", linked_section[1])}) if linked_section else []
     assignees = issue.get("assignees") or []
     owner = ", ".join(u["login"] for u in assignees if isinstance(u, dict) and isinstance(u.get("login"), str))[:160]
     return {
