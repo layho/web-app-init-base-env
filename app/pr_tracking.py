@@ -146,9 +146,9 @@ def explicit_issue_refs(body):
     # GitHub standard closing keywords or deliberate issue/task labels.
     found = set()
     for match in re.finditer(
-            r"(?im)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|relates?\\s+to|"
-            r"issue|task|关联(?:任务|需求|issue))\\s*:?\\s*"
-            r"(?:https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/)?#?([1-9][0-9]{0,6})\\b",
+            r"(?im)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|relates?\s+to|"
+            r"issue|task|关联(?:任务|需求|issue))\s*:?\s*"
+            r"(?:https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/)?#?([1-9][0-9]{0,6})\b",
             body[:40000]):
         found.add(int(match.group(1)))
     return sorted(found)
