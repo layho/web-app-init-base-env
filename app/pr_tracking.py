@@ -13,7 +13,7 @@ CACHE = Path(__file__).resolve().parents[1] / "logs" / "pr-tracking.json"
 LOG_ROOT = Path.home() / ".local/share/macmini-pr-tests"
 REPO = "layho/web-app-init-base-env"
 METADATA = Path(__file__).resolve().parents[1] / ".app-init.json"
-REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\Z")
+REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 CONTEXT = "macmini/isolated-tests-v1"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 STATUS = re.compile(r"base=([0-9a-f]{40}) merge=([0-9a-f]{40}|unknown) ([a-z-]+)\Z")
@@ -213,4 +213,5 @@ def snapshot():
                              "running" if sha and sha == running and event and event["code"] in {"install_ok", "update_ok"} else
                              "deployed" if event and event["code"] in {"install_ok", "update_ok"} else
                              "failed" if event else "unverified", "at": event["at"] if event else None}
-    return {**data, "stale": (datetime.now(timezone.utc) - dt).total_seconds() > 600}
+    return {**data, "can_release_draft": current == (REPO, "preview"),
+            "stale": (datetime.now(timezone.utc) - dt).total_seconds() > 600}
