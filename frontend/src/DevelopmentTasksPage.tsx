@@ -2,6 +2,13 @@ import { useState } from 'react'
 import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Table, Tabs, Tag, Typography } from 'antd'
 
 type DevelopmentTask = {
+  key?: string
+  source?: 'issue' | 'pr'
+  pr_number?: number | null
+  delivery_status?: string
+  test_state?: string | null
+  merge_state?: string | null
+  deployment_state?: string | null
   number: number
   title: string
   url: string
@@ -201,27 +208,33 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
       } />}
       {data?.synced_at && <Typography.Text type="secondary">GitHub 最近同步 {formatDate(data.synced_at)}</Typography.Text>}
       <Table
-        rowKey="number"
+        rowKey={task => task.key ?? 'issue-' + task.number}
         size="small"
         loading={loading}
         dataSource={data?.tasks ?? []}
-        scroll={{ x: 920 }}
+        scroll={{ x: 1300 }}
         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={
-          data?.synced_at ? 'GitHub 暂无可显示的独立开发 Issue' : '暂无同步记录'
+          data?.synced_at ? '暂无开发任务或 PR 记录' : '暂无同步记录'
         } /> }}
         columns={[
-          { title: '任务', dataIndex: 'title', width: 300, render: (title: string, task: DevelopmentTask) =>
+          { title: '任务', dataIndex: 'title', width: 310, render: (title: string, task: DevelopmentTask) =>
             <Typography.Link href={task.url} target="_blank" rel="noreferrer">#{task.number} {title}</Typography.Link> },
-          { title: '状态', dataIndex: 'status', width: 104, render: (status: string) =>
-            <Tag color={statusColors[status] ?? 'default'}>{status}</Tag> },
-          { title: '已完成步骤', key: 'progress', width: 106, render: (_, task: DevelopmentTask) =>
-            task.total_steps ? `${task.completed_steps} / ${task.total_steps}` : '—' },
+          { title: '来源', width: 85, render: (_, task: DevelopmentTask) =>
+            <Tag>{task.source === 'pr' ? '代码任务' : '需求任务'}</Tag> },
+          { title: '当前阶段', width: 205, render: (_, task: DevelopmentTask) =>
+            <Tag color={statusColors[task.status] ?? 'default'}>{task.delivery_status ?? task.status}</Tag> },
+          { title: '测试', width: 92, render: (_, task: DevelopmentTask) =>
+            task.test_state ? ciTag(task.test_state) : '—' },
+          { title: '合并', width: 100, render: (_, task: DevelopmentTask) =>
+            task.merge_state ? <Tag>{mergeLabels[task.merge_state] ?? task.merge_state}</Tag> : '—' },
+          { title: '部署', width: 115, render: (_, task: DevelopmentTask) =>
+            task.deployment_state ? <Tag>{deployLabels[task.deployment_state] ?? task.deployment_state}</Tag> : '—' },
           { title: '最新进展', dataIndex: 'note', render: (note: string) => note || '—' },
-          { title: 'Issue 更新', dataIndex: 'updated_at', width: 164, render: formatDate },
+          { title: '更新时间', dataIndex: 'updated_at', width: 168, render: formatDate },
         ]}
       />
     </Flex>
   return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading}>刷新列表</Button>}>
-    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
+    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'统一任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
   </Card>
 }
