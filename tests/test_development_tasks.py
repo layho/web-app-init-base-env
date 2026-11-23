@@ -31,10 +31,13 @@ def test_explicit_development_progress():
     assert task["note"] == "接口已通过测试。"
     assert (task["completed_steps"], task["total_steps"]) == (1, 2)
     assert task["url"] == "https://github.com/owner/repo/issues/42"
-    assert parse({**ISSUE, "body": "ordinary issue"}, repository) is None
+    ordinary = parse({**ISSUE, "body": "ordinary issue"}, repository)
+    assert ordinary["number"] == 42
+    assert ordinary["status"] == "未记录开发状态"
+    assert ordinary["completed_steps"] == ordinary["total_steps"] == 0
     assert parse({**ISSUE, "pull_request": {}}, repository) is None
     assert parse({**ISSUE, "title": "[APP-FEEDBACK #1] bug"}, repository) is None
-    assert parse({**ISSUE, "body": ISSUE["body"].replace("状态：开发中", "")}, repository)["status"] == "未标记"
+    assert parse({**ISSUE, "body": ISSUE["body"].replace("状态：开发中", "")}, repository)["status"] == "未记录开发状态"
     assert parse({**ISSUE, "state": "closed", "state_reason": "not_planned"}, repository)["status"] == "已关闭"
 
 
@@ -66,3 +69,12 @@ def test_sync_keeps_last_snapshot_on_github_failure(tmp_path, monkeypatch):
     with pytest.raises(URLError):
         sync_development_tasks.sync()
     assert development_tasks.snapshot() == {**stale, "stale": True}
+
+
+def test_unformatted_issue_is_visible_but_does_not_claim_progress():
+    issue = {**ISSUE, "title": "Improve API", "body": "Please add an endpoint", "state": "open"}
+    task = development_tasks.parse_issue(issue, "owner/repo")
+    assert task["status"] == "未记录开发状态"
+    assert task["note"] == ""
+    assert task["total_steps"] == 0
+    assert development_tasks.parse_issue({**issue, "state":"closed", "state_reason":"completed"}, "owner/repo")["status"] == "已完成"

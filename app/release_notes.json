@@ -1,5 +1,27 @@
 [
   {
+    "version": "0.1.24",
+    "title": "通用开发任务与本应用 PR 测试发布追踪",
+    "summary": "将基座的开发任务、MacCI 测试与部署证据追踪下沉为 app-init 所有应用通用能力；每个应用自动读取自己的 GitHub 仓库和正式 main 分支，保留基座 preview 验收专用操作边界。",
+    "changes": [
+      "开发任务列表包含普通 GitHub Issue，不再要求 ## 开发进度 标题才能出现；未记录进展的任务明确显示“未记录开发状态”。",
+      "PR 追踪从当前应用 .app-init.json 解析自身仓库及公网域名，普通应用只跟踪自己 main 分支的 PR，基座验收站仍跟踪 preview。",
+      "MacCI 回执按当前 HEAD/base 读取，列出测试、提交、合并和可验证的本机部署记录，缺失信息不推算；缓存按仓库隔离。",
+      "普通应用只读展示 PR 记录，不显示仅限基座管理员的解除 Draft 按钮；避免误把普通应用发布权限与基座验收权限混用。",
+      "增加普通 Issue、通用仓库解析、跨应用缓存隔离及 PR 状态回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对最新 HEAD/base/merge 执行 pytest、Python 编译与前端构建。",
+      "在 base.layho.com 验证 preview PR 追踪仍正常、解除 Draft 仅限基座管理员。",
+      "基座正式发布后由升级调度器生成 Panel 升级 PR，确认 Panel 显示自身 GitHub Issue 和 main PR 的测试合并部署追踪。",
+      "对不存在 MacCI/部署证据及不同仓库数据的情况确认不展示虚构状态或跨应用记录；核对公网运行 SHA。"
+    ],
+    "validation_note": "发布基座不意味着所有现有应用立刻展示新功能；应用需经过各自基座升级 PR、MacCI 和部署验证。不会把普通应用的 main 合并权授予基座网页。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
     "version": "0.1.23",
     "title": "Panel 升级冲突诊断与自愈反馈",
     "summary": "升级调度器将冲突文件清单与安全分类保存至只读回执，Panel 的基座版本页可直接显示文件路径，避免只有“需审查文件 3”的不透明阻塞。",

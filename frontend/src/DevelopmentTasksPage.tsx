@@ -13,11 +13,12 @@ type DevelopmentTask = {
 }
 
 type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
-type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[] }
+type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean }
 export type TaskSnapshot = { synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
 const statusColors: Record<string, string> = {
   开发中: 'processing',
+  未记录开发状态: 'default',
   待验收: 'blue',
   受阻: 'error',
   已完成: 'success',
@@ -63,7 +64,8 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
     }
   }
   return <Flex vertical gap="middle">
-    <Alert showIcon type={data.stale ? 'warning' : 'info'} message={data.stale ? '同步延迟或尚未同步，保留上次成功记录。' : 'GitHub 测试回执与本机部署记录'} description="每五分钟尝试同步。测试时间以 GitHub 回执为准；日志仅展示安全计数和阶段，未采集信息不推算。仅显示基座 preview PR。" />
+    <Alert showIcon type={data.stale ? 'warning' : 'info'} message={data.stale ? '同步延迟或尚未同步，保留上次成功记录。' : 'GitHub 测试回执与本机部署记录'}
+      description={`每五分钟尝试同步。当前仓库：${data.repository ?? '待识别'}；目标分支：${data.branch ?? '待识别'}。未取得本机测试或部署证据时显示“未记录”，不推算。`} />
     <Typography.Text type="secondary">最近同步：{formatDate(data.synced_at)}</Typography.Text>
     <Table rowKey="number" size="small" dataSource={data.prs} scroll={{x: 1160}} locale={{emptyText: '暂无 PR 测试记录'}} columns={[
       {title: 'PR', width: 280, render: (_,row) => <Typography.Link href={row.url} target="_blank" rel="noreferrer">#{row.number} {row.title}</Typography.Link>},
@@ -75,7 +77,7 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
       {title: '合并', width: 122, render: (_,row) => row.merge_blocked ?
         <Tag color="error" title="Draft 已解除，但与当前 preview 存在冲突，MacCI/自动合并将暂停">存在冲突 · 待修复</Tag> :
         <Tag color={row.merge_state === 'merged' ? 'success' : 'default'}>{mergeLabels[row.merge_state]}</Tag>},
-      {title: '操作', width: 126, render: (_,row) => row.merge_state === 'draft' ?
+      {title: '操作', width: 126, render: (_,row) => data.can_release_draft && row.merge_state === 'draft' ?
         releasedNumbers.includes(row.number) ? <Tag color="processing">已解除 · 待同步</Tag> :
         <Button size="small" disabled={data.stale} title={data.stale ? '同步已过期，请刷新' : '确认后交由 MacCI 自动处理'}
           onClick={() => { setReleaseError(null); setReleaseNumber(row.number) }}>解除 Draft</Button> : '—'},
@@ -135,7 +137,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft 
         dataSource={data?.tasks ?? []}
         scroll={{ x: 920 }}
         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={
-          data?.synced_at ? '暂无登记的开发任务' : '暂无同步记录'
+          data?.synced_at ? 'GitHub 暂无可显示的独立开发 Issue' : '暂无同步记录'
         } /> }}
         columns={[
           { title: '任务', dataIndex: 'title', width: 300, render: (title: string, task: DevelopmentTask) =>
