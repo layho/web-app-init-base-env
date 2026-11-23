@@ -163,3 +163,73 @@ class ApplicationCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApplicationMergeReceiptTests(unittest.TestCase):
+    def test_merge_receipt_is_private_and_never_claims_deployment(self):
+        import tempfile
+        from pathlib import Path
+        import stat
+        with tempfile.TemporaryDirectory() as temporary, patch.object(m, "ROOT", Path(temporary)):
+            file = m.merge_receipt(REPO, 7, HEAD, BASE, MERGE, TREE)
+            record = json.loads(file.read_text())
+            self.assertEqual(record["merge_state"], "github_main_verified")
+            self.assertEqual(record["deployment_state"], "unverified")
+            self.assertEqual(record["head_sha"], HEAD)
+            self.assertEqual(record["previous_main_sha"], BASE)
+            self.assertEqual(record["merged_main_sha"], MERGE)
+            self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(file.parent.stat().st_mode), 0o700)
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                m.merge_receipt(REPO, 7, HEAD, BASE, MERGE, TREE)
+
+    def test_receipt_rejects_untrusted_repo_and_bad_sha(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as temporary, patch.object(m, "ROOT", Path(temporary)):
+            with self.assertRaisesRegex(ValueError, "Invalid merge receipt"):
+                m.merge_receipt("layho/untrusted", 7, HEAD, BASE, MERGE, TREE)
+            with self.assertRaisesRegex(ValueError, "Invalid merge receipt"):
+                m.merge_receipt(REPO, 7, "unverified", BASE, MERGE, TREE)
+            self.assertFalse((Path(temporary) / "app-main-receipts").exists())
+
+    def test_dry_run_writes_no_merge_receipts(self):
+        import tempfile
+        from pathlib import Path
+        def git(folder, *args):
+            if args[:2] == ("show", "-s"):
+                return f"{MERGE} {BASE} {HEAD}" if any("%H %P" in x for x in args) else TREE
+            if args[:1] == ("rev-parse",):
+                return BASE
+            return ""
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(m, "ROOT", Path(temporary)), \
+             patch.object(m, "authorized", return_value=(HEAD, BASE, MERGE, TREE)), \
+             patch.object(m.base, "git", side_effect=git):
+            self.assertTrue(m.merge_one("token", REPO, 7, dry_run=True))
+            self.assertFalse((Path(temporary) / "app-main-receipts").exists())
+
+
+    def test_receipt_written_only_after_exact_remote_main_confirmed(self):
+        calls = []
+        def git(folder, *args):
+            calls.append(args)
+            if args[:2] == ("show", "-s"):
+                return f"{MERGE} {BASE} {HEAD}" if any("%H %P" in x for x in args) else TREE
+            if args[:1] == ("rev-parse",):
+                return BASE
+            return ""
+        with patch.object(m, "authorized", return_value=(HEAD, BASE, MERGE, TREE)), \
+             patch.object(m.base, "git", side_effect=git), \
+             patch.object(m, "api", return_value={"commit": {"sha": MERGE}}), \
+             patch.object(m, "merge_receipt") as receipt:
+            self.assertTrue(m.merge_one("token", REPO, 7))
+            receipt.assert_called_once_with(REPO, 7, HEAD, BASE, MERGE, TREE)
+            self.assertTrue(any(x[0] == "push" for x in calls))
+
+        with patch.object(m, "authorized", return_value=(HEAD, BASE, MERGE, TREE)), \
+             patch.object(m.base, "git", side_effect=git), \
+             patch.object(m, "api", return_value={"commit": {"sha": BASE}}), \
+             patch.object(m, "merge_receipt") as receipt:
+            self.assertFalse(m.merge_one("token", REPO, 7))
+            receipt.assert_not_called()
