@@ -7,6 +7,7 @@ A, B, H = "a" * 40, "b" * 40, "c" * 40
 def target_pr():
     return {
         "state": "open", "draft": True, "author_association": "OWNER",
+        "title": "fix: reusable draft safety control",
         "user": {"login": "layho"}, "node_id": "PR_example",
         "mergeable": True, "mergeable_state": "clean",
         "base": {"ref": "preview", "repo": {"full_name": d.REPO}},
@@ -129,7 +130,7 @@ def test_graphql_permission_denial_does_not_claim_success(monkeypatch):
                 def read(self, *args): return b'{"errors":[{"message":"Resource not accessible by personal access token"}]}'
             return Resp()
     monkeypatch.setattr(d, "build_opener", lambda *args: FakeOpener())
-    with pytest.raises(d.DraftReleaseError, match="Pull requests"):
+    with pytest.raises(d.DraftReleaseError, match="GH-GQL-FORBIDDEN"):
         d.mark_ready("PR_abc123")
 
 
