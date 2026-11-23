@@ -32,6 +32,7 @@ class ApplicationMainTests(unittest.TestCase):
     def test_allowlist_never_includes_foundation(self):
         self.assertIn(REPO, m.ALLOWED)
         self.assertNotIn("layho/web-app-init-base-env", m.ALLOWED)
+        self.assertNotIn("layho/xiongzhan-ti-hunter", m.ALLOWED)
         self.assertNotIn("layho/untrusted", m.ALLOWED)
         self.assertFalse(m.eligible("layho/untrusted", pr()))
 
