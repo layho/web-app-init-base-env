@@ -29,7 +29,7 @@ def parse_issue(issue: dict, repository: str, comments: list[dict] | None = None
     owner = ", ".join(u["login"] for u in assignees if isinstance(u, dict) and isinstance(u.get("login"), str))[:160]
     # GitHub's comment author is often the same service account for every AI
     # worker. Derive the displayed owner ONLY from a trusted structured claim.
-    claim, claimed_at = None, None
+    claim, claimed_at, started_at = None, None, None
     trusted_agents = {"Codex", "Grok", "Claude", "DeepSeek", "Qwen"}
     for comment in comments or []:
         if not isinstance(comment, dict) or (comment.get("user") or {}).get("login") != "layho":
@@ -37,17 +37,19 @@ def parse_issue(issue: dict, repository: str, comments: list[dict] | None = None
         raw = comment.get("body") or ""
         if not isinstance(raw, str) or not raw.startswith("[APP_PROGRESS] "):
             continue
-        fields = dict(re.findall(r"(?m)^([a-z_]+)=([^\\r\\n]{1,160})$", raw))
+        fields = dict(re.findall(r"(?m)^([a-z_]+)=([^\r\n]{1,160})$", raw))
         agent = fields.get("agent")
         if (agent in trusted_agents and fields.get("issue") == str(number)
                 and fields.get("status") in {"claimed", "in_progress", "completed"}
                 and isinstance(comment.get("created_at"), str)):
             claim, claimed_at = agent, comment["created_at"]
+            if fields.get("status") == "in_progress":
+                started_at = comment["created_at"]
     if claim:
         owner = claim
     return {
         "linked_prs": linked, "owner": owner or "未指定",
-        "claimed_at": claimed_at, "development_started_at": claimed_at if claim else None,
+        "claimed_at": claimed_at, "development_started_at": started_at,
         "agent": claim,
         "number": number,
         "title": issue["title"],
