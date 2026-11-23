@@ -141,3 +141,56 @@ upgrade. The scheduler is a separate installed copy. Only the next
 *real host tick* can prove whether the blocked list becomes empty and
 an actual Panel base-upgrade PR is created. Do not mark Panel as deployed
 on the basis of planning or a PR alone.
+
+
+## v0.1.34: once-enabled host scheduler runtime auto-updates
+
+Historically the foundation source can release new versions while the Mac mini
+scheduler keeps running its *older copied Python modules*, forcing a separate
+host installation on every release. An opt-in runtime updater now addresses
+this recurring gap. It is **disabled by default** and does not install itself
+on merging a GitHub PR.
+
+For the **one-time** opt-in, after v0.1.34 has passed precise MacCI tests,
+preview runtime validation, human acceptance and official main publication,
+use a clean exact-main checkout on the Mac mini:
+
+```sh
+SHA="$(git rev-parse HEAD)"
+bash deploy/app-init/install-upgrade-scheduler.sh \
+  --sha "$SHA" \
+  --check-repo layho/macmini-office-app-panel
+bash deploy/app-init/install-upgrade-scheduler.sh \
+  --sha "$SHA" \
+  --check-repo layho/macmini-office-app-panel \
+  --apply --upgrade --enable-auto-runtime
+```
+
+This preserves the existing user LaunchAgent, registry, dedicated GitHub token
+and all application files. The opt-in writes two private 0600 controls:
+\`runtime-installed-sha\` and \`runtime-auto-update.enabled\` in the existing
+0700 scheduler root. The installer refuses unsafe existing controls.
+
+Once opted in, a scheduled tick runs a bounded updater *before* acquiring its
+own tick lock. It fetches the current official foundation main SHA; if already
+installed it does nothing. For a new version, it requires an exact matching
+closed, owner-authored and owner-closed \`[BASE-ACCEPTANCE <SHA>]\` issue whose
+\`[BASE_ACCEPTANCE]\` JSON identifies the same immutable tested merge and
+valid original test/tree SHAs. It then obtains a fresh main checkout and runs
+the existing reviewed installer with \`--apply --upgrade\`. That installer
+re-verifies the exact current official main, GitHub SSH/REST access, and
+regression tests, holds the existing tick lock, backs up the old host runtime
+and updates only the approved scheduler modules. Failures do not merge app PRs
+or change an unaccepted runtime; the normal app upgrade tick continues.
+
+A one-time enabling action is intentional: it gives the administrator control
+over whether a Mac mini will execute future accepted official main code. The
+feature does not bypass review, grant additional token permissions, publish
+Panel main, or certify the public running application SHA. If the configured
+token cannot read the private foundation acceptance issues, the updater must
+remain blocked instead of weakening the acceptance check.
+
+This opt-in mechanism is additive; existing registrations and the original
+five-minute app PR scan remain unchanged. Never manually edit the controls to
+fake a successful update. A fresh acceptance release and observed host runtime
+SHA are required to verify an actual self-update.
