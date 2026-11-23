@@ -84,7 +84,7 @@ def host_identity(content):
     lines = content.decode("utf-8", "strict").splitlines()
     values = {}
     for key in HOST_IDENTITY_KEYS:
-        matches = [line for line in lines if re.fullmatch(r"\\s*" + key + r"=[^\\r\\n]+", line)]
+        matches = [line for line in lines if re.fullmatch(r"\s*" + key + r"=[^\r\n]+", line)]
         if len(matches) != 1:
             return None
         values[key] = matches[0].split("=", 1)[1].strip()
@@ -99,7 +99,7 @@ def resolve_host_script(path, old, new, current):
     """
     if path not in SAFE_HOST_MERGE or old is None or new is None or current is None:
         return None
-    if any(b"\\0" in data for data in (old, new, current)):
+    if any(b"\0" in data for data in (old, new, current)):
         return None
     try:
         original = host_identity(current)
