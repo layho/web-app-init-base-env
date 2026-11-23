@@ -124,3 +124,42 @@ def test_acceptance_readiness_fails_closed_when_github_unreachable(github, monke
         {"code": "update_ok", "sha": RUNNING}
     ])
     assert not gate["ready"]
+
+
+def test_release_page_reports_new_preview_after_previous_sha_was_published(github, monkeypatch):
+    from fastapi import Response
+    from app import main
+
+    refs, _, _, _ = github
+    refs.update(main=RUNNING, preview=HEAD)
+    monkeypatch.setattr(acceptance, "load_receipt", lambda sha: {"issue": 55})
+    monkeypatch.setattr(main.operations, "recent_operations", lambda *a, **kw: [
+        {"code": "update_ok", "sha": RUNNING}])
+    monkeypatch.setattr(main, "deployment_block_reason", lambda sha: "")
+    gate = main.release_notes(Response())["acceptance"]
+    assert gate["state"] == "published"
+    assert gate["preview_sha"] == HEAD
+    assert not gate["ready"]
+    assert "旧版" in gate["reason"]
+
+
+def test_active_deployment_overrides_previous_success(github, monkeypatch, tmp_path):
+    from fastapi import HTTPException, Response
+    from unittest.mock import Mock
+    from app import main
+
+    log = tmp_path / "logs" / "operations.tsv"
+    log.parent.mkdir()
+    log.write_text(f"2026-11-22T13:16:03Z\tupdate_ok\t{RUNNING}\n")
+    monkeypatch.setattr(main.operations, "OPERATIONS_LOG", log)
+    (tmp_path / ".webapp-deploy.lock").mkdir()
+    gate = main.release_notes(Response())["acceptance"]
+    assert not gate["ready"]
+    assert "部署请求尚未完成" in gate["reason"]
+    monkeypatch.setattr(main.auth, "authorize_session", lambda *args: None)
+    request = Mock(headers={"origin": "https://base.layho.com"})
+    with pytest.raises(HTTPException) as error:
+        main.accept_release(main.ReleaseAcceptanceIn(sha=RUNNING, version=main.app.version),
+                            request, Response(), None)
+    assert error.value.status_code == 409
+    assert not github[2]
