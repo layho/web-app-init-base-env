@@ -1,4 +1,4 @@
-"""Base-only manual PR actions through the already trusted MacCI workers.
+"""Shared, instance-scoped manual PR actions through the already trusted MacCI workers.
 
 No direct merges, deployments, arbitrary commands, user-supplied repositories,
 or web-facing GitHub tokens. A 202 response means triggered, not succeeded.
@@ -20,6 +20,8 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 ROOT = Path.home() / ".local/share/macmini-pr-tests"
 TEST_RUNNER = ROOT / "runner.py"
 MERGE_LABEL = "com.layho.macci-preview-merge"
+APP_MERGE_LABEL = "com.layho.macci-app-main-panel"
+APP_MAIN_PUBLISHERS = frozenset({"layho/macmini-office-app-panel"})
 CONTEXT = "macmini/isolated-tests-v1"
 
 
@@ -27,15 +29,30 @@ class ManualActionError(Exception):
     pass
 
 
+def action_scope():
+    """Server-trusted installation, never user-selected repo or branch."""
+    scope = pr_tracking.target()
+    if (scope == (REPO, "preview") and os.getenv("APP_BASE_PREVIEW") == "1"
+            and os.getenv("APP_PUBLIC_ORIGIN") == "https://base.layho.com"):
+        return scope
+    if (scope and scope[0] in APP_MAIN_PUBLISHERS and scope[1] == "main"
+            and os.getenv("APP_BASE_PREVIEW") != "1"):
+        return scope
+    return None
+
+
 def configured():
-    return (pr_tracking.target() == (REPO, "preview")
-            and os.getenv("APP_BASE_PREVIEW") == "1"
-            and os.getenv("APP_PUBLIC_ORIGIN") == "https://base.layho.com")
+    return action_scope() is not None
 
 
 def api(path):
+    scope = action_scope()
+    if scope is None:
+        raise ManualActionError("当前应用没有经过授权的本机 MacCI 协调器")
     try:
-        return release_acceptance.api(path)
+        if scope == (REPO, "preview"):
+            return release_acceptance.api(path)
+        return release_acceptance.github("/repos/" + scope[0] + path)
     except (release_acceptance.AcceptanceError, KeyError, ValueError, TypeError):
         raise ManualActionError("暂时无法读取 GitHub 最新状态，操作未执行") from None
 
@@ -46,12 +63,13 @@ def current_pr(number, head, base):
     if (type(number) is not int or not 1 <= number <= 1000000
             or not all(isinstance(x, str) and SHA.fullmatch(x) for x in (head, base))):
         raise ManualActionError("PR 参数无效，请刷新页面")
-    branch = api("/branches/preview")["commit"]["sha"]
+    repo, branch_name = action_scope()
+    branch = api("/branches/" + branch_name)["commit"]["sha"]
     pr = api(f"/pulls/{number}")
     if branch != base or pr.get("head", {}).get("sha") != head:
         raise ManualActionError("代码或目标版本已变化，请刷新后重试")
-    if (pr.get("state") != "open" or pr.get("base", {}).get("ref") != "preview"
-            or (pr.get("head", {}).get("repo") or {}).get("full_name") != REPO
+    if (pr.get("state") != "open" or pr.get("base", {}).get("ref") != branch_name
+            or (pr.get("head", {}).get("repo") or {}).get("full_name") != repo
             or pr.get("user", {}).get("login") != "layho"):
         raise ManualActionError("PR 状态或所属仓库不符合安全要求")
     if pr.get("mergeable") is not True or pr.get("mergeable_state") not in {"clean", "unstable"}:
@@ -103,10 +121,11 @@ def runner_supports_lock_handoff(path):
 
 def request_test(number, head, base):
     _, merge = current_pr(number, head, base)
+    repo, _ = action_scope()
     trusted_runner(TEST_RUNNER)
     handoff = runner_supports_lock_handoff(TEST_RUNNER)
     lockfile = ROOT / "worker.lock"
-    command = [sys.executable, str(TEST_RUNNER), "--repo", REPO,
+    command = [sys.executable, str(TEST_RUNNER), "--repo", repo,
                "--pr", str(number), "--force"]
     spawn_options = {
         "stdin": subprocess.DEVNULL, "start_new_session": True, "close_fds": True,
@@ -159,15 +178,19 @@ def request_merge(number, head, base):
     if (not isinstance(status, dict) or status.get("state") != "success"
             or status.get("description") != f"base={base} merge={merge} passed"):
         raise ManualActionError("最新版本的 MacCI 尚未通过，不能合并")
-    # The authorized coordinator still checks review comments, ancestor
-    # dependencies, exact test tree and freeze before making any git push.
-    # Guard the freeze before signalling to give users actionable feedback.
-    main = api("/branches/main")["commit"]["sha"]
-    if main != base:
-        raise ManualActionError("当前候选版本尚未完成正式验收，合并已冻结")
+    # The independent host worker always rechecks exact candidate, MacCI,
+    # OWNER review and expected main/preview before any non-force push.
+    scope = action_scope()
+    if scope == (REPO, "preview"):
+        main = api("/branches/main")["commit"]["sha"]
+        if main != base:
+            raise ManualActionError("当前候选版本尚未完成正式验收，合并已冻结")
+        label = MERGE_LABEL
+    else:
+        label = APP_MERGE_LABEL
     try:
         subprocess.run(["/bin/launchctl", "kickstart",
-                        f"gui/{os.getuid()}/{MERGE_LABEL}"],
+                        f"gui/{os.getuid()}/{label}"],
                        check=True, timeout=6, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
@@ -175,4 +198,4 @@ def request_merge(number, head, base):
     return {"accepted": True, "action": "merge-check", "number": number,
             "head": head, "base": base,
             "requested_at": datetime.now(timezone.utc).isoformat(),
-            "message": "已唤醒安全合并程序，仍须核验审查授权、冻结状态和实际合并回执"}
+            "message": "已唤醒实例专属安全合并程序，仍须核验 OWNER 审查和实际合并回执"}
