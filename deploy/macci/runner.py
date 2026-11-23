@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import tarfile
 import time
 from tempfile import TemporaryDirectory
