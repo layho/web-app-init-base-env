@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import admin_settings, auth, development_tasks, feedback_progress, foundation_version, operations, pr_tracking, pr_conflict_controls, release_acceptance, pr_draft_controls
+from . import admin_settings, auth, development_tasks, feedback_progress, feedback_delivery, foundation_version, operations, pr_tracking, pr_conflict_controls, release_acceptance, pr_draft_controls
 from .db import get_db
 from .models import UserFeedback
 
@@ -111,7 +111,15 @@ def list_feedback(response: Response, db: Session = Depends(get_db)):
     response.headers["Cache-Control"] = "no-store"
     rows = db.scalars(select(UserFeedback).order_by(UserFeedback.id.desc()).limit(100)).all()
     progress = feedback_progress.load_cache()
-    return [{"id": x.id, "category": x.category, "message": x.message, "status": x.status,
+    pr_cache = pr_tracking.snapshot() if pr_tracking.enabled() else {"prs": []}
+    prs = pr_cache.get("prs", []) if not pr_cache.get("stale") else []
+    return [{"delivery": feedback_delivery.timeline({
+                 "created_at": x.created_at.isoformat() if x.created_at else None,
+                 "synced_at": x.synced_at.isoformat() if x.synced_at else None,
+                 "github_issue_number": x.github_issue_number,
+                 **feedback_progress.feedback_details(progress, x.id, x.github_issue_number)
+             }, prs),
+             "id": x.id, "category": x.category, "message": x.message, "status": x.status,
              "github_issue_number": x.github_issue_number,
              "created_at": x.created_at.isoformat() if x.created_at else None,
              "synced_at": x.synced_at.isoformat() if x.synced_at else None,
