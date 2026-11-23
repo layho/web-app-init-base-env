@@ -149,3 +149,34 @@ def test_macci_success_not_merge_deployment_or_acceptance():
     progress = delivery.timeline(row, [pr])
     for key in ("merged", "deployed", "accepted"):
         assert next(x for x in progress["steps"] if x["key"] == key)["state"] == "pending"
+
+
+def test_issue_shows_all_explicit_related_prs_but_keeps_primary_sha_gate():
+    row = {**BASE, "github_issue_number": 1, "developer_pr": 3}
+    prs = [
+        {"number": 3, "head": SHA, "linked_issues": [1],
+         "test": {"state": "success", "finished_at": "2026-11-23T01:10:00+00:00"},
+         "merge_state": "draft"},
+        {"number": 4, "head": "b" * 40, "linked_issues": [1, 2],
+         "test": {"state": "unknown"}, "merge_state": "draft"},
+        {"number": 5, "head": "c" * 40, "linked_issues": [2],
+         "test": {"state": "success"}, "merge_state": "merged"},
+    ]
+    result = delivery.timeline(row, prs)
+    assert [p["number"] for p in result["evidence"]["related_prs"]] == [3, 4]
+    assert result["evidence"]["pr"] == 3
+    assert result["evidence"]["related_prs"][1]["test_state"] == "unknown"
+    assert result["steps"][5]["state"] == "complete"
+    assert result["steps"][6]["state"] == "pending"
+
+
+def test_related_pr_never_substitutes_for_primary_sha_test():
+    row = {**BASE, "github_issue_number": 1, "developer_pr": 3}
+    prs = [{"number": 4, "head": "b" * 40, "linked_issues": [1],
+            "test": {"state": "success", "finished_at": "2026-11-23T01:10:00+00:00"},
+            "merge_state": "merged"}]
+    result = delivery.timeline(row, prs)
+    assert result["evidence"]["pr"] is None
+    assert [p["number"] for p in result["evidence"]["related_prs"]] == [4]
+    assert result["steps"][5]["state"] == "pending"
+    assert result["steps"][6]["state"] == "pending"
