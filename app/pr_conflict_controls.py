@@ -2,7 +2,7 @@
 import re
 from . import pr_tracking, release_acceptance
 
-SHA = re.compile(r"[0-9a-f]{40}\\Z")
+SHA = re.compile(r"[0-9a-f]{40}\Z")
 MARKER = "[PR-CONFLICT #{number}]"
 
 class ConflictError(Exception):
