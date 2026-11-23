@@ -69,6 +69,8 @@ def test_collect_normal_app_prs_exact_main_without_cross_repo():
     calls = []
     def github(method, path, data=None):
         calls.append(path)
+        if path.endswith("/branches/main"):
+            return {"commit": {"sha": B}}
         if "/pulls?" in path:
             return [
                 {"number": 9, "title": "Panel fix", "state": "open",
@@ -80,6 +82,17 @@ def test_collect_normal_app_prs_exact_main_without_cross_repo():
                  "head": {"sha": H, "repo": {"full_name": repo}},
                  "draft": False, "merged_at": None, "merge_commit_sha": None},
             ]
+        if path.endswith("/pulls/9"):
+            return {"number": 9, "title": "Panel fix", "state": "open",
+                    "base": {"ref": "main", "sha": B},
+                    "head": {"sha": H, "repo": {"full_name": repo}},
+                    "draft": False, "merged_at": None, "merge_commit_sha": None,
+                    "mergeable": True, "mergeable_state": "clean"}
+        if path.endswith("/pulls/10"):
+            return {"number": 10, "title": "Other branch", "state": "open",
+                    "base": {"ref": "preview", "sha": B},
+                    "head": {"sha": H, "repo": {"full_name": repo}},
+                    "draft": False, "merged_at": None, "merge_commit_sha": None}
         if path.endswith("/statuses?per_page=100"):
             return [status("success", "2026-11-22T03:15:20Z")]
         raise AssertionError(path)
@@ -109,3 +122,36 @@ def test_repository_validation_blocks_relative_segments():
         assert p.valid_repository(bad) is False, bad
     for good in ("layho/web-app-init-base-env", "layho/macmini-office-app-panel", "owner/.github"):
         assert p.valid_repository(good) is True, good
+
+
+def test_dirty_draft_is_blocked_even_when_old_macci_was_successful():
+    repo = "layho/web-app-init-base-env"
+    new_base = "d" * 40
+    calls = []
+    def github(method, path, data=None):
+        calls.append(path)
+        if path.endswith("/branches/preview"):
+            return {"commit": {"sha": new_base}}
+        if "/pulls?state=all" in path:
+            return [{"number": 71, "state": "open"}]
+        if path.endswith("/pulls/71"):
+            return {"number":71, "title":"PR conflict", "state":"open", "draft":True,
+                    "mergeable":False, "mergeable_state":"dirty", "changed_files":1,
+                    "base":{"ref":"preview", "sha": B},
+                    "head":{"sha":H,"repo":{"full_name":repo}}}
+        if "/pulls/71/files?" in path:
+            return [{"filename":"app/main.py"}]
+        if "/statuses?" in path:
+            return [status("success", "2026-11-23T02:53:43Z", base=B)]
+        raise AssertionError(path)
+    rows = p.collect(github, repo, "preview")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["merge_state"] == "draft"
+    assert row["merge_blocked"] is True
+    assert row["conflict"]["blocked"] is True
+    assert row["conflict"]["base_sha"] == new_base
+    assert row["conflict"]["candidate_files"] == ["app/main.py"]
+    assert row["base"] == new_base
+    assert row["test"]["state"] == "unknown"
+    assert "/repos/" + repo + "/pulls/71" in calls
