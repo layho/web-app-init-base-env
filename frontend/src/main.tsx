@@ -127,7 +127,29 @@ function App() {
         : '已唤醒安全合并检查，请刷新查看实际合并结果；尚不代表合并完成。'})
       await loadOperations('tasks')
     } catch (error) {
-      setManualPrResult({type:'error',text:error instanceof Error ? error.message : '操作失败，请刷新后重试'})
+      if (error instanceof TypeError) {
+        // Fetch rejected before an HTTP response was available. This does not
+        // prove that the server did not receive the POST: never auto-retry.
+        let diagnostic = '同源 API 连通性未确认'
+        try {
+          const probe = await fetch('/api/version', {
+            method: 'GET', credentials: 'same-origin', cache: 'no-store',
+            signal: AbortSignal.timeout(6000),
+          })
+          diagnostic = probe.ok
+            ? 'GET /api/version 正常；POST 请求链路、代理或连接可能中断'
+            : 'GET /api/version 返回 HTTP ' + probe.status
+        } catch {
+          diagnostic = 'GET /api/version 也无法连接；请检查本机 DNS、Cloudflare Tunnel 或网络'
+        }
+        setManualPrResult({type:'error',text:
+          '立即执行请求未取得 HTTP 回执（' + diagnostic + '）。无法确认测试是否已经受理，' +
+          '请先刷新 MacCI 状态，避免重复提交；若仍无记录，再检查浏览器 Network 中 ' +
+          (action === 'test' ? 'POST /api/v1/pr-actions/test' : 'POST /api/v1/pr-actions/merge-check') +
+          ' 的实际错误。'})
+      } else {
+        setManualPrResult({type:'error',text:error instanceof Error ? error.message : '操作失败，请刷新后重试'})
+      }
     } finally {setManualPrBusy(false)}
   }
   const [systemLogs, setSystemLogs] = useState<SystemLogs | null>(null)
