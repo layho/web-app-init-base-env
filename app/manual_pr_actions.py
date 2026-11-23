@@ -95,7 +95,8 @@ def runner_supports_lock_handoff(path):
         info = path.stat()
         if info.st_size > 512 * 1024:
             return False
-        return "LOCK_HANDOFF_PROTOCOL = 1" in path.read_text(encoding="utf-8")
+        return re.search(r"(?m)^LOCK_HANDOFF_PROTOCOL = 1(?:[ \t]*#.*)?$",
+                         path.read_text(encoding="utf-8")) is not None
     except (OSError, UnicodeError):
         return False
 
