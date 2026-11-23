@@ -13,14 +13,14 @@ def parse_issue(issue: dict, repository: str) -> dict | None:
         return None
     body = issue.get("body") or ""
     section = re.search(r"^## 开发进度[ \t]*\r?\n([\s\S]*?)(?=^#{1,2} |\Z)", body, re.MULTILINE)
-    if not section:
-        return None
-    progress = section[1]
+    # All genuine issues are visible in the task list. The structured
+    # progress block is optional; absent evidence must not imply development.
+    progress = section[1] if section else ""
     status = re.search(r"^状态[：:]\s*(待开发|开发中|待验收|受阻|已完成)[ \t]*\r?$", progress, re.MULTILINE)
     note = re.search(r"^更新说明[：:][ \t]*([^\r\n]+)", progress, re.MULTILINE)
     checks = re.findall(r"^[ \t]*[-*] \[([ xX])\][ \t]+\S", progress, re.MULTILINE)
     number = issue["number"]
-    state = status[1] if status else "未标记"
+    state = status[1] if status else "未记录开发状态"
     if issue.get("state") == "closed":
         state = "已完成" if issue.get("state_reason") == "completed" else "已关闭"
     return {
