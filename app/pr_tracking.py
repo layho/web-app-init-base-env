@@ -23,6 +23,13 @@ PHASES = {"pending", "passed", "setup-failed", "fetch-failed", "context-failed",
 COUNT = re.compile(r"(\d+) (passed|failed|skipped|errors?|xfailed|xpassed|deselected|warnings?)")
 
 
+def valid_repository(repo):
+    """Reject relative/dot GitHub repository segments before using a repo ref."""
+    return (isinstance(repo, str) and len(repo) <= 200
+            and REPOSITORY.fullmatch(repo) is not None
+            and all(segment not in {".", ".."} for segment in repo.split("/")))
+
+
 def target():
     """Resolve only the current installation's own repository.
 
@@ -36,7 +43,7 @@ def target():
         obj = json.loads(METADATA.read_text(encoding="utf-8"))
         repo, domain = obj["repository"], obj["domain"]
         if (not isinstance(obj, dict) or not isinstance(repo, str)
-                or not REPOSITORY.fullmatch(repo) or not isinstance(domain, str)
+                or not valid_repository(repo) or not isinstance(domain, str)
                 or not re.fullmatch(r"[a-z0-9.-]{3,253}", domain)
                 or os.getenv("APP_PUBLIC_ORIGIN") != "https://" + domain):
             return None
@@ -97,7 +104,7 @@ def log_summary(number, head, base, test, repo=None):
     if test.get("state") not in {"success", "failure"} or not test.get("started_at") or not test.get("finished_at"):
         return None
     repo = repo or REPO
-    if not isinstance(repo, str) or not REPOSITORY.fullmatch(repo):
+    if not valid_repository(repo):
         return None
     path = LOG_ROOT / f"{repo.replace('/', '--')}-{number}-{head[:12]}-{base[:12]}.log"
     try:
@@ -134,7 +141,7 @@ def log_summary(number, head, base, test, repo=None):
 
 def collect(github, repo=None, branch=None):
     current = target() if repo is None else (repo, branch or "main")
-    if current is None or not REPOSITORY.fullmatch(current[0]):
+    if current is None or not valid_repository(current[0]):
         raise ValueError("No verified application repository")
     repo, branch = current
     prefix = "/repos/" + repo
