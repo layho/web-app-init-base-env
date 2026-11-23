@@ -204,6 +204,10 @@ def list_development_tasks(response: Response):
     result = development_tasks.snapshot()
     if pr_tracking.enabled():
         result["pr_tracking"] = pr_tracking.snapshot()
+        result["tasks"] = development_tasks.unified_tasks(
+            result.get("tasks", []), result["pr_tracking"])
+        result["unified"] = True
+        result["stale"] = result["stale"] or result["pr_tracking"].get("stale", True)
     return result
 
 
