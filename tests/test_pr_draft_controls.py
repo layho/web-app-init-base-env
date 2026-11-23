@@ -190,3 +190,23 @@ def test_non_release_prs_unaffected_by_version_gate(github, monkeypatch):
     pr["title"] = "fix: prevent old sha acceptance"
     monkeypatch.setattr(d, "published_version", lambda: None)
     assert d.release(54, H)["released"]
+
+
+def test_missing_dedicated_pr_token_never_falls_back_to_feedback(monkeypatch):
+    monkeypatch.delenv("APP_GITHUB_PR_TOKEN", raising=False)
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "issues-token")
+    invoked = []
+    monkeypatch.setattr(d, "build_opener", lambda *args: invoked.append(args))
+    with pytest.raises(d.DraftReleaseError, match="GH-PR-TOKEN-MISSING"):
+        d.mark_ready("PR_abc123")
+    assert not invoked
+
+
+def test_same_feedback_and_pr_token_rejected_before_network(monkeypatch):
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "shared-token")
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "shared-token")
+    invoked = []
+    monkeypatch.setattr(d, "build_opener", lambda *args: invoked.append(args))
+    with pytest.raises(d.DraftReleaseError, match="GH-PR-TOKEN-SHARED"):
+        d.mark_ready("PR_abc123")
+    assert not invoked
