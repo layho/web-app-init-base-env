@@ -181,3 +181,24 @@ def test_head_status_diagnostic_rejects_untrusted_contexts_and_bad_timestamps():
         {"context": p.CONTEXT, "state": "success", "created_at": "not-a-date"},
     ]
     assert p.head_status_diagnostic(statuses) == {"state": "unknown", "at": None}
+
+
+def test_explicit_refresh_bypasses_five_minute_pr_tracking_cache(monkeypatch, tmp_path):
+    import json
+    monkeypatch.setattr(p, "CACHE", tmp_path / "pr-tracking.json")
+    monkeypatch.setattr(p, "target", lambda: ("layho/macmini-office-app-panel", "main"))
+    from datetime import datetime, timezone
+    initial = {"synced_at": datetime.now(timezone.utc).isoformat(),
+               "repository": "layho/macmini-office-app-panel", "branch": "main",
+               "prs": [{"number": 5, "merge_state": "draft"}]}
+    p.CACHE.write_text(json.dumps(initial))
+    calls = []
+    monkeypatch.setattr(p, "collect",
+                        lambda github, repo, branch: calls.append((repo, branch))
+                        or [{"number": 5, "merge_state": "merged"}])
+    p.sync(lambda method, path: None)
+    assert calls == []
+    p.sync(lambda method, path: None, force=True)
+    assert calls == [("layho/macmini-office-app-panel", "main")]
+    saved = json.loads(p.CACHE.read_text())
+    assert saved["prs"][0]["merge_state"] == "merged"

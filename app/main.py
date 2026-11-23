@@ -199,11 +199,24 @@ def project_info(response: Response, refresh: bool = False):
 
 
 @app.get("/api/v1/development-tasks", dependencies=[Depends(authorize)])
-def list_development_tasks(response: Response):
+def list_development_tasks(response: Response, refresh: bool = False):
     response.headers["Cache-Control"] = "no-store"
+    if refresh and pr_tracking.enabled():
+        # Explicit UI refresh bypasses the five-minute local snapshot, but
+        # uses the trusted instance's repository and only GitHub GET reads.
+        # Never show an old snapshot as if the manual refresh succeeded.
+        try:
+            pr_tracking.sync(lambda method, path: release_acceptance.github(path),
+                             force=True)
+        except (release_acceptance.AcceptanceError, OSError, ValueError,
+                TypeError, KeyError):
+            raise HTTPException(503, "GitHub 实时同步失败；仍可查看上次同步记录") from None
     result = development_tasks.snapshot()
     if pr_tracking.enabled():
         result["pr_tracking"] = pr_tracking.snapshot()
+        # Draft authority differs by repository, but the shared manual
+        # MacCI toolbar is available to explicitly allowlisted app workers.
+        result["pr_tracking"]["manual_actions_available"] = manual_pr_actions.configured()
         result["tasks"] = development_tasks.unified_tasks(
             result.get("tasks", []), result["pr_tracking"])
         result["unified"] = True

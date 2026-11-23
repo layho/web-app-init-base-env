@@ -370,7 +370,7 @@ function App() {
     try {
       if (key === 'releases') setReleaseHistory(await api<ReleaseHistory>('/api/release-notes'))
       else if (key === 'logs') setSystemLogs(await api<SystemLogs>('/api/v1/system-logs'))
-      else if (key === 'tasks') setDevelopmentTasks(await api<TaskSnapshot>('/api/v1/development-tasks'))
+      else if (key === 'tasks') setDevelopmentTasks(await api<TaskSnapshot>(refresh ? '/api/v1/development-tasks?refresh=true' : '/api/v1/development-tasks'))
       else setProjectInfo(await api<ProjectInfo>(refresh ? '/api/v1/project-info?refresh=true' : '/api/v1/project-info'))
     } catch (error) {
       showError(error)
@@ -473,7 +473,7 @@ function App() {
         <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} />
       ) : page === 'tasks' ? (
         <Space direction="vertical" size="middle" style={{width:'100%'}}>
-          {developmentTasks?.pr_tracking?.can_release_draft && <Card title="手动立即执行 · 不必等待定时任务">
+          {developmentTasks?.pr_tracking?.manual_actions_available && <Card title="手动立即执行 · 不必等待定时任务">
             <Space wrap>
               <Select placeholder="选择要处理的 PR" style={{minWidth:250}}
                 value={manualPrNumber ?? undefined} onChange={value => {setManualPrNumber(value);setManualPrResult(null)}}
@@ -493,7 +493,7 @@ function App() {
             {manualPrResult && <Alert showIcon type={manualPrResult.type} message={manualPrResult.text} />}
           </Card>}
         <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'}
-          onRefresh={() => void loadOperations('tasks')}
+          onRefresh={() => void loadOperations('tasks', true)}
           onRequestRepair={async (number, head, base) => {
             if (!session) throw new Error('请先登录')
             const result = await api<{url: string; created: boolean}>('/api/v1/pr-conflicts/repair',

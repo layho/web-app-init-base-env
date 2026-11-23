@@ -1,5 +1,28 @@
 [
   {
+    "version": "0.1.35",
+    "title": "基座与衍生应用统一任务追踪及手动 MacCI 操作",
+    "summary": "修复衍生应用虽复用基座同样代码却因基座专属能力门禁隐藏手动立即执行的问题；将手动测试和安全合并指向当前应用受保护的独立 MacCI 服务，并支持明确刷新 GitHub 的 PR 状态，防止刚合并后仍显示待合并。",
+    "changes": [
+      "手动立即执行菜单不再与基座 preview 的 Draft 权限绑定；仅已登记并获宿主协调器白名单授权的应用可以显示入口。",
+      "Panel 手动立即测试由已授权主机 MacCI Runner 针对 layho/macmini-office-app-panel main 的精确 PR 启动，安全合并请求只唤醒应用专用协调器；所有操作仍需精确 HEAD/base/merge 与 MacCI 审核。",
+      "开发任务刷新按钮现在可以安全地重新读取 GitHub 合并状态，无需等待五分钟同步缓存；失败会明示，不将旧快照冒充实时成功。",
+      "基座和 Panel 沿用同一套 DevelopmentTasksPage、manual_pr_actions、pr_tracking；应用实例仅替换仓库、域名和服务参数，不再因基座专属开关丢失公共能力。",
+      "补充只允许授权仓库操作、不允许其他应用越权、合并需最新 MacCI 成功、刷新五分钟缓存的回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "检查当前 PR 的 MacCI HEAD/base/merge 精确 Success 和前后端构建。",
+      "preview v0.1.35 运行 SHA 与发布记录核对后人工验收发布 main。",
+      "确认安装后基座及 Panel 都展示手动立即执行区，且 Panel 操作范围固定为其自身 main，不触发基座 preview。",
+      "对刚合并的 Panel PR 执行刷新列表应从 GitHub 读到 merged，部署状态仅基于实际运行 SHA/操作回执，不能把 merged 当 deployed。",
+      "检查应用专用 Mac mini 合并协调器是否已安装；未安装时安全提示且不可宣称请求成功。"
+    ],
+    "validation_note": "本修复属于基座公共代码，实际 Panel 同步须由官方 main 的安全 base-upgrade PR 完成。应用独立合并协调器的 Mac mini 安装与实际执行需另行核验，不因菜单显示推断已安装。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
     "version": "0.1.34",
     "title": "基座调度器受控自动更新：一次启用，后续安全升级",
     "summary": "为独立运行在 Mac mini 的基座升级调度器新增默认关闭、管理员一次性启用的宿主更新机制。每轮先核验官方 main 和已关闭的 OWNER 验收单，再复用既有安装器的测试、备份、锁和 SHA 门禁；Panel 业务升级仍由独立安全 PR 流程控制。",

@@ -242,13 +242,13 @@ def collect(github, repo=None, branch=None):
     return rows
 
 
-def sync(github):
+def sync(github, *, force=False):
     current_target = target()
     if current_target is None:
         return
     current = snapshot()
     previous = instant(current.get("synced_at"))
-    if previous and (datetime.now(timezone.utc) - previous).total_seconds() < 300:
+    if not force and previous and (datetime.now(timezone.utc) - previous).total_seconds() < 300:
         return
     data = {"synced_at": datetime.now(timezone.utc).isoformat(),
             "repository": current_target[0], "branch": current_target[1],
