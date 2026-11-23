@@ -125,6 +125,54 @@ def render(root, sha, target, params, folder):
         git(root, "worktree", "remove", "--force", str(checkout))
 
 
+# These files existed in the verified v0.1.29 foundation source but its
+# initializer did not copy them. Panel's initialization completion installed
+# byte-identical copies from that immutable source. Do not treat those as
+# app-authored overlapping additions when the hashes prove provenance.
+PROVEN_TEMPLATE_ADOPTIONS = frozenset({
+    "app/admin_settings.py",
+    "app/feedback_delivery.py",
+    "app/manual_pr_actions.py",
+    "app/pr_conflict_controls.py",
+    "app/pr_draft_controls.py",
+})
+
+
+def render_proven_old_source(raw, params):
+    """Apply only the old generator's audited, literal template substitutions."""
+    source = raw.decode("utf-8", "strict")
+    for before, after in (
+        ("example/web-app", params["repository"]),
+        ("app.example.com", params["domain"]),
+        ("com.example.webapp", params["label"]),
+        (r"com\.example\.webapp", re.escape(params["label"])),
+        ("web-app-foundation-ui", params["repository"].split("/")[1].lower()),
+    ):
+        source = source.replace(before, after)
+    return source.encode("utf-8")
+
+
+def adopt_verified_template_baselines(source, old_sha, params, before, after, current):
+    """Return a new snapshot; never silently adopt modified application files.
+
+    Historical provenance has already been verified against official first
+    parent history. An omitted historical template file may be adopted only
+    when its immutable old source, re-rendered with registered application
+    parameters, is byte-for-byte identical to the tracked app main blob.
+    """
+    result = dict(before)
+    for path in sorted(PROVEN_TEMPLATE_ADOPTIONS & after.keys() & current.keys()):
+        if path in result or not planner.managed(path):
+            continue
+        try:
+            historical = render_proven_old_source(blob(source, old_sha, path), params)
+        except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
+            continue  # Unknown old source: leave a conflict for review.
+        if historical == current[path]:
+            result[path] = historical
+    return result
+
+
 def legacy_check(app, app_sha, old_generated, repository, params):
     """Adopt only a reproducible original initialization, never a guessed SHA."""
     roots = line(app, "rev-list", "--max-parents=0", app_sha).splitlines()
@@ -335,6 +383,7 @@ def coordinate(repository, legacy_base=None, create_pr=False, *, expected_target
         render(source, target_sha, new_dir, params, folder)
         before, after = planner.generated_snapshot(old_dir), planner.generated_snapshot(new_dir)
         actual, current = planner.tracked_snapshot(app, app_sha, before.keys() | after.keys())
+        before = adopt_verified_template_baselines(source, old_sha, params, before, after, current)
         decisions = planner.plan(before, after, current)
         summary = {"schema": 1, "app_sha": actual, "from": old, "target": target,
                    "legacy_verified_root": legacy_root,

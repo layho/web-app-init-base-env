@@ -82,3 +82,29 @@ A blocked file list can contain legitimate, app-specific overlap unrelated to
 the host script. For these, inspect the real file-specific diff and write a
 reviewed, narrow resolver; never add a generic "accept theirs", "accept ours",
 or partial provenance update to disguise incomplete upgrades.
+
+
+## v0.1.32: exact provenance recovery for five Panel false conflicts
+
+The v0.1.29 foundation source had five Python components that its
+\`copy_foundation\` initializer omitted from the generated-file list. The
+completed Panel initializer had nevertheless copied those files unchanged
+into its committed \`main\`. When the newer initializer began managing them,
+the three-way planner had \`old=None\`, \`new=foundation file\`, and
+\`app=existing file\`, which looked like an overlapping addition.
+
+For a fixed five-path allowlist, the coordinator now reads the **immutable**
+old foundation source (already proven to belong to official main first-parent
+history), applies only the historical app-init literal substitutions using
+the validated Panel parameters, and compares the resulting bytes with the
+tracked application \`main\` file. Only exact matches become an old baseline
+for ordinary three-way planning. A byte mismatch, absent source blob,
+unrecognized file, genuine overlapping edits, or non-regular file remains
+blocked. No guessed SHA, force push, or partial provenance metadata is used.
+
+This is a local source-planning fix; the existing Mac mini scheduler copies
+its Python modules independently and MUST be upgraded from an accepted
+foundation main release before it can apply this behavior. The scheduler
+then retries formerly blocked plans rather than permanently caching them.
+A successful code PR is **not** proof that the Panel public app has been
+upgraded or deployed.

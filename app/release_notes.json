@@ -1,5 +1,26 @@
 [
   {
+    "version": "0.1.32",
+    "title": "Office Panel 基座升级：校验旧版漏登记文件并自动恢复",
+    "summary": "修复 Panel 旧版初始化器遗漏五个基座模板文件所导致的假冲突。仅当应用 GitHub main 对应文件与已验证旧基座来源重新渲染后逐字节一致时，规划器才能自动归入基座升级范围；业务定制或未知来源仍受阻。",
+    "changes": [
+      "对五个既有 Panel 文件提供严格的历史基座来源比对：admin_settings、feedback_delivery、manual_pr_actions、pr_conflict_controls、pr_draft_controls。",
+      "只接受官方基座 first-parent 祖先 SHA 下的真实源码，按已登记的应用生成参数还原，和应用主线跟踪文件字节完全相同才自动认领。",
+      "修复旧初始化器遗漏文件导致的 overlapping add 假冲突，其他 app-owned 修改、未知文件、SQL/宿主脚本仍遵守安全冲突与验收门禁。",
+      "与 v0.1.31 的安全 Shell 三方合并、blocked 计划自动重试配合，升级调度器可在规则更新后重新生成 Panel 升级 PR。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 精确 HEAD/base/merge 检查全量 pytest 和前端构建。",
+      "preview 网站验证 v0.1.32 SHA，管理员验收发布到官方 main 后才部署独立 foundation-upgrades scheduler runtime。",
+      "Panel 真实运行调度器报告：registered/create、blocked_files、目标官方 SHA，以及生成的 base-upgrade PR；检查该 PR HEAD/base/merge MacCI 和 OWNER 门禁。",
+      "验证任何被 Panel 修改的文件不被认领或覆盖，真正冲突仍显示需人工审查而非假成功。"
+    ],
+    "validation_note": "仅对五个来源已验证且逐字节一致的旧版遗漏模板文件自动认领，不允许猜测业务自定义；Mac mini 独立调度器升级和公网 Panel 部署必须分别验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
     "version": "0.1.31",
     "title": "下游基座升级：自动解决可验证的部署脚本差异与冲突重试",
     "summary": "升级规划器对 Office Panel 部署脚本引入有约束的自动三方合并，保留应用实例身份；阻塞状态不再永久缓存，调度器在后续周期自动重试。无法安全证明的冲突仍显示具体文件并暂停。",
