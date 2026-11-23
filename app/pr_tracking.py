@@ -225,6 +225,7 @@ def collect(github, repo=None, branch=None):
         test = evidence(statuses, base) if valid_sha(base) else {"state": "unknown"}
         log = log_summary(number, head, base, test, repo)
         rows.append({"number": number, "title": str(pr.get("title", ""))[:300],
+                     "created_at": pr.get("created_at"),
                      "url": "https://github.com/" + repo + "/pull/" + str(number),
                      "owner": str((pr.get("user") or {}).get("login") or "未指定")[:100],
                      "linked_issues": explicit_issue_refs(pr.get("body")),
