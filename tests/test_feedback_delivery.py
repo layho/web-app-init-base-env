@@ -180,3 +180,20 @@ def test_related_pr_never_substitutes_for_primary_sha_test():
     assert [p["number"] for p in result["evidence"]["related_prs"]] == [4]
     assert result["steps"][5]["state"] == "pending"
     assert result["steps"][6]["state"] == "pending"
+
+
+def test_pr_creation_time_not_later_progress_comment():
+    """GitHub PR created_at is the event time, not the delayed progress reply."""
+    progress = {**BASE, "development_submitted_at": "2026-11-23T03:00:00+00:00"}
+    pr = {"number": 19, "head": SHA, "created_at": "2026-11-23T01:08:00+00:00",
+          "test": {"state": "success", "finished_at": "2026-11-23T01:10:00+00:00"},
+          "merge_state": "draft"}
+    events = {row["key"]: row for row in delivery.timeline(progress, [pr])["steps"]}
+    assert events["pr"]["at"] == "2026-11-23T01:08:00+00:00"
+    assert events["tests"]["at"] == "2026-11-23T01:10:00+00:00"
+
+
+def test_pr_created_time_falls_back_to_explicit_progress_for_old_cache():
+    pr = {"number": 19, "head": SHA, "test": {"state": "pending"}, "merge_state": "draft"}
+    events = {row["key"]: row for row in delivery.timeline(BASE, [pr])["steps"]}
+    assert events["pr"]["at"] == BASE["development_submitted_at"]
