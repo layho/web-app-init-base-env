@@ -76,6 +76,7 @@ def main():
         raise SystemExit("Preflight failed: " + (str(exc) if type(exc) is ValueError else type(exc).__name__)) from None
     run(sys.executable, "-B", str(HERE.parents[1] / "tests/test_upgrade_scheduler.py"))
     run(sys.executable, "-B", str(HERE.parents[1] / "tests/test_upgrade_auto_merge.py"))
+    run(sys.executable, "-B", str(HERE.parents[1] / "tests/test_upgrade_runtime_auto.py"))
     domain = "gui/" + str(os.getuid())
     run("launchctl", "print", domain)
     if not args.apply:
