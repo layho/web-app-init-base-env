@@ -102,3 +102,10 @@ def test_tracking_cache_never_leaks_another_application(tmp_path, monkeypatch):
                                    "repository": "layho/another-app", "branch": "main",
                                    "prs": [{"number": 1}]}))
     assert p.snapshot()["prs"] == []
+
+
+def test_repository_validation_blocks_relative_segments():
+    for bad in ("../other", "./other", "owner/..", "owner/.", "../..", "owner//repo", "owner/repo/extra", "owner/repo?x=1"):
+        assert p.valid_repository(bad) is False, bad
+    for good in ("layho/web-app-init-base-env", "layho/macmini-office-app-panel", "owner/.github"):
+        assert p.valid_repository(good) is True, good
