@@ -22,11 +22,17 @@ class DraftReleaseError(Exception):
 
 
 def github(path, payload=None):
-    # Reuse the bounded GitHub helper without exposing credentials.
+    """All Draft preflight reads and owner review writes use one GitHub token.
+
+    Both REST and GraphQL delegate credential selection to release_acceptance;
+    a full-permission credential may be reused for Issues and Pull requests.
+    """
     try:
         return release_acceptance.api(path, payload)
-    except (release_acceptance.AcceptanceError, KeyError, TypeError, ValueError):
-        raise DraftReleaseError("无法核实 GitHub 状态或权限，未解除 Draft") from None
+    except release_acceptance.AcceptanceError as exc:
+        raise DraftReleaseError(str(exc) + "；未解除 Draft") from None
+    except (KeyError, TypeError, ValueError):
+        raise DraftReleaseError("GH-REST-DATA：GitHub 状态数据不完整，未解除 Draft") from None
 
 
 def graphql_failure(errors):
@@ -82,9 +88,9 @@ def mark_ready(node_id):
         raise DraftReleaseError("PR 标识无效，不能解除 Draft")
     # Feedback tokens commonly grant Issues write but not Pull requests write.
     # A dedicated owner PR token can be supplied independently.
-    token = os.getenv("APP_GITHUB_PR_TOKEN") or os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "")
+    token = release_acceptance.github_token()
     if not token:
-        raise DraftReleaseError("未配置 GitHub PR 写入凭据，无法解除 Draft")
+        raise DraftReleaseError("GH-TOKEN-MISSING：基座服务未配置 GitHub Token，无法解除 Draft")
     data = json.dumps({
         "query": "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}",
         "variables": {"id": node_id},
