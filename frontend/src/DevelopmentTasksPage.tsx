@@ -41,39 +41,8 @@ function passRate(row: PRRecord) {
   return n > 0 ? (100 * p / n).toFixed(1) + '%' : '未记录'
 }
 function ciTag(state: string) { return <Tag color={state === 'success' ? 'success' : state === 'pending' ? 'processing' : state === 'failure' || state === 'error' ? 'error' : 'default'}>{ciLabels[state] ?? '未记录'}</Tag> }
-function PRTrackingPage({data, onReleaseDraft, onRequestRepair, onTestPR, onMergePR}: {
-  data: PRTracking
-  onReleaseDraft: (number: number, head: string) => Promise<void>
-  onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>
-  onTestPR: (number: number, head: string, base: string) => Promise<void>
-  onMergePR: (number: number, head: string, base: string) => Promise<void>
-  onTestPR: (number: number, head: string, base: string) => Promise<void>
-  onMergePR: (number: number, head: string, base: string) => Promise<void>
-}) {
+function PRTrackingPage({data, onReleaseDraft, onRequestRepair}: {data: PRTracking; onReleaseDraft: (number: number, head: string) => Promise<void>; onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>}) {
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null)
-  const [manualBusy, setManualBusy] = useState(false)
-  const [manualMessage, setManualMessage] = useState('')
-  const [manualError, setManualError] = useState('')
-  async function runManual(action: 'test' | 'merge') {
-    const row = data.prs.find(item => item.number === selectedNumber)
-    if (!row || !row.base || data.stale || manualBusy || !data.can_release_draft) return
-    setManualBusy(true)
-    setManualMessage('')
-    setManualError('')
-    try {
-      if (action === 'test') {
-        await onTestPR(row.number, row.head, row.base)
-        setManualMessage('已请求立即测试。请刷新查看新的 MacCI 回执，不代表测试已经通过。')
-      } else {
-        await onMergePR(row.number, row.head, row.base)
-        setManualMessage('已请求立即合并检查。安全检查通过后才会合并，请刷新确认。')
-      }
-    } catch (error) {
-      setManualError(error instanceof Error ? error.message : '执行请求失败，请刷新后重试')
-    } finally {
-      setManualBusy(false)
-    }
-  }
   const [repairNumber, setRepairNumber] = useState<number | null>(null)
   const [repairing, setRepairing] = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
@@ -195,16 +164,6 @@ function PRTrackingPage({data, onReleaseDraft, onRequestRepair, onTestPR, onMerg
     </Modal>
     <Drawer title={selected ? 'PR #' + selected.number + ' · 测试与发布详情' : '测试详情'} open={selectedNumber !== null} onClose={() => setSelectedNumber(null)} width="min(680px, 100vw)">
       {selected ? <Flex vertical gap="middle"><Typography.Text strong>{selected.title}</Typography.Text>
-        {data.can_release_draft && selected.merge_state !== 'merged' && selected.merge_state !== 'closed' &&
-          <Space wrap>
-            <Button size="small" loading={manualBusy} disabled={data.stale || !selected.base || selected.conflict?.blocked}
-              onClick={() => void runManual('test')}>立即测试</Button>
-            <Button size="small" type="primary" loading={manualBusy}
-              disabled={data.stale || !selected.base || selected.conflict?.blocked || selected.merge_state !== 'open' || selected.test.state !== 'success'}
-              onClick={() => void runManual('merge')}>请求安全合并</Button>
-          </Space>}
-        {manualMessage && <Alert type="info" showIcon message={manualMessage} />}
-        {manualError && <Alert type="error" showIcon message={manualError} />}
         <Descriptions bordered size="small" column={1} items={[
           {key:'status',label:'测试状态',children: selected.conflict?.blocked ? <Tag color="error">冲突阻止测试</Tag> : ciTag(selected.test.state)},
           {key:'conflict',label:'合并门禁',children:selected.conflict?.blocked ? <Button danger onClick={() => {setSelectedNumber(null);setRepairNumber(selected.number)}}>查看并处理冲突</Button> : '未确认冲突'},
@@ -229,7 +188,7 @@ function PRTrackingPage({data, onReleaseDraft, onRequestRepair, onTestPR, onMerg
   </Flex>
 }
 
-export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft, onRequestRepair, onTestPR, onMergePR }: {
+export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft, onRequestRepair }: {
   data: TaskSnapshot | null
   loading: boolean
   onRefresh: () => void
@@ -263,6 +222,6 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
       />
     </Flex>
   return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading}>刷新列表</Button>}>
-    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair} onTestPR={onTestPR} onMergePR={onMergePR}/>}]} /> : tasks}
+    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
   </Card>
 }
