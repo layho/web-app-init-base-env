@@ -1,5 +1,27 @@
 [
   {
+    "version": "0.1.31",
+    "title": "下游基座升级：自动解决可验证的部署脚本差异与冲突重试",
+    "summary": "升级规划器对 Office Panel 部署脚本引入有约束的自动三方合并，保留应用实例身份；阻塞状态不再永久缓存，调度器在后续周期自动重试。无法安全证明的冲突仍显示具体文件并暂停。",
+    "changes": [
+      "仅对受控的 deploy/macmini/manage.sh，在旧版、新版和应用现有文件均存在的前提下进行三方合并；生成结果须通过 bash -n，且保留 LABEL_PREFIX、PORT、TRACK_BRANCH、EXPECTED_ORIGIN。",
+      "其他宿主脚本、数据库迁移、新增或删除文件不允许自动重写；真实重叠编辑与身份配置改变仍标记 review，避免破坏 Office Panel 服务。",
+      "调度器不再把 blocked 状态作为终态缓存；即使官方 SHA 与 Panel main 没变化，也会在下一轮重新评估已更新的合并规则。",
+      "通过完整规划、MacCI、OWNER 审核后才允许升级 PR 自动合并；原有 Panel 部署更新及公网运行 SHA 验证保持独立。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "精确 MacCI 验证 planner、scheduler、upgrade PR 安全回归及前端构建。",
+      "基座 preview 运行 SHA 与 v0.1.31 元数据一致后人工验收发布 main。",
+      "在 Mac mini 对已安装的独立 foundation-upgrades scheduler 执行官方 main 的安全 --check 和 --apply --upgrade；GitHub 发布不会自动替换独立宿主调度器。",
+      "Panel 版本页检查新的目标 SHA、调度器 create 模式、最新 checked_at、blocked_files 和 base-upgrade PR。",
+      "若仍受其他真正冲突阻塞，应保留冲突文件及原因，不得把普通文件合并成功当成全量升级成功。"
+    ],
+    "validation_note": "本次仅自动解决可证明安全的 manage.sh 三方差异，非无条件覆盖；Panel 显示五项需审核中其余具体文件仍需读取实机调度器 blocked_files 核对后单独评估。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
     "version": "0.1.30",
     "title": "基座升级检测与 Office Panel 自动升级验收",
     "summary": "正式提升基座版本号至 v0.1.30，使使用基座 v0.1.29 的 Office Panel 能检测到官方 main 上的新版本，并通过独立调度器生成、测试和安全审核升级 PR；本版不宣称调度器已经在 Mac mini 实机启用。",
