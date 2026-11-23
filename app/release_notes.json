@@ -1,5 +1,28 @@
 [
   {
+    "version": "0.1.34",
+    "title": "基座调度器受控自动更新：一次启用，后续安全升级",
+    "summary": "为独立运行在 Mac mini 的基座升级调度器新增默认关闭、管理员一次性启用的宿主更新机制。每轮先核验官方 main 和已关闭的 OWNER 验收单，再复用既有安装器的测试、备份、锁和 SHA 门禁；Panel 业务升级仍由独立安全 PR 流程控制。",
+    "changes": [
+      "新增 upgrade_runtime_auto.py，严格核验官方 GitHub main 精确 SHA、OWNER 关闭的 BASE-ACCEPTANCE 闭环证据及私有 opt-in 开关。",
+      "当前已安装的调度器保持默认关闭自动运行时升级，只有首次安全安装时显式传入 --enable-auto-runtime 才允许自动更新。",
+      "自动更新复用原有受保护的 --apply --upgrade 安装器；先跑 MacCI 安全回归，再进行有备份和锁保护的代码更新，不覆盖应用 main、数据库或服务配置。",
+      "已安装 SHA 写入私有控制文件；只有 main 变更且验收单完整时才更新，网络/权限失败则不替换宿主运行时。",
+      "基座调度器实际更新成功与 Panel 基座升级 PR、MacCI、应用自动部署和公网运行 SHA 仍分开验证。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对 v0.1.34 最新 HEAD/base/merge 完成 pytest、编译和前端构建，包含自动更新器及安装器回归。",
+      "基座 preview 运行 v0.1.34 精确 SHA 并验收发布到官方 main。",
+      "在 Mac mini 使用当前官方 main 干净检出以 --check-repo ... --apply --upgrade --enable-auto-runtime 安全执行首次一次性启用；验证私有控制文件及原 LaunchAgent/token/registry 保持不变。",
+      "从真正新的官方 main 验收版本测试后续 tick 触发自动更新：核对安装 SHA、备份记录、未改变 Panel 的 .app-init.json、无错误或越权；没有验收单时禁止更新。",
+      "在 Panel 页核验 base-upgrade PR、精确 MacCI、应用 main、运行 SHA 与部署回执；不能把独立调度器升级算作 Panel 自动升级完成。"
+    ],
+    "validation_note": "宿主 opt-in 仍需第一次由管理员显式启用一次；此 PR 不会悄悄修改 Mac mini 的 LaunchAgent、token 或现有调度器运行时。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
     "version": "0.1.33",
     "title": "Office Panel 自动升级：最后两项误冲突修复",
     "summary": "纠正宿主脚本 Preview/验收动态赋值导致的误审查，并对基座测试源码不变、应用自身测试已通过明确语义核验的场景保留 Panel 的应用专属测试，避免将初始化器规则调整误判为代码冲突。",

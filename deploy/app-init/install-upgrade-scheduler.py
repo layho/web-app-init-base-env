@@ -20,7 +20,7 @@ import upgrade_scheduler as scheduler
 import upgrade_pr as upgrade
 
 HERE = Path(__file__).resolve().parent
-FILES = ("upgrade_scheduler.py", "upgrade_pr.py", "upgrade_plan.py", "upgrade_auto_merge.py")
+FILES = ("upgrade_scheduler.py", "upgrade_pr.py", "upgrade_plan.py", "upgrade_auto_merge.py", "upgrade_runtime_auto.py")
 PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
@@ -34,10 +34,13 @@ def main():
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--upgrade", action="store_true", help="Safely replace an existing reviewed scheduler runtime; requires --apply")
     parser.add_argument("--check-repo", required=True, help="downstream repo for API/SSH preflight")
+    parser.add_argument("--enable-auto-runtime", action="store_true", help="Explicitly opt in to future accepted-main host updates (requires --apply)")
     args = parser.parse_args()
     os.umask(0o077)
     if args.upgrade and not args.apply:
         raise SystemExit("--upgrade requires --apply")
+    if args.enable_auto_runtime and not args.apply:
+        raise SystemExit("--enable-auto-runtime requires --apply")
     if not upgrade.SHA.fullmatch(args.sha):
         raise SystemExit("Invalid SHA")
     if upgrade.line(HERE, "rev-parse", "HEAD") != args.sha or upgrade.line(HERE, "status", "--porcelain", "--untracked-files=normal"):
@@ -73,6 +76,7 @@ def main():
         raise SystemExit("Preflight failed: " + (str(exc) if type(exc) is ValueError else type(exc).__name__)) from None
     run(sys.executable, "-B", str(HERE.parents[1] / "tests/test_upgrade_scheduler.py"))
     run(sys.executable, "-B", str(HERE.parents[1] / "tests/test_upgrade_auto_merge.py"))
+    run(sys.executable, "-B", str(HERE.parents[1] / "tests/test_upgrade_runtime_auto.py"))
     domain = "gui/" + str(os.getuid())
     run("launchctl", "print", domain)
     if not args.apply:
@@ -164,6 +168,28 @@ def main():
         probe = subprocess.run(["launchctl","print",domain+"/"+scheduler.LABEL],capture_output=True,timeout=15)
         if probe.returncode != 0:
             run("launchctl","bootstrap",domain,str(plist))
+    # Record the exact accepted main that supplied this installed host runtime.
+    # Never modify app registry, GitHub token, or its LaunchAgent here.
+    def atomic_control(path, data):
+        if path.exists() or path.is_symlink():
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise SystemExit("Unsafe existing runtime update control file")
+        with NamedTemporaryFile(dir=root, delete=False) as tmp:
+            temporary = Path(tmp.name)
+            try:
+                os.fchmod(tmp.fileno(), 0o600)
+                tmp.write(data.encode("ascii"))
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                tmp.close()
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+    atomic_control(root / "runtime-installed-sha", args.sha + "\n")
+    if args.enable_auto_runtime:
+        atomic_control(root / "runtime-auto-update.enabled", "enabled\n")
+        print("Accepted-main runtime auto-upgrade explicitly enabled")
     print("Scheduler installed; explicitly register an app or initialize a new app with app-init.")
     return 0
 
