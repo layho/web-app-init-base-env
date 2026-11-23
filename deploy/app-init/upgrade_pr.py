@@ -4,6 +4,7 @@ Run on a trusted development host, not inside the application web process.
 No writes to the installed application, launchd, or business database.
 """
 import argparse
+import ast
 import json
 import os
 from pathlib import Path
@@ -171,6 +172,51 @@ def adopt_verified_template_baselines(source, old_sha, params, before, after, cu
         if historical == current[path]:
             result[path] = historical
     return result
+
+
+def preserve_verified_panel_auth_tests(source, old_sha, target_sha, repository,
+                                       before, after, current):
+    """Preserve Panel-owned application tests when upstream test source is unchanged.
+
+    A newer app-init renderer converts foundation-only assertions into app
+    assertions. The already-customized Panel test has its own valid application
+    expectations; treating the renderer rewrite as source code change leads
+    to an artificial three-way conflict. Never skip a real source test change.
+    """
+    path = "tests/test_auth.py"
+    if (repository != "layho/macmini-office-app-panel"
+            or path not in before or path not in after or path not in current):
+        return before, after
+    try:
+        # Both immutable foundation commits have identical test source;
+        # only the generator's transformation policy differs.
+        if blob(source, old_sha, path) != blob(source, target_sha, path):
+            return before, after
+        local = current[path].decode("utf-8", "strict")
+        parsed = ast.parse(local, filename=path)
+        names = {node.name for node in parsed.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if "test_project_info_exposes_versioned_design_to_signed_in_users" not in names:
+            return before, after
+        # Make sure this is the known application-specific test, not a
+        # foundation acceptance test or an unrelated file.
+        required = (
+            'assert guide["scope"] == "application"',
+            'assert data["development_loop"]',
+            'assert data["name"] == "macmini-office-app-panel"',
+        )
+        if any(value not in local for value in required):
+            return before, after
+        if 'assert guide["scope"] == "foundation"' in local:
+            return before, after
+    except (ValueError, UnicodeError, SyntaxError, OSError, subprocess.SubprocessError):
+        return before, after
+    # The upstream test *source* has not changed, so retain the application's
+    # already-committed test instead of overwriting it with re-rendered text.
+    # No test file is staged, no app file is touched, and the SHA provenance
+    # remains pinned to the entire official release.
+    return ({k: v for k, v in before.items() if k != path},
+            {k: v for k, v in after.items() if k != path})
 
 
 def legacy_check(app, app_sha, old_generated, repository, params):
@@ -384,6 +430,8 @@ def coordinate(repository, legacy_base=None, create_pr=False, *, expected_target
         before, after = planner.generated_snapshot(old_dir), planner.generated_snapshot(new_dir)
         actual, current = planner.tracked_snapshot(app, app_sha, before.keys() | after.keys())
         before = adopt_verified_template_baselines(source, old_sha, params, before, after, current)
+        before, after = preserve_verified_panel_auth_tests(
+            source, old_sha, target_sha, repository, before, after, current)
         decisions = planner.plan(before, after, current)
         summary = {"schema": 1, "app_sha": actual, "from": old, "target": target,
                    "legacy_verified_root": legacy_root,
