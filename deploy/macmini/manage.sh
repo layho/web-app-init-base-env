@@ -48,6 +48,12 @@ log() { echo "$(date '+%F %T') [web-app] $*"; }
 load_env() {
   test -f .env || { log 'Missing private .env'; exit 1; }
   set -a; source .env; set +a
+  # Single-token mode is opt-in and overrides legacy names in the process
+  # environment. No credentials are printed, copied into plists, or committed.
+  if test -n "${APP_GITHUB_TOKEN:-}"; then
+    export APP_GITHUB_PR_TOKEN="$APP_GITHUB_TOKEN"
+    export APP_GITHUB_FEEDBACK_TOKEN="$APP_GITHUB_TOKEN"
+  fi
   local proxy
   proxy="$(git config --local --get http.proxy || true)"
   if test -n "$proxy"; then
