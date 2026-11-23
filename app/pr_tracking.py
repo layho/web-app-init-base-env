@@ -154,8 +154,11 @@ def collect(github, repo=None, branch=None):
     if not valid_sha(latest_sha):
         raise ValueError("Invalid current branch")
     rows = []
-    for pr in prs:
-        number = pr["number"]
+    for listing in prs:
+        number = listing["number"]
+        # GitHub's list endpoint may omit mergeable/mergeable_state. Refresh
+        # open PR details or the UI can silently hide a dirty Draft PR.
+        pr = github("GET", prefix + "/pulls/" + str(number)) if listing.get("state") == "open" else listing
         head, base = pr["head"]["sha"], pr["base"]["sha"]
         if type(number) is not int or number <= 0 or not valid_sha(head) or not valid_sha(base):
             continue
