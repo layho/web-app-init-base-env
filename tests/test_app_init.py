@@ -301,3 +301,41 @@ def test_enrollment_registers_with_older_scheduler_cli(tmp_path, monkeypatch):
         "repository": "example/demo", "foundation": {"sha": "a" * 40}
     })
     assert calls[1][2:] == ["register", "--repo", "example/demo", "--mode", "create"]
+
+
+def _generated_fixture(tmp_path):
+    (tmp_path / "app").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "frontend/src").mkdir(parents=True)
+    (tmp_path / "app/main.py").write_text("from . import auth\n")
+    (tmp_path / "app/auth.py").write_text("VALUE = 1\n")
+    (tmp_path / "scripts/check.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests/test_demo.py").write_text("def test_ok(): assert True\n")
+    (tmp_path / "requirements.txt").write_text("fastapi\n")
+    (tmp_path / "frontend/src/main.tsx").write_text("export {}")
+    (tmp_path / "frontend/package.json").write_text("{}")
+    (tmp_path / "app/project_info.json").write_text("{}")
+    (tmp_path / "app/release_notes.json").write_text("[]")
+    return tmp_path
+
+
+def test_generated_application_pre_push_validation_detects_missing_module(tmp_path):
+    root = _generated_fixture(tmp_path)
+    app_init.validate_generated_application(root)
+    (root / "app/auth.py").unlink()
+    with pytest.raises(RuntimeError, match="auth"):
+        app_init.validate_generated_application(root)
+
+
+def test_generated_application_pre_push_validation_detects_invalid_python(tmp_path):
+    root = _generated_fixture(tmp_path)
+    (root / "tests/test_demo.py").write_text("def invalid(:\n")
+    with pytest.raises(RuntimeError, match="Python 语法错误"):
+        app_init.validate_generated_application(root)
+
+
+def test_bootstrap_keeps_ssh_as_default():
+    script = (SOURCE / "deploy/app-init/bootstrap.sh").read_text()
+    assert 'bash "$work/deploy/app-init/app-init" --install-deps' in script
+    assert '--install-deps --github-https' not in script
