@@ -85,6 +85,9 @@ def candidate_accepted(sha):
 
 
 def run_once():
+    os.environ["GIT_TERMINAL_PROMPT"] = "0"
+    os.environ["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    os.environ["GH_PROMPT_DISABLED"] = "1"
     scheduler.private_root()
     if private_value(OPT_IN) != "enabled":
         return "disabled"
@@ -102,8 +105,7 @@ def run_once():
     # trusted installer. No remote code is executed before acceptance review.
     with TemporaryDirectory(prefix="foundation-runtime-") as folder:
         root = Path(folder) / "source"
-        subprocess.run(["git", "clone", "--quiet", "--no-checkout",
-                        "--single-branch", "--branch", "main",
+        subprocess.run(["git", "clone", "--quiet", "--single-branch", "--branch", "main",
                         OFFICIAL, str(root)], check=True, timeout=120)
         observed = upgrade.line(root, "rev-parse", "HEAD")
         if observed != remote or upgrade.line(root, "status", "--porcelain", "--untracked-files=normal"):
