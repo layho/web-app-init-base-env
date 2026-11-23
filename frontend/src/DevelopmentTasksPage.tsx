@@ -12,12 +12,13 @@ type DevelopmentTask = {
   note: string
 }
 
-type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
-type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[] }
+type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
+type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean }
 export type TaskSnapshot = { synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
 const statusColors: Record<string, string> = {
   开发中: 'processing',
+  未记录开发状态: 'default',
   待验收: 'blue',
   受阻: 'error',
   已完成: 'success',
@@ -40,8 +41,12 @@ function passRate(row: PRRecord) {
   return n > 0 ? (100 * p / n).toFixed(1) + '%' : '未记录'
 }
 function ciTag(state: string) { return <Tag color={state === 'success' ? 'success' : state === 'pending' ? 'processing' : state === 'failure' || state === 'error' ? 'error' : 'default'}>{ciLabels[state] ?? '未记录'}</Tag> }
-function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraft: (number: number, head: string) => Promise<void>}) {
+function PRTrackingPage({data, onReleaseDraft, onRequestRepair}: {data: PRTracking; onReleaseDraft: (number: number, head: string) => Promise<void>; onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>}) {
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null)
+  const [repairNumber, setRepairNumber] = useState<number | null>(null)
+  const [repairing, setRepairing] = useState(false)
+  const [repairError, setRepairError] = useState<string | null>(null)
+  const [repairIssueUrl, setRepairIssueUrl] = useState<string | null>(null)
   const [releaseNumber, setReleaseNumber] = useState<number | null>(null)
   const [releasing, setReleasing] = useState(false)
   const [releaseError, setReleaseError] = useState<string | null>(null)
@@ -64,6 +69,18 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
     })
   }
   const selected = data.prs.find(row => row.number === selectedNumber)
+  const repairPR = data.prs.find(row => row.number === repairNumber)
+  async function createRepairTask() {
+    if (!repairPR?.conflict?.blocked || !repairPR.conflict.base_sha || data.stale || repairing) return
+    setRepairing(true)
+    setRepairError(null)
+    try {
+      const result = await onRequestRepair(repairPR.number, repairPR.head, repairPR.conflict.base_sha)
+      setRepairIssueUrl(result.url)
+    } catch(error) {
+      setRepairError(error instanceof Error ? error.message : '创建冲突修复任务失败')
+    } finally { setRepairing(false) }
+  }
   const proposed = data.prs.find(row => row.number === releaseNumber)
   async function approveDraft() {
     if (!proposed || releasing || data.stale || proposed.merge_state !== 'draft' || hasEarlierUnmergedRelease(proposed)) return
@@ -80,19 +97,24 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
     }
   }
   return <Flex vertical gap="middle">
-    <Alert showIcon type={data.stale ? 'warning' : 'info'} message={data.stale ? '同步延迟或尚未同步，保留上次成功记录。' : 'GitHub 测试回执与本机部署记录'} description="每五分钟尝试同步。测试时间以 GitHub 回执为准；日志仅展示安全计数和阶段，未采集信息不推算。仅显示基座 preview PR。" />
+    <Alert showIcon type={data.stale ? 'warning' : 'info'} message={data.stale ? '同步延迟或尚未同步，保留上次成功记录。' : 'GitHub 测试回执与本机部署记录'}
+      description={`每五分钟尝试同步。当前仓库：${data.repository ?? '待识别'}；目标分支：${data.branch ?? '待识别'}。未取得本机测试或部署证据时显示“未记录”，不推算。`} />
     <Typography.Text type="secondary">最近同步：{formatDate(data.synced_at)}</Typography.Text>
     <Table rowKey="number" size="small" dataSource={data.prs} scroll={{x: 1160}} locale={{emptyText: '暂无 PR 测试记录'}} columns={[
       {title: 'PR', width: 280, render: (_,row) => <Typography.Link href={row.url} target="_blank" rel="noreferrer">#{row.number} {row.title}</Typography.Link>},
-      {title: '测试状态', width: 125, render: (_,row) => ciTag(row.test.state)},
+      {title: '测试状态', width: 155, render: (_,row) =>
+        row.conflict?.blocked ? <Tag color="error">冲突阻止重新测试</Tag> : ciTag(row.test.state)},
       {title: '测试开始', width: 165, render: (_,row) => formatDate(row.test.started_at ?? null)},
       {title: '测试结束', width: 165, render: (_,row) => formatDate(row.test.finished_at ?? null)},
       {title: '耗时', width: 95, render: (_,row) => duration(row.test.duration_seconds)},
       {title: '通过率', width: 95, render: (_,row) => passRate(row)},
-      {title: '合并', width: 122, render: (_,row) => row.merge_blocked ?
+      {title: '合并', width: 122, render: (_,row) => row.conflict?.blocked ?
         <Tag color="error" title="Draft 已解除，但与当前 preview 存在冲突，MacCI/自动合并将暂停">存在冲突 · 待修复</Tag> :
         <Tag color={row.merge_state === 'merged' ? 'success' : 'default'}>{mergeLabels[row.merge_state]}</Tag>},
-      {title: '操作', width: 126, render: (_,row) => row.merge_state === 'draft' ?
+      {title: '操作', width: 134, render: (_,row) => row.conflict?.blocked ?
+        <Button danger size="small" disabled={data.stale}
+          onClick={() => { setRepairNumber(row.number); setRepairError(null); setRepairIssueUrl(null) }}>处理冲突</Button> :
+        data.can_release_draft && row.merge_state === 'draft' ?
         releasedNumbers.includes(row.number) ? <Tag color="processing">已解除 · 待同步</Tag> :
         <Button size="small" disabled={data.stale || hasEarlierUnmergedRelease(row)}
           title={data.stale ? '同步已过期，请刷新' : hasEarlierUnmergedRelease(row) ? '存在更早的未合并版本，须先完成前置版本' : '确认后交由 MacCI 自动处理'}
@@ -100,6 +122,33 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
       {title: '部署', width: 125, render: (_,row) => <Tag color={row.deployment.state === 'running' || row.deployment.state === 'deployed' ? 'success' : row.deployment.state === 'failed' ? 'error' : 'default'}>{deployLabels[row.deployment.state]}</Tag>},
       {title: '详情', width: 70, render: (_,row) => <Button type="link" onClick={() => setSelectedNumber(row.number)}>查看</Button>},
     ]}/>
+    <Modal title={repairPR ? 'PR #' + repairPR.number + ' · 合并冲突处理' : '合并冲突'}
+      open={repairNumber !== null} onCancel={() => { if (!repairing) setRepairNumber(null) }}
+      onOk={() => void createRepairTask()} okText="创建 / 查看修复任务"
+      confirmLoading={repairing} okButtonProps={{disabled: data.stale || !repairPR?.conflict?.blocked || Boolean(repairIssueUrl)}}>
+      <Alert showIcon type="error" message="合并冲突阻止当前基线测试"
+        description="GitHub 已判定此 PR 与当前目标分支冲突。旧版测试通过并不等于当前基线通过；解除 Draft 也无法修复冲突。" />
+      <Descriptions size="small" column={1} style={{marginTop:12}} items={[
+        {key:'head', label:'PR HEAD',children:<Typography.Text code copyable>{repairPR?.head}</Typography.Text>},
+        {key:'base', label:'当前目标基线',children:<Typography.Text code copyable>{repairPR?.conflict?.base_sha}</Typography.Text>},
+        {key:'count', label:'PR 修改文件数',children:repairPR?.conflict?.candidate_files.length ?? 0},
+      ]}/>
+      <Typography.Paragraph strong style={{marginTop:12}}>需要检查的文件（不是确认存在冲突的文件）</Typography.Paragraph>
+      <div style={{maxHeight:190,overflowY:'auto',background:'#f6f8fa',padding:12,borderRadius:8}}>
+        {(repairPR?.conflict?.candidate_files ?? []).length ?
+          repairPR?.conflict?.candidate_files.map((name) =>
+            <div key={name}><Typography.Text code>{name}</Typography.Text></div>) :
+          <Typography.Text type="secondary">GitHub 尚未返回文件列表，请打开 PR 查看变更。</Typography.Text>}
+      </div>
+      <Typography.Paragraph style={{marginTop:12}}>
+        <Typography.Link href={repairPR?.url} target="_blank" rel="noreferrer">在 GitHub 打开 PR 并查看冲突</Typography.Link>
+      </Typography.Paragraph>
+      <Typography.Paragraph type="secondary">点击“创建 / 查看修复任务”会在当前仓库建立去重的 Issue，
+        记录精确 SHA、阻塞原因和需检查的文件。开发任务可认领修复；完成后仍须重新通过 MacCI。此操作不会合并、覆盖代码或解除 Draft。</Typography.Paragraph>
+      {repairIssueUrl && <Alert showIcon type="success" message="冲突修复任务已就绪"
+        description={<Typography.Link href={repairIssueUrl} target="_blank" rel="noreferrer">打开 GitHub 修复任务</Typography.Link>} />}
+      {repairError && <Alert showIcon type="error" message={repairError}/>}
+    </Modal>
     <Modal title="确认解除 Draft，进入自动合并流程" open={releaseNumber !== null}
       onCancel={() => { if (!releasing) setReleaseNumber(null) }}
       onOk={() => void approveDraft()} okText="解除 Draft"
@@ -116,7 +165,8 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
     <Drawer title={selected ? 'PR #' + selected.number + ' · 测试与发布详情' : '测试详情'} open={selectedNumber !== null} onClose={() => setSelectedNumber(null)} width="min(680px, 100vw)">
       {selected ? <Flex vertical gap="middle"><Typography.Text strong>{selected.title}</Typography.Text>
         <Descriptions bordered size="small" column={1} items={[
-          {key:'status',label:'测试状态',children: ciTag(selected.test.state)},
+          {key:'status',label:'测试状态',children: selected.conflict?.blocked ? <Tag color="error">冲突阻止测试</Tag> : ciTag(selected.test.state)},
+          {key:'conflict',label:'合并门禁',children:selected.conflict?.blocked ? <Button danger onClick={() => {setSelectedNumber(null);setRepairNumber(selected.number)}}>查看并处理冲突</Button> : '未确认冲突'},
           {key:'stage',label:'测试阶段',children:phaseLabels[selected.test.phase ?? ''] ?? '未记录'},
           {key:'start',label:'开始时间',children:formatDate(selected.test.started_at ?? null)},
           {key:'end',label:'结束时间',children:formatDate(selected.test.finished_at ?? null)},
@@ -138,11 +188,12 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
   </Flex>
 }
 
-export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft }: {
+export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft, onRequestRepair }: {
   data: TaskSnapshot | null
   loading: boolean
   onRefresh: () => void
   onReleaseDraft: (number: number, head: string) => Promise<void>
+  onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>
 }) {
   const tasks = <Flex vertical gap="middle">
       {data?.stale && <Alert type="warning" showIcon message={
@@ -156,7 +207,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft 
         dataSource={data?.tasks ?? []}
         scroll={{ x: 920 }}
         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={
-          data?.synced_at ? '暂无登记的开发任务' : '暂无同步记录'
+          data?.synced_at ? 'GitHub 暂无可显示的独立开发 Issue' : '暂无同步记录'
         } /> }}
         columns={[
           { title: '任务', dataIndex: 'title', width: 300, render: (title: string, task: DevelopmentTask) =>
@@ -171,6 +222,6 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft 
       />
     </Flex>
   return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading}>刷新列表</Button>}>
-    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft}/>}]} /> : tasks}
+    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
   </Card>
 }

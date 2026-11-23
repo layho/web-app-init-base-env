@@ -23,6 +23,50 @@
     "reference_url": "https://github.com/layho/web-app-init-base-env"
   },
   {
+    "version": "0.1.25",
+    "title": "PR 冲突处理中心 · 可见、可诊断、可手动交办",
+    "summary": "解决旧版 MacCI 仍显示通过但当前 PR 与 preview 冲突且无人知晓的情况：明确阻塞原因，展示当前基线和候选文件，支持管理员建立可去重的 GitHub 修复任务。",
+    "changes": [
+      "开放 Draft PR 同样显示最新 GitHub mergeable_state=dirty，不再因为 Draft 状态隐藏合并冲突。",
+      "当前 preview/main 基线变化后重新读取 PR 详情与最新分支 SHA；旧基线通过不再被展示成当前基线测试成功。",
+      "后台列表显示“冲突阻止重新测试”，提供“处理冲突”入口及候选修改文件清单，说明不等于具体冲突行。",
+      "管理员可按精确 HEAD/base 创建或复用 GitHub 冲突修复 Issue；记录排查约束和回归要求，禁止强行合并或自动覆写源文件。",
+      "添加冲突 Draft 识别、旧测试失效、修复任务去重和 Ref 变化保护回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 在当前 HEAD/base/merge 上完成 pytest 和前端构建。",
+      "在 base.layho.com 核验 #71 冲突显示为“冲突阻止重新测试”，并展示候选修改文件和当前目标 SHA。",
+      "管理员点击处理冲突，核实创建或复用 Issue，并确认未强制合并、未修改原 PR。",
+      "在问题修复后验证 GitHub 冲突消失并重新测试当前 preview 基线；确认 UI 从冲突转为真实测试结果。"
+    ],
+    "validation_note": "第一阶段提供准确阻塞可视化、手动交办和 GitHub 原生编辑入口；不是浏览器内的逐行代码三方合并编辑器。具体冲突 hunk 需要独立可信 Git 合并分析实现。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/71"
+  },
+  {
+    "version": "0.1.24",
+    "title": "通用开发任务与本应用 PR 测试发布追踪",
+    "summary": "将基座的开发任务、MacCI 测试与部署证据追踪下沉为 app-init 所有应用通用能力；每个应用自动读取自己的 GitHub 仓库和正式 main 分支，保留基座 preview 验收专用操作边界。",
+    "changes": [
+      "开发任务列表包含普通 GitHub Issue，不再要求 ## 开发进度 标题才能出现；未记录进展的任务明确显示“未记录开发状态”。",
+      "PR 追踪从当前应用 .app-init.json 解析自身仓库及公网域名，普通应用只跟踪自己 main 分支的 PR，基座验收站仍跟踪 preview。",
+      "MacCI 回执按当前 HEAD/base 读取，列出测试、提交、合并和可验证的本机部署记录，缺失信息不推算；缓存按仓库隔离。",
+      "普通应用只读展示 PR 记录，不显示仅限基座管理员的解除 Draft 按钮；避免误把普通应用发布权限与基座验收权限混用。",
+      "增加普通 Issue、通用仓库解析、跨应用缓存隔离及 PR 状态回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对最新 HEAD/base/merge 执行 pytest、Python 编译与前端构建。",
+      "在 base.layho.com 验证 preview PR 追踪仍正常、解除 Draft 仅限基座管理员。",
+      "基座正式发布后由升级调度器生成 Panel 升级 PR，确认 Panel 显示自身 GitHub Issue 和 main PR 的测试合并部署追踪。",
+      "对不存在 MacCI/部署证据及不同仓库数据的情况确认不展示虚构状态或跨应用记录；核对公网运行 SHA。"
+    ],
+    "validation_note": "发布基座不意味着所有现有应用立刻展示新功能；应用需经过各自基座升级 PR、MacCI 和部署验证。不会把普通应用的 main 合并权授予基座网页。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
     "version": "0.1.23",
     "title": "Panel 升级冲突诊断与自愈反馈",
     "summary": "升级调度器将冲突文件清单与安全分类保存至只读回执，Panel 的基座版本页可直接显示文件路径，避免只有“需审查文件 3”的不透明阻塞。",

@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import admin_settings, auth, development_tasks, feedback_progress, feedback_delivery, foundation_version, operations, pr_tracking, release_acceptance, pr_draft_controls
+from . import admin_settings, auth, development_tasks, feedback_progress, feedback_delivery, foundation_version, operations, pr_tracking, pr_conflict_controls, release_acceptance, pr_draft_controls
 from .db import get_db
 from .models import UserFeedback
 
@@ -125,6 +125,15 @@ def list_feedback(response: Response, db: Session = Depends(get_db)):
              "synced_at": x.synced_at.isoformat() if x.synced_at else None,
              **feedback_progress.feedback_details(progress, x.id, x.github_issue_number)} for x in rows]
 
+def deployment_block_reason(sha):
+    status = operations.deploy_status(sha)
+    if status["locked"] or status["state"] in {"request_waiting", "request_unacknowledged"}:
+        return "部署请求尚未完成，请等待本机健康检查后刷新"
+    if status["rollback_failed"] or status["state"] not in {"update_ok", "update_no_change", "unknown"}:
+        return "更新器尚无有效完成回执，请检查系统日志并刷新"
+    return ""
+
+
 @app.get("/api/release-notes", dependencies=[Depends(authorize)])
 def release_notes(response: Response):
     response.headers["Cache-Control"] = "no-store"
@@ -136,15 +145,19 @@ def release_notes(response: Response):
     # Fail closed if the browser has an outdated preview or GitHub cannot be reached.
     readiness = release_acceptance.acceptance_readiness(
         running_sha, app.version, releases[0]["version"], deployments
-    ) if acceptance.get("enabled") and acceptance.get("state") == "not_requested" else {
+    ) if acceptance.get("enabled") else {
         "ready": False, "reason": "当前状态不允许提交验收"
     }
+    if acceptance.get("enabled"):
+        block_reason = deployment_block_reason(running_sha)
+        if block_reason:
+            readiness.update(ready=False, reason=block_reason)
     return {
         "version": app.version,
         "running_sha": running_sha,
         "releases": releases,
         "deployments": deployments,
-        "acceptance": {**acceptance, **readiness},
+        "acceptance": {**acceptance, **readiness, "ready": readiness["ready"] and acceptance.get("state") == "not_requested"},
     }
 
 
@@ -165,6 +178,9 @@ def accept_release(req: ReleaseAcceptanceIn, request: Request, response: Respons
     if req.version != app.version or notes[0]["version"] != req.version or not notes[0].get("acceptance_required"):
         raise HTTPException(409, "当前版本不匹配或无需验收")
     deployments = operations.recent_operations(operations.OPERATIONS_LOG, deployments_only=True)
+    block_reason = deployment_block_reason(req.sha)
+    if block_reason:
+        raise HTTPException(409, block_reason)
     deployed = bool(deployments and deployments[0]["sha"] == req.sha)
     try:
         return release_acceptance.submit(req.sha, req.version, deployed)
@@ -208,6 +224,26 @@ def release_draft_pr(req: DraftReleaseIn, request: Request, response: Response,
     except (pr_draft_controls.DraftReleaseError, KeyError, TypeError, ValueError) as exc:
         raise HTTPException(409, str(exc) if isinstance(exc, pr_draft_controls.DraftReleaseError)
                             else "PR 状态已变化，请刷新后重试") from None
+
+
+class ConflictRepairIn(BaseModel):
+    number: int = Field(ge=1, le=1000000)
+    head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    base: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+@app.post("/api/v1/pr-conflicts/repair")
+def request_conflict_repair(req: ConflictRepairIn, request: Request, response: Response,
+                            db: Session = Depends(get_db)):
+    # A logged-in administrator must explicitly confirm the current HEAD and
+    # base. Never accept a browser-specified repository or GitHub token.
+    auth.authorize_session(request, db)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return pr_conflict_controls.request_repair(req.number, req.head, req.base)
+    except (pr_conflict_controls.ConflictError, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(409, str(exc) if isinstance(exc, pr_conflict_controls.ConflictError)
+                            else "PR 已变化，请刷新后重试") from None
 
 
 @app.get("/api/v1/system-logs", dependencies=[Depends(authorize)])

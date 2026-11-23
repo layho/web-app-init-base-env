@@ -12,6 +12,8 @@ from . import operations
 CACHE = Path(__file__).resolve().parents[1] / "logs" / "pr-tracking.json"
 LOG_ROOT = Path.home() / ".local/share/macmini-pr-tests"
 REPO = "layho/web-app-init-base-env"
+METADATA = Path(__file__).resolve().parents[1] / ".app-init.json"
+REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 CONTEXT = "macmini/isolated-tests-v1"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 STATUS = re.compile(r"base=([0-9a-f]{40}) merge=([0-9a-f]{40}|unknown) ([a-z-]+)\Z")
@@ -21,8 +23,37 @@ PHASES = {"pending", "passed", "setup-failed", "fetch-failed", "context-failed",
 COUNT = re.compile(r"(\d+) (passed|failed|skipped|errors?|xfailed|xpassed|deselected|warnings?)")
 
 
+def valid_repository(repo):
+    """Reject relative/dot GitHub repository segments before using a repo ref."""
+    return (isinstance(repo, str) and len(repo) <= 200
+            and REPOSITORY.fullmatch(repo) is not None
+            and all(segment not in {".", ".."} for segment in repo.split("/")))
+
+
+def target():
+    """Resolve only the current installation's own repository.
+
+    An app cannot query other repositories through a browser-supplied argument.
+    Base preview uses its known static repository; generated apps use the
+    installer-signed local metadata and their configured public origin.
+    """
+    if os.getenv("APP_BASE_PREVIEW") == "1":
+        return (REPO, "preview") if os.getenv("APP_PUBLIC_ORIGIN") == "https://base.layho.com" else None
+    try:
+        obj = json.loads(METADATA.read_text(encoding="utf-8"))
+        repo, domain = obj["repository"], obj["domain"]
+        if (not isinstance(obj, dict) or not isinstance(repo, str)
+                or not valid_repository(repo) or not isinstance(domain, str)
+                or not re.fullmatch(r"[a-z0-9.-]{3,253}", domain)
+                or os.getenv("APP_PUBLIC_ORIGIN") != "https://" + domain):
+            return None
+        return repo, "main"
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def enabled():
-    return os.getenv("APP_BASE_PREVIEW") == "1" and os.getenv("APP_PUBLIC_ORIGIN") == "https://base.layho.com"
+    return target() is not None
 
 
 def instant(value):
@@ -65,14 +96,17 @@ def evidence(statuses, base):
             "phase": match[3], "tested_merge": match[2] if valid_sha(match[2]) else None}
 
 
-def log_summary(number, head, base, test):
+def log_summary(number, head, base, test, repo=None):
     # Exact repository and filenames only. Read a bounded tail without following
     # symlinks, return enumerated stages/counts, never arbitrary log text.
     if type(number) is not int or number <= 0 or not valid_sha(head) or not valid_sha(base):
         return None
     if test.get("state") not in {"success", "failure"} or not test.get("started_at") or not test.get("finished_at"):
         return None
-    path = LOG_ROOT / f"layho--web-app-init-base-env-{number}-{head[:12]}-{base[:12]}.log"
+    repo = repo or REPO
+    if not valid_repository(repo):
+        return None
+    path = LOG_ROOT / f"{repo.replace('/', '--')}-{number}-{head[:12]}-{base[:12]}.log"
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
@@ -105,19 +139,47 @@ def log_summary(number, head, base, test):
     return {"pytest": counts, "phase": test.get("phase"), "source": "MacCI local log summary"}
 
 
-def collect(github):
-    prefix = "/repos/" + REPO
+def collect(github, repo=None, branch=None):
+    current = target() if repo is None else (repo, branch or "main")
+    if current is None or not valid_repository(current[0]):
+        raise ValueError("No verified application repository")
+    repo, branch = current
+    prefix = "/repos/" + repo
     prs = github("GET", prefix + "/pulls?state=all&sort=updated&direction=desc&per_page=50")
     if not isinstance(prs, list):
         raise ValueError("Invalid PR list")
+    # The PR's base.sha can be stale after preview/main advances. A pending
+    # test is valid only against the actual current target branch SHA.
+    latest_sha = github("GET", prefix + "/branches/" + branch)["commit"]["sha"]
+    if not valid_sha(latest_sha):
+        raise ValueError("Invalid current branch")
     rows = []
-    for pr in prs:
-        number = pr["number"]
+    for listing in prs:
+        number = listing["number"]
+        # GitHub's list endpoint may omit mergeable/mergeable_state. Refresh
+        # open PR details or the UI can silently hide a dirty Draft PR.
+        pr = github("GET", prefix + "/pulls/" + str(number)) if listing.get("state") == "open" else listing
         head, base = pr["head"]["sha"], pr["base"]["sha"]
         if type(number) is not int or number <= 0 or not valid_sha(head) or not valid_sha(base):
             continue
-        if pr["base"]["ref"] != "preview" or (pr["head"].get("repo") or {}).get("full_name") != REPO:
+        if pr["base"]["ref"] != branch or (pr["head"].get("repo") or {}).get("full_name") != repo:
             continue
+        # GitHub's mergeable=dirty is the authoritative conflict gate.
+        # /pulls/N/files lists PR-changed files, not necessarily the exact
+        # conflicting hunks; label them as candidates, never as proven conflicts.
+        blocked = (pr.get("state") == "open" and pr.get("mergeable") is False
+                   and pr.get("mergeable_state") == "dirty")
+        candidates = []
+        file_total = pr.get("changed_files")
+        if blocked:
+            files = github("GET", prefix + "/pulls/" + str(number) + "/files?per_page=100")
+            if isinstance(files, list):
+                candidates = [f["filename"] for f in files
+                              if isinstance(f, dict) and isinstance(f.get("filename"), str)
+                              and len(f["filename"]) <= 180 and not f["filename"].startswith("/")
+                              and ".." not in Path(f["filename"]).parts][:100]
+        if pr.get("state") == "open":
+            base = latest_sha
         merged = bool(pr.get("merged_at"))
         merge = pr.get("merge_commit_sha") if merged else None
         if merged and valid_sha(merge):
@@ -129,23 +191,32 @@ def collect(github):
         if not isinstance(statuses, list):
             raise ValueError("Invalid statuses")
         test = evidence(statuses, base) if valid_sha(base) else {"state": "unknown"}
-        log = log_summary(number, head, base, test)
+        log = log_summary(number, head, base, test, repo)
         rows.append({"number": number, "title": str(pr.get("title", ""))[:300],
-                     "url": "https://github.com/" + REPO + "/pull/" + str(number),
+                     "url": "https://github.com/" + repo + "/pull/" + str(number),
                      "head": head, "base": base, "test": test, "log": log,
                      "merge_state": "merged" if merged else "closed" if pr.get("state") == "closed" else "draft" if pr.get("draft") else "open",
-                     "merge_blocked": not merged and not pr.get("draft") and pr.get("mergeable") is False,
+                     "merge_blocked": blocked,
+                     "conflict": {"blocked": blocked, "base_sha": latest_sha,
+                                  "candidate_files": candidates,
+                                  "file_scope": "PR 修改文件（非已确认的逐文件冲突）",
+                                  "reason": "GitHub 确认 PR 与目标分支存在合并冲突" if blocked else None},
                      "mergeability": pr.get("mergeable_state") if isinstance(pr.get("mergeable_state"), str) else "unknown",
                      "merged_at": pr.get("merged_at"), "merge_sha": merge if valid_sha(merge) else None})
     return rows
 
 
 def sync(github):
+    current_target = target()
+    if current_target is None:
+        return
     current = snapshot()
     previous = instant(current.get("synced_at"))
     if previous and (datetime.now(timezone.utc) - previous).total_seconds() < 300:
         return
-    data = {"synced_at": datetime.now(timezone.utc).isoformat(), "prs": collect(github)}
+    data = {"synced_at": datetime.now(timezone.utc).isoformat(),
+            "repository": current_target[0], "branch": current_target[1],
+            "prs": collect(github, *current_target)}
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(mode="w", encoding="utf-8", dir=CACHE.parent, delete=False) as out:
         try:
@@ -158,10 +229,13 @@ def sync(github):
 
 
 def snapshot():
+    current = target()
     try:
         data = json.loads(CACHE.read_text(encoding="utf-8"))
         dt = instant(data["synced_at"])
-        if dt is None or not isinstance(data["prs"], list):
+        if (current is None or data.get("repository") != current[0]
+                or data.get("branch") != current[1]
+                or dt is None or not isinstance(data["prs"], list)):
             raise ValueError("invalid snapshot")
     except (OSError, ValueError, KeyError, TypeError):
         return {"synced_at": None, "stale": True, "prs": []}
@@ -174,4 +248,5 @@ def snapshot():
                              "running" if sha and sha == running and event and event["code"] in {"install_ok", "update_ok"} else
                              "deployed" if event and event["code"] in {"install_ok", "update_ok"} else
                              "failed" if event else "unverified", "at": event["at"] if event else None}
-    return {**data, "stale": (datetime.now(timezone.utc) - dt).total_seconds() > 600}
+    return {**data, "can_release_draft": current == (REPO, "preview"),
+            "stale": (datetime.now(timezone.utc) - dt).total_seconds() > 600}

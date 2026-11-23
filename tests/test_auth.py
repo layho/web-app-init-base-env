@@ -214,7 +214,10 @@ def test_release_acceptance_requires_admin_session_csrf_origin_and_current_versi
     notes = tmp_path / "release_notes.json"
     notes.write_text(json.dumps([{"version": app.version, "acceptance_required": True}]))
     monkeypatch.setattr(api_main, "RELEASE_NOTES", notes)
-    monkeypatch.setattr(operations, "recent_operations", lambda *args, **kwargs: [{"sha": sha}])
+    log = tmp_path / "logs" / "operations.tsv"
+    log.parent.mkdir()
+    log.write_text(f"2026-11-22T13:16:03Z\tupdate_ok\t{sha}\n")
+    monkeypatch.setattr(operations, "OPERATIONS_LOG", log)
     calls = []
     def submit(candidate, version, deployed):
         calls.append((candidate, version, deployed))

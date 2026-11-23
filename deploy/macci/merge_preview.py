@@ -100,7 +100,7 @@ def all_pages(token, path):
     raise ValueError("GitHub pagination limit exceeded")
 
 
-def release_version(token, sha):
+def latest_release(token, sha):
     """Read version from the exact immutable commit, never a moving ref."""
     if not valid(sha):
         raise ValueError("Invalid release commit")
@@ -116,7 +116,10 @@ def release_version(token, sha):
     version = notes[0].get("version")
     if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("Invalid release version")
-    return tuple(map(int, version.split(".")))
+    required = notes[0].get("acceptance_required")
+    if type(required) is not bool:
+        raise ValueError("Invalid release acceptance flag")
+    return tuple(map(int, version.split("."))), required
 
 
 def preview_frozen(token):
@@ -129,14 +132,16 @@ def preview_frozen(token):
     main = api(token, "/branches/main")["commit"]["sha"]
     if not valid(preview) or not valid(main):
         raise ValueError("Invalid branch SHA")
-    preview_version = release_version(token, preview)
-    main_version = release_version(token, main)
+    preview_version, requires_acceptance = latest_release(token, preview)
+    main_version, _ = latest_release(token, main)
     if preview_version < main_version:
         raise ValueError("Preview release version older than main")
     if preview_version > main_version:
         print(f"Preview frozen for candidate v{'.'.join(map(str, preview_version))}; main is v{'.'.join(map(str, main_version))}", flush=True)
         return True
-    return False
+    # The web gate offers acceptance for the running SHA, including revisions
+    # that retain the same release number and release notes.
+    return requires_acceptance and preview != main
 
 
 def authorization(token, number):
