@@ -138,8 +138,7 @@ def test_modified_or_untrusted_historical_app_file_stays_blocked():
     # Unknown arbitrary paths must never be adopted, even if content matches.
     with patch.object(u, "blob") as reader:
         before = u.adopt_verified_template_baselines("source", A, params, {},
-             {"app/business.py": b"old"}, {"app/business.py": b"new"},
-             {"app/business.py": b"old"})
+             {"app/business.py": b"new"}, {"app/business.py": b"old"})
     assert before == {}  # A non-allowlisted path is not adopted or invented.
     reader.assert_not_called()
 
