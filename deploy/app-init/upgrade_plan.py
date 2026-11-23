@@ -112,7 +112,10 @@ def resolve_host_script(path, old, new, current):
     except (UnicodeError, ValueError):
         return None
     # -n validates syntax without running installer commands or making writes.
-    check = subprocess.run(["bash", "-n"], input=result, capture_output=True, timeout=10)
+    try:
+        check = subprocess.run(["bash", "-n"], input=result, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     return result if check.returncode == 0 else None
 
 
