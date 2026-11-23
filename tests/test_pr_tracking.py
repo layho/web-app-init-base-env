@@ -161,3 +161,23 @@ def test_explicit_related_issue_refs_from_office_panel_pr():
     assert p.explicit_issue_refs("Refs #2\\nRelated #1") == [1, 2]
     assert p.explicit_issue_refs("related to #3 and closes #8") == [3, 8]
     assert p.explicit_issue_refs("arbitrary #23 is not an explicit link") == []
+
+
+def test_github_failure_is_visible_when_exact_base_is_not_verified():
+    statuses = [status("failure", "2026-11-23T07:26:00Z", base=H, phase="pytest-failed")]
+    assert p.evidence(statuses, B)["state"] == "unknown"
+    assert p.head_status_diagnostic(statuses) == {
+        "state": "failure", "at": "2026-11-23T07:26:00Z"}
+    # An unverified GitHub success signal must never become a verified pass.
+    success = [status("success", "2026-11-23T07:27:00Z", base=H)]
+    assert p.evidence(success, B)["state"] == "unknown"
+    assert p.head_status_diagnostic(success)["state"] == "success"
+
+
+def test_head_status_diagnostic_rejects_untrusted_contexts_and_bad_timestamps():
+    statuses = [
+        {"context": "unrelated/check", "state": "failure",
+         "created_at": "2026-11-23T07:00:00Z"},
+        {"context": p.CONTEXT, "state": "success", "created_at": "not-a-date"},
+    ]
+    assert p.head_status_diagnostic(statuses) == {"state": "unknown", "at": None}
