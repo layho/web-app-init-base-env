@@ -23,7 +23,7 @@ type DevelopmentTask = {
   note: string
 }
 
-type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
+type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
 type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean }
 export type TaskSnapshot = { synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
@@ -114,7 +114,14 @@ function PRTrackingPage({data, onReleaseDraft, onRequestRepair}: {data: PRTracki
     <Table rowKey="number" size="small" dataSource={data.prs} scroll={{x: 1160}} locale={{emptyText: '暂无 PR 测试记录'}} columns={[
       {title: 'PR', width: 280, render: (_,row) => <Typography.Link href={row.url} target="_blank" rel="noreferrer">#{row.number} {row.title}</Typography.Link>},
       {title: '测试状态', width: 155, render: (_,row) =>
-        row.conflict?.blocked ? <Tag color="error">冲突阻止重新测试</Tag> : ciTag(row.test.state)},
+        row.conflict?.blocked ? <Tag color="error">冲突阻止重新测试</Tag> :
+        row.test.state === 'unknown' && row.head_status?.state === 'failure'
+          ? <Tag color="error" title="GitHub 已记录本 HEAD 的 MacCI 失败，但精确 base/merge 回执尚未核实，不允许合并">失败 · 精确回执待核对</Tag>
+          : row.test.state === 'unknown' && row.head_status?.state === 'error'
+          ? <Tag color="error" title="GitHub 已记录本 HEAD 的 MacCI 异常，精确测试回执尚未核实">异常 · 精确回执待核对</Tag>
+          : row.test.state === 'unknown' && row.head_status?.state === 'success'
+          ? <Tag color="warning" title="GitHub 显示 success，但缺少与当前 base/merge 匹配的可信测试回执">成功信号 · 基线未核实</Tag>
+          : ciTag(row.test.state)},
       {title: '测试开始', width: 165, render: (_,row) => formatDate(row.test.started_at ?? null)},
       {title: '测试结束', width: 165, render: (_,row) => formatDate(row.test.finished_at ?? null)},
       {title: '耗时', width: 95, render: (_,row) => duration(row.test.duration_seconds)},
