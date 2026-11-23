@@ -21,12 +21,51 @@ class DraftReleaseError(Exception):
     pass
 
 
+def pr_token():
+    """One credential for the entire owner PR-review transaction."""
+    token = os.getenv("APP_GITHUB_PR_TOKEN", "").strip()
+    if not token:
+        raise DraftReleaseError(
+            "GH-PR-TOKEN-MISSING：基座服务未加载专用 PR Token，未执行操作")
+    if token == os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "").strip():
+        raise DraftReleaseError(
+            "GH-PR-TOKEN-SHARED：PR Token 与反馈 Token 混用，未执行操作")
+    return token
+
+
 def github(path, payload=None):
-    # Reuse the bounded GitHub helper without exposing credentials.
+    """Use the PR credential for REST checks AND the owner review comment.
+
+    The old implementation used APP_GITHUB_FEEDBACK_TOKEN for all REST calls
+    and APP_GITHUB_PR_TOKEN only for the final GraphQL mutation. This made
+    a correctly configured PR token unable to pass preflight checks.
+    """
+    if not isinstance(path, str) or not path.startswith("/") or "://" in path:
+        raise DraftReleaseError("GitHub 请求路径无效")
+    token = pr_token()
+    request = Request(
+        "https://api.github.com/repos/" + REPO + path,
+        data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+        headers={"Authorization": "Bearer " + token,
+                 "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json",
+                 "User-Agent": "base-owner-draft-release"},
+        method="POST" if payload is not None else "GET")
     try:
-        return release_acceptance.api(path, payload)
-    except (release_acceptance.AcceptanceError, KeyError, TypeError, ValueError):
-        raise DraftReleaseError("无法核实 GitHub 状态或权限，未解除 Draft") from None
+        with build_opener(release_acceptance.NoRedirect()).open(request, timeout=10) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            raise DraftReleaseError(
+                f"GH-PR-REST-{exc.code}：PR Token 的 GitHub 状态核对或审查评论请求被拒；"
+                "请检查仓库授权、Pull requests 写权限及 Issues 写权限。未解除 Draft"
+            ) from None
+        raise DraftReleaseError(
+            f"GH-PR-REST-{exc.code}：GitHub REST 请求失败，未解除 Draft") from None
+    except (URLError, OSError, ValueError, TypeError):
+        raise DraftReleaseError(
+            "GH-PR-REST-NETWORK：PR Token 状态核对连接失败或返回数据无效，未解除 Draft"
+        ) from None
 
 
 def graphql_failure(errors):
@@ -82,9 +121,7 @@ def mark_ready(node_id):
         raise DraftReleaseError("PR 标识无效，不能解除 Draft")
     # Feedback tokens commonly grant Issues write but not Pull requests write.
     # A dedicated owner PR token can be supplied independently.
-    token = os.getenv("APP_GITHUB_PR_TOKEN") or os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "")
-    if not token:
-        raise DraftReleaseError("未配置 GitHub PR 写入凭据，无法解除 Draft")
+    token = pr_token()
     data = json.dumps({
         "query": "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}",
         "variables": {"id": node_id},
