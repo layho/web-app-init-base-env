@@ -439,6 +439,16 @@ function App() {
             await loadOperations('tasks')
             return result
           }}
+          onTestPR={async (number, head, base) => {
+            if (!session) throw new Error('请先登录')
+            await api('/api/v1/pr-actions/test', {method:'POST',body:JSON.stringify({number,head,base})}, session.csrf_token)
+            await loadOperations('tasks')
+          }}
+          onMergePR={async (number, head, base) => {
+            if (!session) throw new Error('请先登录')
+            await api('/api/v1/pr-actions/merge-check', {method:'POST',body:JSON.stringify({number,head,base})}, session.csrf_token)
+            await loadOperations('tasks')
+          }}
           onReleaseDraft={async (number, head) => {
             if (!session) throw new Error('请先登录')
             await api('/api/v1/pr-drafts/release', { method: 'POST', body: JSON.stringify({ number, head }) }, session.csrf_token)
