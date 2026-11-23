@@ -69,6 +69,56 @@ def merge_text(old, new, local):
         return proc.stdout
 
 
+# Only this already-templated host script may be resolved automatically.
+# Runtime installers, service launchers other than manage.sh, and SQL migrations
+# retain mandatory review; never auto-delete any host file.
+SAFE_HOST_MERGE = frozenset({"deploy/macmini/manage.sh"})
+HOST_IDENTITY_KEYS = ("LABEL_PREFIX", "PORT", "TRACK_BRANCH", "EXPECTED_ORIGIN")
+
+
+def host_identity(content):
+    """Protect the real deployed app's instance-specific service settings."""
+    import re
+    if content is None:
+        return None
+    lines = content.decode("utf-8", "strict").splitlines()
+    values = {}
+    for key in HOST_IDENTITY_KEYS:
+        matches = [line for line in lines if re.fullmatch(r"\s*" + key + r"=[^\r\n]+", line)]
+        if len(matches) != 1:
+            return None
+        values[key] = matches[0].split("=", 1)[1].strip()
+    return values
+
+
+def resolve_host_script(path, old, new, current):
+    """Only syntactically safe, identity-preserving, provable three-way changes.
+
+    A conflict, local deletion, changed app identity, or unrecognized host
+    script is never patched silently. Runs bash syntax checking only, not code.
+    """
+    if path not in SAFE_HOST_MERGE or old is None or new is None or current is None:
+        return None
+    if any(b"\0" in data for data in (old, new, current)):
+        return None
+    try:
+        original = host_identity(current)
+        if original is None:
+            return None
+        result = new if current == old else merge_text(old, new, current)
+        if result is None or host_identity(result) != original:
+            return None
+        result.decode("utf-8", "strict")
+    except (UnicodeError, ValueError):
+        return None
+    # -n validates syntax without running installer commands or making writes.
+    try:
+        check = subprocess.run(["bash", "-n"], input=result, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result if check.returncode == 0 else None
+
+
 def plan(old, new, app):
     """Only paths owned by the rendered templates are eligible; preserve app-only files."""
     decisions = []
@@ -78,7 +128,14 @@ def plan(old, new, app):
         before, after, current = old.get(path), new.get(path), app.get(path)
         if before == after or current == after:
             continue
-        if path.startswith(("deploy/macmini/", "migrations/")) or after is None:
+        if path in SAFE_HOST_MERGE and before != after:
+            result = resolve_host_script(path, before, after, current)
+            if result is None:
+                action, reason = "review", "host script requires review: unsafe merge or changed instance settings"
+            else:
+                action = "replace" if current == before else "merge"
+                reason = "verified host script three-way merge, bash syntax and app identity"
+        elif path.startswith(("deploy/macmini/", "migrations/")) or after is None:
             action, reason, result = "review", "host/migration/deletion requires explicit review", None
         elif current == before:
             action, reason, result = ("add" if before is None else "replace"), "app matches old template", after

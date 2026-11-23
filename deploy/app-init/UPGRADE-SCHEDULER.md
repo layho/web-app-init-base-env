@@ -52,3 +52,33 @@ The approved Panel scheduler handles **one pending foundation-upgrade PR at a ti
 If MacCI fails/is missing, app main moves, the PR has been manually amended, the target diverged, multiple pending PRs exist, or GitHub is unavailable, the scheduler **does not** merge or deploy. It records a non-success status with the PR URL. No token, raw stderr or sensitive business data is logged. A special-case PR requiring review cannot be auto-merged without new verifiable evidence.
 
 The installed Mac mini scheduler uses a **copied runtime**, independent of the GitHub repository. After a reviewed foundation main release, the first host upgrade must be performed using the documented safe installer check and `--apply --upgrade`; do not claim a GitHub merge alone activates these changes. The existing application updater then handles ordinary Panel deployment after any successful PR merge, and actual running SHA still needs to be verified.
+
+
+## v0.1.31 automatic safe conflict recovery
+
+The planner will automatically resolve \`deploy/macmini/manage.sh\` only when
+the old and new generated scripts both exist, a clean three-way merge succeeds,
+the output passes \`bash -n\` **without being executed**, and the application's
+original \`LABEL_PREFIX\`, \`PORT\`, \`TRACK_BRANCH\`, and \`EXPECTED_ORIGIN\`
+remain unchanged. This is a **strict allowlist**, not an override of all
+deployment scripts. SQL migrations, other host scripts, deletions, concurrent
+overlapping edits, modified application identity, or invalid shell syntax
+remain blocked for review.
+
+A \`blocked\` result is re-evaluated on subsequent scheduler ticks instead of
+remaining cached forever. This allows newly reviewed resolution rules to take
+effect even when the official and app Git SHAs have not changed. It does not
+bypass exact source provenance or commit/MacCI/OWNER gates.
+
+The scheduler is a **separately installed Mac mini runtime**; merging v0.1.31
+into the foundation's GitHub main does not update its already-running copy.
+Use the existing \`--check-repo ... --apply --upgrade\` process above only
+after official foundation main acceptance. Verify the installed runtime and
+Panel's newest \`checked_at\`, \`blocked_files\`, \`pr_url\`, and target SHA.
+The Panel website should eventually show a real \`base-upgrade/<official-main-SHA>\`
+draft PR if and only if **all** planned changes can be resolved safely.
+
+A blocked file list can contain legitimate, app-specific overlap unrelated to
+the host script. For these, inspect the real file-specific diff and write a
+reviewed, narrow resolver; never add a generic "accept theirs", "accept ours",
+or partial provenance update to disguise incomplete upgrades.

@@ -25,7 +25,9 @@ ROOT = Path.home() / ".local/share/macmini-foundation-upgrades"
 INTERVAL = 300
 LABEL = "com.layho.foundation-upgrades"
 MODES = {"observe", "create"}
-TERMINAL = {"blocked", "current", "closed_pr"}
+# Blocked plans must be re-evaluated after runtime upgrades or changing
+# merge rules, even if the GitHub SHAs remain unchanged. Never cache blocked.
+TERMINAL = {"current", "closed_pr"}
 
 
 def private_root():

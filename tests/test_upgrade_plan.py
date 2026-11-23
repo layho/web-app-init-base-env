@@ -70,3 +70,59 @@ def test_generated_symlink_fails_closed(tmp_path):
     (tmp_path / "app/core.py").symlink_to(outside)
     with pytest.raises(ValueError, match="Unsafe generated file"):
         p.generated_snapshot(tmp_path)
+
+
+def _host(label="com.appinit.test", port="25936", domain="https://office-panel.layho.com", body="echo old"):
+    return (f"#!/bin/bash\nLABEL_PREFIX={label}\nPORT={port}\n"
+            f"TRACK_BRANCH=main\nEXPECTED_ORIGIN=\"{domain}\"\n{body}\n").encode()
+
+
+def test_host_manage_script_safe_upgrade_preserves_instance_identity():
+    path = "deploy/macmini/manage.sh"
+    before = _host(body="echo old")
+    after = _host(body="echo new")
+    d = p.plan({path: before}, {path: after}, {path: before})
+    assert len(d) == 1
+    assert d[0].action == "replace" and d[0].result == after
+    assert d[0].reason.startswith("verified host script")
+
+
+def test_host_manage_script_merges_nonoverlapping_local_customizations():
+    path = "deploy/macmini/manage.sh"
+    before = _host(body="echo old\n# extra\n# end")
+    after = _host(body="echo new\n# extra\n# end")
+    local = _host(body="echo old\n# extra\n# end\n# local configuration")
+    result = p.plan({path: before}, {path: after}, {path: local})[0]
+    assert result.action == "merge"
+    assert b"echo new" in result.result
+    assert b"# local configuration" in result.result
+
+
+def test_host_manage_script_rejects_app_instance_rebinding():
+    path = "deploy/macmini/manage.sh"
+    before = _host()
+    after = _host(port="38080")
+    d = p.plan({path: before}, {path: after}, {path: before})[0]
+    assert d.action == "review" and d.result is None
+
+
+def test_host_manage_script_rejects_bash_syntax_and_conflicting_edit():
+    path = "deploy/macmini/manage.sh"
+    before = _host(body="echo hello")
+    invalid = _host(body="if true; then")
+    d = p.plan({path: before}, {path: invalid}, {path: before})[0]
+    assert d.action == "review" and d.result is None
+    conflict = p.plan({path: before}, {path: _host(body="echo upstream")},
+                      {path: _host(body="echo local")})[0]
+    assert conflict.action == "review" and conflict.result is None
+
+
+def test_other_host_migrations_and_deletions_still_require_review():
+    files = ["deploy/macmini/release.py", "deploy/macmini/acceptance.sh",
+             "migrations/002_admin_sessions.sql"]
+    for path in files:
+        d = p.plan({path: b"old"}, {path: b"new"}, {path: b"old"})[0]
+        assert d.action == "review" and d.result is None
+    gone = p.plan({"deploy/macmini/manage.sh": _host()}, {}, 
+                  {"deploy/macmini/manage.sh": _host()})[0]
+    assert gone.action == "review" and gone.result is None
