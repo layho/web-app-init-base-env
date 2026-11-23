@@ -78,3 +78,56 @@ def test_unformatted_issue_is_visible_but_does_not_claim_progress():
     assert task["note"] == ""
     assert task["total_steps"] == 0
     assert development_tasks.parse_issue({**issue, "state":"closed", "state_reason":"completed"}, "owner/repo")["status"] == "已完成"
+
+
+def test_unified_tasks_include_merged_pr_without_issue():
+    issue = development_tasks.parse_issue(ISSUE, "owner/repo")
+    result = development_tasks.unified_tasks([issue], {"prs": [
+        {"number":77,"title":"Manual PR actions","url":"https://github.com/owner/repo/pull/77",
+         "head":"a"*40,"base":"b"*40,"test":{"state":"success","finished_at":"2026-11-23T04:26:55Z"},
+         "merge_state":"merged","deployment":{"state":"unverified"},"merged_at":"2026-11-23T04:27:00Z"}
+    ]})
+    assert [x["key"] for x in result] == ["issue-42", "pr-77"]
+    row = result[1]
+    assert row["source"] == "pr" and row["pr_number"] == 77
+    assert row["test_state"] == "success"
+    assert row["merge_state"] == "merged"
+    assert row["deployment_state"] == "unverified"
+    assert row["delivery_status"] == "已合并 · 部署待核验"
+    assert row["status"] != "已完成"
+    assert row["url"].endswith("/pull/77")
+
+
+def test_unified_tasks_do_not_treat_macci_success_as_release():
+    prs = [
+        {"number":71,"title":"Feedback center","url":"url", "test":{"state":"success"},
+         "merge_state":"open","deployment":{"state":"not_merged"}},
+        {"number":72,"title":"Draft","url":"url","test":{"state":"unknown"},
+         "merge_state":"draft","deployment":{"state":"not_merged"}},
+        {"number":73,"title":"Conflict","url":"url", "test":{"state":"success"},
+         "merge_state":"draft","deployment":{"state":"not_merged"},
+         "conflict":{"blocked":True}},
+    ]
+    tasks = development_tasks.unified_tasks([], {"prs": prs})
+    assert tasks[0]["delivery_status"] == "测试通过 · 待合并"
+    assert tasks[1]["status"] == "开发中"
+    assert tasks[2]["status"] == "受阻"
+    assert all(task["status"] != "已完成" for task in tasks)
+
+
+def test_unified_tasks_disambiguate_same_number_for_issue_and_pr():
+    issue = development_tasks.parse_issue({**ISSUE, "number":77}, "owner/repo")
+    result = development_tasks.unified_tasks([issue], {"prs":[
+        {"number":77,"title":"PR","test":{"state":"pending"},
+         "merge_state":"open","deployment":{"state":"not_merged"}}
+    ]})
+    assert {x["key"] for x in result} == {"issue-77","pr-77"}
+    assert len(result) == 2
+
+
+def test_unified_tasks_handles_missing_or_partial_tracking():
+    issue = development_tasks.parse_issue(ISSUE, "owner/repo")
+    assert len(development_tasks.unified_tasks([issue], {})) == 1
+    row = development_tasks.unified_tasks([], {"prs":[{"number":80,"title":"Partial PR"}]})[0]
+    assert row["delivery_status"] == "等待测试"
+    assert row["deployment_state"] == "unverified"
