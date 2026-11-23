@@ -7,6 +7,7 @@ A, B, H = "a" * 40, "b" * 40, "c" * 40
 def target_pr():
     return {
         "state": "open", "draft": True, "author_association": "OWNER",
+        "title": "fix: reusable draft safety control",
         "user": {"login": "layho"}, "node_id": "PR_example",
         "mergeable": True, "mergeable_state": "clean",
         "base": {"ref": "preview", "repo": {"full_name": d.REPO}},
@@ -129,7 +130,7 @@ def test_graphql_permission_denial_does_not_claim_success(monkeypatch):
                 def read(self, *args): return b'{"errors":[{"message":"Resource not accessible by personal access token"}]}'
             return Resp()
     monkeypatch.setattr(d, "build_opener", lambda *args: FakeOpener())
-    with pytest.raises(d.DraftReleaseError, match="Pull requests"):
+    with pytest.raises(d.DraftReleaseError, match="GH-GQL-FORBIDDEN"):
         d.mark_ready("PR_abc123")
 
 
@@ -152,3 +153,40 @@ def test_unknown_mergeability_can_exit_draft(github):
     assert result["released"] is True
     assert result["merge_blocked"] is False
     assert len(comments) == 1
+
+
+def test_graphql_error_classification_never_claims_all_are_missing_permissions():
+    assert "GH-GQL-FORBIDDEN" in str(d.graphql_failure([
+        {"message": "Resource not accessible by personal access token", "type": "FORBIDDEN"}]))
+    assert "GH-GQL-VALIDATION" in str(d.graphql_failure([
+        {"message": "Field 'wrongField' doesn't exist on type Mutation"}]))
+    assert "GH-GQL-NODE" in str(d.graphql_failure([
+        {"message": "Could not resolve to a node with the global id"}]))
+    assert "GH-GQL-RATE" in str(d.graphql_failure([
+        {"message": "API rate limit exceeded"}]))
+    assert "the-user-token" not in str(d.graphql_failure([
+        {"message": "Unknown error the-user-token"}]))
+
+
+def test_out_of_order_release_stays_draft_without_writing_review(github, monkeypatch):
+    _, pr, comments = github
+    pr["title"] = "feat(feedback): V0.1.25 反馈交付中心"
+    monkeypatch.setattr(d, "published_version", lambda: (0, 1, 23))
+    with pytest.raises(d.DraftReleaseError, match="版本顺序受阻"):
+        d.release(54, H)
+    assert comments == []
+
+
+def test_immediate_next_release_may_exit_draft(github, monkeypatch):
+    _, pr, comments = github
+    pr["title"] = "feat(tasks): V0.1.24 开发任务"
+    monkeypatch.setattr(d, "published_version", lambda: (0, 1, 23))
+    assert d.release(54, H)["released"] is True
+    assert comments
+
+
+def test_non_release_prs_unaffected_by_version_gate(github, monkeypatch):
+    _, pr, comments = github
+    pr["title"] = "fix: prevent old sha acceptance"
+    monkeypatch.setattr(d, "published_version", lambda: None)
+    assert d.release(54, H)["released"]

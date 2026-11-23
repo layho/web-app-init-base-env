@@ -12,6 +12,8 @@ import type { TaskSnapshot } from './DevelopmentTasksPage'
 import { ProjectInfoPage } from './ProjectInfoPage'
 import type { ProjectInfo } from './ProjectInfoPage'
 import { WorkspaceShell } from './WorkspaceShell'
+import { FeedbackDelivery } from './FeedbackDelivery'
+import type { Delivery } from './FeedbackDelivery'
 
 type DeployStatus = { state: string; event: {at: string; code: string; sha: string} | null; locked: boolean; age_seconds: number | null; requested_at: string | null; running_sha: string; rollback_failed: boolean }
 const deployLabels: Record<string, string> = { request_waiting: "已登记请求，等待更新器领取", request_unacknowledged: "更新器未确认请求，请检查服务或锁", update_started: "更新器已开始检查", update_candidate: "已取得目标提交", update_dependencies: "检查依赖", update_test_build: "测试及构建中", update_restarting: "服务重启及健康验证中", update_ok: "本机部署成功", update_no_change: "已检查，无新提交", update_held: "目标提交被失败保护拦截", update_preflight_failed: "更新前置条件失败", update_fetch_failed: "拉取失败", update_dependencies_failed: "依赖检查失败", update_schema_failed: "数据库结构检查失败", update_test_build_failed: "测试或构建失败", update_restart_failed: "重启或健康检查失败", update_interrupted: "更新进程未完成", running_sha_mismatch: "运行版本与更新记录不一致", unknown: "尚无更新器回执" }
@@ -28,6 +30,7 @@ type Feedback = FeedbackInput & {
   development_finished_at?: string | null; development_submitted_at?: string | null
   overall_status?: string; developer_reply?: string; delivered_sha?: string | null
   developer_pr?: number | null; progress_synced_at?: string | null; progress_stale?: boolean
+  delivery?: Delivery
 }
 const feedbackStatus: Record<string, { label: string; color: string }> = {
   pending_sync: { label: '待同步', color: 'default' },
@@ -456,23 +459,32 @@ function App() {
             <Button onClick={() => void loadFeedback()} loading={feedbackLoading}>刷新状态</Button>
             <Button type="primary" onClick={() => setFeedbackOpen(true)}>提交反馈</Button>
           </Space>}>
-            <Typography.Paragraph type="secondary">提交问题、改进建议及验收意见，并查看反馈原文与同步结果。</Typography.Paragraph>
+            <Typography.Paragraph type="secondary">一条反馈、一条交付链。点击详情查看提交 → 领取 → 开发 → 测试 → 合并 → 部署 → 验收的真实证据和任务执行状态。</Typography.Paragraph>
             <Table<Feedback> rowKey="id" size="small" dataSource={records} loading={feedbackLoading}
-              scroll={{ x: 1660 }} pagination={{ pageSize: 15, showSizeChanger: true }} columns={[
+              scroll={{ x: 1050 }} pagination={{ pageSize: 15, showSizeChanger: true }} columns={[
                 { title: '编号', dataIndex: 'id', width: 80, render: (id: number) => '#' + id },
                 { title: '反馈内容', dataIndex: 'message', ellipsis: true, render: (message: string, row) =>
                   <Button type="link" style={{ padding: 0, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', textAlign: 'left', display: 'block' }} onClick={() => setSelectedFeedbackId(row.id)}>{message}</Button> },
-                { title: '类别', dataIndex: 'category', width: 110, render: (category: string) => feedbackLabels[category] ?? category },
-                { title: '提交时间', dataIndex: 'created_at', width: 170, render: feedbackDate },
-                { title: '同步时间', dataIndex: 'synced_at', width: 170, render: feedbackDate },
-                { title: '领取任务时间', dataIndex: 'claimed_at', width: 170, render: feedbackDate },
-                { title: '开发开始时间', dataIndex: 'development_started_at', width: 170, render: feedbackDate },
-                { title: '开发结束时间', dataIndex: 'development_finished_at', width: 170, render: feedbackDate },
-                { title: '开发提交时间', dataIndex: 'development_submitted_at', width: 170, render: feedbackDate },
-                { title: '整体状态', key: 'overall_status', width: 145, render: (_, row) => <FeedbackStatus row={row} /> },
-                { title: '同步状态', key: 'status', width: 130, render: (_, row) =>
-                  row.status === 'synced' && row.github_issue_number ? <Tag color="success">GitHub #{row.github_issue_number}</Tag> : <Tag>待同步</Tag> },
-                { title: '操作', key: 'action', width: 75, render: (_, row) => <Button type="link" onClick={() => setSelectedFeedbackId(row.id)}>详情</Button> },
+                { title: '当前交付阶段', key: 'phase', width: 190, render: (_, row) =>
+                  <Space direction="vertical" size={0}><FeedbackStatus row={row} /><Typography.Text type="secondary" style={{fontSize:12}}>{
+                    row.delivery?.current_stage === 'blocked' ? '需处理阻塞' :
+                    row.delivery?.current_stage === 'failed' ? '测试/部署失败' :
+                    row.delivery?.steps.find(step => step.key === row.delivery?.current_stage)?.label ?? '等待交付证据'
+                  }</Typography.Text></Space> },
+                { title: '执行情况', key: 'executor', width: 220, render: (_, row) =>
+                  <Space direction="vertical" size={0}>
+                    <Typography.Text>{row.delivery?.executor.name ?? '负责人未关联'}</Typography.Text>
+                    <Typography.Text type="secondary" style={{fontSize:12}}>{row.delivery?.executor.running === true ? '执行中（有心跳）' :
+                      row.delivery?.executor.running === false ? '当前未执行' : '未接通执行器状态'}</Typography.Text>
+                  </Space> },
+                { title: '下次触发', key: 'next-run', width: 175, render: (_, row) =>
+                  <Typography.Text type="secondary">{row.delivery?.executor.next_run_at ?
+                    feedbackDate(row.delivery.executor.next_run_at) : '未取得调度回执'}</Typography.Text> },
+                { title: 'GitHub', key: 'issue', width: 120, render: (_, row) => row.github_issue_number
+                  ? <a href={githubIssues + '/' + row.github_issue_number} target="_blank" rel="noopener noreferrer">Issue #{row.github_issue_number}</a>
+                  : <Typography.Text type="secondary">待同步</Typography.Text> },
+                { title: '操作', key: 'action', width: 100, render: (_, row) =>
+                  <Button type="link" onClick={() => setSelectedFeedbackId(row.id)}>查看链路</Button> },
               ]} />
           </Card>
           <Modal title="提交意见反馈" open={feedbackOpen} onCancel={() => { if (!busy) setFeedbackOpen(false) }} footer={null} width={640}>
@@ -497,6 +509,7 @@ function App() {
             open={selectedFeedbackId !== null} onClose={() => setSelectedFeedbackId(null)}
             extra={<Button loading={feedbackLoading} onClick={() => void loadFeedback()}>刷新状态</Button>}>
             {selectedFeedback ? <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+              <FeedbackDelivery delivery={selectedFeedback.delivery} issueBase={githubIssues} />
               <Descriptions bordered size="small" column={1} items={[
                 { key: 'category', label: '反馈类别', children: feedbackLabels[selectedFeedback.category] ?? selectedFeedback.category },
                 { key: 'created', label: '提交时间', children: feedbackDate(selectedFeedback.created_at) },
