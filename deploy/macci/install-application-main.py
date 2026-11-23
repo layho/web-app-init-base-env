@@ -143,7 +143,22 @@ def enable(sha):
             os.link(temporary, PLIST)
         finally:
             temporary.unlink(missing_ok=True)
-    subprocess.run(["/usr/bin/plutil", "-lint", str(PLIST)], check=True)
+    # A syntax failure means launchd was never invoked: remove only our own
+    # newly-created inode. Do not remove a concurrently replaced plist.
+    created = PLIST.lstat()
+    try:
+        subprocess.run(["/usr/bin/plutil", "-lint", str(PLIST)], check=True)
+    except (OSError, subprocess.CalledProcessError):
+        try:
+            current = PLIST.lstat()
+            if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                PLIST.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    # Bootstrap may have created a job even if the command reports failure.
+    # Keep its plist for inspection rather than leaving an untracked loaded
+    # service or deleting another process's configuration.
     subprocess.run(["/bin/launchctl", "bootstrap", domain, str(PLIST)], check=True)
     return "Installed; host app main coordinator now scheduled"
 

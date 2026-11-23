@@ -91,3 +91,52 @@ class InstallApplicationMainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _installation_fixture(root, monkeypatch=None):
+    """Create only owned test files; no actual launchd calls."""
+    source = root / "source"
+    host = root / "host"
+    agents = root / "agents"
+    source.mkdir()
+    host.mkdir()
+    agents.mkdir()
+    (source / "merge_application.py").write_text("# reviewed")
+    (host / "merge_application.py").write_text("# reviewed")
+    (host / "merge_application.py").chmod(0o700)
+    return source, host, agents / "application.plist"
+
+
+class InstallRollbackTests(unittest.TestCase):
+    def test_plist_lint_failure_removes_only_newly_created_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            source, host, plist = _installation_fixture(Path(d))
+            def run(command, **kwargs):
+                if command[0] == "/usr/bin/plutil":
+                    raise __import__("subprocess").CalledProcessError(1, command)
+                return None
+            with patch.object(installer, "SOURCE", source), \
+                 patch.object(installer, "ROOT", host), \
+                 patch.object(installer, "PLIST", plist), \
+                 patch.object(installer, "preflight"), \
+                 patch.object(installer.subprocess, "run", side_effect=run):
+                with self.assertRaises(__import__("subprocess").CalledProcessError):
+                    installer.enable(SHA)
+                self.assertFalse(plist.exists())
+
+    def test_failed_bootstrap_keeps_plist_for_reconciliation(self):
+        with tempfile.TemporaryDirectory() as d:
+            source, host, plist = _installation_fixture(Path(d))
+            def run(command, **kwargs):
+                if command[:2] == ["/bin/launchctl", "bootstrap"]:
+                    raise __import__("subprocess").CalledProcessError(1, command)
+                return None
+            with patch.object(installer, "SOURCE", source), \
+                 patch.object(installer, "ROOT", host), \
+                 patch.object(installer, "PLIST", plist), \
+                 patch.object(installer, "preflight"), \
+                 patch.object(installer.subprocess, "run", side_effect=run):
+                with self.assertRaises(__import__("subprocess").CalledProcessError):
+                    installer.enable(SHA)
+                self.assertTrue(plist.exists())
+                self.assertEqual(plistlib.loads(plist.read_bytes())["Label"], installer.LABEL)
