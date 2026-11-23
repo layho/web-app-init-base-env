@@ -147,8 +147,11 @@ def merge_one(token, repo, number, dry_run=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True, choices=sorted(ALLOWED))
+    parser.add_argument("--pr", type=int, help="Optional exact PR for a host-triggered one-shot")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.pr is not None and args.pr <= 0:
+        parser.error("--pr must be positive")
     token = base.read_token()
     lockfile = ROOT / ("app-main-" + args.repo.replace("/", "--") + ".lock")
     with lockfile.open("a") as stream:
@@ -156,7 +159,8 @@ def main():
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
-        prs = pages(token, args.repo, "/pulls?state=open&sort=created&direction=asc")
+        prs = ([api(token, args.repo, f"/pulls/{args.pr}")] if args.pr is not None
+               else pages(token, args.repo, "/pulls?state=open&sort=created&direction=asc"))
         for pr in prs:
             if eligible(args.repo, pr) and merge_one(token, args.repo,
                                                      pr["number"], args.dry_run):
