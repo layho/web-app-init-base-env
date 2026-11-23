@@ -110,7 +110,7 @@ class ApplicationMainTests(unittest.TestCase):
         def fake_git(folder, *args):
             calls.append(args)
             if args[:2] == ("show", "-s"):
-                return f"{MERGE} {BASE} {HEAD}" if "%H %P" in args else TREE
+                return f"{MERGE} {BASE} {HEAD}" if any("%H %P" in arg for arg in args) else TREE
             if args[:1] == ("rev-parse",):
                 return BASE
             return ""
@@ -124,7 +124,7 @@ class ApplicationMainTests(unittest.TestCase):
         def fake_git(folder, *args):
             calls.append(args)
             if args[:2] == ("show", "-s"):
-                return f"{MERGE} {BASE} {HEAD}" if "%H %P" in args else "e"*40
+                return f"{MERGE} {BASE} {HEAD}" if any("%H %P" in arg for arg in args) else "e"*40
             if args[:1] == ("rev-parse",):
                 return BASE
             return ""
@@ -132,10 +132,6 @@ class ApplicationMainTests(unittest.TestCase):
              patch.object(m.base, "git", side_effect=fake_git):
             self.assertFalse(m.merge_one("token", REPO, 7))
         self.assertFalse(any(args[0] == "push" for args in calls))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ApplicationCliTests(unittest.TestCase):
@@ -162,3 +158,7 @@ class ApplicationCliTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 m.main()
             token.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
