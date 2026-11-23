@@ -4,13 +4,14 @@ Separate from the base preview publisher. A repository must be in the trusted
 MacCI allowlist and explicitly selected by the trusted host administrator.
 """
 import argparse
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, NamedTemporaryFile
 from urllib.request import Request, build_opener
 import merge_preview as base
 import runner
@@ -119,6 +120,46 @@ def authorized(token, repo, number):
     return head, current, candidate, commit["tree"]["sha"]
 
 
+def merge_receipt(repo, number, head, old_main, new_main, tree):
+    """Durable evidence of GitHub main merge; *never* a deployment receipt."""
+    if (repo not in ALLOWED or type(number) is not int or number <= 0
+            or not all(valid(x) for x in (head, old_main, new_main, tree))):
+        raise ValueError("Invalid merge receipt scope or SHA")
+    root = ROOT / "app-main-receipts"
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    import stat
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o077):
+        raise ValueError("Unsafe receipt directory")
+    name = root / (repo.replace("/", "--") + f"--{number}--" + new_main + ".json")
+    record = {
+        "schema": 1, "repository": repo, "pr": number,
+        "head_sha": head, "previous_main_sha": old_main,
+        "merged_main_sha": new_main, "tree_sha": tree,
+        "merge_state": "github_main_verified",
+        "deployment_state": "unverified",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if name.exists() or name.is_symlink():
+        raise ValueError("Receipt already exists: refuse destructive overwrite")
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=root,
+                            prefix=".app-main-", delete=False) as file:
+        temp = Path(file.name)
+        try:
+            os.fchmod(file.fileno(), 0o600)
+            json.dump(record, file, ensure_ascii=False, sort_keys=True)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+            file.close()
+            # hard link is exclusive and never clobbers another receipt
+            os.link(temp, name)
+        finally:
+            temp.unlink(missing_ok=True)
+    return name
+
+
 def merge_one(token, repo, number, dry_run=False):
     gate = authorized(token, repo, number)
     if gate is None:
@@ -143,7 +184,10 @@ def merge_one(token, repo, number, dry_run=False):
         base.git(folder, "push", "--porcelain", remote,
                  candidate + ":refs/heads/main")
         actual = api(token, repo, "/branches/main")["commit"]["sha"]
-        return actual == candidate
+        if actual != candidate:
+            return False
+        merge_receipt(repo, number, head, current, candidate, tree)
+        return True
 
 
 def main():
