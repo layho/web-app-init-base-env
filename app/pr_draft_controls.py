@@ -29,6 +29,54 @@ def github(path, payload=None):
         raise DraftReleaseError("无法核实 GitHub 状态或权限，未解除 Draft") from None
 
 
+def graphql_failure(errors):
+    """Classify GitHub GraphQL failures without exposing raw data or tokens."""
+    if not isinstance(errors, list) or not errors or not isinstance(errors[0], dict):
+        return DraftReleaseError("GH-GQL-UNKNOWN：GitHub 返回异常错误结构")
+    error = errors[0]
+    message = str(error.get("message", "")).lower()[:500]
+    ext = error.get("extensions") if isinstance(error.get("extensions"), dict) else {}
+    code = str(ext.get("type", "")).upper()
+    if ("resource not accessible" in message or "forbidden" in message
+            or "insufficient" in message or code == "FORBIDDEN"):
+        return DraftReleaseError("GH-GQL-FORBIDDEN：GraphQL 拒绝本次操作，不能据此断定缺少 Pull requests 权限")
+    if "could not resolve to a node" in message or "not found" in message:
+        return DraftReleaseError("GH-GQL-NODE：PR 节点不存在或该 Token 无法访问")
+    if ("validation" in message or "field " in message or
+            code in {"GRAPHQL_VALIDATION_FAILED", "UNPROCESSABLE"}):
+        return DraftReleaseError("GH-GQL-VALIDATION：GitHub GraphQL 请求未通过校验")
+    if "rate limit" in message or "abuse" in message:
+        return DraftReleaseError("GH-GQL-RATE：触发 GitHub 请求限制，请稍后重试")
+    return DraftReleaseError("GH-GQL-OTHER：GitHub 拒绝解除 Draft，需查看服务端脱敏诊断记录")
+
+
+def published_version():
+    """The running, already-accepted application's release version."""
+    try:
+        from pathlib import Path
+        data = json.loads(Path(__file__).with_name("release_notes.json").read_text(encoding="utf-8"))
+        value = data[0]["version"]
+        match = re.fullmatch(r"(\\d+)\\.(\\d+)\\.(\\d+)", value)
+        return tuple(map(int, match.groups())) if match else None
+    except (OSError, IndexError, KeyError, TypeError, ValueError):
+        return None
+
+
+def release_order_gate(title):
+    """Drafts for later releases must not bypass an unresolved earlier release."""
+    if not isinstance(title, str):
+        raise DraftReleaseError("无法核对 PR 版本")
+    match = re.search(r"(?i)\\bv(\\d+)\\.(\\d+)\\.(\\d+)\\b", title)
+    if not match:
+        return
+    candidate = tuple(map(int, match.groups()))
+    current = published_version()
+    if current is None:
+        raise DraftReleaseError("无法读取当前已发布版本，解除 Draft 已锁定")
+    if candidate[:2] == current[:2] and candidate[2] > current[2] + 1:
+        raise DraftReleaseError(f"版本顺序受阻：当前正式版 V{'.'.join(map(str,current))}，请先完成 V{current[0]}.{current[1]}.{current[2] + 1} 的测试与发布")
+
+
 def mark_ready(node_id):
     if not isinstance(node_id, str) or not re.fullmatch(r"PR_[A-Za-z0-9_]+", node_id):
         raise DraftReleaseError("PR 标识无效，不能解除 Draft")
@@ -50,14 +98,19 @@ def mark_ready(node_id):
         with build_opener(release_acceptance.NoRedirect()).open(request, timeout=10) as response:
             result = json.load(response)
     except HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(8192))
+        except (OSError, ValueError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get("errors"):
+            raise graphql_failure(payload["errors"]) from None
         if exc.code in (401, 403):
-            raise DraftReleaseError("解除 Draft 的 GitHub 凭据未获授权，请配置具有 Pull requests 写入权限的 OWNER Token") from None
-        raise DraftReleaseError("GitHub 返回 HTTP 错误，未解除 Draft") from None
+            raise DraftReleaseError(f"GH-HTTP-{exc.code}：GitHub 拒绝请求，需核对运行服务的 Token 身份或仓库授权") from None
+        raise DraftReleaseError(f"GH-HTTP-{exc.code}：GitHub 请求失败，Draft 状态未改变") from None
     except (URLError, OSError, ValueError):
-        raise DraftReleaseError("连接 GitHub GraphQL 失败，未解除 Draft") from None
+        raise DraftReleaseError("GH-NETWORK：GitHub GraphQL 无法连接或回执无效") from None
     if result.get("errors"):
-        # GitHub GraphQL returns errors as untrusted strings, never echo them.
-        raise DraftReleaseError("GitHub GraphQL 拒绝解除 Draft：请检查 OWNER Token 的 Pull requests 写入权限")
+        raise graphql_failure(result["errors"])
     if result.get("data", {}).get("markPullRequestReadyForReview", {}).get("pullRequest", {}).get("isDraft") is not False:
         raise DraftReleaseError("GitHub 未确认 Draft 状态变化，已安全停止")
     return True
@@ -82,6 +135,7 @@ def validate(number, expected_head):
             or base.get("ref") != "preview" or (base.get("repo") or {}).get("full_name") != REPO
             or (head.get("repo") or {}).get("full_name") != REPO or head.get("sha") != expected_head):
         raise DraftReleaseError("PR 已变化、不是 OWNER 的基座 preview 草稿或已解除 Draft")
+    release_order_gate(pr.get("title"))
     # Releasing a Draft is an owner workflow decision, not a merge.
     # Conflicts and pending merge calculations remain blocked by MacCI and
     # the preview coordinator; do not prevent the owner from unpausing work.
