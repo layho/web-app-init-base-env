@@ -67,7 +67,7 @@ def preflight(sha, run_tests=True):
             raise ValueError("Reviewed coordinator module missing")
     if run_tests:
         subprocess.run([sys.executable, "-B", "-m", "unittest", "-v",
-                        "test_merge_application"],
+                        "test_merge_application", "test_install_application_main"],
                        cwd=SOURCE, check=True)
 
 
