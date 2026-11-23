@@ -233,3 +233,80 @@ class ApplicationMergeReceiptTests(unittest.TestCase):
              patch.object(m, "merge_receipt") as receipt:
             self.assertFalse(m.merge_one("token", REPO, 7))
             receipt.assert_not_called()
+
+
+class ApplicationReceiptReconcileTests(unittest.TestCase):
+    def test_reconcile_rejects_closed_pr_without_owner_review(self):
+        closed = {**pr(), "state": "closed", "merged": True}
+        with patch.object(m, "api", side_effect=lambda token, repo, path: (
+                    closed if path == "/pulls/7" else
+                    {"parents": [{"sha": BASE}, {"sha": HEAD}], "tree": {"sha": TREE}})), \
+             patch.object(m, "pages", return_value=[]), \
+             patch.object(m.base, "git") as git, \
+             patch.object(m, "merge_receipt") as receipt:
+            self.assertFalse(m.reconcile_one("token", REPO, 7))
+            git.assert_not_called()
+            receipt.assert_not_called()
+
+    def test_reconcile_requires_historical_candidate_ancestry(self):
+        import subprocess
+        closed = {**pr(), "state": "closed", "merged": True}
+        def api(token, repo, path):
+            if path == "/pulls/7":
+                return closed
+            if path == "/git/commits/" + MERGE:
+                return {"parents": [{"sha": BASE}, {"sha": HEAD}], "tree": {"sha": TREE}}
+            if path.startswith("/commits/"):
+                return [status()]
+            if path == "/branches/main":
+                return {"commit": {"sha": MERGE}}
+            raise AssertionError(path)
+        def git(folder, *args):
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                raise subprocess.CalledProcessError(1, args)
+            if args[0] == "rev-parse":
+                return MERGE
+            return ""
+        with patch.object(m, "api", side_effect=api), \
+             patch.object(m, "pages", return_value=[review()]), \
+             patch.object(m.base, "git", side_effect=git), \
+             patch.object(m, "merge_receipt") as receipt:
+            with self.assertRaises(subprocess.CalledProcessError):
+                m.reconcile_one("token", REPO, 7)
+            receipt.assert_not_called()
+
+    def test_reconcile_exact_success_recovers_receipt_and_dry_run_does_not(self):
+        closed = {**pr(), "state": "closed", "merged": True}
+        def api(token, repo, path):
+            if path == "/pulls/7":
+                return closed
+            if path == "/git/commits/" + MERGE:
+                return {"parents": [{"sha": BASE}, {"sha": HEAD}], "tree": {"sha": TREE}}
+            if path.startswith("/commits/"):
+                return [status()]
+            if path == "/branches/main":
+                return {"commit": {"sha": MERGE}}
+            raise AssertionError(path)
+        def git(folder, *args):
+            if args[0] == "rev-parse":
+                return MERGE
+            if args[:2] == ("show", "-s"):
+                return f"{MERGE} {BASE} {HEAD}" if any("%H %P" in x for x in args) else TREE
+            return ""
+        with patch.object(m, "api", side_effect=api), \
+             patch.object(m, "pages", return_value=[review()]), \
+             patch.object(m.base, "git", side_effect=git), \
+             patch.object(m, "merge_receipt") as receipt:
+            self.assertTrue(m.reconcile_one("token", REPO, 7, dry_run=True))
+            receipt.assert_not_called()
+            self.assertTrue(m.reconcile_one("token", REPO, 7))
+            receipt.assert_called_once_with(REPO, 7, HEAD, BASE, MERGE, TREE)
+
+    def test_reconcile_refuses_wrong_repo_or_open_pr(self):
+        with patch.object(m, "api") as api:
+            self.assertFalse(m.reconcile_one("token", "layho/web-app-init-base-env", 7))
+            api.assert_not_called()
+        with patch.object(m, "api", return_value=pr()), \
+             patch.object(m, "merge_receipt") as receipt:
+            self.assertFalse(m.reconcile_one("token", REPO, 7))
+            receipt.assert_not_called()
