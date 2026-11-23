@@ -52,3 +52,49 @@ deployment receipts, rollback/freeze, and unified user-facing manual trigger.
 
 No changes to deployed applications, production databases, Cloudflare
 Tunnel, credentials, or GitHub Actions are made by this PR.
+
+
+## Stage 2: reviewed Mac mini installation
+
+The source includes a separate fail-closed installer, but **merging this
+documentation or code never installs a background agent**. Only the Mac mini
+operator may carry out the steps below after this PR has itself completed
+MacCI review, preview deployment, explicit website acceptance, and main
+publication.
+
+On the Mac mini, from the *clean, exact accepted main checkout*:
+
+```sh
+cd ~/web-app-init-base-env-preview
+git status --porcelain
+git checkout main
+git pull --ff-only
+cd deploy/macci
+python3 install-application-main.py --sha <accepted-main-commit> --check
+python3 install-application-main.py --sha <accepted-main-commit> --stage
+# Do not enable until the protected app-main review procedure is complete.
+python3 install-application-main.py --sha <accepted-main-commit> --enable
+```
+
+Use the actual installation directory if it differs. The SHA argument must be
+the **40-character exact commit** from GitHub main, never the branch label.
+
+- \`--check\`: validates the unchanged checkout, existing private host
+  installation, token file and offline coordinator regression suite.
+- \`--stage\`: atomically copies only the new \`merge_application.py\` into the
+  trusted host directory. Does **not** register launchd or start a merge.
+  Refuses to overwrite a different existing installed copy.
+- \`--enable\`: requires the staged bytes to match accepted main and creates a
+  fixed app-only LaunchAgent \`com.layho.macci-app-main-panel\` with a 60-second
+  scan; refuses any preexisting plist rather than overwriting it. Application
+  PRs still must be non-Draft, OWNER-approved for their exact HEAD/base and
+  have the latest exact MacCI success to merge.
+
+The deployment check remains separate. After an application PR merges, verify
+the application updater, \`/api/version\` running SHA, login/session and
+deployment receipt before claiming the application is delivered. This stage
+does not install an application updater or create a web-side action.
+
+To stop an already enabled coordinator, unload only the explicitly installed
+label through normal macOS service administration; never delete global MacCI
+tokens, locks, another application's LaunchAgent or production database.
