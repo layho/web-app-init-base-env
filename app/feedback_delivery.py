@@ -52,6 +52,14 @@ def timeline(feedback, prs=None):
             state = "failed"
             at = deployment.get("at")
         steps.append({"key": code, "label": LABELS[code], "state": state, "at": at})
+    # Missing historical milestones must stay explicitly unverified, without
+    # hiding a real later PR or MacCI event behind "waiting to start coding".
+    # No date is inferred and no milestone is marked completed by implication.
+    last_verified = max((i for i, row in enumerate(steps)
+                         if row["state"] == "complete"), default=-1)
+    for i, row in enumerate(steps):
+        if i < last_verified and row["state"] == "pending":
+            row["state"] = "unrecorded"
     if feedback.get("overall_status") == "blocked":
         phase = "blocked"
     elif any(x["state"] == "failed" for x in steps):
