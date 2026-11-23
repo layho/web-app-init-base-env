@@ -135,7 +135,7 @@ def test_unified_tasks_handles_missing_or_partial_tracking():
 
 def test_one_issue_can_have_multiple_prs_with_delivery_history():
     issue = development_tasks.parse_issue({
-        **ISSUE, "body": ISSUE["body"] + "\\n## 关联 PR\\n- #81\\n- #82\\n",
+        **ISSUE, "body": ISSUE["body"] + "\n## 关联 PR\n- #81\n- #82\n",
         "assignees": [{"login": "developer-a"}]}, "owner/repo")
     prs = [
         {"number":81, "title":"Frontend", "owner":"a", "test":{"state":"success"},
@@ -170,7 +170,7 @@ def test_pr_explicit_issue_reference_links_and_preserves_unrelated():
 
 def test_issue_body_pr_references_only_from_explicit_section():
     issue = development_tasks.parse_issue({**ISSUE,
-      "body":"See #91\\n\\n## 关联 PR\\n- #92\\n- #92\\n\\n## Notes\\n#93",
+      "body":"See #91\n\n## 关联 PR\n- #92\n- #92\n\n## Notes\n#93",
       "assignees":[]}, "owner/repo")
     assert issue["linked_prs"] == [92]
     assert issue["owner"] == "未指定"
