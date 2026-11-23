@@ -126,3 +126,44 @@ def test_other_host_migrations_and_deletions_still_require_review():
     gone = p.plan({"deploy/macmini/manage.sh": _host()}, {}, 
                   {"deploy/macmini/manage.sh": _host()})[0]
     assert gone.action == "review" and gone.result is None
+
+
+def test_manage_script_nested_preview_overrides_are_not_instance_identity():
+    path = "deploy/macmini/manage.sh"
+    old = (_host(body="echo previous\n") +
+           b'if test -n "$BASE_PREVIEW_PORT"; then\n'
+           b'  LABEL_PREFIX="com.layho.basepreview"\n'
+           b'  PORT="$BASE_PREVIEW_PORT"\n'
+           b'  TRACK_BRANCH=preview\n'
+           b'  EXPECTED_ORIGIN="https://base.layho.com"\nfi\n')
+    new = old.replace(b"echo previous", b"echo upstream")
+    local = old
+    assert p.host_identity(local) == {
+        "LABEL_PREFIX": "com.appinit.test",
+        "PORT": "25936",
+        "TRACK_BRANCH": "main",
+        "EXPECTED_ORIGIN": '"https://office-panel.layho.com"',
+    }
+    result = p.plan({path: old}, {path: new}, {path: local})[0]
+    assert result.action == "replace"
+    assert b"echo upstream" in result.result
+    assert b'  LABEL_PREFIX="com.layho.basepreview"' in result.result
+    assert b'  TRACK_BRANCH=preview' in result.result
+
+
+def test_manage_script_top_level_identity_redefinition_is_not_safe():
+    path = "deploy/macmini/manage.sh"
+    old = _host()
+    changed = old + b'PORT=12345\n'
+    assert p.host_identity(changed) is None
+    d = p.plan({path: old}, {path: _host(body="echo updated")}, {path: changed})[0]
+    assert d.action == "review"
+
+
+def test_manage_script_app_port_is_unchanged_after_safe_upstream_patch():
+    path = "deploy/macmini/manage.sh"
+    old = _host(port="25936", body="echo old")
+    new = _host(port="25936", body="echo new")
+    result = p.plan({path: old}, {path: new}, {path: old})[0]
+    assert result.action == "replace"
+    assert p.host_identity(result.result) == p.host_identity(old)
