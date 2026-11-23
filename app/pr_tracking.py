@@ -139,6 +139,21 @@ def log_summary(number, head, base, test, repo=None):
     return {"pytest": counts, "phase": test.get("phase"), "source": "MacCI local log summary"}
 
 
+def explicit_issue_refs(body):
+    """Recognize explicit Issue references only; not generic unlabelled #numbers."""
+    if not isinstance(body, str):
+        return []
+    # GitHub standard closing keywords or deliberate issue/task labels.
+    found = set()
+    for match in re.finditer(
+            r"(?im)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|relates?\s+to|"
+            r"issue|task|关联(?:任务|需求|issue))\s*:?\s*"
+            r"(?:https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/)?#?([1-9][0-9]{0,6})\b",
+            body[:40000]):
+        found.add(int(match.group(1)))
+    return sorted(found)
+
+
 def collect(github, repo=None, branch=None):
     current = target() if repo is None else (repo, branch or "main")
     if current is None or not valid_repository(current[0]):
@@ -194,6 +209,8 @@ def collect(github, repo=None, branch=None):
         log = log_summary(number, head, base, test, repo)
         rows.append({"number": number, "title": str(pr.get("title", ""))[:300],
                      "url": "https://github.com/" + repo + "/pull/" + str(number),
+                     "owner": str((pr.get("user") or {}).get("login") or "未指定")[:100],
+                     "linked_issues": explicit_issue_refs(pr.get("body")),
                      "head": head, "base": base, "test": test, "log": log,
                      "merge_state": "merged" if merged else "closed" if pr.get("state") == "closed" else "draft" if pr.get("draft") else "open",
                      "merge_blocked": blocked,

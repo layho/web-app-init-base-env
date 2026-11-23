@@ -1,7 +1,11 @@
 import { useState } from 'react'
 import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Table, Tabs, Tag, Typography } from 'antd'
 
+type LinkedPR = {number: number; title?: string; url?: string; owner?: string; test?: {state?: string; started_at?: string; finished_at?: string}; merge_state?: string; merged_at?: string | null; merge_sha?: string | null; deployment?: {state?: string; at?: string | null}; conflict?: {blocked?: boolean}}
 type DevelopmentTask = {
+  owner?: string
+  pr_numbers?: number[]
+  prs?: LinkedPR[]
   key?: string
   source?: 'issue' | 'pr'
   pr_number?: number | null
@@ -202,6 +206,8 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   onReleaseDraft: (number: number, head: string) => Promise<void>
   onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>
 }) {
+  const [taskSelected, setTaskSelected] = useState<string | null>(null)
+  const selectedTask = data?.tasks.find(task => (task.key ?? 'issue-' + task.number) === taskSelected)
   const tasks = <Flex vertical gap="middle">
       {data?.stale && <Alert type="warning" showIcon message={
         data?.synced_at ? '同步已延迟，以下为上次成功获取的记录。' : '等待从 GitHub 同步开发任务。'
@@ -212,13 +218,17 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
         size="small"
         loading={loading}
         dataSource={data?.tasks ?? []}
-        scroll={{ x: 1300 }}
+        scroll={{ x: 1600 }}
         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={
           data?.synced_at ? '暂无开发任务或 PR 记录' : '暂无同步记录'
         } /> }}
         columns={[
           { title: '任务', dataIndex: 'title', width: 310, render: (title: string, task: DevelopmentTask) =>
             <Typography.Link href={task.url} target="_blank" rel="noreferrer">#{task.number} {title}</Typography.Link> },
+          { title: '负责人', width: 110, render: (_, task: DevelopmentTask) => task.owner || '未指定' },
+          { title: '关联 PR', width: 110, render: (_, task: DevelopmentTask) => task.pr_numbers?.length ? task.pr_numbers.map(n => '#' + n).join('、') : '—' },
+          { title: '操作', width: 84, render: (_, task: DevelopmentTask) => <Button type="link" size="small"
+            onClick={() => setTaskSelected(task.key ?? 'issue-' + task.number)}>查看链路</Button> },
           { title: '来源', width: 85, render: (_, task: DevelopmentTask) =>
             <Tag>{task.source === 'pr' ? '代码任务' : '需求任务'}</Tag> },
           { title: '当前阶段', width: 205, render: (_, task: DevelopmentTask) =>
@@ -236,5 +246,34 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
     </Flex>
   return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading}>刷新列表</Button>}>
     {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'统一任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
+    <Drawer title={selectedTask ? '#' + selectedTask.number + ' · 完整交付链路' : '交付链路'}
+      open={taskSelected !== null} onClose={() => setTaskSelected(null)} width="min(720px, 100vw)">
+      {selectedTask ? <Flex vertical gap="middle">
+        <Typography.Text strong>{selectedTask.title}</Typography.Text>
+        <Descriptions size="small" bordered column={1} items={[
+          {key:'owner',label:'负责人',children:selectedTask.owner || '未指定'},
+          {key:'stage',label:'当前阶段',children:selectedTask.delivery_status || selectedTask.status},
+          {key:'source',label:'任务来源',children:selectedTask.source === 'pr' ? '独立代码任务' : '需求任务'},
+          {key:'link',label:'关联 PR',children:selectedTask.pr_numbers?.length ? selectedTask.pr_numbers.map(n=>'#'+n).join('、') : '暂无关联'},
+        ]}/>
+        <Typography.Paragraph type="secondary">开发任务可对应多个 PR。测试成功不代表已发布，合并成功不代表完成验收；状态仅来自实际记录。</Typography.Paragraph>
+        {(selectedTask.prs ?? []).map(pr => <Card key={pr.number} size="small"
+          title={<Typography.Link href={pr.url} target="_blank" rel="noreferrer">PR #{pr.number} · {pr.title || '代码提交'}</Typography.Link>}>
+          <Descriptions size="small" column={1} items={[
+            {key:'dev',label:'开发负责人',children:pr.owner || '未指定'},
+            {key:'ci',label:'MacCI 测试',children:ciLabels[pr.test?.state || 'unknown'] || '尚未核实'},
+            {key:'start',label:'测试开始',children:formatDate(pr.test?.started_at ?? null)},
+            {key:'end',label:'测试结束',children:formatDate(pr.test?.finished_at ?? null)},
+            {key:'merge',label:'合并状态',children:mergeLabels[pr.merge_state || ''] || '未记录'},
+            {key:'mergedAt',label:'合并时间',children:formatDate(pr.merged_at ?? null)},
+            {key:'deploy',label:'部署状态',children:deployLabels[pr.deployment?.state || ''] || '尚未核实'},
+            {key:'deployAt',label:'部署时间',children:formatDate(pr.deployment?.at ?? null)},
+          ]}/>
+        </Card>)}
+        {!selectedTask.prs?.length && <Alert type="info" showIcon message="尚未找到明确关联的 PR"
+          description="不会根据任务标题或编号猜测关联关系。代码提交需明确填写所对应的 Issue 编号。" />}
+        <Typography.Link href={selectedTask.url} target="_blank" rel="noreferrer">查看原始任务记录</Typography.Link>
+      </Flex> : <Empty description="没有可显示的任务" />}
+    </Drawer>
   </Card>
 }
