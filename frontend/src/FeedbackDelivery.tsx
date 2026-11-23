@@ -44,7 +44,7 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
         {key:'owner',label:'当前执行负责人',children:owner},
         {key:'actor',label:'最近可信开发回复账号',children:delivery.executor.reported_actor ?? '尚无记录（不等于实际任务执行人）'},
         {key:'mode',label:'执行方式',children:delivery.executor.mode === 'unverified'
-          ? '尚未关联定时任务或实时执行回执' : delivery.executor.mode},
+          ? '尚未关联定时任务或实时执行回执' : 'GitHub Issue 执行回写（非独立平台心跳）'},
         {key:'running',label:'是否正在执行',children:delivery.executor.running === null ? '未知（没有执行器心跳）'
           : delivery.executor.running ? '有执行回执' : '当前未执行'},
         {key:'previous',label:'最近一次实际执行',children:date(delivery.executor.last_run_at)},
@@ -53,7 +53,7 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
       ]}/>
       <Alert style={{marginTop:12}} type="info" showIcon
         message="定时任务的计划时间不等于实际开始时间"
-        description="系统尚未接通 ChatGPT 定时任务的身份、计划与执行回执；这里不会用“每小时”推算一个虚假的下次执行时间。" />
+        description="未收到可信回执时不会推算触发时间；显示的执行时间若来自 GitHub Issue 回写，也不等于独立的 Automations 平台心跳。" />
     </Card>
     <Card size="small" title="交付证据">
       <Space direction="vertical" size="small">
