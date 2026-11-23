@@ -99,6 +99,23 @@ def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path, monkeypatch)
     assert meta["label"] == "com.appinit.demo"
     assert meta["foundation"] == source_version
     assert (repo / "app/foundation_version.py").is_file()
+    # Regression: Panel rebuild failed at pytest collection when these modules
+    # were absent even though app/main.py imported them.
+    for module in ("admin_settings", "feedback_delivery", "manual_pr_actions",
+                   "pr_conflict_controls", "pr_draft_controls"):
+        assert (repo / "app" / f"{module}.py").is_file()
+    import ast
+    package = ast.parse((repo / "app/main.py").read_text(encoding="utf-8"))
+    for node in ast.walk(package):
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module is None:
+            for entry in node.names:
+                assert (repo / "app" / f"{entry.name}.py").is_file(), entry.name
+    generated_test = (repo / "tests/test_auth.py").read_text(encoding="utf-8")
+    assert 'assert guide["scope"] == "application"' in generated_test
+    assert 'assert len(guide["sections"]) == 4' in generated_test
+    assert 'assert {"start", "feedback", "foundation", "restore"}' in generated_test
+    assert 'assert "app_development_loop" not in ' in generated_test
+    assert 'assert guide["scope"] == "foundation"' not in generated_test
     assert (repo / "app/upgrade_status.py").is_file()
     assert (repo / "tests/test_upgrade_status.py").is_file()
     assert "基座版本" in (repo / "frontend/src/ProjectInfoPage.tsx").read_text()
