@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import admin_settings, auth, development_tasks, feedback_progress, feedback_delivery, foundation_version, operations, pr_tracking, pr_conflict_controls, release_acceptance, pr_draft_controls
+from . import admin_settings, auth, development_tasks, feedback_progress, feedback_delivery, foundation_version, operations, pr_tracking, pr_conflict_controls, manual_pr_actions, release_acceptance, pr_draft_controls
 from .db import get_db
 from .models import UserFeedback
 
@@ -244,6 +244,34 @@ def request_conflict_repair(req: ConflictRepairIn, request: Request, response: R
     except (pr_conflict_controls.ConflictError, KeyError, TypeError, ValueError) as exc:
         raise HTTPException(409, str(exc) if isinstance(exc, pr_conflict_controls.ConflictError)
                             else "PR 已变化，请刷新后重试") from None
+
+
+class ManualPRActionIn(BaseModel):
+    number: int = Field(ge=1, le=1000000)
+    head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    base: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+@app.post("/api/v1/pr-actions/test", status_code=202)
+def manual_test_pr(req: ManualPRActionIn, request: Request, response: Response,
+                   db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return manual_pr_actions.request_test(req.number, req.head, req.base)
+    except manual_pr_actions.ManualActionError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
+@app.post("/api/v1/pr-actions/merge-check", status_code=202)
+def manual_merge_pr(req: ManualPRActionIn, request: Request, response: Response,
+                    db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return manual_pr_actions.request_merge(req.number, req.head, req.base)
+    except manual_pr_actions.ManualActionError as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 @app.get("/api/v1/system-logs", dependencies=[Depends(authorize)])
