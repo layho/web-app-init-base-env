@@ -34,15 +34,28 @@ def pr_token():
 
 
 def github(path, payload=None):
-    """Use the PR credential for REST checks AND the owner review comment.
+    """Keep REST PR reads on the PR token, Issue review writes on Issues token.
 
-    The old implementation used APP_GITHUB_FEEDBACK_TOKEN for all REST calls
-    and APP_GITHUB_PR_TOKEN only for the final GraphQL mutation. This made
-    a correctly configured PR token unable to pass preflight checks.
+    Previously REST preflight used the Issues credential even when the separate
+    PR credential was valid. Never make a PR-read failure look like a write error.
     """
     if not isinstance(path, str) or not path.startswith("/") or "://" in path:
         raise DraftReleaseError("GitHub 请求路径无效")
-    token = pr_token()
+    # Owner review comments use the dedicated Issues writer, while all
+    # PR state reads and GraphQL mutations use the PR token. Never substitute
+    # one credential for the other: their fine-grained scopes may differ.
+    is_review_comment = payload is not None and re.fullmatch(
+        r"/issues/[1-9][0-9]{0,6}/comments", path) is not None
+    if payload is not None and not is_review_comment:
+        raise DraftReleaseError("仅允许向指定 PR 的 Issue 评论端点写入审查回执")
+    pr_token()  # required even if the next step is an Issues review comment
+    if is_review_comment:
+        token = os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "").strip()
+        if not token:
+            raise DraftReleaseError(
+                "GH-REVIEW-TOKEN-MISSING：未配置用于 OWNER 审查评论的 Issues 写入凭据")
+    else:
+        token = pr_token()
     request = Request(
         "https://api.github.com/repos/" + REPO + path,
         data=json.dumps(payload).encode("utf-8") if payload is not None else None,
@@ -57,8 +70,9 @@ def github(path, payload=None):
     except HTTPError as exc:
         if exc.code in (401, 403):
             raise DraftReleaseError(
-                f"GH-PR-REST-{exc.code}：PR Token 的 GitHub 状态核对或审查评论请求被拒；"
-                "请检查仓库授权、Pull requests 写权限及 Issues 写权限。未解除 Draft"
+                f"GH-PR-REST-{exc.code}：GitHub 拒绝"
+                + ("Issues OWNER 审查评论" if is_review_comment else "PR Token 的状态读取")
+                + "；请核对该用途 Token 的仓库授权和相应权限。未解除 Draft"
             ) from None
         raise DraftReleaseError(
             f"GH-PR-REST-{exc.code}：GitHub REST 请求失败，未解除 Draft") from None
