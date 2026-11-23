@@ -208,3 +208,28 @@ class ApplicationMergeReceiptTests(unittest.TestCase):
              patch.object(m.base, "git", side_effect=git):
             self.assertTrue(m.merge_one("token", REPO, 7, dry_run=True))
             self.assertFalse((Path(temporary) / "app-main-receipts").exists())
+
+
+    def test_receipt_written_only_after_exact_remote_main_confirmed(self):
+        calls = []
+        def git(folder, *args):
+            calls.append(args)
+            if args[:2] == ("show", "-s"):
+                return f"{MERGE} {BASE} {HEAD}" if any("%H %P" in x for x in args) else TREE
+            if args[:1] == ("rev-parse",):
+                return BASE
+            return ""
+        with patch.object(m, "authorized", return_value=(HEAD, BASE, MERGE, TREE)), \
+             patch.object(m.base, "git", side_effect=git), \
+             patch.object(m, "api", return_value={"commit": {"sha": MERGE}}), \
+             patch.object(m, "merge_receipt") as receipt:
+            self.assertTrue(m.merge_one("token", REPO, 7))
+            receipt.assert_called_once_with(REPO, 7, HEAD, BASE, MERGE, TREE)
+            self.assertTrue(any(x[0] == "push" for x in calls))
+
+        with patch.object(m, "authorized", return_value=(HEAD, BASE, MERGE, TREE)), \
+             patch.object(m.base, "git", side_effect=git), \
+             patch.object(m, "api", return_value={"commit": {"sha": BASE}}), \
+             patch.object(m, "merge_receipt") as receipt:
+            self.assertFalse(m.merge_one("token", REPO, 7))
+            receipt.assert_not_called()
