@@ -60,8 +60,19 @@ def current_pr(number, head, base):
     if not isinstance(merge_sha, str) or not SHA.fullmatch(merge_sha):
         raise ManualActionError("GitHub 测试候选尚未就绪，请刷新后重试")
     commit = api("/git/commits/" + merge_sha)
-    if [p.get("sha") for p in commit.get("parents", [])] != [base, head]:
-        raise ManualActionError("GitHub 合并候选与当前版本不一致，请刷新后重试")
+    parents = [p.get("sha") for p in commit.get("parents", [])]
+    if parents != [base, head]:
+        if len(parents) == 2 and parents[1] == head:
+            raise ManualActionError(
+                "GitHub 合并候选仍基于旧 preview（候选基线 " + str(parents[0])[:12] +
+                "，当前基线 " + base[:12] + "）。"
+                "刷新页面不会重新生成合并候选；请先安全更新 PR 开发分支到当前 preview，"
+                "再对新的 HEAD/base/merge 执行 MacCI。旧测试结果不得复用。"
+            )
+        raise ManualActionError(
+            "GitHub 合并候选的父提交与当前 HEAD/base 不匹配；未触发测试。"
+            "请核对 PR mergeability 和当前分支，禁止复用旧 MacCI 回执。"
+        )
     return pr, merge_sha
 
 

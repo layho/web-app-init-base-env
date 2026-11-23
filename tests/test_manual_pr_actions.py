@@ -109,3 +109,23 @@ def test_manual_test_refuses_busy_worker(monkeypatch, tmp_path):
     monkeypatch.setattr(m.fcntl, "flock", busy)
     with pytest.raises(m.ManualActionError, match="已有测试"):
         m.request_test(71, HEAD, BASE)
+
+
+def test_stale_github_merge_candidate_reports_actual_old_and_new_base(monkeypatch):
+    """Panel #85: after #83 merges, old GH synthetic merge must not run MacCI."""
+    setup(monkeypatch)
+    original = m.api
+    old_base = "d" * 40
+    def stale(path):
+        if path == "/git/commits/" + MERGE:
+            return {"parents": [{"sha": old_base}, {"sha": HEAD}]}
+        return original(path)
+    monkeypatch.setattr(m, "api", stale)
+    launched = []
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *args, **kw: launched.append(args))
+    with pytest.raises(m.ManualActionError, match="仍基于旧 preview") as error:
+        m.request_test(71, HEAD, BASE)
+    assert old_base[:12] in str(error.value)
+    assert BASE[:12] in str(error.value)
+    assert "旧测试结果不得复用" in str(error.value)
+    assert launched == []
