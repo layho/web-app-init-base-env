@@ -43,7 +43,7 @@ def timeline(feedback, prs=None):
         "synced": feedback.get("synced_at") if feedback.get("github_issue_number") else None,
         "claimed": feedback.get("claimed_at"),
         "coding": feedback.get("development_started_at"),
-        "pr": feedback.get("development_submitted_at") if linked else None,
+        "pr": (linked.get("created_at") or feedback.get("development_submitted_at")) if linked else None,
         "tests": tested.get("finished_at") if tested.get("state") == "success" else None,
         "merged": linked.get("merged_at") if linked and linked.get("merge_state") == "merged" else None,
         "deployed": deployment.get("at") if deployment.get("state") in ("running", "deployed") else None,
