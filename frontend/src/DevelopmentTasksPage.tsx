@@ -47,7 +47,7 @@ function PRTrackingPage({data, onReleaseDraft}: {data: PRTracking; onReleaseDraf
   const [releaseError, setReleaseError] = useState<string | null>(null)
   const [releasedNumbers, setReleasedNumbers] = useState<number[]>([])
   const releaseOrdinal = (title: string) => {
-    const match = /\\bv(\\d+)\\.(\\d+)\\.(\\d+)\\b/i.exec(title)
+    const match = /\bv(\d+)\.(\d+)\.(\d+)\b/i.exec(title)
     return match ? match.slice(1).map(Number) : null
   }
   const hasEarlierUnmergedRelease = (row: PRRecord) => {
