@@ -155,3 +155,9 @@ def test_dirty_draft_is_blocked_even_when_old_macci_was_successful():
     assert row["base"] == new_base
     assert row["test"]["state"] == "unknown"
     assert "/repos/" + repo + "/pulls/71" in calls
+
+
+def test_explicit_related_issue_refs_from_office_panel_pr():
+    assert p.explicit_issue_refs("Refs #2\\nRelated #1") == [1, 2]
+    assert p.explicit_issue_refs("related to #3 and closes #8") == [3, 8]
+    assert p.explicit_issue_refs("arbitrary #23 is not an explicit link") == []
