@@ -192,44 +192,54 @@ def test_non_release_prs_unaffected_by_version_gate(github, monkeypatch):
     assert d.release(54, H)["released"]
 
 
-def test_pr_rest_preflight_uses_dedicated_pr_token(monkeypatch):
-    import json
-    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "issues-only")
-    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "pr-write-token")
+def test_single_token_is_shared_by_rest_and_graphql(monkeypatch):
+    monkeypatch.setenv("APP_GITHUB_TOKEN", "full-token")
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "legacy-pr")
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "legacy-issues")
     captured = []
+
     class FakeOpener:
         def open(self, request, timeout=None):
             captured.append(request)
+            payload = (b'{"data":{"markPullRequestReadyForReview":{"pullRequest":{"isDraft":false}}}}'
+                       if "graphql" in request.full_url else b'{"commit":{"sha":"123"}}')
             class Resp:
                 def __enter__(self): return self
                 def __exit__(self, *args): pass
-                def read(self, *args): return b'{"commit":{"sha":"123"}}'
+                def read(self, *args): return payload
             return Resp()
+
+    monkeypatch.setattr(d.release_acceptance, "build_opener", lambda *args: FakeOpener())
     monkeypatch.setattr(d, "build_opener", lambda *args: FakeOpener())
     assert d.github("/branches/preview") == {"commit": {"sha": "123"}}
-    assert captured[0].headers["Authorization"] == "Bearer pr-write-token"
+    d.github("/issues/90/comments", {"body": "owner review"})
+    assert d.mark_ready("PR_abc123")
+    assert len(captured) == 3
+    assert all(req.headers["Authorization"] == "Bearer full-token" for req in captured)
     assert captured[0].get_method() == "GET"
-    assert captured[0].full_url.endswith("/repos/layho/web-app-init-base-env/branches/preview")
-    d.github("/issues/90/comments", {"body": "safe review marker"})
     assert captured[1].get_method() == "POST"
-    assert captured[1].headers["Authorization"] == "Bearer issues-only"
+    assert captured[2].full_url == "https://api.github.com/graphql"
 
 
-def test_missing_pr_token_stops_rest_without_fallback(monkeypatch):
-    monkeypatch.delenv("APP_GITHUB_PR_TOKEN", raising=False)
-    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "issues-only")
+def test_shared_legacy_token_is_allowed(monkeypatch):
+    monkeypatch.delenv("APP_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "shared-token")
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "shared-token")
+    assert d.release_acceptance.github_token() == "shared-token"
+
+
+def test_fallback_prefers_pr_token_over_issues_only_legacy_token(monkeypatch):
+    monkeypatch.delenv("APP_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "full-pr-token")
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "old-issues-token")
+    assert d.release_acceptance.github_token() == "full-pr-token"
+
+
+def test_no_token_fails_before_any_request(monkeypatch):
+    for key in ("APP_GITHUB_TOKEN", "APP_GITHUB_PR_TOKEN", "APP_GITHUB_FEEDBACK_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
     calls = []
-    monkeypatch.setattr(d, "build_opener", lambda *args: calls.append(args))
-    with pytest.raises(d.DraftReleaseError, match="GH-PR-TOKEN-MISSING"):
+    monkeypatch.setattr(d.release_acceptance, "build_opener", lambda *args: calls.append(args))
+    with pytest.raises(d.DraftReleaseError, match="GH-TOKEN-MISSING"):
         d.github("/branches/preview")
     assert calls == []
-
-
-def test_pr_rest_rejects_shared_token_and_unsafe_urls(monkeypatch):
-    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "same")
-    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "same")
-    with pytest.raises(d.DraftReleaseError, match="GH-PR-TOKEN-SHARED"):
-        d.github("/branches/preview")
-    monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "dedicated")
-    with pytest.raises(d.DraftReleaseError, match="路径无效"):
-        d.github("https://attacker.invalid/steal")
