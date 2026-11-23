@@ -7,7 +7,7 @@ Scope: only entries in the fixed MacCI Runner allowlist with a **main-only**
 branch. The base repository is excluded. The program accepts only a fixed
 \`--repo\` choice, never a GitHub URL, arbitrary shell command, target branch,
 token, or HTTP payload. It reuses the existing protected MacCI token file.
-Nothing is installed or enabled by merging this source PR.
+Nothing is installed or enabled by merging this source PR. The exact-PR\nCLI mode shares the identical merge gate with the ordinary scan; it does not\nconstitute a web-exposed manual button or authorize draft transition.
 
 ## Release gate
 
@@ -36,6 +36,7 @@ From a reviewed source checkout:
 cd deploy/macci
 python3 -m unittest -v test_merge_application
 python3 merge_application.py --repo layho/macmini-office-app-panel --dry-run
+python3 merge_application.py --repo layho/macmini-office-app-panel --pr 7 --dry-run
 \`\`\`
 
 The dry run still requires protected host token and Git SSH access. **Do not**
