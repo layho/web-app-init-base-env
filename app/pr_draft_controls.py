@@ -21,65 +21,18 @@ class DraftReleaseError(Exception):
     pass
 
 
-def pr_token():
-    """One credential for the entire owner PR-review transaction."""
-    token = os.getenv("APP_GITHUB_PR_TOKEN", "").strip()
-    if not token:
-        raise DraftReleaseError(
-            "GH-PR-TOKEN-MISSING：基座服务未加载专用 PR Token，未执行操作")
-    if token == os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "").strip():
-        raise DraftReleaseError(
-            "GH-PR-TOKEN-SHARED：PR Token 与反馈 Token 混用，未执行操作")
-    return token
-
-
 def github(path, payload=None):
-    """Keep REST PR reads on the PR token, Issue review writes on Issues token.
+    """All Draft preflight reads and owner review writes use one GitHub token.
 
-    Previously REST preflight used the Issues credential even when the separate
-    PR credential was valid. Never make a PR-read failure look like a write error.
+    Both REST and GraphQL delegate credential selection to release_acceptance;
+    a full-permission credential may be reused for Issues and Pull requests.
     """
-    if not isinstance(path, str) or not path.startswith("/") or "://" in path:
-        raise DraftReleaseError("GitHub 请求路径无效")
-    # Owner review comments use the dedicated Issues writer, while all
-    # PR state reads and GraphQL mutations use the PR token. Never substitute
-    # one credential for the other: their fine-grained scopes may differ.
-    is_review_comment = payload is not None and re.fullmatch(
-        r"/issues/[1-9][0-9]{0,6}/comments", path) is not None
-    if payload is not None and not is_review_comment:
-        raise DraftReleaseError("仅允许向指定 PR 的 Issue 评论端点写入审查回执")
-    pr_token()  # required even if the next step is an Issues review comment
-    if is_review_comment:
-        token = os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "").strip()
-        if not token:
-            raise DraftReleaseError(
-                "GH-REVIEW-TOKEN-MISSING：未配置用于 OWNER 审查评论的 Issues 写入凭据")
-    else:
-        token = pr_token()
-    request = Request(
-        "https://api.github.com/repos/" + REPO + path,
-        data=json.dumps(payload).encode("utf-8") if payload is not None else None,
-        headers={"Authorization": "Bearer " + token,
-                 "Accept": "application/vnd.github+json",
-                 "Content-Type": "application/json",
-                 "User-Agent": "base-owner-draft-release"},
-        method="POST" if payload is not None else "GET")
     try:
-        with build_opener(release_acceptance.NoRedirect()).open(request, timeout=10) as response:
-            return json.load(response)
-    except HTTPError as exc:
-        if exc.code in (401, 403):
-            raise DraftReleaseError(
-                f"GH-PR-REST-{exc.code}：GitHub 拒绝"
-                + ("Issues OWNER 审查评论" if is_review_comment else "PR Token 的状态读取")
-                + "；请核对该用途 Token 的仓库授权和相应权限。未解除 Draft"
-            ) from None
-        raise DraftReleaseError(
-            f"GH-PR-REST-{exc.code}：GitHub REST 请求失败，未解除 Draft") from None
-    except (URLError, OSError, ValueError, TypeError):
-        raise DraftReleaseError(
-            "GH-PR-REST-NETWORK：PR Token 状态核对连接失败或返回数据无效，未解除 Draft"
-        ) from None
+        return release_acceptance.api(path, payload)
+    except release_acceptance.AcceptanceError as exc:
+        raise DraftReleaseError(str(exc) + "；未解除 Draft") from None
+    except (KeyError, TypeError, ValueError):
+        raise DraftReleaseError("GH-REST-DATA：GitHub 状态数据不完整，未解除 Draft") from None
 
 
 def graphql_failure(errors):
@@ -135,7 +88,9 @@ def mark_ready(node_id):
         raise DraftReleaseError("PR 标识无效，不能解除 Draft")
     # Feedback tokens commonly grant Issues write but not Pull requests write.
     # A dedicated owner PR token can be supplied independently.
-    token = pr_token()
+    token = release_acceptance.github_token()
+    if not token:
+        raise DraftReleaseError("GH-TOKEN-MISSING：基座服务未配置 GitHub Token，无法解除 Draft")
     data = json.dumps({
         "query": "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}",
         "variables": {"id": node_id},
