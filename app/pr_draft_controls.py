@@ -39,7 +39,7 @@ def graphql_failure(errors):
     code = str(ext.get("type", "")).upper()
     if ("resource not accessible" in message or "forbidden" in message
             or "insufficient" in message or code == "FORBIDDEN"):
-        return DraftReleaseError("GH-GQL-FORBIDDEN：GraphQL 拒绝本次操作，不能据此断定缺少 Pull requests 权限")
+        return DraftReleaseError("GH-GQL-FORBIDDEN：专用 PR Token 的 GraphQL 写入被拒；请核查 Token 有效性、仓库授权范围、Pull requests 写权限及服务实际加载凭据。不要重复点击")
     if "could not resolve to a node" in message or "not found" in message:
         return DraftReleaseError("GH-GQL-NODE：PR 节点不存在或该 Token 无法访问")
     if ("validation" in message or "field " in message or
@@ -80,11 +80,20 @@ def release_order_gate(title):
 def mark_ready(node_id):
     if not isinstance(node_id, str) or not re.fullmatch(r"PR_[A-Za-z0-9_]+", node_id):
         raise DraftReleaseError("PR 标识无效，不能解除 Draft")
-    # Feedback tokens commonly grant Issues write but not Pull requests write.
-    # A dedicated owner PR token can be supplied independently.
-    token = os.getenv("APP_GITHUB_PR_TOKEN") or os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "")
+    # Never fall back to the feedback (Issues-only) credential. The previous
+    # fallback silently sent an unsuitable token to GraphQL and produced
+    # GH-GQL-FORBIDDEN only after creating the owner review comment.
+    token = os.getenv("APP_GITHUB_PR_TOKEN", "").strip()
     if not token:
-        raise DraftReleaseError("未配置 GitHub PR 写入凭据，无法解除 Draft")
+        raise DraftReleaseError(
+            "GH-PR-TOKEN-MISSING：基座服务未配置专用 APP_GITHUB_PR_TOKEN；"
+            "意见反馈 Token 不可代替 PR 操作凭据。未尝试 GraphQL 变更。"
+        )
+    if token == os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "").strip():
+        raise DraftReleaseError(
+            "GH-PR-TOKEN-SHARED：PR Token 与反馈 Token 相同；"
+            "请配置独立、已授权 Pull requests 写入的凭据。未尝试 GraphQL 变更。"
+        )
     data = json.dumps({
         "query": "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}",
         "variables": {"id": node_id},
