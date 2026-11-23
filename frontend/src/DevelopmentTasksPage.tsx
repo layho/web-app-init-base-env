@@ -24,7 +24,7 @@ type DevelopmentTask = {
 }
 
 type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
-type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean }
+type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
 export type TaskSnapshot = { synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
 const statusColors: Record<string, string> = {
