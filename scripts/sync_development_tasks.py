@@ -26,7 +26,17 @@ def sync() -> None:
         if not isinstance(issues, list):
             raise ValueError("Unexpected issue page")
         for issue in issues:
-            task = development_tasks.parse_issue(issue, REPO)
+            if "pull_request" in issue:
+                continue
+            # GitHub user/login is shared by multiple AI workers. Structured
+            # APP_PROGRESS comments provide an attributable agent claim.
+            # Do not fabricate ownership from the GitHub account alone.
+            comments = []
+            if type(issue.get("comments")) is int and issue["comments"] > 0:
+                comments = github("GET", f"/repos/{REPO}/issues/{issue['number']}/comments?per_page=100")
+                if not isinstance(comments, list):
+                    raise ValueError("Unexpected Issue comments")
+            task = development_tasks.parse_issue(issue, REPO, comments)
             if task:
                 tasks.append(task)
         if len(issues) < page_size:
