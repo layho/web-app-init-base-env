@@ -40,6 +40,8 @@ def blank_progress():
         "developer_reply": "",
         "delivered_sha": None,
         "developer_pr": None,
+        "accepted_at": None,
+        "developer_actor": None,
     }
 
 
@@ -61,7 +63,8 @@ def progress_from_comments(comments):
             continue
         lines = [line for line in body.splitlines() if line.startswith(MARKER)]
         if not lines and body.startswith("[APP-CLAIM] "):
-            events.append((created, number, {"status": "claimed", "reply": body[len("[APP-CLAIM] "):]}))
+            events.append((created, number, {"status": "claimed", "reply": body[len("[APP-CLAIM] "):],
+                                         "actor": (comment.get("user") or {}).get("login")}))
             continue
         if len(lines) != 1 or len(lines[0]) > 10000:
             continue
@@ -80,6 +83,9 @@ def progress_from_comments(comments):
                 continue
             if type(pr) is not int or pr <= 0:
                 continue
+        actor = (comment.get("user") or {}).get("login")
+        if isinstance(actor, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", actor):
+            event = {**event, "actor": actor}
         events.append((created, number, event))
     for at, _, event in sorted(events, key=lambda row: (row[0], row[1])):
         status = event["status"]
@@ -88,6 +94,12 @@ def progress_from_comments(comments):
             if result[field] is None:
                 result[field] = at.isoformat()
         result["overall_status"] = status
+        if status == "accepted" and result["accepted_at"] is None:
+            result["accepted_at"] = at.isoformat()
+        if status in {"claimed", "in_progress", "development_finished", "submitted", "blocked"}:
+            actor = event.get("actor")
+            if isinstance(actor, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", actor):
+                result["developer_actor"] = actor
         reply = event.get("reply")
         if isinstance(reply, str):
             result["developer_reply"] = reply[:6000]
