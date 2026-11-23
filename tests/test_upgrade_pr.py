@@ -140,7 +140,7 @@ def test_modified_or_untrusted_historical_app_file_stays_blocked():
         before = u.adopt_verified_template_baselines("source", A, params, {},
              {"app/business.py": b"old"}, {"app/business.py": b"new"},
              {"app/business.py": b"old"})
-    assert before == {"app/business.py": b"old"}
+    assert before == {}  # A non-allowlisted path is not adopted or invented.
     reader.assert_not_called()
 
 
