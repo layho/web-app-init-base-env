@@ -136,3 +136,29 @@ class ApplicationMainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApplicationCliTests(unittest.TestCase):
+    def test_exact_pr_manual_path_uses_same_safe_merge_gate(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(m, "ROOT", Path(folder)), \
+             patch.object(m.base, "read_token", return_value="test"), \
+             patch.object(m, "api", return_value=pr()) as api, \
+             patch.object(m, "pages") as pages, \
+             patch.object(m, "merge_one", return_value=True) as merge, \
+             patch("sys.argv", ["merge_application.py", "--repo", REPO,
+                                "--pr", "7", "--dry-run"]):
+            self.assertEqual(m.main(), 0)
+            api.assert_called_once_with("test", REPO, "/pulls/7")
+            pages.assert_not_called()
+            merge.assert_called_once_with("test", REPO, 7, True)
+
+    def test_unknown_repo_rejected_before_reading_token(self):
+        with patch.object(m.base, "read_token") as token, \
+             patch("sys.argv", ["merge_application.py", "--repo",
+                                "layho/web-app-init-base-env", "--pr", "7"]):
+            with self.assertRaises(SystemExit):
+                m.main()
+            token.assert_not_called()
