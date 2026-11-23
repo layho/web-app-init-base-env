@@ -84,7 +84,7 @@ def host_identity(content):
     lines = content.decode("utf-8", "strict").splitlines()
     values = {}
     for key in HOST_IDENTITY_KEYS:
-        matches = [line for line in lines if re.fullmatch(r"\s*" + key + r"=[^\r\n]+", line)]
+        matches = [line for line in lines if re.fullmatch(key + r"=[^\r\n]+", line)]
         if len(matches) != 1:
             return None
         values[key] = matches[0].split("=", 1)[1].strip()
