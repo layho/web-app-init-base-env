@@ -58,14 +58,30 @@ def timeline(feedback, prs=None):
         phase = "failed"
     else:
         phase = next((x["key"] for x in steps if x["state"] == "pending"), "accepted")
-    # This data source has no authenticated executor heartbeat nor next-run
-    # record from ChatGPT Automations. Never calculate fictitious run times.
+    # An owner-authored GitHub execution receipt is a declared executor
+    # status, not an independent platform heartbeat. Expire stale "started"
+    # evidence rather than silently claiming ongoing activity.
+    receipt = feedback.get("executor_receipt")
+    actor = {"name": None, "reported_actor": feedback.get("developer_actor"),
+             "mode": "unverified", "running": None, "last_run_at": None,
+             "next_run_at": None, "schedule_source": None}
+    if isinstance(receipt, dict):
+        at = receipt.get("last_event_at")
+        try:
+            when = datetime.fromisoformat(at) if isinstance(at, str) else None
+            age = (datetime.now(timezone.utc) - when).total_seconds() if when and when.tzinfo else None
+        except ValueError:
+            age = None
+        state = receipt.get("state")
+        actor.update(name=receipt.get("executor"), mode="github_execution_receipt",
+                     running=True if state == "started" and age is not None and 0 <= age <= 900 else
+                     False if state in ("finished", "failed", "queued") else None,
+                     last_run_at=at if state in ("started", "finished", "failed") else None,
+                     next_run_at=receipt.get("next_run_at"),
+                     schedule_source="GitHub Issue OWNER execution receipt")
     return {
         "steps": steps, "current_stage": phase,
-        "executor": {"name": None, "reported_actor": feedback.get("developer_actor"),
-                     "mode": "unverified",
-                     "running": None, "last_run_at": None,
-                     "next_run_at": None, "schedule_source": None},
+        "executor": actor,
         "evidence": {"issue": feedback.get("github_issue_number"),
                      "pr": linked.get("number") if linked else None,
                      "head_sha": linked.get("head") if linked else None,
