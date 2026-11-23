@@ -90,20 +90,20 @@ def request_test(number, head, base):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ManualActionError("已有测试正在运行，请在其结束后点击重新测试") from None
-        # Release the preflight lock before launching: the trusted runner
-        # must acquire worker.lock itself, or it would skip the test.
-        log = ROOT / "manual-test-request.log"
-        with log.open("ab") as out:
-            subprocess.Popen(
-                [sys.executable, str(TEST_RUNNER), "--repo", REPO,
-                 "--pr", str(number), "--force"],
-                stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                start_new_session=True, close_fds=True,
-                env={key: value for key, value in os.environ.items()
-                     if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
-                                "SSH_AUTH_SOCK", "DOCKER_HOST"}} |
-                    {"PYTHONDONTWRITEBYTECODE": "1"},
-            )
+            # Transfer the same locked file description to the child.
+            # No other runner can grab worker.lock between check and launch.
+            log = ROOT / "manual-test-request.log"
+            with log.open("ab") as out:
+                subprocess.Popen(
+                    [sys.executable, str(TEST_RUNNER), "--repo", REPO,
+                     "--pr", str(number), "--force", "--lock-fd", str(lock.fileno())],
+                    stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                    start_new_session=True, close_fds=True, pass_fds=(lock.fileno(),),
+                    env={key: value for key, value in os.environ.items()
+                         if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
+                                    "SSH_AUTH_SOCK", "DOCKER_HOST"}} |
+                        {"PYTHONDONTWRITEBYTECODE": "1"},
+                )
     except OSError:
         raise ManualActionError("本机测试程序启动失败，未受理此次操作") from None
     return {"accepted": True, "action": "test", "number": number,
