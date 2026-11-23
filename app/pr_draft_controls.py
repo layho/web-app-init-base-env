@@ -56,7 +56,7 @@ def published_version():
         from pathlib import Path
         data = json.loads(Path(__file__).with_name("release_notes.json").read_text(encoding="utf-8"))
         value = data[0]["version"]
-        match = re.fullmatch(r"(\\d+)\\.(\\d+)\\.(\\d+)", value)
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
         return tuple(map(int, match.groups())) if match else None
     except (OSError, IndexError, KeyError, TypeError, ValueError):
         return None
@@ -66,7 +66,7 @@ def release_order_gate(title):
     """Drafts for later releases must not bypass an unresolved earlier release."""
     if not isinstance(title, str):
         raise DraftReleaseError("无法核对 PR 版本")
-    match = re.search(r"(?i)\\bv(\\d+)\\.(\\d+)\\.(\\d+)\\b", title)
+    match = re.search(r"(?i)\bv(\d+)\.(\d+)\.(\d+)\b", title)
     if not match:
         return
     candidate = tuple(map(int, match.groups()))
