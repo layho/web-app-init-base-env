@@ -169,3 +169,62 @@ def test_adoption_does_not_swallow_missing_history_into_false_provenance():
         before = u.adopt_verified_template_baselines("source", A, params, {},
                                                       {path: b"new"}, {path: b"old"})
     assert before == {}
+
+
+def _app_auth_test():
+    return (b'def test_project_info_exposes_versioned_design_to_signed_in_users(client):\n'
+            b'    data = {"name": "macmini-office-app-panel", "development_loop": [1]}\n'
+            b'    guide = {"scope": "application"}\n'
+            b'    assert data["name"] == "macmini-office-app-panel"\n'
+            b'    assert guide["scope"] == "application"\n'
+            b'    assert data["development_loop"]\n')
+
+
+def test_preserve_application_auth_test_when_only_generator_changes():
+    path = "tests/test_auth.py"
+    old = {path: b"assert guide['scope'] == 'foundation'\n"}
+    new = {path: b"assert guide['scope'] == 'application'\n"}
+    current = {path: _app_auth_test()}
+    with patch.object(u, "blob", side_effect=[b"same-upstream-test", b"same-upstream-test"]):
+        before, after = u.preserve_verified_panel_auth_tests(
+            "source", A, B, "layho/macmini-office-app-panel", old, new, current)
+    assert before == {} and after == {}
+    assert u.planner.plan(before, after, current) == []
+    assert current[path] == _app_auth_test()
+
+
+def test_auth_test_real_upstream_change_is_not_suppressed():
+    path = "tests/test_auth.py"
+    before = {path: b"old foundation test\n"}
+    after = {path: b"new foundation test\n"}
+    current = {path: _app_auth_test()}
+    with patch.object(u, "blob", side_effect=[b"old source", b"changed source"]):
+        old, new = u.preserve_verified_panel_auth_tests(
+            "source", A, B, "layho/macmini-office-app-panel", before, after, current)
+    assert old == before and new == after
+
+
+def test_preserve_auth_test_rejects_other_repo_or_unparseable_code():
+    path = "tests/test_auth.py"
+    old, new = {path: b"old\n"}, {path: b"new\n"}
+    with patch.object(u, "blob") as source:
+        a, b = u.preserve_verified_panel_auth_tests(
+            "source", A, B, "layho/other-app", old, new, {path: _app_auth_test()})
+        assert (a, b) == (old, new)
+        source.assert_not_called()
+    with patch.object(u, "blob", side_effect=[b"old", b"old"]):
+        a, b = u.preserve_verified_panel_auth_tests(
+            "source", A, B, "layho/macmini-office-app-panel",
+            old, new, {path: b"def corrupt(\n"})
+        assert (a, b) == (old, new)
+
+
+def test_preserve_auth_test_requires_app_assertions_not_foundation_acceptance():
+    path = "tests/test_auth.py"
+    old, new = {path: b"old\n"}, {path: b"new\n"}
+    local = _app_auth_test().replace(b'"application"', b'"foundation"')
+    with patch.object(u, "blob", side_effect=[b"old", b"old"]):
+        a, b = u.preserve_verified_panel_auth_tests(
+            "source", A, B, "layho/macmini-office-app-panel", old, new,
+            {path: local})
+    assert (a, b) == (old, new)

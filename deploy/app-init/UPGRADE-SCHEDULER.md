@@ -108,3 +108,36 @@ foundation main release before it can apply this behavior. The scheduler
 then retries formerly blocked plans rather than permanently caching them.
 A successful code PR is **not** proof that the Panel public app has been
 upgraded or deployed.
+
+
+## v0.1.33: two remaining real-world Panel upgrade blockers
+
+After updating the copied Mac mini scheduler runtime to accepted v0.1.32,
+the user's live Panel page reported two remaining items:
+\`deploy/macmini/manage.sh\` (review) and \`tests/test_auth.py\` (conflict).
+
+For \`manage.sh\`, the earlier identity checker matched both the true,
+unindented instance declarations and indented temporary assignments inside
+the preview and acceptance conditionals. It now verifies only unindented
+instance settings; it **still** rejects duplicated top-level declarations,
+changed port/label/branch/origin, invalid Bash and overlapping three-way edits.
+
+For \`tests/test_auth.py\`, the official foundation test source is identical
+between Panel's registered old source and the newer target. Only
+\`copy_foundation\`'s generated-application test transformations changed.
+The already-committed Panel test was explicitly adapted to application
+scope. In this narrowly limited case, the coordinator may retain the
+Panel-owned test file **without staging any change to that path**, if:
+the repo is the approved Office Panel; the immutable old/new official
+foundation test blobs are identical; the current app test parses as Python;
+and its named project-info test still asserts application scope, the Panel
+project identity and the application development loop. Real upstream test
+changes, absent assertions, malformed Python or any other app remain
+subject to normal conflict handling.
+
+Both changes require a fresh MacCI pass, base preview acceptance and
+official main publication before a reviewed Mac mini scheduler runtime
+upgrade. The scheduler is a separate installed copy. Only the next
+*real host tick* can prove whether the blocked list becomes empty and
+an actual Panel base-upgrade PR is created. Do not mark Panel as deployed
+on the basis of planning or a PR alone.

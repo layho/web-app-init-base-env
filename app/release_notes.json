@@ -1,5 +1,27 @@
 [
   {
+    "version": "0.1.33",
+    "title": "Office Panel 自动升级：最后两项误冲突修复",
+    "summary": "纠正宿主脚本 Preview/验收动态赋值导致的误审查，并对基座测试源码不变、应用自身测试已通过明确语义核验的场景保留 Panel 的应用专属测试，避免将初始化器规则调整误判为代码冲突。",
+    "changes": [
+      "deploy/macmini/manage.sh 自动合并时，只把顶层 LABEL_PREFIX、PORT、TRACK_BRANCH、EXPECTED_ORIGIN 作为实例身份；带缩进的 Preview/Acceptance 临时赋值不会触发身份重复误判。",
+      "只允许三方合并成功、bash -n 通过、顶层实例身份不变时自动处理脚本；真正内容冲突仍阻塞。",
+      "对 Office Panel 的 tests/test_auth.py，若已验证官方基座旧/新 SHA 的测试源码完全一致，且 Panel 当前测试 Python 语法有效、包含应用专属的必要断言，则保持 Panel 原测试文件，不覆盖其定制内容。",
+      "原有 MacCI 精确测试、OWNER 审查、基座 preview 验收、独立调度器运行时升级和 Panel 公网部署核验继续有效。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 验证新增宿主身份解析及应用自有测试保留的回归。",
+      "先在基座 preview 核对 v0.1.33 和 SHA，验收后才能正式发布 main。",
+      "用 Mac mini 的安全 installer 从正式 main 升级独立的 foundation-upgrades 调度器运行副本，并立即执行一次 tick。",
+      "核对 Panel 版本页的 target_sha、blocked_files 与升级 PR；如仍存在真正冲突不跳过。",
+      "只有生成的 Panel PR 经精确 MacCI 和安全审核合并并验证公网运行 SHA，才算升级闭环完成。"
+    ],
+    "validation_note": "本版处理已核验的两个残余冲突根因；不能把测试通过或源代码发布直接视为 Mac mini 已升级。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
     "version": "0.1.32",
     "title": "Office Panel 基座升级：校验旧版漏登记文件并自动恢复",
     "summary": "修复 Panel 旧版初始化器遗漏五个基座模板文件所导致的假冲突。仅当应用 GitHub main 对应文件与已验证旧基座来源重新渲染后逐字节一致时，规划器才能自动归入基座升级范围；业务定制或未知来源仍受阻。",
