@@ -110,6 +110,26 @@ function App() {
   const [releaseHistory, setReleaseHistory] = useState<ReleaseHistory | null>(null)
   const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(null)
   const [developmentTasks, setDevelopmentTasks] = useState<TaskSnapshot | null>(null)
+  const [manualPrNumber, setManualPrNumber] = useState<number | null>(null)
+  const [manualPrBusy, setManualPrBusy] = useState(false)
+  const [manualPrResult, setManualPrResult] = useState<{type: 'success' | 'error'; text: string} | null>(null)
+  const manualPR = developmentTasks?.pr_tracking?.prs.find(row => row.number === manualPrNumber)
+  async function runManualPR(action: 'test' | 'merge') {
+    if (!session || !manualPR || !manualPR.base || manualPrBusy) return
+    setManualPrBusy(true)
+    setManualPrResult(null)
+    try {
+      await api(action === 'test' ? '/api/v1/pr-actions/test' : '/api/v1/pr-actions/merge-check',
+        {method: 'POST', body: JSON.stringify({number:manualPR.number,head:manualPR.head,base:manualPR.base})},
+        session.csrf_token)
+      setManualPrResult({type:'success',text:action === 'test'
+        ? '测试请求已受理，请刷新查看实际 MacCI 结果；尚不代表测试通过。'
+        : '已唤醒安全合并检查，请刷新查看实际合并结果；尚不代表合并完成。'})
+      await loadOperations('tasks')
+    } catch (error) {
+      setManualPrResult({type:'error',text:error instanceof Error ? error.message : '操作失败，请刷新后重试'})
+    } finally {setManualPrBusy(false)}
+  }
   const [systemLogs, setSystemLogs] = useState<SystemLogs | null>(null)
   const [loadingOperations, setLoadingOperations] = useState<'releases' | 'logs' | 'tasks' | 'project' | null>(null)
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
@@ -430,6 +450,26 @@ function App() {
       ) : page === 'project' ? (
         <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} />
       ) : page === 'tasks' ? (
+        <Space direction="vertical" size="middle" style={{width:'100%'}}>
+          {developmentTasks?.pr_tracking?.can_release_draft && <Card title="手动立即执行 · 不必等待定时任务">
+            <Space wrap>
+              <Select placeholder="选择要处理的 PR" style={{minWidth:250}}
+                value={manualPrNumber ?? undefined} onChange={value => {setManualPrNumber(value);setManualPrResult(null)}}
+                options={developmentTasks.pr_tracking.prs
+                  .filter(row => row.merge_state === 'open' || row.merge_state === 'draft')
+                  .map(row => ({value:row.number,label:'#' + row.number + ' · ' + row.title}))}/>
+              <Button loading={manualPrBusy} disabled={!manualPR || developmentTasks.pr_tracking.stale || manualPR.conflict?.blocked || !manualPR.base}
+                onClick={() => void runManualPR('test')}>立即测试</Button>
+              <Button type="primary" loading={manualPrBusy}
+                disabled={!manualPR || developmentTasks.pr_tracking.stale || manualPR.conflict?.blocked ||
+                  !manualPR.base || manualPR.merge_state !== 'open' || manualPR.test.state !== 'success'}
+                onClick={() => void runManualPR('merge')}>请求安全合并</Button>
+            </Space>
+            <Typography.Paragraph type="secondary" style={{margin:'10px 0 0'}}>
+              手动操作和自动调度使用同一套测试与发布安全规则。点击仅受理执行请求，完成情况以测试与发布追踪为准。
+            </Typography.Paragraph>
+            {manualPrResult && <Alert showIcon type={manualPrResult.type} message={manualPrResult.text} />}
+          </Card>}
         <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'}
           onRefresh={() => void loadOperations('tasks')}
           onRequestRepair={async (number, head, base) => {
@@ -439,22 +479,13 @@ function App() {
             await loadOperations('tasks')
             return result
           }}
-          onTestPR={async (number, head, base) => {
-            if (!session) throw new Error('请先登录')
-            await api('/api/v1/pr-actions/test', {method:'POST',body:JSON.stringify({number,head,base})}, session.csrf_token)
-            await loadOperations('tasks')
-          }}
-          onMergePR={async (number, head, base) => {
-            if (!session) throw new Error('请先登录')
-            await api('/api/v1/pr-actions/merge-check', {method:'POST',body:JSON.stringify({number,head,base})}, session.csrf_token)
-            await loadOperations('tasks')
-          }}
           onReleaseDraft={async (number, head) => {
             if (!session) throw new Error('请先登录')
             await api('/api/v1/pr-drafts/release', { method: 'POST', body: JSON.stringify({ number, head }) }, session.csrf_token)
             setNotice({ type: 'success', text: `PR #${number} 已解除 Draft，等待当前基线 MacCI 验证及自动合并。` })
             await loadOperations('tasks')
           }} />
+        </Space>
       ) : page === 'releases' ? (
         <ReleasePage data={releaseHistory} loading={loadingOperations === 'releases'} onRefresh={() => void loadOperations('releases')}
           onAccept={async (sha, version) => {
