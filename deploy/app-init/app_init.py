@@ -180,6 +180,48 @@ def sync_rollback_test_fix(root):
         print(f"已同步部署回滚测试修复，应用 SHA：{new}", flush=True)
 
 
+
+def validate_generated_application(target):
+    """Fail before first remote push if generated Python is invalid or imports are missing.
+
+    This is a fast static gate, not a substitute for isolated pytest/build.
+    """
+    import ast
+
+    app_dir = target / "app"
+    required = (app_dir / "main.py", target / "requirements.txt",
+                target / "frontend/src/main.tsx", target / "frontend/package.json",
+                target / "app/project_info.json", target / "app/release_notes.json")
+    for path in required:
+        need(path.is_file(), f"生成应用缺少必要文件：{path.relative_to(target)}")
+    for folder in ("app", "scripts", "tests"):
+        for path in sorted((target / folder).rglob("*.py")):
+            relative = path.relative_to(target)
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(relative))
+            except (SyntaxError, UnicodeError) as exc:
+                raise RuntimeError(f"生成应用 Python 语法错误：{relative}: {exc}") from None
+            if folder != "app":
+                continue
+            # Resolve local relative imports used by the generated runtime.
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or node.level == 0:
+                    continue
+                package = path.parent
+                for _ in range(node.level - 1):
+                    package = package.parent
+                if node.module:
+                    module = package.joinpath(*node.module.split("."))
+                    need(module.with_suffix(".py").is_file() or (module / "__init__.py").is_file(),
+                         f"生成应用缺少本地模块：{relative} -> {node.module}")
+                else:
+                    for item in node.names:
+                        module = package / item.name
+                        need(module.with_suffix(".py").is_file() or (module / "__init__.py").is_file(),
+                             f"生成应用缺少本地模块：{relative} -> {item.name}")
+    print("生成应用静态检查通过：必要文件、Python 语法与相对导入", flush=True)
+
+
 def seed(source, remote, target, repository, title, domain, port, label, *, github_login=False):
     refs = git(source, "ls-remote", remote, github_login=github_login)
     if refs:
@@ -188,6 +230,7 @@ def seed(source, remote, target, repository, title, domain, port, label, *, gith
         git(source, "clone", remote, target, github_login=github_login)
         git(target, "symbolic-ref", "HEAD", "refs/heads/main")
         copy_foundation(source, target, repository, title, domain, port, label)
+        validate_generated_application(target)
         git(target, "add", ".")
         git(target, "-c", "user.name=App Init", "-c", "user.email=app-init@localhost",
             "commit", "--no-gpg-sign", "-m", "Initialize application foundation")
