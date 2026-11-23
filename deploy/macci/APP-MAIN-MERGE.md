@@ -3,8 +3,11 @@
 This is a **new, host-only coordinator**, intentionally separate from the
 foundation preview merge worker and from the foundation's main publisher.
 
-Scope: only entries in the fixed MacCI Runner allowlist with a **main-only**
-branch. The base repository is excluded. The program accepts only a fixed
+Scope: only repos in the **explicit publish opt-in** set *and* the trusted
+MacCI Runner allowlist with a **main-only** branch. For this first rollout,
+only `layho/macmini-office-app-panel` is opted in. TI Hunter is legacy and
+**not** opted in, even though its PRs may be tested by MacCI. New apps must
+undergo a separate reviewed opt-in change; the base repo is always excluded. The program accepts only a fixed
 \`--repo\` choice, never a GitHub URL, arbitrary shell command, target branch,
 token, or HTTP payload. It reuses the existing protected MacCI token file.
 Nothing is installed or enabled by merging this source PR. The exact-PR\nCLI mode shares the identical merge gate with the ordinary scan; it does not\nconstitute a web-exposed manual button or authorize draft transition.
