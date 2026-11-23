@@ -473,7 +473,7 @@ function App() {
         <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} />
       ) : page === 'tasks' ? (
         <Space direction="vertical" size="middle" style={{width:'100%'}}>
-          {developmentTasks?.pr_tracking?.can_release_draft && <Card title="手动立即执行 · 不必等待定时任务">
+          {developmentTasks?.pr_tracking?.manual_actions_available && <Card title="手动立即执行 · 不必等待定时任务">
             <Space wrap>
               <Select placeholder="选择要处理的 PR" style={{minWidth:250}}
                 value={manualPrNumber ?? undefined} onChange={value => {setManualPrNumber(value);setManualPrResult(null)}}
