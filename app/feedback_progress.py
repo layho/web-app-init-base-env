@@ -12,6 +12,7 @@ from tempfile import NamedTemporaryFile
 
 CACHE_PATH = Path(__file__).resolve().parents[1] / "logs" / "feedback-progress.json"
 MARKER = "[APP_PROGRESS] "
+EXECUTION_MARKER = "[APP_EXECUTION] "
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 STAGES = {
     "claimed": "claimed_at",
@@ -42,6 +43,7 @@ def blank_progress():
         "developer_pr": None,
         "accepted_at": None,
         "developer_actor": None,
+        "executor_receipt": None,
     }
 
 
@@ -60,6 +62,24 @@ def progress_from_comments(comments):
         body = comment.get("body")
         number = comment.get("id")
         if not isinstance(body, str) or not isinstance(number, int):
+            continue
+        # Execution evidence is separate from development milestones. A
+        # scheduled task is not running merely because its schedule exists.
+        if body.startswith(EXECUTION_MARKER) and len(body) <= 3000:
+            try:
+                receipt = json.loads(body[len(EXECUTION_MARKER):])
+            except ValueError:
+                continue
+            if not isinstance(receipt, dict):
+                continue
+            state, runner, task = receipt.get("state"), receipt.get("executor"), receipt.get("task_id")
+            if (state not in {"started", "finished", "failed", "queued"} or
+                    not isinstance(runner, str) or not re.fullmatch(r"[A-Za-z0-9_. -]{1,64}", runner) or
+                    not isinstance(task, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", task)):
+                continue
+            next_run = parse_time(receipt.get("next_run_at"))
+            events.append((created, number, {"status": "_execution", "state": state, "executor": runner,
+                                             "task_id": task, "next_run_at": next_run.isoformat() if next_run else None}))
             continue
         lines = [line for line in body.splitlines() if line.startswith(MARKER)]
         if not lines and body.startswith("[APP-CLAIM] "):
@@ -89,6 +109,11 @@ def progress_from_comments(comments):
         events.append((created, number, event))
     for at, _, event in sorted(events, key=lambda row: (row[0], row[1])):
         status = event["status"]
+        if status == "_execution":
+            result["executor_receipt"] = {"state": event["state"],
+                 "executor": event["executor"], "task_id": event["task_id"],
+                 "last_event_at": at.isoformat(), "next_run_at": event["next_run_at"]}
+            continue
         if status in STAGES:
             field = STAGES[status]
             if result[field] is None:
