@@ -23,7 +23,17 @@ def valid_sha(value):
 def timeline(feedback, prs=None):
     """Return stages with grounded event times and conservative statuses."""
     prs = prs or []
-    linked = next((row for row in prs if feedback.get("developer_pr") == row.get("number")
+    # Keep exact submitted SHA as the primary milestone. Other PRs are shown
+    # only when they explicitly reference this Issue; no title-based guessing.
+    issue = feedback.get("github_issue_number")
+    primary_number = feedback.get("developer_pr")
+    related = [row for row in prs if isinstance(row, dict) and (
+        (type(row.get("number")) is int and row["number"] == primary_number)
+        or (type(issue) is int and issue in (row.get("linked_issues") or [])))]
+    related = sorted({row["number"]: row for row in related
+                      if type(row.get("number")) is int and row["number"] > 0}.values(),
+                     key=lambda row: row["number"])
+    linked = next((row for row in related if primary_number == row.get("number")
                    and valid_sha(feedback.get("delivered_sha"))
                    and row.get("head") == feedback["delivered_sha"]), None)
     tested = linked.get("test", {}) if linked else {}
@@ -92,6 +102,10 @@ def timeline(feedback, prs=None):
         "executor": actor,
         "evidence": {"issue": feedback.get("github_issue_number"),
                      "pr": linked.get("number") if linked else None,
+                     "related_prs": [{"number": row["number"], "head_sha": row.get("head"),
+                                      "test_state": (row.get("test") or {}).get("state"),
+                                      "merge_state": row.get("merge_state")}
+                                     for row in related],
                      "head_sha": linked.get("head") if linked else None,
                      "merge_sha": linked.get("merge_sha") if linked else None},
         "last_verified_at": feedback.get("progress_synced_at"),
