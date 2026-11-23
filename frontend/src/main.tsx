@@ -429,6 +429,13 @@ function App() {
       ) : page === 'tasks' ? (
         <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'}
           onRefresh={() => void loadOperations('tasks')}
+          onRequestRepair={async (number, head, base) => {
+            if (!session) throw new Error('请先登录')
+            const result = await api<{url: string; created: boolean}>('/api/v1/pr-conflicts/repair',
+              {method:'POST',body:JSON.stringify({number,head,base})}, session.csrf_token)
+            await loadOperations('tasks')
+            return result
+          }}
           onReleaseDraft={async (number, head) => {
             if (!session) throw new Error('请先登录')
             await api('/api/v1/pr-drafts/release', { method: 'POST', body: JSON.stringify({ number, head }) }, session.csrf_token)

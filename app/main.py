@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import admin_settings, auth, development_tasks, feedback_progress, foundation_version, operations, pr_tracking, release_acceptance, pr_draft_controls
+from . import admin_settings, auth, development_tasks, feedback_progress, foundation_version, operations, pr_tracking, pr_conflict_controls, release_acceptance, pr_draft_controls
 from .db import get_db
 from .models import UserFeedback
 
@@ -216,6 +216,26 @@ def release_draft_pr(req: DraftReleaseIn, request: Request, response: Response,
     except (pr_draft_controls.DraftReleaseError, KeyError, TypeError, ValueError) as exc:
         raise HTTPException(409, str(exc) if isinstance(exc, pr_draft_controls.DraftReleaseError)
                             else "PR 状态已变化，请刷新后重试") from None
+
+
+class ConflictRepairIn(BaseModel):
+    number: int = Field(ge=1, le=1000000)
+    head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    base: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+@app.post("/api/v1/pr-conflicts/repair")
+def request_conflict_repair(req: ConflictRepairIn, request: Request, response: Response,
+                            db: Session = Depends(get_db)):
+    # A logged-in administrator must explicitly confirm the current HEAD and
+    # base. Never accept a browser-specified repository or GitHub token.
+    auth.authorize_session(request, db)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return pr_conflict_controls.request_repair(req.number, req.head, req.base)
+    except (pr_conflict_controls.ConflictError, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(409, str(exc) if isinstance(exc, pr_conflict_controls.ConflictError)
+                            else "PR 已变化，请刷新后重试") from None
 
 
 @app.get("/api/v1/system-logs", dependencies=[Depends(authorize)])
