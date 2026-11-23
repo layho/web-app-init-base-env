@@ -171,3 +171,23 @@ def test_old_worker_still_receives_compatible_arguments(monkeypatch, tmp_path):
     assert "兼容模式" in result["message"]
     assert launched[0][0][-5:] == ["--repo", m.REPO, "--pr", "71", "--force"]
     assert "pass_fds" not in launched[0][1]
+
+
+def test_stale_github_merge_candidate_reports_actual_old_and_new_base(monkeypatch):
+    """Panel #85: after #83 merges, old GH synthetic merge must not run MacCI."""
+    setup(monkeypatch)
+    original = m.api
+    old_base = "d" * 40
+    def stale(path):
+        if path == "/git/commits/" + MERGE:
+            return {"parents": [{"sha": old_base}, {"sha": HEAD}]}
+        return original(path)
+    monkeypatch.setattr(m, "api", stale)
+    launched = []
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *args, **kw: launched.append(args))
+    with pytest.raises(m.ManualActionError, match="仍基于旧 preview") as error:
+        m.request_test(71, HEAD, BASE)
+    assert old_base[:12] in str(error.value)
+    assert BASE[:12] in str(error.value)
+    assert "旧测试结果不得复用" in str(error.value)
+    assert launched == []
