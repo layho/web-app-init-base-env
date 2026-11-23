@@ -62,7 +62,8 @@ def timeline(feedback, prs=None):
     # record from ChatGPT Automations. Never calculate fictitious run times.
     return {
         "steps": steps, "current_stage": phase,
-        "executor": {"name": None, "mode": "unverified",
+        "executor": {"name": None, "reported_actor": feedback.get("developer_actor"),
+                     "mode": "unverified",
                      "running": None, "last_run_at": None,
                      "next_run_at": None, "schedule_source": None},
         "evidence": {"issue": feedback.get("github_issue_number"),
