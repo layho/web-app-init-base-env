@@ -35,7 +35,7 @@ def target():
     try:
         obj = json.loads(METADATA.read_text(encoding="utf-8"))
         repo, domain = obj["repository"], obj["domain"]
-        if (obj.get("schema") != 1 or not isinstance(repo, str)
+        if (not isinstance(obj, dict) or not isinstance(repo, str)
                 or not REPOSITORY.fullmatch(repo) or not isinstance(domain, str)
                 or not re.fullmatch(r"[a-z0-9.-]{3,253}", domain)
                 or os.getenv("APP_PUBLIC_ORIGIN") != "https://" + domain):
