@@ -20,9 +20,11 @@ CONTEXT = "macmini/isolated-tests-v1"
 MARKER = "[APP_MAIN_REVIEW] "
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 ROOT = Path.home() / ".local/share/macmini-pr-tests"
-# The foundation uses preview-only release and must never enter this executor.
-ALLOWED = {repo for repo, branches in runner.REPOS.items()
-           if repo != base.REPO and branches == {"main"}}
+# Explicit opt-in. A repo being in the MacCI *test* allowlist is not
+# enough to authorize publishing it. TI Hunter is legacy and stays excluded.
+APP_MAIN_OPT_IN = frozenset({"layho/macmini-office-app-panel"})
+ALLOWED = {repo for repo in APP_MAIN_OPT_IN
+           if repo != base.REPO and runner.REPOS.get(repo) == {"main"}}
 
 
 def valid(value):
