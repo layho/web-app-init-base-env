@@ -190,14 +190,76 @@ def merge_one(token, repo, number, dry_run=False):
         return True
 
 
+def reconcile_one(token, repo, number, dry_run=False):
+    """Recover a missing receipt only for a historically verified exact merge.
+
+    A closed PR is not sufficient evidence. Verify OWNER approval, exact MacCI
+    success, immutable merge parents/tree and main branch ancestry first.
+    """
+    if repo not in ALLOWED or type(number) is not int or number <= 0:
+        return False
+    pr = api(token, repo, f"/pulls/{number}")
+    if (pr.get("state") != "closed" or pr.get("merged") is not True
+            or pr.get("author_association") != "OWNER"
+            or (pr.get("user") or {}).get("login") != OWNER
+            or (pr.get("base") or {}).get("ref") != "main"
+            or ((pr.get("base") or {}).get("repo") or {}).get("full_name") != repo
+            or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo):
+        return False
+    head, candidate = (pr.get("head") or {}).get("sha"), pr.get("merge_commit_sha")
+    if not valid(head) or not valid(candidate):
+        return False
+    commit = api(token, repo, "/git/commits/" + candidate)
+    parents = [x.get("sha") for x in commit.get("parents", [])]
+    tree = (commit.get("tree") or {}).get("sha")
+    if len(parents) != 2 or parents[1] != head or not all(valid(x) for x in parents) or not valid(tree):
+        return False
+    prior = parents[0]
+    if not review(pages(token, repo, f"/issues/{number}/comments"), head, prior):
+        return False
+    if not base.tested(api(token, repo, "/commits/" + head + "/statuses?per_page=100"),
+                       head, prior, candidate):
+        return False
+    main = api(token, repo, "/branches/main")["commit"]["sha"]
+    if not valid(main):
+        return False
+    remote = f"git@github.com:{repo}.git"
+    with TemporaryDirectory(prefix="macci-app-reconcile-") as folder:
+        base.git(folder, "init", "--bare")
+        base.git(folder, "fetch", "--no-tags", remote, "refs/heads/main:refs/macci/main")
+        if base.git(folder, "rev-parse", "refs/macci/main") != main:
+            return False
+        # Require the actual tested commit to belong to published main history;
+        # GitHub's 'merged' flag alone is not proof of this exact tree.
+        base.git(folder, "merge-base", "--is-ancestor", candidate, main)
+        if (base.git(folder, "show", "-s", "--format=%H %P", candidate).split()
+                != [candidate, prior, head]
+                or base.git(folder, "show", "-s", "--format=%T", candidate) != tree):
+            return False
+        # Do not write if GitHub's immutable evidence changes during the check.
+        latest = api(token, repo, f"/pulls/{number}")
+        if (latest.get("merged") is not True
+                or latest.get("merge_commit_sha") != candidate
+                or (latest.get("head") or {}).get("sha") != head
+                or api(token, repo, "/branches/main")["commit"]["sha"] != main):
+            return False
+        if dry_run:
+            return True
+        merge_receipt(repo, number, head, prior, candidate, tree)
+        return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True, choices=sorted(ALLOWED))
     parser.add_argument("--pr", type=int, help="Optional exact PR for a host-triggered one-shot")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--reconcile-pr", type=int, help="Rebuild a missing receipt after trusted merged-PR checks")
     args = parser.parse_args()
     if args.pr is not None and args.pr <= 0:
         parser.error("--pr must be positive")
+    if args.reconcile_pr is not None and (args.reconcile_pr <= 0 or args.pr is not None):
+        parser.error("--reconcile-pr must be positive and exclusive of --pr")
     token = base.read_token()
     lockfile = ROOT / ("app-main-" + args.repo.replace("/", "--") + ".lock")
     with lockfile.open("a") as stream:
@@ -205,6 +267,8 @@ def main():
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        if args.reconcile_pr is not None:
+            return 0 if reconcile_one(token, args.repo, args.reconcile_pr, args.dry_run) else 1
         prs = ([api(token, args.repo, f"/pulls/{args.pr}")] if args.pr is not None
                else pages(token, args.repo, "/pulls?state=open&sort=created&direction=asc"))
         for pr in prs:
