@@ -339,3 +339,26 @@ def test_bootstrap_keeps_ssh_as_default():
     script = (SOURCE / "deploy/app-init/bootstrap.sh").read_text()
     assert 'bash "$work/deploy/app-init/app-init" --install-deps' in script
     assert '--install-deps --github-https' not in script
+
+
+def test_seed_rejects_missing_generated_dependency_before_remote_push(tmp_path, monkeypatch):
+    """A newly created GitHub repo must remain empty on template integrity failure."""
+    source_version = {"schema": 1, "repository": "layho/web-app-init-base-env",
+                      "sha": "a" * 40, "version": "0.1.29"}
+    monkeypatch.setattr(app_init, "foundation_provenance", lambda source: source_version)
+    remote = tmp_path / "empty.git"
+    subprocess.run(["git", "init", "--bare", "-q", remote], check=True)
+    actual_copy = app_init.copy_foundation
+
+    def damaged_copy(source, target, *args):
+        actual_copy(source, target, *args)
+        (target / "app" / "auth.py").unlink()
+
+    monkeypatch.setattr(app_init, "copy_foundation", damaged_copy)
+    with pytest.raises(RuntimeError, match="缺少本地模块"):
+        app_init.seed(SOURCE, str(remote), tmp_path / "generated",
+                      "example/failing-app", "failing-app", "failing.example.com",
+                      18124, "com.appinit.failing")
+    result = subprocess.run(["git", "--git-dir", str(remote), "show-ref"],
+                            capture_output=True, text=True)
+    assert result.returncode == 1, "Template integrity failure must never push an initial commit"
