@@ -70,3 +70,47 @@ def test_blocked_is_not_executor_running():
     assert row["stale"] is True
     assert row["executor"]["mode"] == "unverified"
     assert row["executor"]["last_run_at"] is None
+
+
+def test_owner_execution_receipt_is_separate_from_development_status():
+    from app import feedback_progress
+    import json
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    comment = {
+        "id": 2, "body": feedback_progress.EXECUTION_MARKER + json.dumps({
+            "state": "started", "executor": "Panel Automation", "task_id": "panel-feedback",
+            "next_run_at": "2026-11-24T02:00:00+00:00"}),
+        "created_at": now, "updated_at": now, "author_association": "OWNER"}
+    evidence = feedback_progress.progress_from_comments([comment])
+    assert evidence["overall_status"] == "awaiting_claim"
+    assert evidence["claimed_at"] is None
+    assert evidence["executor_receipt"]["state"] == "started"
+    row = delivery.timeline({**BASE, **evidence})
+    assert row["executor"]["mode"] == "github_execution_receipt"
+    assert row["executor"]["running"] is True
+    assert row["executor"]["name"] == "Panel Automation"
+    assert row["executor"]["next_run_at"] == "2026-11-24T02:00:00+00:00"
+
+
+def test_untrusted_execution_receipt_cannot_claim_task_running():
+    from app import feedback_progress
+    from datetime import datetime, timezone
+    import json
+    now = datetime.now(timezone.utc).isoformat()
+    comment = {
+        "id": 3, "body": feedback_progress.EXECUTION_MARKER + json.dumps({
+            "state": "started", "executor": "Unknown", "task_id": "claimed-task"}),
+        "created_at": now, "updated_at": now, "author_association": "NONE"}
+    evidence = feedback_progress.progress_from_comments([comment])
+    assert evidence["executor_receipt"] is None
+    row = delivery.timeline({**BASE, **evidence})
+    assert row["executor"]["running"] is None
+
+
+def test_stale_start_receipt_does_not_claim_current_execution():
+    row = delivery.timeline({**BASE, "executor_receipt": {
+        "state": "started", "executor": "Panel Automation", "task_id": "task",
+        "last_event_at": "2026-01-01T00:00:00+00:00",
+        "next_run_at": None}})
+    assert row["executor"]["running"] is None
