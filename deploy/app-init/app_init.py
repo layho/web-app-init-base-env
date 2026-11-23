@@ -91,7 +91,10 @@ def copy_foundation(source, target, repository, title, domain, port, label):
     foundation = foundation_provenance(source)
     paths = [
         ".gitignore", "requirements.txt", "app/__init__.py", "app/auth.py", "app/db.py",
-        "app/development_tasks.py", "app/foundation_version.py", "app/upgrade_status.py", "app/feedback_progress.py", "app/pr_tracking.py", "app/release_acceptance.py", "app/main.py", "app/models.py", "app/operations.py",
+        "app/development_tasks.py", "app/foundation_version.py", "app/upgrade_status.py", "app/feedback_progress.py",
+        "app/admin_settings.py", "app/feedback_delivery.py", "app/manual_pr_actions.py",
+        "app/pr_conflict_controls.py", "app/pr_draft_controls.py",
+        "app/pr_tracking.py", "app/release_acceptance.py", "app/main.py", "app/models.py", "app/operations.py",
         "migrations/002_admin_sessions.sql", "migrations/003_feedback.sql",
         "scripts/apply_migrations.py", "scripts/hash_admin_password.py", "scripts/sync_feedback.py",
         "scripts/sync_development_tasks.py", "deploy/macmini/manage.sh", "deploy/macmini/acceptance.py",
@@ -120,6 +123,24 @@ def copy_foundation(source, target, repository, title, domain, port, label):
             content = content.replace("Web App Foundation", html.escape(title))
         elif name in {"app/main.py", "tests/test_auth.py"}:
             content = content.replace('"Web App Foundation"', json.dumps(title, ensure_ascii=False))
+        if name == "tests/test_auth.py":
+            # Base acceptance rules differ from generated applications. Never copy
+            # foundation-only release/workflow expectations into downstream tests.
+            substitutions = {
+                'assert guide["scope"] == "foundation"': 'assert guide["scope"] == "application"',
+                'assert len(guide["sections"]) >= 5': 'assert len(guide["sections"]) == 4',
+                'assert {"before", "initialize", "develop", "downstream", "rebuild"} <= {row["id"] for row in guide["sections"]}':
+                    'assert {"start", "feedback", "foundation", "restore"} == {row["id"] for row in guide["sections"]}',
+                'assert {"web-accept", "publish-main", "upgrade-scheduler", "app-test-deploy"} <= {row["id"] for row in data["development_loop"]}':
+                    'assert data["development_loop"] and all(row["id"] != "publish-main" for row in data["development_loop"])',
+                'assert any("8018" in step["detail"] for section in guide["sections"] for step in section["steps"])':
+                    'assert all(section["steps"] for section in guide["sections"])',
+                'assert "app_development_loop" in json.loads((Path(__file__).resolve().parents[1] / "app/project_info.json").read_text())':
+                    'assert "app_development_loop" not in json.loads((Path(__file__).resolve().parents[1] / "app/project_info.json").read_text())',
+            }
+            for old, new in substitutions.items():
+                need(content.count(old) == 1, f"应用测试模板发生变化，无法安全转换：{old}")
+                content = content.replace(old, new)
         file.write_text(content, encoding="utf-8")
     project = json.loads((source / "app/project_info.json").read_text(encoding="utf-8"))
     project.update(name=title, summary="应用基座已初始化。可在意见反馈登记需求。", tasks=[])
