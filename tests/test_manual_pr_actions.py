@@ -191,3 +191,13 @@ def test_stale_github_merge_candidate_reports_actual_old_and_new_base(monkeypatc
     assert BASE[:12] in str(error.value)
     assert "旧测试结果不得复用" in str(error.value)
     assert launched == []
+
+
+def test_protocol_comment_cannot_impersonate_upgraded_runner(tmp_path):
+    script = tmp_path / "runner.py"
+    script.write_text("# LOCK_HANDOFF_PROTOCOL = 1\n# legacy mode\n")
+    assert m.runner_supports_lock_handoff(script) is False
+    script.write_text("LOCK_HANDOFF_PROTOCOL = 1  # trusted runner capability\n")
+    assert m.runner_supports_lock_handoff(script) is True
+    script.write_text("LOCK_HANDOFF_PROTOCOL = 0\n")
+    assert m.runner_supports_lock_handoff(script) is False
