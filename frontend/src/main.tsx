@@ -12,6 +12,8 @@ import type { TaskSnapshot } from './DevelopmentTasksPage'
 import { ProjectInfoPage } from './ProjectInfoPage'
 import type { ProjectInfo } from './ProjectInfoPage'
 import { WorkspaceShell } from './WorkspaceShell'
+import { FeedbackDelivery } from './FeedbackDelivery'
+import type { Delivery } from './FeedbackDelivery'
 
 type DeployStatus = { state: string; event: {at: string; code: string; sha: string} | null; locked: boolean; age_seconds: number | null; requested_at: string | null; running_sha: string; rollback_failed: boolean }
 const deployLabels: Record<string, string> = { request_waiting: "已登记请求，等待更新器领取", request_unacknowledged: "更新器未确认请求，请检查服务或锁", update_started: "更新器已开始检查", update_candidate: "已取得目标提交", update_dependencies: "检查依赖", update_test_build: "测试及构建中", update_restarting: "服务重启及健康验证中", update_ok: "本机部署成功", update_no_change: "已检查，无新提交", update_held: "目标提交被失败保护拦截", update_preflight_failed: "更新前置条件失败", update_fetch_failed: "拉取失败", update_dependencies_failed: "依赖检查失败", update_schema_failed: "数据库结构检查失败", update_test_build_failed: "测试或构建失败", update_restart_failed: "重启或健康检查失败", update_interrupted: "更新进程未完成", running_sha_mismatch: "运行版本与更新记录不一致", unknown: "尚无更新器回执" }
@@ -28,6 +30,7 @@ type Feedback = FeedbackInput & {
   development_finished_at?: string | null; development_submitted_at?: string | null
   overall_status?: string; developer_reply?: string; delivered_sha?: string | null
   developer_pr?: number | null; progress_synced_at?: string | null; progress_stale?: boolean
+  delivery?: Delivery
 }
 const feedbackStatus: Record<string, { label: string; color: string }> = {
   pending_sync: { label: '待同步', color: 'default' },
@@ -449,7 +452,7 @@ function App() {
             <Button onClick={() => void loadFeedback()} loading={feedbackLoading}>刷新状态</Button>
             <Button type="primary" onClick={() => setFeedbackOpen(true)}>提交反馈</Button>
           </Space>}>
-            <Typography.Paragraph type="secondary">提交问题、改进建议及验收意见，并查看反馈原文与同步结果。</Typography.Paragraph>
+            <Typography.Paragraph type="secondary">一条反馈、一条交付链。点击详情查看提交 → 领取 → 开发 → 测试 → 合并 → 部署 → 验收的真实证据和任务执行状态。</Typography.Paragraph>
             <Table<Feedback> rowKey="id" size="small" dataSource={records} loading={feedbackLoading}
               scroll={{ x: 1660 }} pagination={{ pageSize: 15, showSizeChanger: true }} columns={[
                 { title: '编号', dataIndex: 'id', width: 80, render: (id: number) => '#' + id },
@@ -490,6 +493,7 @@ function App() {
             open={selectedFeedbackId !== null} onClose={() => setSelectedFeedbackId(null)}
             extra={<Button loading={feedbackLoading} onClick={() => void loadFeedback()}>刷新状态</Button>}>
             {selectedFeedback ? <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+              <FeedbackDelivery delivery={selectedFeedback.delivery} issueBase={githubIssues} />
               <Descriptions bordered size="small" column={1} items={[
                 { key: 'category', label: '反馈类别', children: feedbackLabels[selectedFeedback.category] ?? selectedFeedback.category },
                 { key: 'created', label: '提交时间', children: feedbackDate(selectedFeedback.created_at) },
