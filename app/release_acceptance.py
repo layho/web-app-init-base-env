@@ -26,14 +26,28 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def github_token():
+    """Use one configured GitHub credential for release REST and GraphQL.
+
+    APP_GITHUB_TOKEN is the preferred single-token setting. Legacy variable
+    names remain supported for existing installations, with PR token taking
+    precedence to avoid selecting an old Issues-only credential.
+    """
+    return (os.getenv("APP_GITHUB_TOKEN", "").strip()
+            or os.getenv("APP_GITHUB_PR_TOKEN", "").strip()
+            or os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "").strip())
+
+
 def enabled():
     return (os.getenv("APP_BASE_PREVIEW") == "1"
             and os.getenv("APP_PUBLIC_ORIGIN") == "https://base.layho.com"
-            and bool(os.getenv("APP_GITHUB_FEEDBACK_TOKEN")))
+            and bool(github_token()))
 
 
 def github(path, data=None):
-    token = os.environ.get("APP_GITHUB_FEEDBACK_TOKEN", "")
+    token = github_token()
+    if not token:
+        raise AcceptanceError("GH-TOKEN-MISSING：运行服务未配置 GitHub Token")
     request = Request("https://api.github.com" + path,
                       data=json.dumps(data).encode() if data is not None else None,
                       headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
@@ -41,9 +55,14 @@ def github(path, data=None):
     try:
         with build_opener(NoRedirect()).open(request, timeout=8) as response:
             return json.load(response)
-    except (HTTPError, URLError, OSError, ValueError):
-        raise AcceptanceError("GitHub 请求失败，请检查网络及 Issues 读写权限后重试") from None
-
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            raise AcceptanceError(
+                f"GH-REST-{exc.code}：当前 GitHub Token 被拒绝；"
+                "请核查运行服务的凭据、仓库授权和对应 API 权限") from None
+        raise AcceptanceError(f"GH-REST-{exc.code}：GitHub 请求失败") from None
+    except (URLError, OSError, ValueError):
+        raise AcceptanceError("GH-REST-NETWORK：GitHub 请求失败或回执无效") from None
 
 def api(path, data=None):
     return github(f"/repos/{REPO}{path}", data)
