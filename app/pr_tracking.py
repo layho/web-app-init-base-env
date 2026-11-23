@@ -96,6 +96,23 @@ def evidence(statuses, base):
             "phase": match[3], "tested_merge": match[2] if valid_sha(match[2]) else None}
 
 
+def head_status_diagnostic(statuses):
+    """Describe latest GitHub MacCI signal separately from exact-base evidence.
+
+    A failure for this HEAD is worth displaying even if its base/merge
+    description is malformed or stale. It must NOT authorize a merge or be
+    treated as an exact verified test result.
+    """
+    rows = [(instant(item.get("created_at")), item) for item in statuses
+            if isinstance(item, dict) and item.get("context") == CONTEXT
+            and item.get("state") in {"pending", "success", "failure", "error"}
+            and instant(item.get("created_at")) is not None]
+    if not rows:
+        return {"state": "unknown", "at": None}
+    _, latest = max(rows, key=lambda pair: pair[0])
+    return {"state": latest["state"], "at": latest["created_at"]}
+
+
 def log_summary(number, head, base, test, repo=None):
     # Exact repository and filenames only. Read a bounded tail without following
     # symlinks, return enumerated stages/counts, never arbitrary log text.
@@ -147,7 +164,7 @@ def explicit_issue_refs(body):
     found = set()
     for match in re.finditer(
             r"(?im)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|relates?\s+to|"
-            r"issue|task|关联(?:任务|需求|issue))\s*:?\s*"
+            r"related(?:\s+to)?|issue|task|关联(?:任务|需求|issue))\s*:?\s*"
             r"(?:https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/)?#?([1-9][0-9]{0,6})\b",
             body[:40000]):
         found.add(int(match.group(1)))
@@ -212,6 +229,7 @@ def collect(github, repo=None, branch=None):
                      "owner": str((pr.get("user") or {}).get("login") or "未指定")[:100],
                      "linked_issues": explicit_issue_refs(pr.get("body")),
                      "head": head, "base": base, "test": test, "log": log,
+                     "head_status": head_status_diagnostic(statuses),
                      "merge_state": "merged" if merged else "closed" if pr.get("state") == "closed" else "draft" if pr.get("draft") else "open",
                      "merge_blocked": blocked,
                      "conflict": {"blocked": blocked, "base_sha": latest_sha,
