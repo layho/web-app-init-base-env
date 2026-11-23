@@ -89,38 +89,61 @@ def trusted_runner(path):
         raise ManualActionError("本机测试程序尚未安装，无法立即运行") from None
 
 
+def runner_supports_lock_handoff(path):
+    """Recognize only the reviewed host runner protocol, not a guessed version."""
+    try:
+        info = path.stat()
+        if info.st_size > 512 * 1024:
+            return False
+        return re.search(r"(?m)^LOCK_HANDOFF_PROTOCOL = 1(?:[ \t]*#.*)?$",
+                         path.read_text(encoding="utf-8")) is not None
+    except (OSError, UnicodeError):
+        return False
+
+
 def request_test(number, head, base):
     _, merge = current_pr(number, head, base)
     trusted_runner(TEST_RUNNER)
-    # Refuse concurrent launches, rather than claiming a request was queued
-    # when an existing worker would immediately discard it.
+    handoff = runner_supports_lock_handoff(TEST_RUNNER)
     lockfile = ROOT / "worker.lock"
+    command = [sys.executable, str(TEST_RUNNER), "--repo", REPO,
+               "--pr", str(number), "--force"]
+    spawn_options = {
+        "stdin": subprocess.DEVNULL, "start_new_session": True, "close_fds": True,
+        "env": {key: value for key, value in os.environ.items()
+                if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
+                           "SSH_AUTH_SOCK", "DOCKER_HOST"}} |
+               {"PYTHONDONTWRITEBYTECODE": "1"},
+    }
     try:
         with lockfile.open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ManualActionError("已有测试正在运行，请在其结束后点击重新测试") from None
-        # Release the preflight lock before launching: the trusted runner
-        # must acquire worker.lock itself, or it would skip the test.
-        log = ROOT / "manual-test-request.log"
-        with log.open("ab") as out:
-            subprocess.Popen(
-                [sys.executable, str(TEST_RUNNER), "--repo", REPO,
-                 "--pr", str(number), "--force"],
-                stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                start_new_session=True, close_fds=True,
-                env={key: value for key, value in os.environ.items()
-                     if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
-                                "SSH_AUTH_SOCK", "DOCKER_HOST"}} |
-                    {"PYTHONDONTWRITEBYTECODE": "1"},
-            )
+            if handoff:
+                # The same file description remains locked in the child.
+                # No gap exists between the test for a busy runner and spawn.
+                with (ROOT / "manual-test-request.log").open("ab") as out:
+                    subprocess.Popen(command + ["--lock-fd", str(lock.fileno())],
+                                     stdout=out, stderr=out,
+                                     pass_fds=(lock.fileno(),), **spawn_options)
+        if not handoff:
+            # A separately installed host worker may still be on the old
+            # protocol. Preserve its old invocation until reviewed upgrade.
+            # This legacy path retains the old scheduling race.
+            with (ROOT / "manual-test-request.log").open("ab") as out:
+                subprocess.Popen(command, stdout=out, stderr=out, **spawn_options)
     except OSError:
         raise ManualActionError("本机测试程序启动失败，未受理此次操作") from None
     return {"accepted": True, "action": "test", "number": number,
             "head": head, "base": base, "candidate": merge,
             "requested_at": datetime.now(timezone.utc).isoformat(),
-            "message": "已向本机测试程序发起指定 PR 的执行请求，请刷新确认实际 MacCI 回执"}
+            "lock_handoff": handoff,
+            "message": ("已向本机测试程序发起指定 PR 的执行请求，请刷新确认实际 MacCI 回执"
+                        if handoff else
+                        "已调用旧版 MacCI Runner（兼容模式，可能被并行测试抢锁），"
+                        "请升级本机 Runner 并核对实际测试回执")}
 
 
 def latest_status(head):

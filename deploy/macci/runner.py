@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import tarfile
 import time
 from tempfile import TemporaryDirectory
@@ -16,6 +17,7 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 import uuid
 
 ROOT = Path.home() / '.local/share/macmini-pr-tests'
+LOCK_HANDOFF_PROTOCOL = 1  # Supported by trusted web-side manual PR runner
 CONTEXT = 'macmini/isolated-tests-v1'
 REPOS = {
     'layho/web-app-init-base-env': {'preview'},
@@ -222,6 +224,21 @@ def lock():
         yield
 
 
+@contextmanager
+def inherited_lock(fd):
+    """Adopt the web handler's already locked worker file without a release gap."""
+    if not isinstance(fd, int) or fd < 3:
+        raise ValueError('Invalid inherited worker lock')
+    info = os.fstat(fd)
+    expected = (ROOT / 'worker.lock').lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o022
+            or (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino)):
+        raise ValueError('Unsafe inherited worker lock')
+    with os.fdopen(fd, 'a', closefd=True):
+        yield
+
+
 def token_file():
     return ROOT / 'github-token'
 
@@ -232,6 +249,7 @@ def main():
     parser.add_argument('--repo', choices=REPOS)
     parser.add_argument('--pr', type=int)
     parser.add_argument('--force', action='store_true')
+    parser.add_argument('--lock-fd', type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -247,6 +265,8 @@ def main():
         return 0
     if args.pr is not None and (not args.repo or args.pr <= 0):
         parser.error('--pr requires --repo and a positive PR number')
+    if args.lock_fd is not None and (args.configure or args.pr is None or not args.force):
+        parser.error('--lock-fd requires an explicit forced PR test')
     path = token_file()
     if path.is_symlink() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
         raise SystemExit('Unsafe token file permissions')
@@ -254,7 +274,7 @@ def main():
     docker_command()
     subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
     try:
-        with lock():
+        with (lock() if args.lock_fd is None else inherited_lock(args.lock_fd)):
             for repo in ([args.repo] if args.repo else REPOS):
                 if args.pr:
                     prs = [api(token, f'/repos/{repo}/pulls/{args.pr}')]

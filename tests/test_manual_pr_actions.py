@@ -82,7 +82,7 @@ def test_manual_test_targets_exact_pr_without_force_merging(monkeypatch, tmp_pat
     setup(monkeypatch)
     monkeypatch.setattr(m, "ROOT", tmp_path)
     monkeypatch.setattr(m, "TEST_RUNNER", tmp_path / "runner.py")
-    (tmp_path / "runner.py").write_text("print('test')")
+    (tmp_path / "runner.py").write_text("LOCK_HANDOFF_PROTOCOL = 1\n")
     monkeypatch.setattr(m, "trusted_runner", lambda path: None)
     launched = []
     def launch(args, **kwargs):
@@ -92,8 +92,11 @@ def test_manual_test_targets_exact_pr_without_force_merging(monkeypatch, tmp_pat
     result = m.request_test(71, HEAD, BASE)
     assert result["accepted"] is True
     assert result["candidate"] == MERGE
-    assert launched[0][0][-5:] == ["--repo", m.REPO, "--pr", "71", "--force"]
-    assert launched[0][1]["start_new_session"] is True
+    args, options = launched[0]
+    assert args[2:7] == ["--repo", m.REPO, "--pr", "71", "--force"]
+    assert args[-2] == "--lock-fd"
+    assert options["pass_fds"] == (int(args[-1]),)
+    assert options["start_new_session"] is True
 
 
 def test_manual_test_refuses_busy_worker(monkeypatch, tmp_path):
@@ -109,6 +112,65 @@ def test_manual_test_refuses_busy_worker(monkeypatch, tmp_path):
     monkeypatch.setattr(m.fcntl, "flock", busy)
     with pytest.raises(m.ManualActionError, match="已有测试"):
         m.request_test(71, HEAD, BASE)
+
+
+def test_manual_worker_lock_remains_held_through_spawn(monkeypatch, tmp_path):
+    """No second worker may acquire the file while Popen is being called."""
+    import fcntl
+    setup(monkeypatch)
+    monkeypatch.setattr(m, "ROOT", tmp_path)
+    monkeypatch.setattr(m, "TEST_RUNNER", tmp_path / "runner.py")
+    (tmp_path / "runner.py").write_text("LOCK_HANDOFF_PROTOCOL = 1\n")
+    monkeypatch.setattr(m, "trusted_runner", lambda path: None)
+    observed = []
+
+    def launch(args, **kwargs):
+        fd = kwargs["pass_fds"][0]
+        assert int(args[-1]) == fd
+        with (tmp_path / "worker.lock").open("a") as second:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        observed.append(fd)
+        return SimpleNamespace(pid=313)
+
+    monkeypatch.setattr(m.subprocess, "Popen", launch)
+    assert m.request_test(71, HEAD, BASE)["accepted"]
+    assert observed
+
+
+def test_failed_spawn_releases_worker_lock(monkeypatch, tmp_path):
+    import fcntl
+    setup(monkeypatch)
+    monkeypatch.setattr(m, "ROOT", tmp_path)
+    monkeypatch.setattr(m, "TEST_RUNNER", tmp_path / "runner.py")
+    (tmp_path / "runner.py").write_text("# trusted fixture")
+    monkeypatch.setattr(m, "trusted_runner", lambda path: None)
+
+    def fail_launch(args, **kwargs):
+        raise OSError("failed to spawn")
+
+    monkeypatch.setattr(m.subprocess, "Popen", fail_launch)
+    with pytest.raises(m.ManualActionError, match="启动失败"):
+        m.request_test(71, HEAD, BASE)
+    with (tmp_path / "worker.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_old_worker_still_receives_compatible_arguments(monkeypatch, tmp_path):
+    setup(monkeypatch)
+    monkeypatch.setattr(m, "ROOT", tmp_path)
+    monkeypatch.setattr(m, "TEST_RUNNER", tmp_path / "runner.py")
+    (tmp_path / "runner.py").write_text("# legacy runner")
+    monkeypatch.setattr(m, "trusted_runner", lambda path: None)
+    launched = []
+    monkeypatch.setattr(m.subprocess, "Popen",
+                        lambda args, **kwargs: launched.append((args, kwargs)) or SimpleNamespace(pid=314))
+    result = m.request_test(71, HEAD, BASE)
+    assert result["accepted"] is True
+    assert result["lock_handoff"] is False
+    assert "兼容模式" in result["message"]
+    assert launched[0][0][-5:] == ["--repo", m.REPO, "--pr", "71", "--force"]
+    assert "pass_fds" not in launched[0][1]
 
 
 def test_stale_github_merge_candidate_reports_actual_old_and_new_base(monkeypatch):
@@ -129,3 +191,13 @@ def test_stale_github_merge_candidate_reports_actual_old_and_new_base(monkeypatc
     assert BASE[:12] in str(error.value)
     assert "旧测试结果不得复用" in str(error.value)
     assert launched == []
+
+
+def test_protocol_comment_cannot_impersonate_upgraded_runner(tmp_path):
+    script = tmp_path / "runner.py"
+    script.write_text("# LOCK_HANDOFF_PROTOCOL = 1\n# legacy mode\n")
+    assert m.runner_supports_lock_handoff(script) is False
+    script.write_text("LOCK_HANDOFF_PROTOCOL = 1  # trusted runner capability\n")
+    assert m.runner_supports_lock_handoff(script) is True
+    script.write_text("LOCK_HANDOFF_PROTOCOL = 0\n")
+    assert m.runner_supports_lock_handoff(script) is False
