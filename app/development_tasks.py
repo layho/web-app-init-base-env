@@ -8,8 +8,8 @@ CACHE_PATH = Path(__file__).resolve().parents[1] / "logs" / "development-tasks.j
 REFRESH_INTERVAL = timedelta(minutes=5)
 
 
-def parse_issue(issue: dict, repository: str) -> dict | None:
-    if "pull_request" in issue or issue.get("title", "").startswith("[APP-FEEDBACK #"):
+def parse_issue(issue: dict, repository: str, comments: list[dict] | None = None) -> dict | None:
+    if "pull_request" in issue:
         return None
     body = issue.get("body") or ""
     section = re.search(r"^## 开发进度[ \t]*\r?\n([\s\S]*?)(?=^#{1,2} |\Z)", body, re.MULTILINE)
@@ -27,8 +27,28 @@ def parse_issue(issue: dict, repository: str) -> dict | None:
     linked = sorted({int(n) for n in re.findall(r"(?<![A-Za-z0-9])#([1-9][0-9]{0,6})\b", linked_section[1])}) if linked_section else []
     assignees = issue.get("assignees") or []
     owner = ", ".join(u["login"] for u in assignees if isinstance(u, dict) and isinstance(u.get("login"), str))[:160]
+    # GitHub's comment author is often the same service account for every AI
+    # worker. Derive the displayed owner ONLY from a trusted structured claim.
+    claim, claimed_at = None, None
+    trusted_agents = {"Codex", "Grok", "Claude", "DeepSeek", "Qwen"}
+    for comment in comments or []:
+        if not isinstance(comment, dict) or (comment.get("user") or {}).get("login") != "layho":
+            continue
+        raw = comment.get("body") or ""
+        if not isinstance(raw, str) or not raw.startswith("[APP_PROGRESS] "):
+            continue
+        fields = dict(re.findall(r"(?m)^([a-z_]+)=([^\\r\\n]{1,160})$", raw))
+        agent = fields.get("agent")
+        if (agent in trusted_agents and fields.get("issue") == str(number)
+                and fields.get("status") in {"claimed", "in_progress", "completed"}
+                and isinstance(comment.get("created_at"), str)):
+            claim, claimed_at = agent, comment["created_at"]
+    if claim:
+        owner = claim
     return {
         "linked_prs": linked, "owner": owner or "未指定",
+        "claimed_at": claimed_at, "development_started_at": claimed_at if claim else None,
+        "agent": claim,
         "number": number,
         "title": issue["title"],
         "url": f"https://github.com/{repository}/issues/{number}",
@@ -158,4 +178,5 @@ def pr_detail(pr: dict) -> dict:
     """Structured evidence for the task's delivery drawer, including history."""
     return {key: pr.get(key) for key in
             ("number", "title", "url", "owner", "head", "base", "test",
-             "merge_state", "merge_sha", "merged_at", "deployment", "conflict")}
+             "merge_state", "merge_sha", "merged_at", "deployment", "conflict",
+             "linked_issues", "review_state", "reviewed_at", "accepted_at")}
