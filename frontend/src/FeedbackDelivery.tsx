@@ -5,7 +5,7 @@ export type DeliveryStep = { key: string; label: string; state: 'complete' | 'pe
 export type Delivery = {
   steps: DeliveryStep[]
   current_stage: string
-  executor: { name: string | null; mode: string; running: boolean | null; last_run_at: string | null
+  executor: { name: string | null; reported_actor?: string | null; mode: string; running: boolean | null; last_run_at: string | null
     next_run_at: string | null; schedule_source: string | null }
   evidence: { issue: number | null; pr: number | null; head_sha: string | null; merge_sha: string | null }
   last_verified_at: string | null
@@ -42,6 +42,7 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
     <Card size="small" title="任务执行与触发">
       <Descriptions size="small" bordered column={1} items={[
         {key:'owner',label:'当前执行负责人',children:owner},
+        {key:'actor',label:'最近可信开发回复账号',children:delivery.executor.reported_actor ?? '尚无记录（不等于实际任务执行人）'},
         {key:'mode',label:'执行方式',children:delivery.executor.mode === 'unverified'
           ? '尚未关联定时任务或实时执行回执' : delivery.executor.mode},
         {key:'running',label:'是否正在执行',children:delivery.executor.running === null ? '未知（没有执行器心跳）'
