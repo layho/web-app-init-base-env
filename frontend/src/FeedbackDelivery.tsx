@@ -1,13 +1,13 @@
 import React from 'react'
 import { Alert, Card, Descriptions, Space, Tag, Timeline, Typography } from 'antd'
 
-export type DeliveryStep = { key: string; label: string; state: 'complete' | 'pending' | 'failed'; at: string | null }
+export type DeliveryStep = { key: string; label: string; state: 'complete' | 'pending' | 'failed' | 'unrecorded'; at: string | null }
 export type Delivery = {
   steps: DeliveryStep[]
   current_stage: string
   executor: { name: string | null; reported_actor?: string | null; mode: string; running: boolean | null; last_run_at: string | null
     next_run_at: string | null; schedule_source: string | null }
-  evidence: { issue: number | null; pr: number | null; head_sha: string | null; merge_sha: string | null }
+  evidence: { issue: number | null; pr: number | null; related_prs?: Array<{number: number; head_sha?: string | null; test_state?: string | null; merge_state?: string | null}>; head_sha: string | null; merge_sha: string | null }
   last_verified_at: string | null
   stale: boolean
 }
@@ -19,6 +19,7 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
   if (!delivery) return <Alert type="info" showIcon message="旧版反馈尚未生成交付进度快照，请刷新同步" />
   const current = delivery.steps.find(step => step.key === delivery.current_stage)
   const owner = delivery.executor.name ?? '未取得执行负责人信息'
+  const missingHistory = delivery.steps.filter(step => step.state === 'unrecorded').length
   const currentState = delivery.current_stage === 'blocked' ? '当前受阻'
     : delivery.current_stage === 'failed' ? '测试或部署失败'
     : current ? '等待：' + current.label : '交付链路已完成'
@@ -29,14 +30,15 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
         只显示有真实证据的进度。MacCI 测试、合并、部署和验收分别核实，不能互相代替。
       </Typography.Paragraph>
       <Timeline items={delivery.steps.map(step => ({
-        color: step.state === 'complete' ? 'green' : step.state === 'failed' ? 'red' : 'gray',
+        color: step.state === 'complete' ? 'green' : step.state === 'failed' ? 'red' : step.state === 'unrecorded' ? 'orange' : 'gray',
         children: <Space direction="vertical" size={0}>
           <Typography.Text strong={step.key === delivery.current_stage}>{step.label}
-            {step.state === 'complete' ? ' · 已完成' : step.state === 'failed' ? ' · 失败' : ' · 等待证据'}
+            {step.state === 'complete' ? ' · 已完成' : step.state === 'failed' ? ' · 失败' : step.state === 'unrecorded' ? ' · 历史回执缺失' : ' · 等待证据'}
           </Typography.Text>
           <Typography.Text type="secondary" style={{fontSize: 12}}>{date(step.at)}</Typography.Text>
         </Space>
       }))}/>
+      {missingHistory > 0 && <Alert showIcon type="warning" message={`已有后续进展，但 ${missingHistory} 项历史里程碑缺少独立回执`} description="这些历史阶段没有可信时间记录，不会补造完成时间；当前交付阶段按后续真实 PR、MacCI 等证据推进。" />}
       {delivery.stale && <Alert showIcon type="warning" message="进度同步已过期；当前状态可能落后于 GitHub" />}
     </Card>
     <Card size="small" title="任务执行与触发">
@@ -63,6 +65,13 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
         {delivery.evidence.pr
           ? <a href={base + '/pull/' + delivery.evidence.pr} target="_blank" rel="noopener noreferrer">修复 PR #{delivery.evidence.pr}</a>
           : <Typography.Text type="secondary">修复 PR：尚未核实</Typography.Text>}
+        {(delivery.evidence.related_prs ?? []).length > 0 && <Space direction="vertical" size={4}>
+          <Typography.Text type="secondary">显式关联的 PR（各自状态独立，不代表全部已部署）</Typography.Text>
+          {(delivery.evidence.related_prs ?? []).map(pr => <Space key={pr.number}>
+            <a href={base + '/pull/' + pr.number} target="_blank" rel="noopener noreferrer">PR #{pr.number}</a>
+            <Tag>{pr.test_state ?? '测试未知'}</Tag><Tag>{pr.merge_state ?? '合并未知'}</Tag>
+          </Space>)}
+        </Space>}
         {delivery.evidence.head_sha && <Typography.Text copyable>开发 HEAD：{delivery.evidence.head_sha}</Typography.Text>}
         {delivery.evidence.merge_sha && <Typography.Text copyable>合并 SHA：{delivery.evidence.merge_sha}</Typography.Text>}
       </Space>
