@@ -45,16 +45,16 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(result["pr_url"],"https://github.com/example/app/pull/3")
             create.assert_not_called()
 
-    def test_same_blocked_snapshot_no_repeat_until_change(self):
-        with patch.object(s.upgrade,"remote_ref",return_value=A), patch.object(s,"open_upgrades",return_value=[]), patch.object(s.upgrade,"coordinate",return_value={"state":"blocked","changes":[{"action":"conflict"}]}) as create:
+    def test_blocked_plan_retries_on_next_tick_after_resolver_upgrade(self):
+        with patch.object(s.upgrade,"remote_ref",return_value=A), patch.object(s,"open_upgrades",return_value=[]), patch.object(s.upgrade,"coordinate",side_effect=[
+            {"state":"blocked","changes":[{"path":"deploy/macmini/manage.sh","action":"review"}]},
+            {"state":"draft_created","url":"https://github.com/example/app/pull/8"}]) as create:
             entry={"mode":"create"}
             first=s.tick_app(REPO,entry,B)
             second=s.tick_app(REPO,entry,B)
-            self.assertEqual(first["review_count"],0)
-            self.assertEqual(first["blocked_files"], [])
-            self.assertEqual(second["state"],"blocked")
-            self.assertEqual(create.call_count,1)
-            s.tick_app(REPO,entry,"c"*40)
+            self.assertEqual(first["state"],"blocked")
+            self.assertEqual(first["review_count"],1)
+            self.assertEqual(second["state"],"draft_created")
             self.assertEqual(create.call_count,2)
 
     def test_errors_retry_and_urls_are_scoped(self):
