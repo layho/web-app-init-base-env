@@ -212,7 +212,7 @@ def test_pr_rest_preflight_uses_dedicated_pr_token(monkeypatch):
     assert captured[0].full_url.endswith("/repos/layho/web-app-init-base-env/branches/preview")
     d.github("/issues/90/comments", {"body": "safe review marker"})
     assert captured[1].get_method() == "POST"
-    assert captured[1].headers["Authorization"] == "Bearer pr-write-token"
+    assert captured[1].headers["Authorization"] == "Bearer issues-only"
 
 
 def test_missing_pr_token_stops_rest_without_fallback(monkeypatch):
