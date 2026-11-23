@@ -37,7 +37,7 @@ def test_explicit_development_progress():
     assert ordinary["completed_steps"] == ordinary["total_steps"] == 0
     assert parse({**ISSUE, "pull_request": {}}, repository) is None
     assert parse({**ISSUE, "title": "[APP-FEEDBACK #1] bug"}, repository) is None
-    assert parse({**ISSUE, "body": ISSUE["body"].replace("状态：开发中", "")}, repository)["status"] == "未标记"
+    assert parse({**ISSUE, "body": ISSUE["body"].replace("状态：开发中", "")}, repository)["status"] == "未记录开发状态"
     assert parse({**ISSUE, "state": "closed", "state_reason": "not_planned"}, repository)["status"] == "已关闭"
 
 
