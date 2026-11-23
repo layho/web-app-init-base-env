@@ -82,7 +82,7 @@ def test_manual_test_targets_exact_pr_without_force_merging(monkeypatch, tmp_pat
     setup(monkeypatch)
     monkeypatch.setattr(m, "ROOT", tmp_path)
     monkeypatch.setattr(m, "TEST_RUNNER", tmp_path / "runner.py")
-    (tmp_path / "runner.py").write_text("print('test')")
+    (tmp_path / "runner.py").write_text("LOCK_HANDOFF_PROTOCOL = 1\n")
     monkeypatch.setattr(m, "trusted_runner", lambda path: None)
     launched = []
     def launch(args, **kwargs):
@@ -120,7 +120,7 @@ def test_manual_worker_lock_remains_held_through_spawn(monkeypatch, tmp_path):
     setup(monkeypatch)
     monkeypatch.setattr(m, "ROOT", tmp_path)
     monkeypatch.setattr(m, "TEST_RUNNER", tmp_path / "runner.py")
-    (tmp_path / "runner.py").write_text("# trusted fixture")
+    (tmp_path / "runner.py").write_text("LOCK_HANDOFF_PROTOCOL = 1\n")
     monkeypatch.setattr(m, "trusted_runner", lambda path: None)
     observed = []
 
@@ -154,3 +154,20 @@ def test_failed_spawn_releases_worker_lock(monkeypatch, tmp_path):
         m.request_test(71, HEAD, BASE)
     with (tmp_path / "worker.lock").open("a") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_old_worker_still_receives_compatible_arguments(monkeypatch, tmp_path):
+    setup(monkeypatch)
+    monkeypatch.setattr(m, "ROOT", tmp_path)
+    monkeypatch.setattr(m, "TEST_RUNNER", tmp_path / "runner.py")
+    (tmp_path / "runner.py").write_text("# legacy runner")
+    monkeypatch.setattr(m, "trusted_runner", lambda path: None)
+    launched = []
+    monkeypatch.setattr(m.subprocess, "Popen",
+                        lambda args, **kwargs: launched.append((args, kwargs)) or SimpleNamespace(pid=314))
+    result = m.request_test(71, HEAD, BASE)
+    assert result["accepted"] is True
+    assert result["lock_handoff"] is False
+    assert "兼容模式" in result["message"]
+    assert launched[0][0][-5:] == ["--repo", m.REPO, "--pr", "71", "--force"]
+    assert "pass_fds" not in launched[0][1]
