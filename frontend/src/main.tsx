@@ -364,6 +364,22 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    if (!signedIn || page !== 'tasks') return
+    let active = true
+    let pending = false
+    const timer = window.setInterval(async () => {
+      if (pending) return
+      pending = true
+      try {
+        const result = await api<TaskSnapshot>('/api/v1/development-tasks')
+        if (active) setDevelopmentTasks(result)
+      } catch { /* retain last visible snapshot */ }
+      finally { pending = false }
+    }, 3000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [signedIn, page])
+
   async function loadOperations(key: 'releases' | 'logs' | 'tasks' | 'project', refresh = false) {
     setLoadingOperations(key)
     setNotice(null)

@@ -1,5 +1,7 @@
 """Refresh the development task snapshot independently of feedback writes."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import fcntl
+import time
 import json
 import os
 from tempfile import NamedTemporaryFile
@@ -62,15 +64,77 @@ def sync(*, force=False, repository=None, request=None) -> None:
                 os.unlink(temp.name)
 
 
-if __name__ == "__main__":
-    failed = False
-    jobs = [sync]
-    if pr_tracking.enabled():
-        jobs.append(lambda: pr_tracking.sync(github))
-    for job in jobs:
+
+# Both the scheduled worker and the manually spawned worker use this lock.
+# Only local status is exposed to the browser; no credential or raw API body.
+def refresh_status():
+    try:
+        data = json.loads((development_tasks.CACHE_PATH.parent / "task-sync-status.json").read_text())
+        if not isinstance(data, dict):
+            return {"state": "unknown"}
+        if data.get("state") in {"queued", "running"}:
+            stamp = datetime.fromisoformat(data["updated_at"])
+            if datetime.now(timezone.utc) - stamp > timedelta(minutes=15):
+                return {**data, "state": "interrupted"}
+        return data
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"state": "unknown"}
+
+
+def write_status(data):
+    folder = development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=folder, delete=False) as out:
         try:
-            job()
-        except (OSError, URLError, ValueError, TypeError, KeyError):
-            print("Task or PR tracking sync failed; last successful snapshot retained")
-            failed = True
-    raise SystemExit(int(failed))
+            json.dump({**data, "updated_at": datetime.now(timezone.utc).isoformat()}, out)
+            out.close()
+            os.replace(out.name, folder / "task-sync-status.json")
+        finally:
+            if os.path.exists(out.name):
+                os.unlink(out.name)
+
+
+def run_refresh(force=False):
+    from app import release_acceptance
+    folder = development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "task-sync.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        target = pr_tracking.target()
+        previous = development_tasks.snapshot()
+        tracking = pr_tracking.snapshot() if target else {}
+        if not force and not previous.get("stale") and not tracking.get("stale", True):
+            if all(datetime.now(timezone.utc) - datetime.fromisoformat(x["synced_at"]) < development_tasks.REFRESH_INTERVAL for x in (previous, tracking)):
+                return 0
+        start = time.monotonic()
+        state = {"state": "running", "phase": "issues", "requests": 0,
+                 "started_at": datetime.now(timezone.utc).isoformat()}
+        write_status(state)
+        def request(method, path):
+            if method != "GET":
+                raise ValueError("Read-only task sync")
+            state["requests"] += 1
+            write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
+            return release_acceptance.github(path)
+        try:
+            if target is None:
+                raise ValueError("No verified repository")
+            sync(force=True, repository=target[0], request=request)
+            state["phase"] = "pulls"
+            write_status(state)
+            pr_tracking.sync(request, force=True)
+            state["state"] = "success"
+        except (release_acceptance.AcceptanceError, OSError, ValueError, TypeError, KeyError) as exc:
+            state["state"] = "failed"
+            # AcceptanceError messages are already sanitized by the REST client.
+            state["reason"] = str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else type(exc).__name__
+        write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
+        return int(state["state"] != "success")
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(run_refresh(force="--force" in sys.argv[1:]))

@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.1.37",
+    "title": "任务列表后台刷新与同步状态",
+    "summary": "将全量 GitHub 同步移出网页请求，显示后台真实状态并防止重复执行。",
+    "changes": [
+      "手动刷新立即返回缓存，后台同步与定时任务共用跨进程锁。",
+      "任务页轮询本地状态，显示同步阶段、请求数、耗时和失败原因。",
+      "保留旧快照，不把同步失败冒充成功。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证刷新请求不等待 GitHub、重复触发去重及后台状态。",
+      "核对 #128 负责人及最新同步记录。",
+      "核对精确 MacCI、preview 运行 SHA 后人工验收。"
+    ],
+    "validation_note": "候选；尚未取得测试或部署回执。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/128"
+  },
+  {
     "version": "0.1.36",
     "title": "统一开发任务与反馈交付证据",
     "summary": "将意见反馈纳入任务清单，展示开发 Agent、关联 Issue/PR、领取时间和交付 SHA，区分提交回执缺失、PR 同步等待及 HEAD 不匹配。",

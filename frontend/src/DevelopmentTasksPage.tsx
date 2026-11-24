@@ -29,7 +29,7 @@ type DevelopmentTask = {
 
 type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
 type PRTracking = { running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
-export type TaskSnapshot = { synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
+export type TaskSnapshot = { refresh_status?: {state: string; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
 const statusColors: Record<string, string> = {
   开发中: 'processing',
@@ -220,7 +220,14 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
 }) {
   const [taskSelected, setTaskSelected] = useState<string | null>(null)
   const selectedTask = data?.tasks.find(task => (task.key ?? 'issue-' + task.number) === taskSelected)
+  const sync = data?.refresh_status
+  const syncing = sync?.state === 'queued' || sync?.state === 'running'
   const tasks = <Flex vertical gap="middle">
+      {sync && sync.state !== 'unknown' && <Alert showIcon
+        type={sync.state === 'failed' || sync.state === 'interrupted' ? 'warning' : sync.state === 'success' ? 'success' : 'info'}
+        message={syncing ? '后台同步中 · 可继续操作' : sync.state === 'success' ? '最近同步成功' : '同步未完成 · 保留已有记录'}
+        description={`阶段：${sync.phase ?? '等待领取'}；GitHub 请求：${sync.requests ?? 0}；耗时：${sync.elapsed_seconds ?? 0}秒${sync.reason ? '；原因：' + sync.reason : ''}`}/>}
+
       {data?.stale && <Alert type="warning" showIcon message={
         data?.synced_at ? '同步已延迟，以下为上次成功获取的记录。' : '等待从 GitHub 同步开发任务。'
       } />}
@@ -256,7 +263,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
         ]}
       />
     </Flex>
-  return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading}>刷新列表</Button>}>
+  return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading} disabled={syncing}>{syncing ? "同步中" : "立即同步"}</Button>}>
     {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'统一任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage tasks={data.tasks} data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
     <Drawer title={selectedTask ? '#' + selectedTask.number + ' · 完整交付链路' : '交付链路'}
       open={taskSelected !== null} onClose={() => setTaskSelected(null)} width="min(720px, 100vw)">
