@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.1.40",
+    "title": "部署失败恢复及独立宿主回执",
+    "summary": "修复失败候选交付链路，优先部署日志独立采集。",
+    "changes": [
+      "MacCI 独立读取既有基座部署日志，回写精确候选部署成功或失败、回滚结果；暂仅覆盖基座验收站。",
+      "宿主测试与前端构建失败分开分类；旧版回滚允许缺少构建 SHA 文件。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "实机核对失败候选回执及回滚结果",
+      "验证修复候选部署及前后端 SHA"
+    ],
+    "validation_note": "候选未测试未部署；独立宿主运行时必须升级后才可回传。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/139"
+  },
+  {
     "version": "0.1.39",
     "title": "历史任务状态治理与宿主凭据修复",
     "summary": "区分正式发布代码与需求结项，清理历史任务分类；统一凭据及宿主诊断分阶段交付。",

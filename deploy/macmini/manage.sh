@@ -121,7 +121,7 @@ health_once() {
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
   .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" else 1)' 2>/dev/null &&
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/" | grep -q '/assets/' &&
-  test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected" &&
+  { test ! -f frontend/dist/build-sha.txt || test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected"; } &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/v1/feedback")" = "401" &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/session")" = "401"
 }
@@ -423,7 +423,12 @@ update() {
   fi
   UPDATE_FAILURE=update_test_build_failed
   record_operation update_test_build "$new"
-  if ! test_app || ! build; then
+  if ! test_app; then
+    UPDATE_DETAIL=host_test_failed
+    rollback "$old" "$new"; exit 1
+  fi
+  if ! build; then
+    UPDATE_DETAIL=frontend_build_failed
     rollback "$old" "$new"; exit 1
   fi
   UPDATE_FAILURE=update_restart_failed

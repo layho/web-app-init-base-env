@@ -131,5 +131,17 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(payload["state"],"pending")
             self.assertIn("dependencies",payload["description"])
 
+class DeploymentJournalTests(unittest.TestCase):
+    def test_rollback_failure_receipt(self):
+        lines=[("update_started",BASE),("update_candidate",MERGE),("update_test_build",MERGE),
+               ("rollback",MERGE),("rollback_ok",BASE),("update_test_build_failed",MERGE)]
+        raw="\n".join("2026-11-24T22:55:18Z\t"+code+"\t"+sha for code,sha in lines)
+        result=runner.deployment_events(raw)
+        self.assertEqual(len(result),1)
+        self.assertEqual(result[0]["candidate"],MERGE)
+        self.assertEqual(result[0]["rollback"],"ok")
+        self.assertEqual(result[0]["previous"],BASE)
+        self.assertEqual(runner.deployment_events(raw.split("rollback_ok")[0]),[])
+
 if __name__ == "__main__":
     unittest.main()
