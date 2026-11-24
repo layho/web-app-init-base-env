@@ -4,6 +4,10 @@ import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Table, T
 type LinkedPR = {number: number; title?: string; url?: string; owner?: string; test?: {state?: string; started_at?: string; finished_at?: string}; merge_state?: string; merged_at?: string | null; merge_sha?: string | null; deployment?: {state?: string; at?: string | null}; conflict?: {blocked?: boolean}}
 type DevelopmentTask = {
   owner?: string
+  origin?: string
+  github_actor?: string
+  claimed_at?: string
+  development_started_at?: string
   pr_numbers?: number[]
   prs?: LinkedPR[]
   key?: string
@@ -40,7 +44,7 @@ function formatDate(value: string | null) {
 }
 
 const ciLabels: Record<string, string> = { success: '通过', pending: '测试中', failure: '失败', error: '失效 / 异常', unknown: '待测试 / 未记录' }
-const mergeLabels: Record<string, string> = { merged: '已合并', draft: '已暂停 · 等待解除', open: '待合并', closed: '已关闭' }
+const mergeLabels: Record<string, string> = { merged: '已合并', draft: '草稿 · 等待开发审查', open: '待合并', closed: '已关闭' }
 const deployLabels: Record<string, string> = { running: '当前运行', deployed: '曾成功部署', failed: '部署失败 / 回退', unverified: '待核验', not_merged: '尚未合并' }
 const phaseLabels: Record<string, string> = { pending: '正在测试', passed: '后端测试、编译及前端构建通过', 'setup-failed': '环境准备失败', 'fetch-failed': '候选代码拉取失败', 'context-failed': '构建上下文失败', 'dependencies-failed': '依赖安装 / 镜像构建失败', 'pytest-failed': '后端测试失败', 'compile-failed': 'Python 编译失败', 'frontend-failed': '前端构建失败', 'test-failed': '容器测试失败', 'ref-changed': '分支已变更，回执无效' }
 function duration(seconds?: number | null) { return seconds == null ? '未记录' : seconds < 60 ? seconds + '秒' : Math.floor(seconds / 60) + '分' + seconds % 60 + '秒' }
@@ -52,7 +56,7 @@ function passRate(row: PRRecord) {
   return n > 0 ? (100 * p / n).toFixed(1) + '%' : '未记录'
 }
 function ciTag(state: string) { return <Tag color={state === 'success' ? 'success' : state === 'pending' ? 'processing' : state === 'failure' || state === 'error' ? 'error' : 'default'}>{ciLabels[state] ?? '未记录'}</Tag> }
-function PRTrackingPage({data, onReleaseDraft, onRequestRepair}: {data: PRTracking; onReleaseDraft: (number: number, head: string) => Promise<void>; onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>}) {
+function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: PRTracking; tasks: DevelopmentTask[]; onReleaseDraft: (number: number, head: string) => Promise<void>; onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>}) {
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null)
   const [repairNumber, setRepairNumber] = useState<number | null>(null)
   const [repairing, setRepairing] = useState(false)
@@ -112,6 +116,7 @@ function PRTrackingPage({data, onReleaseDraft, onRequestRepair}: {data: PRTracki
       description={`每五分钟尝试同步。当前仓库：${data.repository ?? '待识别'}；目标分支：${data.branch ?? '待识别'}。未取得本机测试或部署证据时显示“未记录”，不推算。`} />
     <Typography.Text type="secondary">最近同步：{formatDate(data.synced_at)}</Typography.Text>
     <Table rowKey="number" size="small" dataSource={data.prs} scroll={{x: 1160}} locale={{emptyText: '暂无 PR 测试记录'}} columns={[
+      {title: '关联任务', width: 120, render: (_,row) => tasks.filter(t => t.source !== 'pr' && t.pr_numbers?.includes(row.number)).map(t => '#' + t.number).join('、') || '—'},
       {title: 'PR', width: 280, render: (_,row) => <Typography.Link href={row.url} target="_blank" rel="noreferrer">#{row.number} {row.title}</Typography.Link>},
       {title: '测试状态', width: 155, render: (_,row) =>
         row.conflict?.blocked ? <Tag color="error">冲突阻止重新测试</Tag> :
@@ -237,7 +242,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
           { title: '操作', width: 84, render: (_, task: DevelopmentTask) => <Button type="link" size="small"
             onClick={() => setTaskSelected(task.key ?? 'issue-' + task.number)}>查看链路</Button> },
           { title: '来源', width: 85, render: (_, task: DevelopmentTask) =>
-            <Tag>{task.source === 'pr' ? '代码任务' : '需求任务'}</Tag> },
+            <Tag>{task.source === 'pr' ? '代码任务' : task.origin === 'feedback' ? '意见反馈' : '需求任务'}</Tag> },
           { title: '当前阶段', width: 205, render: (_, task: DevelopmentTask) =>
             <Tag color={statusColors[task.status] ?? 'default'}>{task.delivery_status ?? task.status}</Tag> },
           { title: '测试', width: 92, render: (_, task: DevelopmentTask) =>
@@ -252,13 +257,16 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
       />
     </Flex>
   return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading}>刷新列表</Button>}>
-    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'统一任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
+    {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'统一任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage tasks={data.tasks} data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
     <Drawer title={selectedTask ? '#' + selectedTask.number + ' · 完整交付链路' : '交付链路'}
       open={taskSelected !== null} onClose={() => setTaskSelected(null)} width="min(720px, 100vw)">
       {selectedTask ? <Flex vertical gap="middle">
         <Typography.Text strong>{selectedTask.title}</Typography.Text>
         <Descriptions size="small" bordered column={1} items={[
           {key:'owner',label:'负责人',children:selectedTask.owner || '未指定'},
+          {key:'actor',label:'GitHub 作者',children:selectedTask.github_actor || '未记录'},
+          {key:'claimed',label:'领取时间',children:formatDate(selectedTask.claimed_at ?? null)},
+          {key:'started',label:'开发开始',children:formatDate(selectedTask.development_started_at ?? null)},
           {key:'stage',label:'当前阶段',children:selectedTask.delivery_status || selectedTask.status},
           {key:'source',label:'任务来源',children:selectedTask.source === 'pr' ? '独立代码任务' : '需求任务'},
           {key:'link',label:'关联 PR',children:selectedTask.pr_numbers?.length ? selectedTask.pr_numbers.map(n=>'#'+n).join('、') : '暂无关联'},
@@ -271,6 +279,8 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
             {key:'ci',label:'MacCI 测试',children:ciLabels[pr.test?.state || 'unknown'] || '尚未核实'},
             {key:'start',label:'测试开始',children:formatDate(pr.test?.started_at ?? null)},
             {key:'end',label:'测试结束',children:formatDate(pr.test?.finished_at ?? null)},
+            {key:'head',label:'PR HEAD',children:data?.pr_tracking?.prs.find(r=>r.number===pr.number)?.head ?? '未记录'},
+            {key:'mergeSha',label:'合并 SHA',children:pr.merge_sha ?? '未记录'},
             {key:'merge',label:'合并状态',children:mergeLabels[pr.merge_state || ''] || '未记录'},
             {key:'mergedAt',label:'合并时间',children:formatDate(pr.merged_at ?? null)},
             {key:'deploy',label:'部署状态',children:deployLabels[pr.deployment?.state || ''] || '尚未核实'},
