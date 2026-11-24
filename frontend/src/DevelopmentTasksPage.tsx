@@ -222,20 +222,35 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>
 }) {
   const [taskSelected, setTaskSelected] = useState<string | null>(null)
-  const [filter, setFilter] = useState('all')
+  const [filter, setFilter] = useState('current')
   const [search, setSearch] = useState('')
+  const [order,setOrder]=useState('work')
   const category = (t: DevelopmentTask) => {
-    if (t.status === '已完成') return 'done'
+    const stage=t.delivery_status ?? ''
     if (t.status === '已关闭' || (t.source === 'pr' && t.merge_state === 'closed')) return 'closed'
-    if (t.test_failures?.length || t.status === '受阻' || t.delivery_status?.includes('冲突') || t.delivery_status?.includes('失败')) return 'blocked'
-    if (t.merge_state === 'merged' || (t.status === '待验收' && t.test_state === 'success')) return 'review'
-    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.status === '开发中') return 'active'
+    if (t.status === '已完成' || stage === '用户验收通过 · 已正式发布') return 'done'
+    if (t.test_failures?.length || t.status === '受阻' || /冲突|失败|不通过/.test(stage)) return 'blocked'
+    if (/待验收确认|待正式发布/.test(stage) || (t.status==='待验收' && t.merge_state==='merged' && t.deployment_state==='running')) return 'review'
+    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.merge_state==='merged' || t.status === '开发中') return 'active'
     return 'todo'
   }
-  const visibleTasks = [...(data?.tasks ?? [])].filter(t =>
-    (filter === 'all' || category(t) === filter) &&
-    (!search.trim() || [t.number, t.title, t.owner, ...(t.pr_numbers ?? [])].join(' ').toLowerCase().includes(search.trim().replace(/^#/, '').toLowerCase()))
-  ).sort((a,b)=>b.number-a.number)
+  const priority:Record<string,number>={blocked:0,review:1,active:2,todo:3,done:4,closed:5}
+  const allTasks=data?.tasks ?? []
+  const counts=allTasks.reduce<Record<string,number>>((acc,t)=>{const key=category(t);acc[key]=(acc[key]??0)+1;return acc},{})
+  const timestamp=(t:DevelopmentTask)=>{const ts=Date.parse(t.updated_at ?? '');return Number.isFinite(ts)?ts:0}
+  const visibleTasks = [...allTasks].filter(t => {
+    const c=category(t)
+    return (filter==='all' || (filter==='current' && c!=='done' && c!=='closed') || filter===c) &&
+      (!search.trim() || [t.number,t.title,t.owner,...(t.pr_numbers??[])].join(' ').toLowerCase().includes(search.trim().replace(/^#/,'').toLowerCase()))
+  }).sort((a,b)=>{
+    if(order==='number_desc')return b.number-a.number
+    if(order==='number_asc')return a.number-b.number
+    if(order==='work'){
+      const diff=priority[category(a)]-priority[category(b)]
+      if(diff)return diff
+    }
+    return timestamp(b)-timestamp(a)||b.number-a.number
+  })
   const selectedTask = data?.tasks.find(task => (task.key ?? 'issue-' + task.number) === taskSelected)
   const sync = data?.refresh_status
   const syncing = sync?.state === 'queued' || sync?.state === 'running'
@@ -263,11 +278,18 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
       <Space wrap>
         <Input.Search allowClear placeholder="搜索任务、PR 或负责人" value={search} onChange={e=>setSearch(e.target.value)} style={{width:240}}/>
         <Select value={filter} onChange={setFilter} style={{width:155}} options={[
-          {value:'all',label:'全部任务'},{value:'todo',label:'待开发'},{value:'active',label:'开发中'},
+          {value:'current',label:'当前任务'},{value:'all',label:'全部任务'},{value:'todo',label:'待开发'},{value:'active',label:'开发中'},
           {value:'blocked',label:'受阻 / 失败'},{value:'review',label:'待验收 / 发布'},
           {value:'done',label:'已完成'},{value:'closed',label:'已关闭'}
         ]}/>
-        <Typography.Text type="secondary">{visibleTasks.length} 条 · 最新编号优先</Typography.Text>
+        <Select value={order} onChange={setOrder} style={{width:155}} options={[
+          {value:'work',label:'当前工作优先'},{value:'updated',label:'最近更新优先'},
+          {value:'number_desc',label:'编号从新到旧'},{value:'number_asc',label:'编号从旧到新'}
+        ]}/>
+        <Typography.Text type="secondary">{visibleTasks.length} / {allTasks.length} 条</Typography.Text>
+      </Space>
+      <Space wrap>{([{key:'blocked',label:'受阻'},{key:'review',label:'待验收 / 发布'},{key:'active',label:'开发中'},{key:'todo',label:'待开发'},{key:'done',label:'已完成'},{key:'closed',label:'已关闭'}]).map(x=><Button key={x.key} size="small" type={filter===x.key?'primary':'default'} onClick={()=>setFilter(filter===x.key?'current':x.key)}>{x.label} {counts[x.key]??0}</Button>)}
+        {filter==='current'&&<Typography.Text type="secondary">历史任务已隐藏，可切换查看</Typography.Text>}
       </Space>
       <Table
         rowKey={task => task.key ?? 'issue-' + task.number}
