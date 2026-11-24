@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import re
 
+from app.feedback_progress import progress_from_comments
+
 CACHE_PATH = Path(__file__).resolve().parents[1] / "logs" / "development-tasks.json"
 REFRESH_INTERVAL = timedelta(minutes=5)
 
@@ -27,30 +29,28 @@ def parse_issue(issue: dict, repository: str, comments: list[dict] | None = None
     linked = sorted({int(n) for n in re.findall(r"(?<![A-Za-z0-9])#([1-9][0-9]{0,6})\b", linked_section[1])}) if linked_section else []
     assignees = issue.get("assignees") or []
     owner = ", ".join(u["login"] for u in assignees if isinstance(u, dict) and isinstance(u.get("login"), str))[:160]
-    # GitHub's comment author is often the same service account for every AI
-    # worker. Derive the displayed owner ONLY from a trusted structured claim.
-    claim, claimed_at, started_at = None, None, None
-    trusted_agents = {"Codex", "Grok", "Claude", "DeepSeek", "Qwen"}
-    for comment in comments or []:
-        if not isinstance(comment, dict) or (comment.get("user") or {}).get("login") != "layho":
-            continue
-        raw = comment.get("body") or ""
-        if not isinstance(raw, str) or not raw.startswith("[APP_PROGRESS] "):
-            continue
-        fields = dict(re.findall(r"(?m)^([a-z_]+)=([^\r\n]{1,160})$", raw))
-        agent = fields.get("agent")
-        if (agent in trusted_agents and fields.get("issue") == str(number)
-                and fields.get("status") in {"claimed", "in_progress", "completed"}
-                and isinstance(comment.get("created_at"), str)):
-            claim, claimed_at = agent, comment["created_at"]
-            if fields.get("status") == "in_progress":
-                started_at = comment["created_at"]
+    # Reuse the feedback protocol parser; never interpret a second wire format.
+    receipt = progress_from_comments(comments or [])
+    claim = receipt["developer_agent"]
     if claim:
         owner = claim
+    elif receipt["developer_actor"]:
+        owner = receipt["developer_actor"]
+    claimed_at = receipt["claimed_at"]
+    started_at = receipt["development_started_at"]
+    if issue.get("state") != "closed":
+        phase = receipt["overall_status"]
+        state = {"claimed": "待开发", "in_progress": "开发中",
+                 "development_finished": "开发中", "submitted": "开发中",
+                 "ready_for_review": "待验收", "blocked": "受阻"}.get(phase, state)
+    if receipt["developer_pr"]:
+        linked = sorted(set(linked) | {receipt["developer_pr"]})
     return {
         "linked_prs": linked, "owner": owner or "未指定",
         "claimed_at": claimed_at, "development_started_at": started_at,
-        "agent": claim,
+        "agent": claim, "github_actor": receipt["developer_actor"],
+        "feedback_progress": receipt,
+        "origin": "feedback" if issue.get("title", "").startswith("[APP-FEEDBACK #") else "issue",
         "number": number,
         "title": issue["title"],
         "url": f"https://github.com/{repository}/issues/{number}",
@@ -138,7 +138,9 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             stage = "关联代码测试失败"
         elif any(x != "merged" for x in merges):
             stage = "代码开发与合并中"
-        elif any(x in {"failed", "unverified", "not_merged"} for x in deploys):
+        elif any(x == "failed" for x in deploys):
+            stage = "部署失败"
+        elif any(x not in {"running", "deployed"} for x in deploys):
             stage = "代码已合并 · 部署待核验"
         else:
             stage = "代码已部署 · 待验收确认"
