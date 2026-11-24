@@ -206,8 +206,16 @@ def list_development_tasks(response: Response, refresh: bool = False):
         # uses the trusted instance's repository and only GitHub GET reads.
         # Never show an old snapshot as if the manual refresh succeeded.
         try:
-            pr_tracking.sync(lambda method, path: release_acceptance.github(path),
-                             force=True)
+            from scripts.sync_development_tasks import sync as sync_issues
+            target = pr_tracking.target()
+            if target is None:
+                raise ValueError("No verified application repository")
+            def read_github(method, path):
+                if method != "GET":
+                    raise ValueError("Read-only task refresh")
+                return release_acceptance.github(path)
+            sync_issues(force=True, repository=target[0], request=read_github)
+            pr_tracking.sync(read_github, force=True)
         except (release_acceptance.AcceptanceError, OSError, ValueError,
                 TypeError, KeyError):
             raise HTTPException(503, "GitHub 实时同步失败；仍可查看上次同步记录") from None
