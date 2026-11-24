@@ -43,6 +43,7 @@ def blank_progress():
         "developer_pr": None,
         "accepted_at": None,
         "developer_actor": None,
+        "developer_agent": None,
         "executor_receipt": None,
     }
 
@@ -103,6 +104,9 @@ def progress_from_comments(comments):
                 continue
             if type(pr) is not int or pr <= 0:
                 continue
+        if event.get("agent") not in ("Codex", "Grok", "Claude", "DeepSeek", "Qwen"):
+            event.pop("agent", None)
+        event.pop("actor", None)
         actor = (comment.get("user") or {}).get("login")
         if isinstance(actor, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", actor):
             event = {**event, "actor": actor}
@@ -125,6 +129,7 @@ def progress_from_comments(comments):
             actor = event.get("actor")
             if isinstance(actor, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", actor):
                 result["developer_actor"] = actor
+                result["developer_agent"] = event.get("agent")
         reply = event.get("reply")
         if isinstance(reply, str):
             result["developer_reply"] = reply[:6000]

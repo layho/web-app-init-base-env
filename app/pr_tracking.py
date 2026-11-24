@@ -171,15 +171,33 @@ def explicit_issue_refs(body):
     return sorted(found)
 
 
+def list_all_prs(github, prefix):
+    """Traverse stable creation order, deduplicate, and fail closed on bad pages."""
+    rows = {}
+    page = 1
+    while True:
+        batch = github("GET", prefix + "/pulls?state=all&sort=created&direction=asc&per_page=100&page=" + str(page))
+        if not isinstance(batch, list) or len(batch) > 100:
+            raise ValueError("Invalid PR page")
+        previous = len(rows)
+        for row in batch:
+            if not isinstance(row, dict) or type(row.get("number")) is not int or row["number"] <= 0:
+                raise ValueError("Invalid PR entry")
+            rows[row["number"]] = row
+        if len(batch) < 100:
+            return sorted(rows.values(), key=lambda row: row["number"], reverse=True)
+        if len(rows) == previous:
+            raise ValueError("PR pagination did not advance")
+        page += 1
+
+
 def collect(github, repo=None, branch=None):
     current = target() if repo is None else (repo, branch or "main")
     if current is None or not valid_repository(current[0]):
         raise ValueError("No verified application repository")
     repo, branch = current
     prefix = "/repos/" + repo
-    prs = github("GET", prefix + "/pulls?state=all&sort=updated&direction=desc&per_page=50")
-    if not isinstance(prs, list):
-        raise ValueError("Invalid PR list")
+    prs = list_all_prs(github, prefix)
     # The PR's base.sha can be stale after preview/main advances. A pending
     # test is valid only against the actual current target branch SHA.
     latest_sha = github("GET", prefix + "/branches/" + branch)["commit"]["sha"]
@@ -229,7 +247,8 @@ def collect(github, repo=None, branch=None):
                      "url": "https://github.com/" + repo + "/pull/" + str(number),
                      "owner": str((pr.get("user") or {}).get("login") or "未指定")[:100],
                      "linked_issues": explicit_issue_refs(pr.get("body")),
-                     "head": head, "base": base, "test": test, "log": log,
+                     "head": head, "base": base, "head_branch": pr["head"].get("ref"),
+                     "base_branch": pr["base"].get("ref"), "test": test, "log": log,
                      "head_status": head_status_diagnostic(statuses),
                      "merge_state": "merged" if merged else "closed" if pr.get("state") == "closed" else "draft" if pr.get("draft") else "open",
                      "merge_blocked": blocked,
@@ -284,5 +303,6 @@ def snapshot():
                              "running" if sha and sha == running and event and event["code"] in {"install_ok", "update_ok"} else
                              "deployed" if event and event["code"] in {"install_ok", "update_ok"} else
                              "failed" if event else "unverified", "at": event["at"] if event else None}
-    return {**data, "can_release_draft": current == (REPO, "preview"),
+    return {**data, "running_sha": running if valid_sha(running) else None,
+            "can_release_draft": current == (REPO, "preview"),
             "stale": (datetime.now(timezone.utc) - dt).total_seconds() > 600}

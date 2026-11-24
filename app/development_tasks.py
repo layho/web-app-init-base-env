@@ -4,12 +4,14 @@ import json
 from pathlib import Path
 import re
 
+from app.feedback_progress import progress_from_comments
+
 CACHE_PATH = Path(__file__).resolve().parents[1] / "logs" / "development-tasks.json"
 REFRESH_INTERVAL = timedelta(minutes=5)
 
 
-def parse_issue(issue: dict, repository: str) -> dict | None:
-    if "pull_request" in issue or issue.get("title", "").startswith("[APP-FEEDBACK #"):
+def parse_issue(issue: dict, repository: str, comments: list[dict] | None = None) -> dict | None:
+    if "pull_request" in issue:
         return None
     body = issue.get("body") or ""
     section = re.search(r"^## 开发进度[ \t]*\r?\n([\s\S]*?)(?=^#{1,2} |\Z)", body, re.MULTILINE)
@@ -27,8 +29,28 @@ def parse_issue(issue: dict, repository: str) -> dict | None:
     linked = sorted({int(n) for n in re.findall(r"(?<![A-Za-z0-9])#([1-9][0-9]{0,6})\b", linked_section[1])}) if linked_section else []
     assignees = issue.get("assignees") or []
     owner = ", ".join(u["login"] for u in assignees if isinstance(u, dict) and isinstance(u.get("login"), str))[:160]
+    # Reuse the feedback protocol parser; never interpret a second wire format.
+    receipt = progress_from_comments(comments or [])
+    claim = receipt["developer_agent"]
+    if claim:
+        owner = claim
+    elif receipt["developer_actor"]:
+        owner = receipt["developer_actor"]
+    claimed_at = receipt["claimed_at"]
+    started_at = receipt["development_started_at"]
+    if issue.get("state") != "closed":
+        phase = receipt["overall_status"]
+        state = {"claimed": "待开发", "in_progress": "开发中",
+                 "development_finished": "开发中", "submitted": "开发中",
+                 "ready_for_review": "待验收", "blocked": "受阻"}.get(phase, state)
+    if receipt["developer_pr"]:
+        linked = sorted(set(linked) | {receipt["developer_pr"]})
     return {
         "linked_prs": linked, "owner": owner or "未指定",
+        "claimed_at": claimed_at, "development_started_at": started_at,
+        "agent": claim, "github_actor": receipt["developer_actor"],
+        "feedback_progress": receipt,
+        "origin": "feedback" if issue.get("title", "").startswith("[APP-FEEDBACK #") else "issue",
         "number": number,
         "title": issue["title"],
         "url": f"https://github.com/{repository}/issues/{number}",
@@ -116,7 +138,9 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             stage = "关联代码测试失败"
         elif any(x != "merged" for x in merges):
             stage = "代码开发与合并中"
-        elif any(x in {"failed", "unverified", "not_merged"} for x in deploys):
+        elif any(x == "failed" for x in deploys):
+            stage = "部署失败"
+        elif any(x not in {"running", "deployed"} for x in deploys):
             stage = "代码已合并 · 部署待核验"
         else:
             stage = "代码已部署 · 待验收确认"
@@ -158,4 +182,5 @@ def pr_detail(pr: dict) -> dict:
     """Structured evidence for the task's delivery drawer, including history."""
     return {key: pr.get(key) for key in
             ("number", "title", "url", "owner", "head", "base", "test",
-             "merge_state", "merge_sha", "merged_at", "deployment", "conflict")}
+             "merge_state", "merge_sha", "merged_at", "deployment", "conflict",
+             "linked_issues", "review_state", "reviewed_at", "accepted_at")}

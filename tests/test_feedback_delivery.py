@@ -197,3 +197,20 @@ def test_pr_created_time_falls_back_to_explicit_progress_for_old_cache():
     pr = {"number": 19, "head": SHA, "test": {"state": "pending"}, "merge_state": "draft"}
     events = {row["key"]: row for row in delivery.timeline(BASE, [pr])["steps"]}
     assert events["pr"]["at"] == BASE["development_submitted_at"]
+
+
+def test_submission_diagnostic_distinguishes_receipt_sync_and_head_change():
+    missing = delivery.timeline({**BASE, "developer_pr": None})
+    assert missing["submission_diagnostic"] == "awaiting_receipt"
+    waiting = delivery.timeline(BASE)
+    assert waiting["submission_diagnostic"] == "awaiting_pr_sync"
+    assert waiting["reported_pr"] == 19
+    assert waiting["reported_head"] == SHA
+    changed = delivery.timeline(BASE, [{"number": 19, "head": "f" * 40,
+        "test": {"state": "success"}, "merge_state": "merged"}])
+    assert changed["submission_diagnostic"] == "head_mismatch"
+    assert changed["observed_head"] == "f" * 40
+    assert changed["evidence"]["pr"] is None
+    assert changed["steps"][5]["state"] == "pending"
+    verified = delivery.timeline(BASE, [{"number": 19, "head": SHA}])
+    assert verified["submission_diagnostic"] == "verified"
