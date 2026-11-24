@@ -265,6 +265,7 @@ def list_development_tasks(response: Response, refresh: bool = False):
                                        or result["refresh_status"].get("state") in {"failed", "interrupted"})
         except (OSError, ValueError, TypeError, KeyError):
             pass
+        result["pr_tracking"] = pr_tracking.active_snapshot(result["pr_tracking"])
         # Draft authority differs by repository, but the shared manual
         # MacCI toolbar is available to explicitly allowlisted app workers.
         result["pr_tracking"]["manual_actions_available"] = manual_pr_actions.configured()
@@ -274,6 +275,23 @@ def list_development_tasks(response: Response, refresh: bool = False):
         result["stale"] = result["stale"] or result["pr_tracking"].get("stale", True)
     return result
 
+
+@app.post("/api/v1/development-tasks/active-refresh", status_code=202)
+def request_active_refresh(request: Request, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    if not pr_tracking.enabled():
+        raise HTTPException(503, "No verified repository")
+    import sys
+    folder=development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True,exist_ok=True)
+    try:
+        with (folder/"pr-active-worker.log").open("ab") as log:
+            subprocess.Popen([sys.executable,"-m","scripts.sync_development_tasks","--active"],
+                             cwd=str(Path(__file__).resolve().parents[1]),stdin=subprocess.DEVNULL,
+                             stdout=log,stderr=log,start_new_session=True)
+    except OSError:
+        raise HTTPException(503,"活跃PR同步进程启动失败") from None
+    return {"state":"requested"}
 
 @app.post("/api/v1/development-tasks/refresh", status_code=202)
 def request_task_refresh(request: Request, db: Session = Depends(get_db)):

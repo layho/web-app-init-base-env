@@ -258,6 +258,66 @@ def run_refresh(force=False):
         return int(state["state"] != "success")
 
 
+def refresh_active():
+    """Fast path independent of the full-history lock; no HTTP request waits."""
+    target = pr_tracking.target()
+    if not target:
+        return 0
+    folder = development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder/"pr-active.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        path=folder/"pr-active.json"
+        try:
+            old=json.loads(path.read_text())
+        except (OSError,ValueError):
+            old={}
+        stamp=pr_tracking.instant(old.get("synced_at"))
+        if stamp and (old.get("repository"),old.get("branch"))==target and (datetime.now(timezone.utc)-stamp).total_seconds()<25:
+            return 0
+        def request(method,path):
+            if method!="GET":
+                raise ValueError("Read only")
+            return release_acceptance.github(path)
+        try:
+            repo,branch=target
+            prefix="/repos/"+repo
+            listings=[]
+            seen=set()
+            for page in range(1,21):
+                batch=request("GET",prefix+"/pulls?state=open&sort=created&direction=desc&per_page=100&page="+str(page))
+                if not isinstance(batch,list):
+                    raise ValueError("Invalid open PR page")
+                for row in batch:
+                    if row["number"] not in seen:
+                        listings.append(row)
+                        seen.add(row["number"])
+                if len(batch)<100:
+                    break
+            else:
+                raise ValueError("Open PR pagination limit")
+            # Resolve previously open PRs that just closed/merged, so the fast
+            # overlay cannot leave a ghost Draft or pending merge indefinitely.
+            previous=pr_tracking.snapshot()
+            old_rows={p["number"]:p for p in previous.get("prs",[])}
+            if (old.get("repository"),old.get("branch"))==target:
+                old_rows.update({p["number"]:p for p in old.get("prs",[])})
+            for number,row in old_rows.items():
+                if row.get("merge_state") in {"open","draft"} and number not in seen:
+                    listings.append(request("GET",prefix+"/pulls/"+str(number)))
+            rows=pr_tracking.collect(request,repo,branch,listings=listings)
+            # Carry forward recent terminal transitions until history catches up.
+            for row in old_rows.values():
+                if row["number"] not in {p["number"] for p in rows} and row.get("merge_state") in {"merged","closed"} and row["number"] not in {p["number"] for p in previous.get("prs",[])}:
+                    rows.append(row)
+            write_json(path,{"repository":repo,"branch":branch,"synced_at":datetime.now(timezone.utc).isoformat(),"prs":rows})
+            return 0
+        except (release_acceptance.AcceptanceError,OSError,ValueError,KeyError,TypeError):
+            return 1
+
+
 if __name__ == "__main__":
-    import sys
-    raise SystemExit(run_refresh(force="--force" in sys.argv[1:]))
+    raise SystemExit(refresh_active() if "--active" in sys.argv[1:] else run_refresh(force="--force" in sys.argv[1:]))

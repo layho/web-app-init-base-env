@@ -207,6 +207,9 @@ install() {
 feedback() {
   load_env
   local result rc=0 tasks_rc=0
+  if test -n "$APP_GITHUB_FEEDBACK_TOKEN"; then
+    .venv/bin/python -m scripts.sync_development_tasks --active || log "Active PR sync failed"
+  fi
   # Task refresh must run even if feedback submission fails. Both use the
   # server-only GitHub token; without it, retain the previous task snapshot.
   if test -n "$APP_GITHUB_FEEDBACK_TOKEN"; then

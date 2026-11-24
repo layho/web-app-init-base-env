@@ -191,13 +191,13 @@ def list_all_prs(github, prefix):
         page += 1
 
 
-def collect(github, repo=None, branch=None, *, cached=None):
+def collect(github, repo=None, branch=None, *, cached=None, listings=None):
     current = target() if repo is None else (repo, branch or "main")
     if current is None or not valid_repository(current[0]):
         raise ValueError("No verified application repository")
     repo, branch = current
     prefix = "/repos/" + repo
-    prs = list_all_prs(github, prefix)
+    prs = list_all_prs(github, prefix) if listings is None else listings
     # The PR's base.sha can be stale after preview/main advances. A pending
     # test is valid only against the actual current target branch SHA.
     latest_sha = github("GET", prefix + "/branches/" + branch)["commit"]["sha"]
@@ -333,3 +333,25 @@ def snapshot(data=None):
     return {**data, "running_sha": running if valid_sha(running) else None,
             "can_release_draft": current == (REPO, "preview"),
             "stale": (datetime.now(timezone.utc) - dt).total_seconds() > 600}
+
+def active_snapshot(data):
+    """Overlay independently fetched current PRs, never erase history on failure."""
+    current = target()
+    try:
+        raw = json.loads((CACHE.parent / "pr-active.json").read_text())
+        stamp = instant(raw["synced_at"])
+        if not current or (raw["repository"],raw["branch"]) != current or not stamp:
+            return data
+        if instant(data.get("synced_at")) and stamp < instant(data["synced_at"]):
+            return data
+        rows = {p["number"]:p for p in data.get("prs",[])}
+        for p in raw["prs"]:
+            rows[p["number"]] = p
+        result = snapshot({**data, "repository":current[0],"branch":current[1],
+                           "synced_at":raw["synced_at"],"prs":sorted(rows.values(),key=lambda p:p["number"],reverse=True)})
+        result["active_synced_at"] = raw["synced_at"]
+        result["history_synced_at"] = data.get("synced_at")
+        result["stale"] = (datetime.now(timezone.utc)-stamp).total_seconds()>120
+        return result
+    except (OSError, ValueError, TypeError, KeyError):
+        return data

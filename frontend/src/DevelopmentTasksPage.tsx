@@ -31,7 +31,7 @@ type DevelopmentTask = {
 }
 
 type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
-type PRTracking = { running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
+type PRTracking = { active_synced_at?: string; history_synced_at?: string|null; running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
 export type TaskSnapshot = { refresh_status?: {state: string; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string; token_health?: Record<string, {state:string; reason?:string; login?:string; permission?:string; remaining?:number; limit?:number; permissions?:Record<string,boolean>; elapsed_seconds?:number}>}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
 const statusColors: Record<string, string> = {
@@ -116,10 +116,10 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
   }
   return <Flex vertical gap="middle">
     <Alert showIcon type={data.stale ? 'warning' : 'info'} message={data.stale ? '同步延迟或尚未同步，保留上次成功记录。' : 'GitHub 测试回执与本机部署记录'}
-      description={`每五分钟尝试同步。当前仓库：${data.repository ?? '待识别'}；目标分支：${data.branch ?? '待识别'}。未取得本机测试或部署证据时显示“未记录”，不推算。`} />
-    <Typography.Text type="secondary">最近同步：{formatDate(data.synced_at)}</Typography.Text>
-    <Table rowKey="number" size="small" dataSource={data.prs} scroll={{x: 1160}} locale={{emptyText: '暂无 PR 测试记录'}} columns={[
-      {title: '关联任务', width: 120, render: (_,row) => tasks.filter(t => t.source !== 'pr' && t.pr_numbers?.includes(row.number)).map(t => '#' + t.number).join('、') || '—'},
+      description={`活跃 PR 独立同步，历史记录后台增量更新。当前仓库：${data.repository ?? '待识别'}；目标分支：${data.branch ?? '待识别'}。未取得本机测试或部署证据时显示“未记录”，不推算。`} />
+    <Typography.Text type="secondary">活跃 PR 最近同步：{formatDate(data.active_synced_at ?? data.synced_at)} · 历史同步：{formatDate(data.history_synced_at ?? data.synced_at)}</Typography.Text>
+    <Table rowKey="number" size="small" dataSource={[...data.prs].sort((a,b)=>Number(['open','draft'].includes(b.merge_state))-Number(['open','draft'].includes(a.merge_state))||b.number-a.number)} scroll={{x: 1160}} locale={{emptyText: '暂无 PR 测试记录'}} columns={[
+      {title: '关联任务', width: 120, render: (_,row) => tasks.filter(t => t.source !== 'pr' && t.pr_numbers?.includes(row.number)).map(t => '#' + t.number).join('、') || '待关联'},
       {title: 'PR', width: 280, render: (_,row) => <Typography.Link href={row.url} target="_blank" rel="noreferrer">#{row.number} {row.title}</Typography.Link>},
       {title: '测试状态', width: 155, render: (_,row) =>
         row.conflict?.blocked ? <Tag color="error">冲突阻止重新测试</Tag> :
@@ -129,7 +129,7 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
           ? <Tag color="error" title="GitHub 已记录本 HEAD 的 MacCI 异常，精确测试回执尚未核实">异常 · 精确回执待核对</Tag>
           : row.test.state === 'unknown' && row.head_status?.state === 'success'
           ? <Tag color="warning" title="GitHub 显示 success，但缺少与当前 base/merge 匹配的可信测试回执">成功信号 · 基线未核实</Tag>
-          : ciTag(row.test.state)},
+          : <Flex vertical gap={2}>{ciTag(row.test.state)}{row.test.phase&&<Typography.Text type="secondary">{phaseLabels[row.test.phase]??row.test.phase}</Typography.Text>}</Flex>},
       {title: '测试开始', width: 165, render: (_,row) => formatDate(row.test.started_at ?? null)},
       {title: '测试结束', width: 165, render: (_,row) => formatDate(row.test.finished_at ?? null)},
       {title: '耗时', width: 95, render: (_,row) => duration(row.test.duration_seconds)},

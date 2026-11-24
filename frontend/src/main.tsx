@@ -374,10 +374,15 @@ function App() {
     if (!signedIn || page !== 'tasks') return
     let active = true
     let pending = false
+    let lastActiveRequest = 0
     const timer = window.setInterval(async () => {
       if (pending) return
       pending = true
       try {
+        if(session && Date.now()-lastActiveRequest>=30000){
+          lastActiveRequest=Date.now()
+          await api('/api/v1/development-tasks/active-refresh',{method:'POST'},session.csrf_token).catch(()=>undefined)
+        }
         const result = await api<TaskSnapshot>('/api/v1/development-tasks')
         if (active) setDevelopmentTasks(result)
       } catch { /* retain last visible snapshot */ }
@@ -393,7 +398,10 @@ function App() {
       if (key === 'releases') setReleaseHistory(await api<ReleaseHistory>('/api/release-notes'))
       else if (key === 'logs') setSystemLogs(await api<SystemLogs>('/api/v1/system-logs'))
       else if (key === 'tasks') {
-        if (refresh && session) await api('/api/v1/development-tasks/refresh', {method:'POST'}, session.csrf_token)
+        if (refresh && session) {
+          await api('/api/v1/development-tasks/active-refresh',{method:'POST'},session.csrf_token)
+          await api('/api/v1/development-tasks/refresh', {method:'POST'}, session.csrf_token)
+        }
         setDevelopmentTasks(await api<TaskSnapshot>('/api/v1/development-tasks'))
       }
       else setProjectInfo(await api<ProjectInfo>(refresh ? '/api/v1/project-info?refresh=true' : '/api/v1/project-info'))
