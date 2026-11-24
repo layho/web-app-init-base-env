@@ -258,3 +258,19 @@ def test_incremental_sync_reuses_only_unchanged_same_repo_rows(tmp_path, monkeyp
     run("owner/two")
     assert len(calls) == 7
     assert development_tasks.snapshot()["tasks"][0]["url"].startswith("https://github.com/owner/two/")
+
+
+def test_enqueue_refresh_deduplicates_and_reports_spawn_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    calls = []
+    def spawn(*args, **kwargs):
+        calls.append(args)
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", spawn)
+    assert sync_development_tasks.enqueue_refresh()["state"] == "queued"
+    assert sync_development_tasks.enqueue_refresh()["state"] == "queued"
+    assert len(calls) == 1
+    sync_development_tasks.write_status({"state": "success"})
+    def fail(*args, **kwargs):
+        raise OSError("spawn failed")
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", fail)
+    assert sync_development_tasks.enqueue_refresh()["state"] == "failed"

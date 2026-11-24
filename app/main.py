@@ -202,30 +202,9 @@ def project_info(response: Response, refresh: bool = False):
 def list_development_tasks(response: Response, refresh: bool = False):
     response.headers["Cache-Control"] = "no-store"
     from scripts.sync_development_tasks import refresh_status
-    if refresh and pr_tracking.enabled():
-        # Spawn a local read-only worker. It owns the same cross-process lock
-        # as scheduled sync; the HTTP response never waits for GitHub.
-        import sys
-        import fcntl
-        folder = development_tasks.CACHE_PATH.parent
-        folder.mkdir(parents=True, exist_ok=True)
-        with (folder / "task-sync-request.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            status = refresh_status()
-            if status.get("state") not in {"queued", "running"}:
-                from scripts.sync_development_tasks import write_status
-                write_status({"state": "queued", "requests": 0})
-                try:
-                    with (folder / "task-sync-worker.log").open("ab") as log:
-                        subprocess.Popen([sys.executable, "-m", "scripts.sync_development_tasks", "--force"],
-                                         cwd=str(Path(__file__).resolve().parents[1]),
-                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                         start_new_session=True)
-                except OSError:
-                    write_status({"state": "failed", "reason": "WorkerStartFailed"})
     result = development_tasks.snapshot()
-    result["refresh_status"] = refresh_status()
     if pr_tracking.enabled():
+        result["refresh_status"] = refresh_status()
         result["pr_tracking"] = pr_tracking.snapshot()
         # Draft authority differs by repository, but the shared manual
         # MacCI toolbar is available to explicitly allowlisted app workers.
@@ -235,6 +214,15 @@ def list_development_tasks(response: Response, refresh: bool = False):
         result["unified"] = True
         result["stale"] = result["stale"] or result["pr_tracking"].get("stale", True)
     return result
+
+
+@app.post("/api/v1/development-tasks/refresh", status_code=202)
+def request_task_refresh(request: Request, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    if not pr_tracking.enabled():
+        raise HTTPException(503, "No verified repository")
+    from scripts.sync_development_tasks import enqueue_refresh
+    return enqueue_refresh()
 
 
 class DraftReleaseIn(BaseModel):

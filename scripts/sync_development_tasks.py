@@ -2,6 +2,8 @@
 from datetime import datetime, timezone, timedelta
 import fcntl
 import time
+import subprocess
+import sys
 import json
 import os
 from tempfile import NamedTemporaryFile
@@ -101,15 +103,40 @@ def write_status(data):
                 os.unlink(out.name)
 
 
+def enqueue_refresh():
+    folder = development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "task-sync-request.lock").open("a") as gate:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        with (folder / "task-sync.lock").open("a") as worker:
+            try:
+                fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return refresh_status()
+            if refresh_status().get("state") == "queued":
+                return refresh_status()
+            write_status({"state": "queued", "requests": 0})
+            try:
+                with (folder / "task-sync-worker.log").open("ab") as log:
+                    subprocess.Popen([sys.executable, "-m", "scripts.sync_development_tasks", "--force"],
+                                     cwd=str(development_tasks.CACHE_PATH.parent.parent),
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                     start_new_session=True)
+            except OSError:
+                write_status({"state": "failed", "reason": "WorkerStartFailed"})
+            return refresh_status()
+
+
 def run_refresh(force=False):
     from app import release_acceptance
     folder = development_tasks.CACHE_PATH.parent
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / "task-sync.lock").open("a") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX if force else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        force = force or refresh_status().get("state") == "queued"
         target = pr_tracking.target()
         previous = development_tasks.snapshot()
         tracking = pr_tracking.snapshot() if target else {}

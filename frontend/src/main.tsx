@@ -386,7 +386,10 @@ function App() {
     try {
       if (key === 'releases') setReleaseHistory(await api<ReleaseHistory>('/api/release-notes'))
       else if (key === 'logs') setSystemLogs(await api<SystemLogs>('/api/v1/system-logs'))
-      else if (key === 'tasks') setDevelopmentTasks(await api<TaskSnapshot>(refresh ? '/api/v1/development-tasks?refresh=true' : '/api/v1/development-tasks'))
+      else if (key === 'tasks') {
+        if (refresh && session) await api('/api/v1/development-tasks/refresh', {method:'POST'}, session.csrf_token)
+        setDevelopmentTasks(await api<TaskSnapshot>('/api/v1/development-tasks'))
+      }
       else setProjectInfo(await api<ProjectInfo>(refresh ? '/api/v1/project-info?refresh=true' : '/api/v1/project-info'))
     } catch (error) {
       showError(error)
