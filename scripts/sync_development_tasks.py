@@ -244,7 +244,30 @@ def run_refresh(force=False):
                     previous = evidence.get(event["candidate_sha"])
                     if previous is None or event["at"] > previous["at"]:
                         evidence[event["candidate_sha"]] = event
-            pr_data = {"synced_at": stamp, "repository": target[0], "branch": target[1], "prs": prs, "release_evidence": evidence}
+            # Publication is a distinct fact from per-PR user acceptance.
+            # Prove historical commits by ancestry of actual official main.
+            # Keep only immutable positive results while the observed main is unchanged.
+            published = {}
+            main_sha = None
+            if target == (release_acceptance.REPO, "preview"):
+                state["phase"] = "publication_history"
+                write_status(state)
+                main_sha = request("GET", "/repos/" + target[0] + "/branches/main")["commit"]["sha"]
+                if not release_acceptance.valid_sha(main_sha):
+                    raise ValueError("Invalid official main")
+                old = tracking.get("published_commits", {}) if tracking.get("published_main_sha") == main_sha else {}
+                for pr in prs:
+                    candidate = pr.get("merge_sha")
+                    if pr.get("merge_state") != "merged" or not release_acceptance.valid_sha(candidate):
+                        continue
+                    if candidate == main_sha or old.get(candidate) is True:
+                        published[candidate] = True
+                    elif candidate not in published:
+                        result = request("GET", "/repos/" + target[0] + "/compare/" + candidate + "..." + main_sha)
+                        published[candidate] = (result.get("status") in {"ahead","identical"} and
+                            (result.get("merge_base_commit") or {}).get("sha") == candidate)
+            pr_data = {"synced_at": stamp, "repository": target[0], "branch": target[1], "prs": prs, "release_evidence": evidence,
+                       "published_main_sha":main_sha, "published_commits":published}
             # One atomic publication is authoritative for the unified page.
             write_json(development_tasks.CACHE_PATH, issues)
             write_json(pr_tracking.CACHE, pr_data)

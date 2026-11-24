@@ -314,8 +314,10 @@ def snapshot(data=None):
     running = os.getenv("APP_RUNNING_SHA", "unknown")
     from app import release_acceptance
     evidence = data.get("release_evidence", {}) if current == (REPO, "preview") else {}
+    published = data.get("published_commits", {}) if current == (REPO, "preview") else {}
     for row in data["prs"]:
         sha = row.get("merge_sha")
+        row["published_in_main"] = bool(row.get("merge_state") == "merged" and valid_sha(sha) and published.get(sha) is True)
         event = next((e for e in events if sha and e["sha"] == sha and e["code"] in {"install_ok", "update_ok", "rollback", "install_failed"}), None)
         if current == (REPO, "preview") and row.get("merge_state") == "merged" and valid_sha(sha):
             row["release_acceptance_enabled"] = True

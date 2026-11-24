@@ -84,12 +84,16 @@ def pr_stage(pr: dict) -> tuple[str, str]:
     test = pr.get("test") or {}
     merge = pr.get("merge_state") or "unknown"
     deploy = (pr.get("deployment") or {}).get("state") or "unverified"
-    if (pr.get("conflict") or {}).get("blocked"):
-        return "合并冲突", "受阻"
-    if merge == "draft":
-        return "等待开发确认", "开发中"
     if merge == "closed":
         return "已关闭", "已关闭"
+    if merge == "merged" and pr.get("published_in_main"):
+        return "代码已正式发布", "已完成"
+    if (pr.get("conflict") or {}).get("blocked"):
+        return "合并冲突", "受阻"
+    if merge == "draft" and test.get("state") in {"failure","error"}:
+        return "测试未通过", "受阻"
+    if merge == "draft":
+        return "等待开发确认", "开发中"
     if merge == "merged":
         if deploy == "running":
             return "当前版本运行中 · 待验收确认", "待验收"
@@ -154,10 +158,14 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             stage = "关联 Issue 待同步"
         elif task.get("status") in {"已完成", "已关闭"}:
             stage = task["status"]
+        elif task.get("status") == "受阻":
+            stage = "受阻 · " + (task.get("feedback_progress", {}).get("developer_reply") or task.get("note") or "待处理")[:160]
         elif linked and not active:
             stage = "关联 PR 已关闭 · 待重新开发"
         elif not linked:
             stage = task.get("status", "未记录开发状态")
+        elif active and all(p.get("merge_state") == "merged" and p.get("published_in_main") for p in active):
+            stage = "关联代码已正式发布 · 需求待结项"
         elif any((p.get("conflict") or {}).get("blocked") for p in active):
             stage = "关联代码存在冲突"
         elif any(x in {"failure", "error"} for x in tests):
@@ -217,4 +225,4 @@ def pr_detail(pr: dict) -> dict:
     return {key: pr.get(key) for key in
             ("number", "title", "url", "owner", "head", "base", "test",
              "merge_state", "merge_sha", "merged_at", "deployment", "conflict",
-             "linked_issues", "review_state", "reviewed_at", "accepted_at", "acceptance")}
+             "linked_issues", "review_state", "reviewed_at", "accepted_at", "acceptance", "published_in_main")}

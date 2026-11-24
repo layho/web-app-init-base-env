@@ -238,10 +238,12 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   const category = (t: DevelopmentTask) => {
     const stage=t.delivery_status ?? ''
     if (t.status === '已关闭' || (t.source === 'pr' && t.merge_state === 'closed')) return 'closed'
-    if (t.status === '已完成' || stage === '用户验收通过 · 已正式发布') return 'done'
+    if (t.status === '已完成' || (t.source==='pr' && stage === '用户验收通过 · 已正式发布')) return 'done'
     if (t.test_failures?.length || t.status === '受阻' || /冲突|失败|不通过/.test(stage)) return 'blocked'
     if (/待验收确认|待正式发布/.test(stage) || (t.status==='待验收' && t.merge_state==='merged' && t.deployment_state==='running')) return 'review'
-    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.merge_state==='merged' || t.status === '开发中') return 'active'
+    if (stage === '关联代码已正式发布 · 需求待结项') return 'review'
+    if (t.merge_state === 'merged') return 'review'
+    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.status === '开发中') return 'active'
     return 'todo'
   }
   const priority:Record<string,number>={blocked:0,review:1,active:2,todo:3,done:4,closed:5}

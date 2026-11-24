@@ -345,3 +345,21 @@ def test_active_snapshot_overlays_new_pr_without_waiting_for_history(tmp_path,mo
     assert [p["number"] for p in result["prs"]]==[132,129]
     assert result["active_synced_at"]==stamp
     assert result["history_synced_at"]==old["synced_at"]
+
+
+def test_published_pr_is_complete_but_open_requirement_is_not_closed():
+    pr={"number":81,"merge_state":"merged","published_in_main":True,"deployment":{"state":"unverified"},"test":{"state":"success"}}
+    standalone=development_tasks.unified_tasks([],{"prs":[pr]})[0]
+    assert standalone["status"]=="已完成"
+    issue=development_tasks.parse_issue({**ISSUE,"state":"open"},"owner/repo")
+    row=development_tasks.unified_tasks([issue],{"prs":[{**pr,"linked_issues":[42]}]})[0]
+    assert row["delivery_status"]=="关联代码已正式发布 · 需求待结项"
+    assert row["status"]!="已完成"
+
+def test_blocked_issue_overrides_historical_published_pr():
+    issue={**development_tasks.parse_issue(ISSUE,"owner/repo"),"status":"受阻"}
+    row=development_tasks.unified_tasks([issue],{"prs":[{"number":81,"linked_issues":[42],"merge_state":"merged","published_in_main":True}]})[0]
+    assert row["delivery_status"].startswith("受阻")
+
+def test_closed_pr_with_old_conflict_is_not_active():
+    assert development_tasks.pr_stage({"merge_state":"closed","conflict":{"blocked":True}})==("已关闭","已关闭")
