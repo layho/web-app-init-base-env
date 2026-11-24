@@ -5,6 +5,10 @@ export type DeliveryStep = { key: string; label: string; state: 'complete' | 'pe
 export type Delivery = {
   steps: DeliveryStep[]
   current_stage: string
+  submission_diagnostic?: 'verified' | 'awaiting_receipt' | 'awaiting_pr_sync' | 'head_mismatch'
+  reported_pr?: number | null
+  reported_head?: string | null
+  observed_head?: string | null
   executor: { name: string | null; reported_actor?: string | null; mode: string; running: boolean | null; last_run_at: string | null
     next_run_at: string | null; schedule_source: string | null }
   evidence: { issue: number | null; pr: number | null; related_prs?: Array<{number: number; head_sha?: string | null; test_state?: string | null; merge_state?: string | null}>; head_sha: string | null; merge_sha: string | null }
@@ -23,12 +27,17 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
   const currentState = delivery.current_stage === 'blocked' ? '当前受阻'
     : delivery.current_stage === 'failed' ? '测试或部署失败'
     : current ? '等待：' + current.label : '交付链路已完成'
+  const submissionLabels = {verified: '提交已核验', awaiting_receipt: '等待开发提交回执', awaiting_pr_sync: '已收到提交回执 · 等待 PR 同步', head_mismatch: 'PR HEAD 已变更 · 等待最新交付回执'}
+  const diagnostic = delivery.submission_diagnostic
   const base = issueBase.replace(/\/issues$/, '')
   return <Space direction="vertical" size="middle" style={{width: '100%'}}>
     <Card size="small" title="反馈交付进度" extra={<Tag color={delivery.current_stage === 'blocked' || delivery.current_stage === 'failed' ? 'error' : 'processing'}>{currentState}</Tag>}>
       <Typography.Paragraph type="secondary" style={{marginBottom: 12}}>
         只显示有真实证据的进度。MacCI 测试、合并、部署和验收分别核实，不能互相代替。
       </Typography.Paragraph>
+      {diagnostic && diagnostic !== 'verified' && <Alert showIcon type={diagnostic === 'head_mismatch' ? 'warning' : 'info'}
+        message={submissionLabels[diagnostic]}
+        description="提交回执、PR 实际 HEAD 必须一致才确认交付；不会借用旧版本测试或部署结果。" style={{marginBottom:12}}/>}
       <Timeline items={delivery.steps.map(step => ({
         color: step.state === 'complete' ? 'green' : step.state === 'failed' ? 'red' : step.state === 'unrecorded' ? 'orange' : 'gray',
         children: <Space direction="vertical" size={0}>
@@ -71,6 +80,11 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
             <a href={base + '/pull/' + pr.number} target="_blank" rel="noopener noreferrer">PR #{pr.number}</a>
             <Tag>{pr.test_state ?? '测试未知'}</Tag><Tag>{pr.merge_state ?? '合并未知'}</Tag>
           </Space>)}
+        </Space>}
+        {diagnostic && diagnostic !== 'verified' && delivery.reported_pr && <Typography.Text>回执 PR：#{delivery.reported_pr}（待核验）</Typography.Text>}
+        {diagnostic === 'head_mismatch' && <Space direction="vertical">
+          <Typography.Text copyable>回执 HEAD：{delivery.reported_head}</Typography.Text>
+          <Typography.Text copyable>观察到的 HEAD：{delivery.observed_head ?? '未记录'}</Typography.Text>
         </Space>}
         {delivery.evidence.head_sha && <Typography.Text copyable>开发 HEAD：{delivery.evidence.head_sha}</Typography.Text>}
         {delivery.evidence.merge_sha && <Typography.Text copyable>合并 SHA：{delivery.evidence.merge_sha}</Typography.Text>}
