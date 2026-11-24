@@ -110,7 +110,8 @@ build() {
     log 'Reviewed frontend/package-lock.json required'; return 1
   fi
   rm -rf frontend/dist.next || return 1
-  (cd frontend && npm run build -- --outDir dist.next) || return 1
+  (cd frontend && VITE_BUILD_SHA="$(git rev-parse HEAD)" npm run build -- --outDir dist.next) || return 1
+  printf "%s\\n" "$(git rev-parse HEAD)" > frontend/dist.next/build-sha.txt || return 1
   test -s frontend/dist.next/index.html
 }
 health_once() {
@@ -120,6 +121,7 @@ health_once() {
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
   .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" else 1)' 2>/dev/null &&
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/" | grep -q '/assets/' &&
+  test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected" &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/v1/feedback")" = "401" &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/session")" = "401"
 }

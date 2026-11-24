@@ -44,10 +44,14 @@ def shared_migrate(root, apply=False):
         values[name] = parts[0]
     if values.get("APP_PUBLIC_ORIGIN") != "https://base.layho.com":
         raise ValueError("仅支持基座验收站")
-    token = next((values[name] for name in NAMES if values.get(name)), "")
-    if not re.fullmatch(r"[A-Za-z0-9_]{20,300}", token):
-        raise ValueError("基座 Token 格式无效")
     home = Path.home() / ".local/share"
+    token = private_read(home/"macmini-pr-tests/github-token",512).strip()
+    scheduler = private_read(home/"macmini-foundation-upgrades/github-token",512).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{20,300}", token) or not compare_digest(token,scheduler):
+        raise ValueError("宿主凭据不一致或格式无效，拒绝自动选源")
+    for name in NAMES:
+        if values.get(name):
+            print(name + ("：与宿主一致" if compare_digest(values[name],token) else "：与宿主不同"))
     destination = home / "macmini-github"
     for label, file in (("MacCI",home/"macmini-pr-tests/github-token"),
                         ("升级调度器",home/"macmini-foundation-upgrades/github-token"),
@@ -61,6 +65,8 @@ def shared_migrate(root, apply=False):
     if not apply:
         print("只读检查结束；不代表 GraphQL 写权限已验证")
         return
+    if not compare_digest(next((values[name] for name in NAMES if values.get(name)), ""), token):
+        raise ValueError("基座有效凭据与宿主不同，先核实并统一现有配置")
     # Explicit activation only; never replace a different existing canonical token.
     destination.mkdir(mode=0o700, exist_ok=True)
     info = destination.lstat()

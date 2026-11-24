@@ -16,8 +16,12 @@ def test_shared_migration_is_explicit_private_and_non_overwriting(tmp_path,monke
     legacy=home/"macmini-pr-tests"
     legacy.mkdir()
     old=legacy/"github-token"
-    old.write_text("b"*40)
+    old.write_text(token)
     old.chmod(0o600)
+    scheduler=home/"macmini-foundation-upgrades"
+    scheduler.mkdir()
+    (scheduler/"github-token").write_text(token)
+    (scheduler/"github-token").chmod(0o600)
     dest=home/"macmini-github/github-token"
     m.shared_migrate(root)
     assert not dest.exists()
@@ -25,9 +29,9 @@ def test_shared_migration_is_explicit_private_and_non_overwriting(tmp_path,monke
     m.shared_migrate(root,True)
     assert dest.read_text().strip()==token
     assert dest.stat().st_mode&0o777==0o600
-    assert old.read_text()=="b"*40
+    assert old.read_text()==token
     assert token not in capsys.readouterr().out
     env.write_text(env.read_text().replace(token,"c"*40))
-    with pytest.raises(ValueError,match="拒绝覆盖"):
+    with pytest.raises(ValueError,match="先核实"):
         m.shared_migrate(root,True)
     assert dest.read_text().strip()==token

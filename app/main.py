@@ -416,7 +416,17 @@ def version(response: Response):
     }
 
 
+# HTML is never reusable across deployments; hashed assets keep normal caching.
+class FoundationStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if path in {"", ".", "index.html"} or response.headers.get("content-type","").startswith("text/html"):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+
 # Cloudflare forwards the API and the React build to the same local service.
 frontend_dist = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 if frontend_dist.joinpath("index.html").is_file():
-    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
+    app.mount("/", FoundationStaticFiles(directory=str(frontend_dist), html=True), name="frontend")
