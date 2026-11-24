@@ -36,7 +36,7 @@ def test_explicit_development_progress():
     assert ordinary["status"] == "未记录开发状态"
     assert ordinary["completed_steps"] == ordinary["total_steps"] == 0
     assert parse({**ISSUE, "pull_request": {}}, repository) is None
-    assert parse({**ISSUE, "title": "[APP-FEEDBACK #1] bug"}, repository) is None
+    assert parse({**ISSUE, "title": "[APP-FEEDBACK #1] bug"}, repository)["origin"] == "feedback"
     assert parse({**ISSUE, "body": ISSUE["body"].replace("状态：开发中", "")}, repository)["status"] == "未记录开发状态"
     assert parse({**ISSUE, "state": "closed", "state_reason": "not_planned"}, repository)["status"] == "已关闭"
 
@@ -174,3 +174,36 @@ def test_issue_body_pr_references_only_from_explicit_section():
       "assignees":[]}, "owner/repo")
     assert issue["linked_prs"] == [92]
     assert issue["owner"] == "未指定"
+
+
+def test_feedback_task_uses_shared_json_protocol():
+    issue = {**ISSUE, "title": "[APP-FEEDBACK #2] bug", "state": "open", "body": ""}
+    def receipt(number, status, timestamp, **fields):
+        return {"id": number, "author_association": "OWNER",
+                "user": {"login": "layho"}, "created_at": timestamp,
+                "updated_at": timestamp,
+                "body": "[APP_PROGRESS] " + json.dumps({"status": status, "agent": "Codex", **fields})}
+    claim = receipt(1, "claimed", "2026-11-24T00:01:00Z")
+    start = receipt(2, "in_progress", "2026-11-24T00:02:00Z")
+    row = development_tasks.parse_issue(issue, "owner/repo", [start, claim])
+    assert row["owner"] == "Codex"
+    assert row["github_actor"] == "layho"
+    assert row["claimed_at"] == "2026-11-24T00:01:00+00:00"
+    assert row["development_started_at"] == "2026-11-24T00:02:00+00:00"
+    assert row["status"] == "开发中"
+    invalid = {**start, "body": "[APP_PROGRESS] status=in_progress\\nagent=Grok"}
+    outsider = {**start, "author_association": "NONE"}
+    row = development_tasks.parse_issue(issue, "owner/repo", [invalid, outsider])
+    assert row["owner"] == "未指定"
+    assert row["claimed_at"] is None
+    assert row["development_started_at"] is None
+    assert row["status"] == "未记录开发状态"
+
+
+def test_unknown_deployment_is_not_success():
+    issue = development_tasks.parse_issue(ISSUE, "owner/repo")
+    rows = development_tasks.unified_tasks([issue], {"prs": [
+        {"number": 81, "linked_issues": [42], "merge_state": "merged",
+         "test": {"state": "success"}, "deployment": {"state": "unknown"}}
+    ]})
+    assert rows[0]["delivery_status"] == "代码已合并 · 部署待核验"
