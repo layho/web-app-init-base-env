@@ -171,15 +171,33 @@ def explicit_issue_refs(body):
     return sorted(found)
 
 
+def list_all_prs(github, prefix):
+    """Traverse stable creation order, deduplicate, and fail closed on bad pages."""
+    rows = {}
+    page = 1
+    while True:
+        batch = github("GET", prefix + "/pulls?state=all&sort=created&direction=asc&per_page=100&page=" + str(page))
+        if not isinstance(batch, list) or len(batch) > 100:
+            raise ValueError("Invalid PR page")
+        previous = len(rows)
+        for row in batch:
+            if not isinstance(row, dict) or type(row.get("number")) is not int or row["number"] <= 0:
+                raise ValueError("Invalid PR entry")
+            rows[row["number"]] = row
+        if len(batch) < 100:
+            return sorted(rows.values(), key=lambda row: row["number"], reverse=True)
+        if len(rows) == previous:
+            raise ValueError("PR pagination did not advance")
+        page += 1
+
+
 def collect(github, repo=None, branch=None):
     current = target() if repo is None else (repo, branch or "main")
     if current is None or not valid_repository(current[0]):
         raise ValueError("No verified application repository")
     repo, branch = current
     prefix = "/repos/" + repo
-    prs = github("GET", prefix + "/pulls?state=all&sort=updated&direction=desc&per_page=50")
-    if not isinstance(prs, list):
-        raise ValueError("Invalid PR list")
+    prs = list_all_prs(github, prefix)
     # The PR's base.sha can be stale after preview/main advances. A pending
     # test is valid only against the actual current target branch SHA.
     latest_sha = github("GET", prefix + "/branches/" + branch)["commit"]["sha"]
