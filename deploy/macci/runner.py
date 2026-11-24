@@ -416,10 +416,14 @@ def deployment_events(raw):
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",stamp) or not SHA.fullmatch(sha):
             continue
         if code=="update_started":
-            attempt={"started":stamp,"previous":sha,"candidate":None,"rollback":"unknown"}
+            attempt={"started":stamp,"previous":sha,"candidate":None,"rollback":"unknown","failures":[]}
         elif attempt is not None:
             if code=="update_candidate":
                 attempt["candidate"]=sha
+            elif code=="host_test_case_failed" and sha==attempt["candidate"] and len(cols)==4:
+                identity=cols[3]
+                if re.fullmatch(r"tests/[A-Za-z0-9_/]{1,120}\.py::[A-Za-z_][A-Za-z0-9_]{0,79}(?:::[A-Za-z_][A-Za-z0-9_]{0,79})?",identity) and identity not in attempt["failures"] and len(attempt["failures"])<12:
+                    attempt["failures"].append(identity)
             elif code=="rollback_ok" and sha==attempt["previous"]:
                 attempt["rollback"]="ok"
             elif code=="rollback_failed" and sha==attempt["candidate"]:
@@ -454,10 +458,23 @@ def report_base_deployments(token):
             statuses=api(token,f"/repos/{repo}/commits/{sha}/statuses?per_page=100")
             existing=next((s for s in statuses if s.get("context")==DEPLOY_CONTEXT and
                            (s.get("creator") or {}).get("login")=="layho"),None)
-            if existing and (existing.get("description")==detail or
-                str(existing.get("description","")).rsplit(" at=",1)[-1]>row["finished"]):
-                continue
-            api(token,f"/repos/{repo}/statuses/{sha}",{"state":state,"context":DEPLOY_CONTEXT,"description":detail})
+            if not existing or (existing.get("description")!=detail and
+                str(existing.get("description","")).rsplit(" at=",1)[-1]<=row["finished"]):
+                api(token,f"/repos/{repo}/statuses/{sha}",{"state":state,"context":DEPLOY_CONTEXT,"description":detail})
+            # Stable event identity: a lost acknowledgement cannot create another issue.
+            if state=="failure":
+                title=f"[BASE-DEPLOY-FAILURE {sha}]"
+                found=None
+                for page in range(1,11):
+                    issues=api(token,f"/repos/{repo}/issues?state=all&per_page=100&page={page}")
+                    found=next((i for i in issues if i.get("title")==title and "pull_request" not in i and (i.get("user") or {}).get("login")=="layho"),None)
+                    if found or len(issues)<100:
+                        break
+                else:
+                    raise ValueError("Deployment failure issue pagination exhausted")
+                if not found:
+                    body="[BASE_DEPLOY_FAILURE] "+json.dumps({"schema":1,"candidate_sha":sha,**row},sort_keys=True,separators=(",",":"))
+                    api(token,f"/repos/{repo}/issues",{"title":title,"body":body})
     except (OSError,ValueError,KeyError,TypeError):
         print("Deployment journal delivery pending; will retry",flush=True)
 

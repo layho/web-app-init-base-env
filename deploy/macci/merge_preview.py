@@ -144,6 +144,52 @@ def preview_frozen(token):
     return requires_acceptance and preview != main
 
 
+def deployment_replacement_allowed(token, number, base, head, merge, main):
+    """Only a real failed deployment with successful rollback may be replaced.
+    Never synthesize user rejection or acceptance.
+    """
+    statuses = api(token, "/commits/" + base + "/statuses?per_page=100")
+    receipt = next((s for s in statuses if s.get("context") == "macmini/deployment-v1"), None)
+    if not receipt or receipt.get("state") != "failure" or (receipt.get("creator") or {}).get("login") != OWNER:
+        return False
+    description = receipt.get("description") or ""
+    if not re.fullmatch(r"(?:update_test_build_failed|update_restart_failed|update_dependencies_failed|host_test_failed|frontend_build_failed) rollback=ok at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", description):
+        return False
+    # Check the host's actual held candidate and checkout, not GitHub alone.
+    checkout = Path.home() / "web-app-init-base-env-preview"
+    try:
+        fd = os.open(checkout / ".webapp-failed-sha", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "r", encoding="ascii") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022 or info.st_size > 64 or stream.read().strip() != base:
+                return False
+        if git(checkout, "rev-parse", "HEAD") != main:
+            return False
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    comments = all_pages(token, f"/issues/{number}/comments")
+    for comment in sorted(comments, key=lambda c:c["id"], reverse=True):
+        if comment.get("author_association") != "OWNER" or (comment.get("user") or {}).get("login") != OWNER:
+            continue
+        body=comment.get("body") or ""
+        marker="[BASE_DEPLOY_REPAIR_REVIEW] "
+        if not body.startswith(marker):
+            continue
+        try:
+            event=json.loads(body[len(marker):])
+        except ValueError:
+            continue
+        if not isinstance(event,dict) or event.get("head") != head:
+            continue
+        expected={"schema":1,"head":head,"failed_sha":base,"rollback_sha":main,"decision":"approved"}
+        if event != expected:
+            return False
+        old_version,_=latest_release(token,base)
+        new_version,required=latest_release(token,merge)
+        return required and new_version>old_version
+    return False
+
+
 def replacement_allowed(token, number, base, head, merge):
     """Narrow exception: an explicitly rejected SHA and a specifically approved repair PR."""
     if api(token, "/branches/preview")["commit"]["sha"] != base:
@@ -169,6 +215,8 @@ def replacement_allowed(token, number, base, head, merge):
                 and isinstance(data.get("reason"), str) and len(data["reason"].strip()) >= 5
                 and type(issue.get("number")) is int):
             rejected.append(issue["number"])
+    if not rejected:
+        return deployment_replacement_allowed(token,number,base,head,merge,main)
     if len(rejected) != 1:
         return False
     comments = all_pages(token, f"/issues/{number}/comments")

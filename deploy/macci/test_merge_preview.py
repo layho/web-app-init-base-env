@@ -168,5 +168,27 @@ class MergeTests(unittest.TestCase):
             return {"commit":{"sha":B if path.endswith("preview") else D}}
         with patch.object(m,"api",side_effect=api),patch.object(m,"all_pages",side_effect=lambda _,path:[review] if "comments" in path else [issue]),patch.object(m,"latest_release",side_effect=[((0,1,37),True),((0,1,38),True)]):
             self.assertTrue(m.replacement_allowed("fake",7,B,H,C))
-        with patch.object(m,"api",side_effect=api),patch.object(m,"all_pages",side_effect=lambda _,path:[review] if "comments" in path else []):
+        with patch.object(m,"api",side_effect=api),patch.object(m,"all_pages",side_effect=lambda _,path:[review] if "comments" in path else []),patch.object(m,"deployment_replacement_allowed",return_value=False):
             self.assertFalse(m.replacement_allowed("fake",7,B,H,C))
+
+
+    def test_deployment_replacement_requires_owner_receipt_held_sha_and_review(self):
+        import tempfile
+        from pathlib import Path
+        status={"context":"macmini/deployment-v1","state":"failure","creator":{"login":m.OWNER},
+                "description":"host_test_failed rollback=ok at=2026-11-24T22:55:18Z"}
+        review={"id":1,"author_association":"OWNER","user":{"login":m.OWNER},
+                "body":"[BASE_DEPLOY_REPAIR_REVIEW] "+json.dumps({"schema":1,"head":H,"failed_sha":B,"rollback_sha":D,"decision":"approved"})}
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            checkout=root/"web-app-init-base-env-preview"
+            checkout.mkdir()
+            held=checkout/".webapp-failed-sha"
+            held.write_text(B+"\n")
+            held.chmod(0o600)
+            with patch.object(m.Path,"home",return_value=root),patch.object(m,"git",return_value=D),patch.object(m,"api",return_value=[status]),patch.object(m,"all_pages",return_value=[review]),patch.object(m,"latest_release",side_effect=[((0,1,39),True),((0,1,40),True)]):
+                self.assertTrue(m.deployment_replacement_allowed("fake",7,B,H,C,D))
+                held.write_text(C)
+                self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
+            with patch.object(m,"api",return_value=[{**status,"state":"success"}]):
+                self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
