@@ -5,6 +5,8 @@ export type DeliveryStep = { key: string; label: string; state: 'complete' | 'pe
 export type Delivery = {
   steps: DeliveryStep[]
   current_stage: string
+  developer_agent?: string|null
+  developer_actor?: string|null
   test_failures?: {number:number; head?:string; phase?:string; at?:string}[]
   submission_diagnostic?: 'verified' | 'awaiting_receipt' | 'awaiting_pr_sync' | 'head_mismatch'
   reported_pr?: number | null
@@ -24,7 +26,7 @@ const date = (input: string | null | undefined) => input
 export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; issueBase: string}) {
   if (!delivery) return <Alert type="info" showIcon message="旧版反馈尚未生成交付进度快照，请刷新同步" />
   const current = delivery.steps.find(step => step.key === delivery.current_stage)
-  const owner = delivery.executor.name ?? '未取得执行负责人信息'
+  const owner = delivery.developer_agent ?? (delivery.developer_actor ? 'GitHub: '+delivery.developer_actor : '未取得开发负责人信息')
   const missingHistory = delivery.steps.filter(step => step.state === 'unrecorded').length
   const currentState = delivery.current_stage === 'blocked' ? '当前受阻'
     : delivery.current_stage === 'failed' ? '测试或部署失败'

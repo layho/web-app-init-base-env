@@ -75,7 +75,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
   const [confirm, setConfirm] = useState<{sha: string; version: string} | null>(null)
   const [acceptError, setAcceptError] = useState<string | null>(null)
   const [rejecting,setRejecting]=useState(false)
-  const [rejectOpen,setRejectOpen]=useState(false)
+  const [rejectTarget,setRejectTarget]=useState<{sha:string;version:string}|null>(null)
   const [reason,setReason]=useState('')
   const [screenshots,setScreenshots]=useState<string[]>([])
   const [rejectError,setRejectError]=useState('')
@@ -118,7 +118,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
   const selected = data?.releases.find(release => release.version === selectedVersion)
   const awaitingAcceptance = Boolean(data?.releases[0]?.acceptance_required && acceptance?.state === 'not_requested' && acceptance.ready)
   return <Flex vertical gap="middle">
-    <Card title="当前运行版本" extra={<Space wrap>{awaitingAcceptance && <Tag color="warning">待验收 v{data?.version}</Tag>}{acceptanceAction()}{canReject&&<Button danger onClick={()=>{setRejectError('');setRejectOpen(true)}}>验收不通过</Button>}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
+    <Card title="当前运行版本" extra={<Space wrap>{awaitingAcceptance && <Tag color="warning">待验收 v{data?.version}</Tag>}{acceptanceAction()}{canReject&&<Button danger onClick={()=>{setRejectError('');setRejectTarget(data?{sha:data.running_sha,version:data.version}:null)}}>验收不通过</Button>}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
       {data ? <Flex wrap gap="small" align="center">
         <Tag color="blue">{data.version}</Tag>
         <Typography.Text copyable code style={{ overflowWrap: 'anywhere' }}>{data.running_sha === 'unknown' ? '未上报 Git SHA' : data.running_sha}</Typography.Text>
@@ -129,16 +129,16 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
       <Alert type="info" showIcon message="代码已提交不等于线上已验收" description={acceptance?.enabled ? '仅在最新 preview 与运行 SHA 和部署记录一致时允许验收。' : '请核对当前运行版本和 Git SHA，以实际验证结果为准。'} />}
     {acceptance?.issue && <Typography.Link href={`https://github.com/layho/web-app-init-base-env/issues/${acceptance.issue}`} target="_blank" rel="noopener noreferrer">{acceptance.state==='rejected'?'查看修复任务':'查看正式发布任务'} #{acceptance.issue}</Typography.Link>}
     {acceptance?.state==='rejected'&&<Alert type="error" showIcon message="当前候选验收不通过" description={<Space direction="vertical"><span>{acceptance.reason}</span><Space wrap>{acceptance.attachments?.map(x=><Image key={x.id} width={100} src={x.url}/>)}</Space></Space>}/>}
-    <Modal title="提交验收不通过" open={rejectOpen} onCancel={()=>{if(!rejecting)setRejectOpen(false)}} confirmLoading={rejecting} okText="提交不通过" cancelText="取消"
+    <Modal title="提交验收不通过" open={rejectTarget!==null} onCancel={()=>{if(!rejecting)setRejectTarget(null)}} confirmLoading={rejecting} okText="提交不通过" cancelText="取消"
       okButtonProps={{danger:true,disabled:!canReject||reason.trim().length<5}} onOk={async()=>{
-        if(!data||!canReject||rejecting)return
+        if(!data||!canReject||rejecting||!rejectTarget||data.running_sha!==rejectTarget.sha||data.version!==rejectTarget.version){setRejectError('候选已变化，请重新打开验收窗口');return}
         setRejecting(true);setRejectError('')
-        try{await onReject(data.running_sha,data.version,reason,screenshots);setRejectOpen(false);setReason('');setScreenshots([])}
+        try{await onReject(rejectTarget.sha,rejectTarget.version,reason,screenshots);setRejectOpen(false);setReason('');setScreenshots([])}
         catch(e){setRejectError(e instanceof Error?e.message:'提交失败')}
         finally{setRejecting(false)}
       }}>
       <Space direction="vertical" style={{width:'100%'}}>
-        <Typography.Text>v{data?.version} · {data?.running_sha}</Typography.Text>
+        <Typography.Text>v{rejectTarget?.version} · {rejectTarget?.sha}</Typography.Text>
         <Input.TextArea rows={5} maxLength={2000} showCount value={reason} onChange={e=>setReason(e.target.value)} placeholder="必填：描述验收失败原因"/>
         <ScreenshotPicker value={screenshots} onChange={setScreenshots} disabled={rejecting}/>
         {rejectError&&<Alert type="error" message={rejectError}/>}

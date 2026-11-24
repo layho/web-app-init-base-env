@@ -144,6 +144,56 @@ def preview_frozen(token):
     return requires_acceptance and preview != main
 
 
+def replacement_allowed(token, number, base, head, merge):
+    """Narrow exception: an explicitly rejected SHA and a specifically approved repair PR."""
+    if api(token, "/branches/preview")["commit"]["sha"] != base:
+        return False
+    main = api(token, "/branches/main")["commit"]["sha"]
+    if not valid(main) or main == base:
+        return False
+    title = f"[BASE-REJECTION {base}]"
+    issues = all_pages(token, "/issues?state=open&sort=created&direction=desc")
+    rejected = []
+    for issue in issues:
+        if (issue.get("title") != title or issue.get("author_association") != "OWNER"
+                or issue.get("user", {}).get("login") != OWNER or "pull_request" in issue):
+            continue
+        body = issue.get("body") or ""
+        if not body.startswith("[BASE_REJECTION] "):
+            continue
+        try:
+            data = json.loads(body[len("[BASE_REJECTION] "):])
+        except ValueError:
+            continue
+        if (isinstance(data, dict) and data.get("schema") == 1 and data.get("candidate_sha") == base
+                and isinstance(data.get("reason"), str) and len(data["reason"].strip()) >= 5
+                and type(issue.get("number")) is int):
+            rejected.append(issue["number"])
+    if len(rejected) != 1:
+        return False
+    comments = all_pages(token, f"/issues/{number}/comments")
+    for comment in sorted(comments, key=lambda c: c["id"], reverse=True):
+        if comment.get("author_association") != "OWNER" or comment.get("user", {}).get("login") != OWNER:
+            continue
+        body = comment.get("body") or ""
+        if not body.startswith("[BASE_REPAIR_REVIEW] "):
+            continue
+        try:
+            event = json.loads(body[len("[BASE_REPAIR_REVIEW] "):])
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("head") != head:
+            continue
+        expected = {"schema": 1, "head": head, "rejected_sha": base,
+                    "rejection_issue": rejected[0], "decision": "approved"}
+        if event != expected:
+            return False
+        old_version, _ = latest_release(token, base)
+        new_version, required = latest_release(token, merge)
+        return required and new_version > old_version
+    return False
+
+
 def authorization(token, number):
     pr = api(token, f"/pulls/{number}")
     if not eligible(pr):
@@ -186,12 +236,13 @@ def verify_candidate(folder, base, head, candidate, required):
 
 
 def merge_one(token, number, dry_run=False):
-    if preview_frozen(token):
-        return False
+    frozen = preview_frozen(token)
     gate = authorization(token, number)
     if gate is None:
         return False
     head, base, merge, required = gate
+    if frozen and not replacement_allowed(token, number, base, head, merge):
+        return False
     with TemporaryDirectory(prefix="macci-preview-") as folder:
         git(folder, "init", "--bare")
         git(folder, "fetch", "--no-tags", REMOTE,
@@ -205,8 +256,8 @@ def merge_one(token, number, dry_run=False):
         if authorization(token, number) != gate:
             print(f"PR #{number}: gate changed; no push", flush=True)
             return False
-        if preview_frozen(token):
-            print(f"PR #{number}: preview entered acceptance freeze; no push", flush=True)
+        if preview_frozen(token) and not replacement_allowed(token, number, base, head, merge):
+            print(f"PR #{number}: preview acceptance freeze; no authorized replacement", flush=True)
             return False
         if dry_run:
             print(f"PR #{number}: dry run verified {merge}; no push", flush=True)
@@ -248,8 +299,6 @@ def main():
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return 0
-            if preview_frozen(token):
                 return 0
             prs = all_pages(token, "/pulls?state=open&base=preview&sort=created&direction=asc")
             for pr in prs:

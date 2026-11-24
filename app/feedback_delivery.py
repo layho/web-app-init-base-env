@@ -115,6 +115,7 @@ def timeline(feedback, prs=None):
                      schedule_source="GitHub Issue OWNER execution receipt")
     return {
         "steps": steps, "current_stage": phase,
+        "developer_agent": feedback.get("developer_agent"), "developer_actor": feedback.get("developer_actor"),
         "test_failures": failures,
         "submission_diagnostic": diagnostic,
         "reported_pr": primary_number if has_receipt else None,

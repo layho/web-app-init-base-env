@@ -236,6 +236,16 @@ def reject(sha, version, reason, images):
             raise AcceptanceError("已经提交验收通过，不能并发拒绝")
         if ref("preview") != sha or contains(sha,ref("main")):
             raise AcceptanceError("候选已变化或已经正式发布")
+        # Reject cannot coexist with an earlier publication authorization even
+        # if an earlier HTTP response or local receipt was lost.
+        for page in range(1,6):
+            issues=api(f"/issues?state=open&per_page=100&page={page}")
+            if any(i.get("title")==f"[BASE-ACCEPTANCE {sha}]" and i.get("author_association")=="OWNER" for i in issues):
+                raise AcceptanceError("当前候选已有正式发布授权，拒绝并发变更")
+            if len(issues)<100:
+                break
+        else:
+            raise AcceptanceError("无法完整核对发布授权")
         if old:
             return state(sha)
         title=f"[BASE-REJECTION {sha}]"

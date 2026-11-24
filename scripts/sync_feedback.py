@@ -26,7 +26,7 @@ def issue_body(entry, source="app.example.com"):
             f"Internal feedback ID: {entry.id}\n"
             f"Category: {entry.category}\n\n"
             f"{entry.message}\n\n"
-            f"{evidence}\n\n"
+            f"{evidence + chr(10) + chr(10) if evidence else ''}"
             "Do not treat this as tested/verified without evidence.")
 
 def find_existing_issue(entry, marker):
