@@ -195,6 +195,11 @@ class ReleaseRejectIn(ReleaseAcceptanceIn):
 @app.post("/api/v1/releases/reject")
 def reject_release(req: ReleaseRejectIn, request: Request, db: Session = Depends(get_db)):
     auth.authorize_session(request, db)
+    if request.headers.get("origin") != os.getenv("APP_PUBLIC_ORIGIN") or not request.headers.get("origin"):
+        raise HTTPException(403, "请在基座验收站提交拒绝")
+    notes = json.loads(RELEASE_NOTES.read_text(encoding="utf-8"))
+    if notes[0]["version"] != req.version or not notes[0].get("acceptance_required"):
+        raise HTTPException(409, "当前版本不匹配或无需验收")
     if not release_acceptance.enabled() or req.version != app.version or req.sha != os.getenv("APP_RUNNING_SHA"):
         raise HTTPException(409, "仅允许拒绝当前基座候选版本")
     try:

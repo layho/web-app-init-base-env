@@ -167,3 +167,17 @@ def test_private_attachment_roundtrip(client,monkeypatch,tmp_path):
     assert client.post("/api/v1/feedback",headers=headers,json={**payload,"screenshots":["invalid"]}).status_code==422
     client.post("/api/logout",headers=headers)
     assert client.get(url).status_code==401
+
+
+def test_attachment_rejects_aggregate_before_decode(monkeypatch):
+    from app import feedback_attachments as a
+    monkeypatch.setattr(a, "MAX_TOTAL", 12)
+    monkeypatch.setattr(a, "MAX_ENCODED", 32)
+    with pytest.raises(ValueError,match="总大小"):
+        a.normalize(["A"*32,"A"*32])
+
+def test_attachment_rejects_oversized_encoded_input(monkeypatch):
+    from app import feedback_attachments as a
+    monkeypatch.setattr(a,"MAX_ENCODED",16)
+    with pytest.raises(ValueError,match="单张"):
+        a.normalize(["A"*20])

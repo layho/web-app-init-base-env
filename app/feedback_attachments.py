@@ -13,15 +13,25 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 ROOT = Path(__file__).resolve().parents[1] / "logs" / "feedback-attachments"
 MAX_BYTES = 10 * 1024 * 1024
 MAX_FILES = 9
+MAX_TOTAL = 30 * 1024 * 1024
+MAX_ENCODED = 4 * ((MAX_BYTES + 2) // 3)
 ID = re.compile(r"[0-9a-f]{32}\Z")
 
 def normalize(values):
     if len(values) > MAX_FILES:
         raise ValueError("最多上传9张截图")
+    if any(not isinstance(value, str) or len(value) > MAX_ENCODED for value in values):
+        raise ValueError("单张截图不得超过10MB")
+    if sum(map(len, values)) > 4 * ((MAX_TOTAL + 2) // 3) + 4 * MAX_FILES:
+        raise ValueError("截图总大小不得超过30MB")
     result = []
+    total = 0
     for value in values:
         try:
             raw = base64.b64decode(value, validate=True)
+            total += len(raw)
+            if total > MAX_TOTAL:
+                raise ValueError("截图总大小不得超过30MB")
             if not raw or len(raw) > MAX_BYTES:
                 raise ValueError("单张截图不得超过10MB")
             with Image.open(io.BytesIO(raw)) as im:
