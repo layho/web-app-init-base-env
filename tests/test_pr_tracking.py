@@ -202,3 +202,42 @@ def test_explicit_refresh_bypasses_five_minute_pr_tracking_cache(monkeypatch, tm
     assert calls == [("layho/macmini-office-app-panel", "main")]
     saved = json.loads(p.CACHE.read_text())
     assert saved["prs"][0]["merge_state"] == "merged"
+
+
+def test_all_pr_pages_include_old_tasks_and_deduplicate():
+    calls = []
+    pages = {1: [{"number": n} for n in range(1, 101)],
+             2: [{"number": n} for n in range(100, 200)],
+             3: [{"number": n} for n in range(200, 206)]}
+    def github(method, path):
+        page = int(path.rsplit("=", 1)[1])
+        calls.append(page)
+        return pages[page]
+    rows = p.list_all_prs(github, "/repos/owner/repo")
+    assert calls == [1, 2, 3]
+    assert [r["number"] for r in rows] == list(range(205, 0, -1))
+
+
+def test_pr_pagination_failure_preserves_previous_snapshot(tmp_path, monkeypatch):
+    import json
+    import pytest
+    monkeypatch.setattr(p, "CACHE", tmp_path / "tracking.json")
+    monkeypatch.setattr(p, "target", lambda: (p.REPO, "preview"))
+    initial = {"synced_at": datetime.now(timezone.utc).isoformat(),
+               "repository": p.REPO, "branch": "preview",
+               "prs": [{"number": 1, "merge_state": "draft"}]}
+    p.CACHE.write_text(json.dumps(initial))
+    def github(method, path):
+        if path.endswith("page=1"):
+            return [{"number": n} for n in range(1, 101)]
+        return {"message": "invalid page"}
+    with pytest.raises(ValueError):
+        p.sync(github, force=True)
+    assert json.loads(p.CACHE.read_text()) == initial
+
+
+def test_pr_pagination_rejects_repeated_full_page():
+    import pytest
+    with pytest.raises(ValueError, match="did not advance"):
+        p.list_all_prs(lambda method, path: [{"number": n} for n in range(1, 101)],
+                       "/repos/owner/repo")
