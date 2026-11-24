@@ -36,6 +36,16 @@ def timeline(feedback, prs=None):
     linked = next((row for row in related if primary_number == row.get("number")
                    and valid_sha(feedback.get("delivered_sha"))
                    and row.get("head") == feedback["delivered_sha"]), None)
+    primary = next((row for row in related if row.get("number") == primary_number), None)
+    has_receipt = type(primary_number) is int and primary_number > 0 and valid_sha(feedback.get("delivered_sha"))
+    if linked:
+        diagnostic = "verified"
+    elif not has_receipt:
+        diagnostic = "awaiting_receipt"
+    elif primary is None:
+        diagnostic = "awaiting_pr_sync"
+    else:
+        diagnostic = "head_mismatch"
     tested = linked.get("test", {}) if linked else {}
     deployment = linked.get("deployment", {}) if linked else {}
     events = {
@@ -99,6 +109,10 @@ def timeline(feedback, prs=None):
                      schedule_source="GitHub Issue OWNER execution receipt")
     return {
         "steps": steps, "current_stage": phase,
+        "submission_diagnostic": diagnostic,
+        "reported_pr": primary_number if has_receipt else None,
+        "reported_head": feedback.get("delivered_sha") if has_receipt else None,
+        "observed_head": primary.get("head") if primary else None,
         "executor": actor,
         "evidence": {"issue": feedback.get("github_issue_number"),
                      "pr": linked.get("number") if linked else None,
