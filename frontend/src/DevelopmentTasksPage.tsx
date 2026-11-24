@@ -59,8 +59,17 @@ function passRate(row: PRRecord) {
   return n > 0 ? (100 * p / n).toFixed(1) + '%' : '未记录'
 }
 function ciTag(state: string) { return <Tag color={state === 'success' ? 'success' : state === 'pending' ? 'processing' : state === 'failure' || state === 'error' ? 'error' : 'default'}>{ciLabels[state] ?? '未记录'}</Tag> }
+// Case-insensitive partial match across explicitly selected fields.
+// Whitespace-separated terms may match different fields; #128 matches 128.
+function matchesSearch(query:string, fields:unknown[]) {
+  const normalize=(v:unknown)=>String(v??'').normalize('NFKC').toLowerCase().replace(/#/g,'')
+  const haystack=fields.map(normalize).join(' ')
+  return normalize(query).trim().split(/\s+/).filter(Boolean).every(term=>haystack.includes(term))
+}
 function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: PRTracking; tasks: DevelopmentTask[]; onReleaseDraft: (number: number, head: string) => Promise<void>; onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>}) {
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null)
+  const [prSearch,setPrSearch]=useState('')
+  const visiblePRs=[...data.prs].filter(p=>matchesSearch(prSearch,[p.number,p.title,p.head,p.base,p.merge_sha,p.head_branch,p.base_branch,ciLabels[p.test.state],phaseLabels[p.test.phase??''],mergeLabels[p.merge_state],deployLabels[p.deployment.state],...tasks.filter(t=>t.pr_numbers?.includes(p.number)).flatMap(t=>[t.number,t.title,t.owner])])).sort((a,b)=>Number(['open','draft'].includes(b.merge_state))-Number(['open','draft'].includes(a.merge_state))||b.number-a.number)
   const [repairNumber, setRepairNumber] = useState<number | null>(null)
   const [repairing, setRepairing] = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
@@ -118,7 +127,8 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
     <Alert showIcon type={data.stale ? 'warning' : 'info'} message={data.stale ? '同步延迟或尚未同步，保留上次成功记录。' : 'GitHub 测试回执与本机部署记录'}
       description={`活跃 PR 独立同步，历史记录后台增量更新。当前仓库：${data.repository ?? '待识别'}；目标分支：${data.branch ?? '待识别'}。未取得本机测试或部署证据时显示“未记录”，不推算。`} />
     <Typography.Text type="secondary">活跃 PR 最近同步：{formatDate(data.active_synced_at ?? data.synced_at)} · 历史同步：{formatDate(data.history_synced_at ?? data.synced_at)}</Typography.Text>
-    <Table rowKey="number" size="small" dataSource={[...data.prs].sort((a,b)=>Number(['open','draft'].includes(b.merge_state))-Number(['open','draft'].includes(a.merge_state))||b.number-a.number)} scroll={{x: 1160}} locale={{emptyText: '暂无 PR 测试记录'}} columns={[
+    <Space wrap><Input.Search allowClear value={prSearch} onChange={e=>setPrSearch(e.target.value)} placeholder="搜索 PR、任务、负责人、版本、SHA、测试状态" style={{width:350}}/><Typography.Text type="secondary">{visiblePRs.length} / {data.prs.length} 条</Typography.Text></Space>
+    <Table rowKey="number" size="small" dataSource={visiblePRs} scroll={{x: 1160}} locale={{emptyText: '暂无 PR 测试记录'}} columns={[
       {title: '关联任务', width: 120, render: (_,row) => tasks.filter(t => t.source !== 'pr' && t.pr_numbers?.includes(row.number)).map(t => '#' + t.number).join('、') || '待关联'},
       {title: 'PR', width: 280, render: (_,row) => <Typography.Link href={row.url} target="_blank" rel="noreferrer">#{row.number} {row.title}</Typography.Link>},
       {title: '测试状态', width: 155, render: (_,row) =>
@@ -241,7 +251,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   const visibleTasks = [...allTasks].filter(t => {
     const c=category(t)
     return (filter==='all' || (filter==='current' && c!=='done' && c!=='closed') || filter===c) &&
-      (!search.trim() || [t.number,t.title,t.owner,...(t.pr_numbers??[])].join(' ').toLowerCase().includes(search.trim().replace(/^#/,'').toLowerCase()))
+      matchesSearch(search,[t.number,t.title,t.owner,t.github_actor,t.note,t.status,t.delivery_status,...(t.pr_numbers??[]),...(t.prs??[]).flatMap(p=>[p.number,p.title,p.merge_sha,phaseLabels[p.test?.phase??'']]),...(data?.pr_tracking?.prs??[]).filter(p=>t.pr_numbers?.includes(p.number)).flatMap(p=>[p.head,p.base,p.head_branch,p.title,ciLabels[p.test.state],phaseLabels[p.test.phase??'']])])
   }).sort((a,b)=>{
     if(order==='number_desc')return b.number-a.number
     if(order==='number_asc')return a.number-b.number
@@ -276,7 +286,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
       } />}
       {data?.synced_at && <Typography.Text type="secondary">GitHub 最近同步 {formatDate(data.synced_at)}</Typography.Text>}
       <Space wrap>
-        <Input.Search allowClear placeholder="搜索任务、PR 或负责人" value={search} onChange={e=>setSearch(e.target.value)} style={{width:240}}/>
+        <Input.Search allowClear placeholder="搜索任务、PR、负责人、版本或状态" value={search} onChange={e=>setSearch(e.target.value)} style={{width:310}}/>
         <Select value={filter} onChange={setFilter} style={{width:155}} options={[
           {value:'current',label:'当前任务'},{value:'all',label:'全部任务'},{value:'todo',label:'待开发'},{value:'active',label:'开发中'},
           {value:'blocked',label:'受阻 / 失败'},{value:'review',label:'待验收 / 发布'},
