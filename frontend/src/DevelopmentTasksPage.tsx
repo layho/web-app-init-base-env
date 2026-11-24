@@ -30,7 +30,7 @@ type DevelopmentTask = {
   note: string
 }
 
-type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
+type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null; progress?: {phase:string;heartbeat_at:string;heartbeat_stale:boolean;elapsed_seconds:number}|null; failure_report?: {run_id:string; failures:{file:string;category:string;test?:string;line?:number;column?:number}[]}|null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
 type PRTracking = { active_synced_at?: string; history_synced_at?: string|null; running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
 export type TaskSnapshot = { refresh_status?: {state: string; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string; token_health?: Record<string, {state:string; reason?:string; login?:string; permission?:string; remaining?:number; limit?:number; permissions?:Record<string,boolean>; elapsed_seconds?:number}>}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
@@ -50,6 +50,7 @@ const ciLabels: Record<string, string> = { success: '通过', pending: '测试�
 const mergeLabels: Record<string, string> = { merged: '已合并', draft: '草稿 · 等待开发审查', open: '待合并', closed: '已关闭' }
 const deployLabels: Record<string, string> = { running: '当前运行', deployed: '曾成功部署', failed: '部署失败 / 回退', unverified: '待核验', not_merged: '尚未合并' }
 const phaseLabels: Record<string, string> = { pending: '正在测试', passed: '后端测试、编译及前端构建通过', 'setup-failed': '环境准备失败', 'fetch-failed': '候选代码拉取失败', 'context-failed': '构建上下文失败', 'dependencies-failed': '依赖安装 / 镜像构建失败', 'pytest-failed': '后端测试失败', 'compile-failed': 'Python 编译失败', 'frontend-failed': '前端构建失败', 'test-failed': '容器测试失败', 'ref-changed': '分支已变更，回执无效' }
+const progressLabels: Record<string,string>={setup:'准备环境',fetch:'拉取精确候选',context:'准备构建上下文',dependencies:'依赖安装 / 镜像构建',test:'隔离容器测试及构建',cleanup:'清理测试环境'}
 function duration(seconds?: number | null) { return seconds == null ? '未记录' : seconds < 60 ? seconds + '秒' : Math.floor(seconds / 60) + '分' + seconds % 60 + '秒' }
 function passRate(row: PRRecord) {
   const c = row.log?.pytest
@@ -139,10 +140,10 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
           ? <Tag color="error" title="GitHub 已记录本 HEAD 的 MacCI 异常，精确测试回执尚未核实">异常 · 精确回执待核对</Tag>
           : row.test.state === 'unknown' && row.head_status?.state === 'success'
           ? <Tag color="warning" title="GitHub 显示 success，但缺少与当前 base/merge 匹配的可信测试回执">成功信号 · 基线未核实</Tag>
-          : <Flex vertical gap={2}>{ciTag(row.test.state)}{row.test.phase&&<Typography.Text type="secondary">{phaseLabels[row.test.phase]??row.test.phase}</Typography.Text>}</Flex>},
+          : <Flex vertical gap={2}>{ciTag(row.test.state)}{row.test.phase&&<Typography.Text type="secondary">{progressLabels[row.test.progress?.phase??'']??phaseLabels[row.test.phase]??row.test.phase}</Typography.Text>}{row.test.progress?.heartbeat_stale && <Tag color="warning">心跳超时 · 待核查</Tag>}</Flex>},
       {title: '测试开始', width: 165, render: (_,row) => formatDate(row.test.started_at ?? null)},
       {title: '测试结束', width: 165, render: (_,row) => formatDate(row.test.finished_at ?? null)},
-      {title: '耗时', width: 95, render: (_,row) => duration(row.test.duration_seconds)},
+      {title: '耗时', width: 95, render: (_,row) => duration(row.test.progress?.elapsed_seconds ?? row.test.duration_seconds)},
       {title: '通过率', width: 95, render: (_,row) => passRate(row)},
       {title: '合并', width: 122, render: (_,row) => row.conflict?.blocked ?
         <Tag color="error" title="Draft 已解除，但与当前 preview 存在冲突，MacCI/自动合并将暂停">存在冲突 · 待修复</Tag> :
@@ -203,10 +204,11 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
         <Descriptions bordered size="small" column={1} items={[
           {key:'status',label:'测试状态',children: selected.conflict?.blocked ? <Tag color="error">冲突阻止测试</Tag> : ciTag(selected.test.state)},
           {key:'conflict',label:'合并门禁',children:selected.conflict?.blocked ? <Button danger onClick={() => {setSelectedNumber(null);setRepairNumber(selected.number)}}>查看并处理冲突</Button> : '未确认冲突'},
-          {key:'stage',label:'测试阶段',children:phaseLabels[selected.test.phase ?? ''] ?? '未记录'},
+          {key:'stage',label:'测试阶段',children:progressLabels[selected.test.progress?.phase??'']??phaseLabels[selected.test.phase ?? ''] ?? '未记录'},
+          {key:'heartbeat',label:'最近心跳',children:selected.test.progress ? <Space>{formatDate(selected.test.progress.heartbeat_at)}{selected.test.progress.heartbeat_stale&&<Tag color="warning">超时 · 待核查</Tag>}</Space> : '未记录'},
           {key:'start',label:'开始时间',children:formatDate(selected.test.started_at ?? null)},
           {key:'end',label:'结束时间',children:formatDate(selected.test.finished_at ?? null)},
-          {key:'duration',label:'测试耗时',children:duration(selected.test.duration_seconds)},
+          {key:'duration',label:'测试耗时',children:duration(selected.test.progress?.elapsed_seconds ?? selected.test.duration_seconds)},
           {key:'rate',label:'Pytest 通过率',children:passRate(selected)},
           {key:'head',label:'PR HEAD',children:<Typography.Text copyable code style={{overflowWrap:'anywhere'}}>{selected.head}</Typography.Text>},
           {key:'base',label:'测试基线',children:selected.base ?? '未记录'},
@@ -217,6 +219,10 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
           {key:'deployAt',label:'部署时间',children:formatDate(selected.deployment.at)},
         ]}/>
         <Card size="small" title="测试日志安全摘要">
+          {selected.test.failure_report && <Card size="small" title="MacCI 结构化失败报告">
+            <Typography.Text type="secondary">运行 ID：{selected.test.failure_report.run_id}；诊断信息不作为合并授权。</Typography.Text>
+            {selected.test.failure_report.failures.length ? selected.test.failure_report.failures.map((item,i)=><div key={i}><Typography.Text code>{item.file}{item.line ? ':'+item.line+':'+item.column : ''}{item.test ? '::'+item.test : ''} · {item.category}</Typography.Text></div>) : <Typography.Text>未提取到可安全展示的失败用例，请核对宿主日志。</Typography.Text>}
+          </Card>}
           {selected.log?.pytest ? <Descriptions column={1} size="small" items={Object.entries(selected.log.pytest).map(([name,n])=>({key:name,label:name,children:n}))}/> : <Typography.Text type="secondary">未取得匹配本次测试的本机计数。可在 GitHub 核对回执；原始日志保留在 Mac mini。</Typography.Text>}
           <Typography.Paragraph type="secondary" style={{margin:'8px 0 0'}}>通过率 = passed / (passed + failed + errors + xpassed)，不计跳过、预期失败及未执行用例。前端构建结果单独以阶段回执记录。</Typography.Paragraph>
         </Card><Typography.Link href={selected.url} target="_blank" rel="noreferrer">查看 GitHub PR 原始状态</Typography.Link></Flex> : <Empty description="记录已更新或不可用"/>}
@@ -238,10 +244,12 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   const category = (t: DevelopmentTask) => {
     const stage=t.delivery_status ?? ''
     if (t.status === '已关闭' || (t.source === 'pr' && t.merge_state === 'closed')) return 'closed'
-    if (t.status === '已完成' || stage === '用户验收通过 · 已正式发布') return 'done'
+    if (t.status === '已完成' || (t.source==='pr' && stage === '用户验收通过 · 已正式发布')) return 'done'
     if (t.test_failures?.length || t.status === '受阻' || /冲突|失败|不通过/.test(stage)) return 'blocked'
     if (/待验收确认|待正式发布/.test(stage) || (t.status==='待验收' && t.merge_state==='merged' && t.deployment_state==='running')) return 'review'
-    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.merge_state==='merged' || t.status === '开发中') return 'active'
+    if (stage === '关联代码已正式发布 · 需求待结项') return 'review'
+    if (t.merge_state === 'merged') return 'review'
+    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.status === '开发中') return 'active'
     return 'todo'
   }
   const priority:Record<string,number>={blocked:0,review:1,active:2,todo:3,done:4,closed:5}

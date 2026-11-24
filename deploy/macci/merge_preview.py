@@ -275,8 +275,25 @@ def merge_one(token, number, dry_run=False):
         return True
 
 
+def shared_token_path():
+    """Explicit opt-in: a private, same-user host credential; never use a symlink."""
+    root = Path.home() / ".local/share/macmini-github"
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("Unsafe shared GitHub credential directory")
+    path = root / "github-token"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    return path
+
+
 def read_token():
-    path = ROOT / "github-token"
+    path = shared_token_path() or ROOT / "github-token"
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "r") as stream:
         info = os.fstat(stream.fileno())

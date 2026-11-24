@@ -462,6 +462,7 @@ function App() {
             Boolean(deployStatus?.locked)}>立即部署</Button>
       </>}
     >
+      {runningVersion && /^[0-9a-f]{40}$/.test(import.meta.env.VITE_BUILD_SHA ?? '') && runningVersion.running_sha !== import.meta.env.VITE_BUILD_SHA && <Alert type="warning" showIcon message="系统已更新，当前页面仍使用旧版前端" description="请先保存未提交内容，再刷新页面。系统不会自动丢弃表单。" action={<Button onClick={()=>{if(window.confirm('请确认已保存未提交内容，是否重新加载？'))window.location.reload()}}>重新加载</Button>} style={{marginBottom:16}}/>}
       {basePreview && <Alert type="warning" showIcon message="基座候选版本验收环境；反馈将同步到公开 GitHub 仓库，请勿填写敏感信息。" style={{ marginBottom: 16 }} />}
       {notice && <Alert type={notice.type} showIcon message={notice.text} style={{ marginBottom: 16 }} />}
       {deployStatus && <Alert showIcon

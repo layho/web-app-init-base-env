@@ -241,3 +241,16 @@ def test_pr_pagination_rejects_repeated_full_page():
     with pytest.raises(ValueError, match="did not advance"):
         p.list_all_prs(lambda method, path: [{"number": n} for n in range(1, 101)],
                        "/repos/owner/repo")
+
+
+def test_advisory_progress_is_exact_and_never_replaces_terminal_evidence():
+    from datetime import datetime, timezone
+    started="2026-11-22T03:14:50Z"
+    receipt={"state":"pending","started_at":started}
+    row={"context":"macmini/progress-v1","state":"pending","description":f"base={B} merge={M} dependencies","created_at":"2026-11-22T03:15:00Z","creator":{"login":"layho"}}
+    now=datetime(2026,11,22,3,18,tzinfo=timezone.utc)
+    result=p.advisory_progress([row],B,M,receipt,"layho",now)
+    assert result["phase"]=="dependencies" and result["heartbeat_stale"]
+    assert p.advisory_progress([row],B,H,receipt,"layho",now) is None
+    assert p.advisory_progress([row],B,M,{"state":"success"},"layho",now) is None
+    assert p.advisory_progress([row],B,M,receipt,"outsider",now) is None

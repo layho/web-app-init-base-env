@@ -96,6 +96,33 @@ def evidence(statuses, base):
             "phase": match[3], "tested_merge": match[2] if valid_sha(match[2]) else None}
 
 
+def advisory_progress(statuses, base, candidate, test, owner, now=None):
+    """Advisory heartbeat must belong to the current pending attempt."""
+    if test.get("state") != "pending" or not valid_sha(candidate):
+        return None
+    started = instant(test.get("started_at"))
+    if not started:
+        return None
+    now = now or datetime.now(timezone.utc)
+    rows = []
+    for item in statuses:
+        if (item.get("context") != "macmini/progress-v1" or item.get("state")!="pending"
+                or (item.get("creator") or {}).get("login")!=owner):
+            continue
+        match=STATUS.fullmatch(item.get("description") or "")
+        at=instant(item.get("created_at"))
+        if (match and match[1]==base and match[2]==candidate and
+            match[3] in {"setup","fetch","context","dependencies","test","cleanup"}
+            and at and started<=at<=now):
+            rows.append((at,match[3]))
+    if not rows:
+        return None
+    at,phase=max(rows,key=lambda x:x[0])
+    return {"phase":phase,"heartbeat_at":at.isoformat(),
+            "heartbeat_stale":(now-at).total_seconds()>120,
+            "elapsed_seconds":max(0,int((now-started).total_seconds()))}
+
+
 def head_status_diagnostic(statuses):
     """Describe latest GitHub MacCI signal separately from exact-base evidence.
 
@@ -191,6 +218,59 @@ def list_all_prs(github, prefix):
         page += 1
 
 
+def failure_report(comments, repo, number, head, base, test):
+    """Diagnostic only. Exact candidate and latest terminal attempt required."""
+    if test.get("state") not in {"failure", "error"} or not valid_sha(test.get("tested_merge")):
+        return None
+    end = instant(test.get("finished_at"))
+    start = instant(test.get("started_at"))
+    if not end:
+        return None
+    reports = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        if (comment.get("author_association") != "OWNER" or
+                (comment.get("user") or {}).get("login") != repo.split("/")[0] or
+                comment.get("updated_at") != comment.get("created_at") or
+                not isinstance(body,str) or not body.startswith("[MACCI_REPORT] ") or len(body)>12000):
+            continue
+        try:
+            row = json.loads(body[len("[MACCI_REPORT] "):])
+            if not isinstance(row,dict) or row.get("schema")!=1:
+                continue
+            if (row.get("repository"),row.get("pr"),row.get("head"),row.get("base"),row.get("merge"),
+                row.get("state"),row.get("phase")) != (repo,number,head,base,test["tested_merge"],test["state"],test.get("phase")):
+                continue
+            run = row.get("run_id")
+            if not isinstance(run,str) or not re.fullmatch(r"[0-9a-f]{32}",run):
+                continue
+            finished = row.get("finished_at")
+            began = row.get("started_at")
+            if type(finished) is not int or type(began) is not int or began>finished or abs(finished-end.timestamp())>120 or (start and began<start.timestamp()-5):
+                continue
+            entries=[]
+            if not isinstance(row.get("failures"),list):
+                continue
+            for item in row["failures"][:12]:
+                if not isinstance(item,dict):
+                    continue
+                file,category=item.get("file"),item.get("category")
+                if not isinstance(file,str) or not isinstance(category,str) or ".." in Path(file).parts:
+                    continue
+                if category=="pytest_failure" and re.fullmatch(r"tests/[A-Za-z0-9_/]{1,120}\.py",file):
+                    name=item.get("test")
+                    if isinstance(name,str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}(?:::[A-Za-z_][A-Za-z0-9_]{0,79})?",name):
+                        entries.append({"file":file,"test":name,"category":category})
+                elif re.fullmatch(r"TS\d{4}",category) and re.fullmatch(r"frontend/src/[A-Za-z0-9_/-]{1,120}\.tsx?",file):
+                    line,col=item.get("line"),item.get("column")
+                    if type(line) is int and type(col) is int and 0<line<=999999 and 0<col<=999999:
+                        entries.append({"file":file,"category":category,"line":line,"column":col})
+            reports.append((finished,{"run_id":run,"failures":entries,"phase":row["phase"]}))
+        except (ValueError,TypeError,KeyError,OverflowError):
+            continue
+    return max(reports,key=lambda pair:pair[0])[1] if reports else None
+
+
 def collect(github, repo=None, branch=None, *, cached=None, listings=None):
     current = target() if repo is None else (repo, branch or "main")
     if current is None or not valid_repository(current[0]):
@@ -256,7 +336,13 @@ def collect(github, repo=None, branch=None, *, cached=None, listings=None):
         if not isinstance(statuses, list):
             raise ValueError("Invalid statuses")
         test = evidence(statuses, base) if valid_sha(base) else {"state": "unknown"}
+        if pr.get("state") == "open":
+            test["progress"] = advisory_progress(statuses,base,pr.get("merge_commit_sha"),test,repo.split("/")[0])
         log = log_summary(number, head, base, test, repo)
+        if test.get("state") in {"failure","error"} and test.get("tested_merge"):
+            comments = github("GET", prefix + "/issues/" + str(number) + "/comments?per_page=100")
+            if isinstance(comments,list):
+                test["failure_report"] = failure_report(comments,repo,number,head,base,test)
         rows.append({"number": number, "title": str(pr.get("title", ""))[:300],
                      "created_at": pr.get("created_at"), "github_updated_at": pr.get("updated_at"),
                      "url": "https://github.com/" + repo + "/pull/" + str(number),
@@ -314,8 +400,10 @@ def snapshot(data=None):
     running = os.getenv("APP_RUNNING_SHA", "unknown")
     from app import release_acceptance
     evidence = data.get("release_evidence", {}) if current == (REPO, "preview") else {}
+    published = data.get("published_commits", {}) if current == (REPO, "preview") else {}
     for row in data["prs"]:
         sha = row.get("merge_sha")
+        row["published_in_main"] = bool(row.get("merge_state") == "merged" and valid_sha(sha) and published.get(sha) is True)
         event = next((e for e in events if sha and e["sha"] == sha and e["code"] in {"install_ok", "update_ok", "rollback", "install_failed"}), None)
         if current == (REPO, "preview") and row.get("merge_state") == "merged" and valid_sha(sha):
             row["release_acceptance_enabled"] = True

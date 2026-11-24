@@ -12,6 +12,7 @@ import subprocess
 import stat
 import tarfile
 import time
+import threading
 from tempfile import TemporaryDirectory
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 import uuid
@@ -167,7 +168,7 @@ def docker_command():
     return endpoint
 
 
-def test_candidate(repo, pr, log):
+def test_candidate(repo, pr, log, progress=lambda phase: None):
     head, base = identity(pr)
     job = 'macci-' + uuid.uuid4().hex
     image = job + ':test'
@@ -183,6 +184,7 @@ def test_candidate(repo, pr, log):
             with TemporaryDirectory(prefix='macci-') as folder:
                 gitdir, context = Path(folder) / 'repo.git', Path(folder) / 'context.tar'
                 phase = 'fetch'
+                progress(phase)
                 run(['git', 'init', '--bare', str(gitdir)], log)
                 env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes'}
                 fetch_merge_ref(gitdir, repo, pr["number"], log, env)
@@ -191,11 +193,14 @@ def test_candidate(repo, pr, log):
                 if merge != pr['merge_commit_sha']:
                     raise RuntimeError('Candidate SHA changed before testing')
                 phase = 'context'
+                progress(phase)
                 make_context(gitdir, merge, context)
                 phase = 'dependencies'
+                progress(phase)
                 with context.open('rb') as source:
                     run(docker + ['build', '--file', '.macci.Dockerfile', '--tag', image, '-'], log, timeout=1800, stdin=source, env=docker_env)
                 phase = 'test'
+                progress(phase)
                 run(docker + ['run', '--name', job, '--network', 'none', '--cap-drop', 'ALL',
                      '--security-opt', 'no-new-privileges', '--pids-limit', '256', '--memory', '3g', '--cpus', '2', image], log, timeout=1200, env=docker_env)
             return 'success', merge, 'passed'
@@ -211,6 +216,138 @@ def test_candidate(repo, pr, log):
                         subprocess.run(docker + cmd, stdout=log, stderr=log, timeout=30, env=docker_env)
                     except (OSError, subprocess.SubprocessError):
                         pass
+
+REPORT_MARKER = "[MACCI_REPORT] "
+REPORT_PHASES = {"setup-failed","fetch-failed","context-failed","dependencies-failed",
+                 "pytest-failed","compile-failed","frontend-failed","test-failed","ref-changed","passed"}
+
+
+def failure_summary(raw, phase):
+    """Return only bounded, grammar-checked test identifiers / compiler codes.
+    Never include arbitrary error messages, environment or raw log lines.
+    Candidate-controlled output is diagnostic, not an authorization receipt.
+    """
+    result = []
+    for line in raw.splitlines():
+        if len(line) > 512:
+            continue
+        if phase == "pytest-failed":
+            match = re.fullmatch(r"FAILED (tests/[A-Za-z0-9_/]{1,120}\.py)::([A-Za-z_][A-Za-z0-9_]{0,79})(?:::(?:([A-Za-z_][A-Za-z0-9_]{0,79})))?(?:\[[^\r\n]*\])?(?: - .*)?",line)
+            if match:
+                row = {"file":match[1],"test":match[2]+("::"+match[3] if match[3] else ""),"category":"pytest_failure"}
+            else:
+                continue
+        elif phase == "frontend-failed":
+            match = re.fullmatch(r"(?:frontend/)?(src/[A-Za-z0-9_/-]{1,120}\.tsx?)\((\d{1,6}),(\d{1,6})\): error (TS\d{4}):.*",line)
+            if not match:
+                continue
+            row = {"file":"frontend/"+match[1],"line":int(match[2]),"column":int(match[3]),"category":match[4]}
+        else:
+            continue
+        if row not in result:
+            result.append(row)
+        if len(result) >= 12:
+            break
+    return result
+
+
+def save_report(report):
+    from tempfile import NamedTemporaryFile
+    folder = ROOT / "report-outbox"
+    folder.mkdir(mode=0o700,exist_ok=True)
+    info=folder.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise ValueError("Unsafe report outbox")
+    path=folder/(report["run_id"]+".json")
+    with NamedTemporaryFile(mode="w",dir=folder,delete=False,encoding="utf-8") as stream:
+        temp=Path(stream.name)
+        try:
+            json.dump(report,stream,ensure_ascii=True,separators=(",",":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            os.replace(temp,path)
+        finally:
+            temp.unlink(missing_ok=True)
+    return path
+
+
+def flush_reports(token):
+    folder=ROOT/"report-outbox"
+    if not folder.exists():
+        return
+    info=folder.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise ValueError("Unsafe report outbox")
+    for path in sorted(folder.glob("*.json"))[:20]:
+        try:
+            fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            with os.fdopen(fd,"r",encoding="utf-8") as stream:
+                info=os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>12000:
+                    raise ValueError("Unsafe report")
+                report=json.load(stream)
+            if report.get("repository") not in REPOS or type(report.get("pr")) is not int or report["pr"]<=0 or not re.fullmatch(r"[0-9a-f]{32}",report.get("run_id","")) or path.stem!=report["run_id"] or any(not SHA.fullmatch(str(report.get(k,""))) for k in ("head","base","merge")) or report.get("phase") not in REPORT_PHASES:
+                raise ValueError("Invalid report")
+            endpoint=f"/repos/{report['repository']}/issues/{report['pr']}/comments"
+            # Compare the exact serialized report before retrying a lost POST.
+            body=REPORT_MARKER+json.dumps(report,sort_keys=True,separators=(",",":"))
+            found=False
+            for page in range(1,11):
+                comments=api(token,endpoint+f"?per_page=100&page={page}")
+                if any(c.get("body")==body and c.get("author_association")=="OWNER" for c in comments):
+                    found=True
+                    break
+                if len(comments)<100:
+                    break
+            else:
+                raise ValueError("Report dedup pagination limit")
+            if not found:
+                api(token,endpoint,{"body":body})
+            path.unlink()
+        except (OSError,ValueError,KeyError,TypeError):
+            print("MacCI report delivery pending; will retry",flush=True)
+
+
+PROGRESS_CONTEXT = "macmini/progress-v1"
+PROGRESS_PHASES = {"setup","fetch","context","dependencies","test","cleanup"}
+
+
+class Progress:
+    """Independent advisory status. Never replace the authoritative test context."""
+    def __init__(self, token, repo, head, base, merge):
+        self.token, self.repo, self.head = token, repo, head
+        self.base, self.merge = base, merge
+        self.phase = "setup"
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.heartbeat, daemon=True)
+
+    def send(self):
+        try:
+            api(self.token,f"/repos/{self.repo}/statuses/{self.head}",{
+                "state":"pending","context":PROGRESS_CONTEXT,
+                "description":description(self.base,self.merge,self.phase)})
+        except (OSError,ValueError,TypeError):
+            print("MacCI advisory progress unavailable",flush=True)
+
+    def update(self, phase):
+        if phase in PROGRESS_PHASES:
+            self.phase=phase
+            self.send()
+
+    def heartbeat(self):
+        while not self.stop.wait(30):
+            self.send()
+
+    def __enter__(self):
+        self.send()
+        self.thread.start()
+        return self
+
+    def __exit__(self,*args):
+        self.stop.set()
+        self.thread.join(timeout=35)
+
 
 def status(token, repo, head, base, merge, state, detail=None):
     api(token, f'/repos/{repo}/statuses/{head}', {'state': state, 'context': CONTEXT,
@@ -239,8 +376,25 @@ def inherited_lock(fd):
         yield
 
 
+def shared_token_path():
+    """Explicit opt-in: a private, same-user host credential; never use a symlink."""
+    root = Path.home() / ".local/share/macmini-github"
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("Unsafe shared GitHub credential directory")
+    path = root / "github-token"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    return path
+
+
 def token_file():
-    return ROOT / 'github-token'
+    return shared_token_path() or ROOT / 'github-token'
 
 
 def main():
@@ -268,13 +422,19 @@ def main():
     if args.lock_fd is not None and (args.configure or args.pr is None or not args.force):
         parser.error('--lock-fd requires an explicit forced PR test')
     path = token_file()
-    if path.is_symlink() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
-        raise SystemExit('Unsafe token file permissions')
-    token = path.read_text().strip()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "r", encoding="ascii") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 512:
+            raise SystemExit("Unsafe token file permissions")
+        token = stream.read().strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,300}", token):
+        raise SystemExit("Invalid credential format")
     docker_command()
     subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
     try:
         with (lock() if args.lock_fd is None else inherited_lock(args.lock_fd)):
+            flush_reports(token)
             for repo in ([args.repo] if args.repo else REPOS):
                 if args.pr:
                     prs = [api(token, f'/repos/{repo}/pulls/{args.pr}')]
@@ -305,8 +465,16 @@ def main():
                     print(f'Testing {repo} PR #{pr["number"]}: {head} against {base}', flush=True)
                     status(token, repo, head, base, None, 'pending')
                     logfile = ROOT / f'{repo.replace("/", "--")}-{pr["number"]}-{head[:12]}-{base[:12]}.log'
+                    run_id=uuid.uuid4().hex
+                    started=time.time()
                     with logfile.open('a', encoding='utf-8') as log:
-                        state, merge, detail = test_candidate(repo, pr, log)
+                        offset=log.tell()
+                        with Progress(token,repo,head,base,expected_merge) as progress:
+                            state, merge, detail = test_candidate(repo, pr, log, progress.update)
+                    # Restrict extraction to this attempt and a bounded tail.
+                    with logfile.open('rb') as stream:
+                        stream.seek(max(offset,logfile.stat().st_size-262144))
+                        diagnostic=failure_summary(stream.read(262144).decode("utf-8",errors="replace"),detail)
                     try:
                         latest = api(token, f'/repos/{repo}/pulls/{pr["number"]}')
                         unchanged = current_candidate(token, repo, latest) == candidate
@@ -315,6 +483,15 @@ def main():
                     if not unchanged or (state == 'success' and merge != expected_merge):
                         state, detail = 'error', 'ref-changed'
                     status(token, repo, head, base, expected_merge, state, detail)
+                    if state != "success":
+                        report={"schema":1,"repository":repo,"pr":pr["number"],"head":head,"base":base,"merge":expected_merge,
+                                "run_id":run_id,"state":state,"phase":detail,"started_at":int(started),
+                                "finished_at":int(time.time()),"failures":diagnostic if detail!="ref-changed" else []}
+                        try:
+                            save_report(report)
+                            flush_reports(token)
+                        except (OSError,ValueError,TypeError):
+                            print("MacCI report unavailable; local test log retained",flush=True)
                     print(f'{state}: {logfile}', flush=True)
                     return 0 if state == 'success' else 1
             print('No eligible untested PRs (already tested, closed, or outside the trusted project profile)', flush=True)

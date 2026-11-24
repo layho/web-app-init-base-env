@@ -52,6 +52,23 @@ log() { echo "$(date '+%F %T') [web-app] $*"; }
 load_env() {
   test -f .env || { log 'Missing private .env'; exit 1; }
   set -a; source .env; set +a
+  # Only the foundation host opts into the shared privileged credential.
+  # Downstream application web services retain their repository-scoped tokens.
+  if test "${APP_BASE_PREVIEW:-}" = 1 && test -e "$HOME/.local/share/macmini-github"; then
+    local shared_dir="$HOME/.local/share/macmini-github"
+    local shared="$shared_dir/github-token"
+    if test -e "$shared" || test -L "$shared"; then
+      test ! -L "$shared_dir" && test -d "$shared_dir" &&
+        test "$(stat -f '%u:%Lp' "$shared_dir")" = "$(id -u):700" &&
+        test ! -L "$shared" && test -f "$shared" &&
+        test "$(stat -f '%u:%Lp' "$shared")" = "$(id -u):600" ||
+        { log 'Unsafe shared GitHub credential'; exit 1; }
+      APP_GITHUB_TOKEN="$(cat "$shared")"
+      [[ "$APP_GITHUB_TOKEN" =~ ^[A-Za-z0-9_-]{20,300}$ ]] ||
+        { log 'Invalid shared GitHub credential'; exit 1; }
+      export APP_GITHUB_TOKEN
+    fi
+  fi
   # Single-token mode is opt-in and overrides legacy names in the process
   # environment. No credentials are printed, copied into plists, or committed.
   if test -n "${APP_GITHUB_TOKEN:-}"; then
@@ -93,7 +110,8 @@ build() {
     log 'Reviewed frontend/package-lock.json required'; return 1
   fi
   rm -rf frontend/dist.next || return 1
-  (cd frontend && npm run build -- --outDir dist.next) || return 1
+  (cd frontend && VITE_BUILD_SHA="$(git rev-parse HEAD)" npm run build -- --outDir dist.next) || return 1
+  printf "%s\\n" "$(git rev-parse HEAD)" > frontend/dist.next/build-sha.txt || return 1
   test -s frontend/dist.next/index.html
 }
 health_once() {
@@ -103,6 +121,7 @@ health_once() {
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
   .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" else 1)' 2>/dev/null &&
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/" | grep -q '/assets/' &&
+  test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected" &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/v1/feedback")" = "401" &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/session")" = "401"
 }

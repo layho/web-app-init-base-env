@@ -1,5 +1,27 @@
 [
   {
+    "version": "0.1.39",
+    "title": "历史任务状态治理与宿主凭据修复",
+    "summary": "区分正式发布代码与需求结项，清理历史任务分类；统一凭据及宿主诊断分阶段交付。",
+    "changes": [
+      "历史独立 PR 按正式 main 祖先证据认定发布，未关闭需求保留待结项。",
+      "显式受阻状态优先于历史 PR，关闭 PR 不再计入开发中。",
+      "统一宿主 GitHub 凭据文件可显式启用，兼容旧文件；提供只读一致性核对及原子无覆盖迁移，保留原配置。",
+      "统一凭据迁移必须以现有一致的宿主凭据为源，并核对基座有效配置；不自动选择旧 Web PR Token。",
+      "HTML 入口禁止缓存，部署检查前端构建 SHA，旧页面提示保存表单后重新加载。",
+      "MacCI 失败报告：绑定精确候选及运行 ID，仅提取限长测试标识或 TypeScript 错误码，私有 outbox 重试回写 GitHub。",
+      "测试详情页读取与最新精确候选匹配的 MacCI 结构化失败报告，拒绝旧候选或未授权评论。",
+      "MacCI 使用独立 advisory 状态报告环境准备、拉取、依赖构建、隔离测试阶段及30秒心跳；前端显示耗时和心跳超时，不改变正式合并门禁。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "同步历史任务并核对已发布 PR、受阻 Issue 和待结项需求。"
+    ],
+    "validation_note": "候选，尚未测试或部署。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/134"
+  },
+  {
     "version": "0.1.38",
     "title": "验收修复：任务状态、筛选及更新器诊断",
     "summary": "针对 V0.1.37 验收未通过的问题修正历史 PR 状态与任务操作体验，并增加 Git 拉取重试和安全故障分类。",
