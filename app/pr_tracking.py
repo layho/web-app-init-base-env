@@ -191,6 +191,59 @@ def list_all_prs(github, prefix):
         page += 1
 
 
+def failure_report(comments, repo, number, head, base, test):
+    """Diagnostic only. Exact candidate and latest terminal attempt required."""
+    if test.get("state") not in {"failure", "error"} or not valid_sha(test.get("tested_merge")):
+        return None
+    end = instant(test.get("finished_at"))
+    start = instant(test.get("started_at"))
+    if not end:
+        return None
+    reports = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        if (comment.get("author_association") != "OWNER" or
+                (comment.get("user") or {}).get("login") != repo.split("/")[0] or
+                comment.get("updated_at") != comment.get("created_at") or
+                not isinstance(body,str) or not body.startswith("[MACCI_REPORT] ") or len(body)>12000):
+            continue
+        try:
+            row = json.loads(body[len("[MACCI_REPORT] "):])
+            if not isinstance(row,dict) or row.get("schema")!=1:
+                continue
+            if (row.get("repository"),row.get("pr"),row.get("head"),row.get("base"),row.get("merge"),
+                row.get("state"),row.get("phase")) != (repo,number,head,base,test["tested_merge"],test["state"],test.get("phase")):
+                continue
+            run = row.get("run_id")
+            if not isinstance(run,str) or not re.fullmatch(r"[0-9a-f]{32}",run):
+                continue
+            finished = row.get("finished_at")
+            began = row.get("started_at")
+            if type(finished) is not int or type(began) is not int or began>finished or abs(finished-end.timestamp())>120 or (start and began<start.timestamp()-5):
+                continue
+            entries=[]
+            if not isinstance(row.get("failures"),list):
+                continue
+            for item in row["failures"][:12]:
+                if not isinstance(item,dict):
+                    continue
+                file,category=item.get("file"),item.get("category")
+                if not isinstance(file,str) or not isinstance(category,str) or ".." in Path(file).parts:
+                    continue
+                if category=="pytest_failure" and re.fullmatch(r"tests/[A-Za-z0-9_/]{1,120}\.py",file):
+                    name=item.get("test")
+                    if isinstance(name,str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}(?:::[A-Za-z_][A-Za-z0-9_]{0,79})?",name):
+                        entries.append({"file":file,"test":name,"category":category})
+                elif re.fullmatch(r"TS\d{4}",category) and re.fullmatch(r"frontend/src/[A-Za-z0-9_/-]{1,120}\.tsx?",file):
+                    line,col=item.get("line"),item.get("column")
+                    if type(line) is int and type(col) is int and 0<line<=999999 and 0<col<=999999:
+                        entries.append({"file":file,"category":category,"line":line,"column":col})
+            reports.append((finished,{"run_id":run,"failures":entries,"phase":row["phase"]}))
+        except (ValueError,TypeError,KeyError,OverflowError):
+            continue
+    return max(reports,key=lambda pair:pair[0])[1] if reports else None
+
+
 def collect(github, repo=None, branch=None, *, cached=None, listings=None):
     current = target() if repo is None else (repo, branch or "main")
     if current is None or not valid_repository(current[0]):
@@ -257,6 +310,10 @@ def collect(github, repo=None, branch=None, *, cached=None, listings=None):
             raise ValueError("Invalid statuses")
         test = evidence(statuses, base) if valid_sha(base) else {"state": "unknown"}
         log = log_summary(number, head, base, test, repo)
+        if test.get("state") in {"failure","error"} and test.get("tested_merge"):
+            comments = github("GET", prefix + "/issues/" + str(number) + "/comments?per_page=100")
+            if isinstance(comments,list):
+                test["failure_report"] = failure_report(comments,repo,number,head,base,test)
         rows.append({"number": number, "title": str(pr.get("title", ""))[:300],
                      "created_at": pr.get("created_at"), "github_updated_at": pr.get("updated_at"),
                      "url": "https://github.com/" + repo + "/pull/" + str(number),

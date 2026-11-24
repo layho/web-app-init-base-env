@@ -30,7 +30,7 @@ type DevelopmentTask = {
   note: string
 }
 
-type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
+type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null; failure_report?: {run_id:string; failures:{file:string;category:string;test?:string;line?:number;column?:number}[]}|null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
 type PRTracking = { active_synced_at?: string; history_synced_at?: string|null; running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
 export type TaskSnapshot = { refresh_status?: {state: string; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string; token_health?: Record<string, {state:string; reason?:string; login?:string; permission?:string; remaining?:number; limit?:number; permissions?:Record<string,boolean>; elapsed_seconds?:number}>}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
@@ -217,6 +217,10 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
           {key:'deployAt',label:'部署时间',children:formatDate(selected.deployment.at)},
         ]}/>
         <Card size="small" title="测试日志安全摘要">
+          {selected.test.failure_report && <Card size="small" title="MacCI 结构化失败报告">
+            <Typography.Text type="secondary">运行 ID：{selected.test.failure_report.run_id}；诊断信息不作为合并授权。</Typography.Text>
+            {selected.test.failure_report.failures.length ? selected.test.failure_report.failures.map((item,i)=><div key={i}><Typography.Text code>{item.file}{item.line ? ':'+item.line+':'+item.column : ''}{item.test ? '::'+item.test : ''} · {item.category}</Typography.Text></div>) : <Typography.Text>未提取到可安全展示的失败用例，请核对宿主日志。</Typography.Text>}
+          </Card>}
           {selected.log?.pytest ? <Descriptions column={1} size="small" items={Object.entries(selected.log.pytest).map(([name,n])=>({key:name,label:name,children:n}))}/> : <Typography.Text type="secondary">未取得匹配本次测试的本机计数。可在 GitHub 核对回执；原始日志保留在 Mac mini。</Typography.Text>}
           <Typography.Paragraph type="secondary" style={{margin:'8px 0 0'}}>通过率 = passed / (passed + failed + errors + xpassed)，不计跳过、预期失败及未执行用例。前端构建结果单独以阶段回执记录。</Typography.Paragraph>
         </Card><Typography.Link href={selected.url} target="_blank" rel="noreferrer">查看 GitHub PR 原始状态</Typography.Link></Flex> : <Empty description="记录已更新或不可用"/>}

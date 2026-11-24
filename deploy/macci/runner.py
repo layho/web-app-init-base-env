@@ -227,13 +227,13 @@ def failure_summary(raw, phase):
         if len(line) > 512:
             continue
         if phase == "pytest-failed":
-            match = re.fullmatch(r"FAILED (tests/[A-Za-z0-9_/]{1,120}\\.py)::([A-Za-z_][A-Za-z0-9_]{0,79})(?:::(?:([A-Za-z_][A-Za-z0-9_]{0,79})))?(?:\\[[^\\r\\n]*\\])?(?: - .*)?",line)
+            match = re.fullmatch(r"FAILED (tests/[A-Za-z0-9_/]{1,120}\.py)::([A-Za-z_][A-Za-z0-9_]{0,79})(?:::(?:([A-Za-z_][A-Za-z0-9_]{0,79})))?(?:\[[^\r\n]*\])?(?: - .*)?",line)
             if match:
                 row = {"file":match[1],"test":match[2]+("::"+match[3] if match[3] else ""),"category":"pytest_failure"}
             else:
                 continue
         elif phase == "frontend-failed":
-            match = re.fullmatch(r"(?:frontend/)?(src/[A-Za-z0-9_/-]{1,120}\\.tsx?)\\((\\d{1,6}),(\\d{1,6})\\): error (TS\\d{4}):.*",line)
+            match = re.fullmatch(r"(?:frontend/)?(src/[A-Za-z0-9_/-]{1,120}\.tsx?)\((\d{1,6}),(\d{1,6})\): error (TS\d{4}):.*",line)
             if not match:
                 continue
             row = {"file":"frontend/"+match[1],"line":int(match[2]),"column":int(match[3]),"category":match[4]}
@@ -436,6 +436,7 @@ def main():
                         unchanged = False
                     if not unchanged or (state == 'success' and merge != expected_merge):
                         state, detail = 'error', 'ref-changed'
+                    status(token, repo, head, base, expected_merge, state, detail)
                     if state != "success":
                         report={"schema":1,"repository":repo,"pr":pr["number"],"head":head,"base":base,"merge":expected_merge,
                                 "run_id":run_id,"state":state,"phase":detail,"started_at":int(started),
@@ -445,7 +446,6 @@ def main():
                             flush_reports(token)
                         except (OSError,ValueError,TypeError):
                             print("MacCI report unavailable; local test log retained",flush=True)
-                    status(token, repo, head, base, expected_merge, state, detail)
                     print(f'{state}: {logfile}', flush=True)
                     return 0 if state == 'success' else 1
             print('No eligible untested PRs (already tested, closed, or outside the trusted project profile)', flush=True)
