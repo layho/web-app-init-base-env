@@ -27,8 +27,8 @@ type DevelopmentTask = {
   note: string
 }
 
-type PRRecord = { number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
-type PRTracking = { synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
+type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
+type PRTracking = { running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
 export type TaskSnapshot = { synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
 const statusColors: Record<string, string> = {
@@ -279,7 +279,10 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
             {key:'ci',label:'MacCI 测试',children:ciLabels[pr.test?.state || 'unknown'] || '尚未核实'},
             {key:'start',label:'测试开始',children:formatDate(pr.test?.started_at ?? null)},
             {key:'end',label:'测试结束',children:formatDate(pr.test?.finished_at ?? null)},
+            {key:'branch',label:'开发分支',children:data?.pr_tracking?.prs.find(r=>r.number===pr.number)?.head_branch ?? '未记录'},
+            {key:'targetBranch',label:'目标分支',children:data?.pr_tracking?.prs.find(r=>r.number===pr.number)?.base_branch ?? '未记录'},
             {key:'head',label:'PR HEAD',children:data?.pr_tracking?.prs.find(r=>r.number===pr.number)?.head ?? '未记录'},
+            {key:'running',label:'当前应用运行 SHA',children:data?.pr_tracking?.running_sha ?? '尚未核实'},
             {key:'mergeSha',label:'合并 SHA',children:pr.merge_sha ?? '未记录'},
             {key:'merge',label:'合并状态',children:mergeLabels[pr.merge_state || ''] || '未记录'},
             {key:'mergedAt',label:'合并时间',children:formatDate(pr.merged_at ?? null)},
