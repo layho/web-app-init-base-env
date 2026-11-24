@@ -74,3 +74,11 @@ def test_cache_staleness_and_feedback_id_isolation(tmp_path):
     assert progress.feedback_details(cache, 1, None, now)["overall_status"] == "pending_sync"
     path.write_text("broken")
     assert progress.load_cache(path) == {}
+
+
+def test_same_actor_status_preserves_agent_but_other_actor_does_not():
+    first = {**event(1, "claimed", agent="Codex"), "user": {"login": "layho"}}
+    second = {**event(2, "in_progress"), "user": {"login": "layho"}}
+    assert progress.progress_from_comments([first, second])["developer_agent"] == "Codex"
+    third = {**event(3, "in_progress"), "user": {"login": "other"}}
+    assert progress.progress_from_comments([first, second, third])["developer_agent"] is None

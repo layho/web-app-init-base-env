@@ -128,8 +128,12 @@ def progress_from_comments(comments):
         if status in {"claimed", "in_progress", "development_finished", "submitted", "blocked"}:
             actor = event.get("actor")
             if isinstance(actor, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", actor):
+                # A later status without an agent does not erase the known
+                # agent of the same GitHub actor. A different actor must claim
+                # their own identity rather than inheriting it.
+                if actor != result["developer_actor"] or event.get("agent"):
+                    result["developer_agent"] = event.get("agent")
                 result["developer_actor"] = actor
-                result["developer_agent"] = event.get("agent")
         reply = event.get("reply")
         if isinstance(reply, str):
             result["developer_reply"] = reply[:6000]

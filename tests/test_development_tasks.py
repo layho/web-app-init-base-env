@@ -230,3 +230,31 @@ def test_force_issue_refresh_uses_verified_repository_and_bypasses_cache(tmp_pat
     assert len(calls) == 2
     sync_development_tasks.sync(force=True, repository="owner/verified", request=request)
     assert len(calls) == 4
+
+
+def test_incremental_sync_reuses_only_unchanged_same_repo_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    calls = []
+    issue = {**ISSUE, "comments": 1, "updated_at": "2026-11-24T00:00:00Z"}
+    def request(method, path):
+        calls.append(path)
+        if "/comments?" in path:
+            return [{"id": 1, "author_association": "OWNER",
+                     "user": {"login": "owner"},
+                     "created_at": "2026-11-24T00:00:00Z",
+                     "updated_at": "2026-11-24T00:00:00Z",
+                     "body": '[APP_PROGRESS] {"status":"claimed","agent":"Codex"}'}]
+        return [issue]
+    def run(repo):
+        sync_development_tasks.sync(force=True, repository=repo, request=request, incremental=True)
+    run("owner/one")
+    assert len(calls) == 2
+    run("owner/one")
+    assert len(calls) == 3
+    assert development_tasks.snapshot()["tasks"][0]["owner"] == "Codex"
+    issue["updated_at"] = "2026-11-24T00:01:00Z"
+    run("owner/one")
+    assert len(calls) == 5
+    run("owner/two")
+    assert len(calls) == 7
+    assert development_tasks.snapshot()["tasks"][0]["url"].startswith("https://github.com/owner/two/")

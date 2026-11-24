@@ -12,7 +12,7 @@ from app import development_tasks, pr_tracking
 from scripts.sync_feedback import REPO, github
 
 
-def sync(*, force=False, repository=None, request=None) -> None:
+def sync(*, force=False, repository=None, request=None, incremental=False) -> None:
     repository = repository or REPO
     request = request or github
     cache = development_tasks.CACHE_PATH
@@ -21,6 +21,7 @@ def sync(*, force=False, repository=None, request=None) -> None:
     if not force and previous["synced_at"] and now - datetime.fromisoformat(previous["synced_at"]) < development_tasks.REFRESH_INTERVAL:
         return
 
+    cached = {t["number"]: t for t in previous["tasks"]} if incremental and previous.get("repository") == repository else {}
     tasks = []
     page = 1
     page_size = 100
@@ -35,6 +36,11 @@ def sync(*, force=False, repository=None, request=None) -> None:
             # GitHub user/login is shared by multiple AI workers. Structured
             # APP_PROGRESS comments provide an attributable agent claim.
             # Do not fabricate ownership from the GitHub account alone.
+            old = cached.get(issue["number"])
+            if (old and issue.get("updated_at") and old.get("updated_at") == issue["updated_at"]
+                    and old.get("comment_count") == issue.get("comments")):
+                tasks.append(old)
+                continue
             comments = []
             if type(issue.get("comments")) is int and issue["comments"] > 0:
                 comment_page = 1
@@ -48,6 +54,7 @@ def sync(*, force=False, repository=None, request=None) -> None:
                     comment_page += 1
             task = development_tasks.parse_issue(issue, repository, comments)
             if task:
+                task['comment_count'] = issue.get('comments')
                 tasks.append(task)
         if len(issues) < page_size:
             break
@@ -56,7 +63,7 @@ def sync(*, force=False, repository=None, request=None) -> None:
     cache.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache.parent, delete=False) as temp:
         try:
-            json.dump({"synced_at": datetime.now(timezone.utc).isoformat(), "tasks": tasks}, temp, ensure_ascii=False)
+            json.dump({"synced_at": datetime.now(timezone.utc).isoformat(), "repository": repository, "tasks": tasks}, temp, ensure_ascii=False)
             temp.close()
             os.replace(temp.name, cache)
         finally:
@@ -122,7 +129,7 @@ def run_refresh(force=False):
         try:
             if target is None:
                 raise ValueError("No verified repository")
-            sync(force=True, repository=target[0], request=request)
+            sync(force=True, repository=target[0], request=request, incremental=not force)
             state["phase"] = "pulls"
             write_status(state)
             pr_tracking.sync(request, force=True)
