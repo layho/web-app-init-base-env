@@ -59,6 +59,8 @@ def test_preview_separate_from_normal_generated_app():
     manager = (ROOT / "deploy/macmini/manage.sh").read_text()
     assert "TRACK_BRANCH=main" in manager
     assert "TRACK_BRANCH=preview" in manager
-    assert 'git fetch --quiet origin "${TRACK_BRANCH:-main}"' in manager
+    assert 'fetch --quiet origin "${TRACK_BRANCH:-main}"' in manager
+    assert "fetch_with_retry || exit $?" in manager
+    assert "GIT_TERMINAL_PROMPT=0" in manager
     assert preview.TRACK == "preview"
     assert preview.LABEL == "com.layho.basepreview"

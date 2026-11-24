@@ -325,22 +325,24 @@ fetch_reason() {
   esac
 }
 fetch_with_retry() {
-  local attempt=1 err reason
+  local attempt=1 err reason rc=1
   while test "$attempt" -le 3; do
     if err="$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2' git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=20 fetch --quiet origin "${TRACK_BRANCH:-main}" 2>&1)"; then
       return 0
+    else
+      rc=$?
     fi
     reason="$(fetch_reason "$err")"
     UPDATE_DETAIL="$reason"
     log "Git fetch attempt $attempt/3 failed: $reason"
-    case "$reason" in authentication|repository_access) return 1;; esac
+    case "$reason" in authentication|repository_access) return "$rc";; esac
     if test "$attempt" -lt 3; then
       record_operation update_fetch_retry "$UPDATE_SHA" "$reason"
       sleep "$((attempt * 2))"
     fi
     attempt=$((attempt + 1))
   done
-  return 1
+  return "$rc"
 }
 finish_update() {
   local rc="$1"
@@ -363,7 +365,7 @@ update() {
   record_operation update_started "$old"
   assert_main; load_env
   UPDATE_FAILURE=update_fetch_failed
-  fetch_with_retry || exit 1
+  fetch_with_retry || exit $?
   UPDATE_DETAIL=""
   new="$(git rev-parse "origin/${TRACK_BRANCH:-main}")"
   UPDATE_SHA="$new"

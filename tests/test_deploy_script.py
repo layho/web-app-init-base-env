@@ -305,21 +305,29 @@ mkdir logs
 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 assert_main() { :; }
 load_env() { :; }
+sleep() { :; }
 git() {
+    while test "$1" = -c; do shift 2; done
     if test "$1" = rev-parse; then echo "$sha"; return 0; fi
-    if test "$1" = fetch; then return "$fetch_rc"; fi
+    if test "$1" = fetch; then
+        test "$2" = --quiet && test "$3" = origin && test "$4" = "${TRACK_BRANCH:-main}" || return 98
+        echo attempt >> fetch-attempts
+        return "$fetch_rc"
+    fi
     return 99
 }
 fetch_rc=0
 (update)
 grep -q "$(printf '\tupdate_no_change\t%s' "$sha")" logs/operations.tsv
 test ! -d "$LOCK"
+test "$(wc -l < fetch-attempts | tr -d ' ')" = 1
 fetch_rc=7
 set +e
 (set -e; update)
 rc=$?
 set -e
 test "$rc" = 7
+test "$(wc -l < fetch-attempts | tr -d ' ')" = 4
 grep -q "$(printf '\tupdate_fetch_failed\t%s' "$sha")" logs/operations.tsv
 test ! -d "$LOCK"
 '''
