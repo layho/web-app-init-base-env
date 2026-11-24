@@ -98,7 +98,35 @@ dependencies() {
   .venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
 }
 check_schema() { .venv/bin/python -m scripts.apply_migrations --check; }
-test_app() { .venv/bin/python -m pytest -q && .venv/bin/python -m compileall -q app; }
+test_app() {
+  # Never inherit application secrets or production database settings into tests.
+  local sha output rc=0
+  sha="$(git rev-parse HEAD)" || return 1
+  output="$(mktemp "$ROOT/logs/.test-output.XXXXXX")" || return 1
+  chmod 600 "$output" || { rm -f "$output"; return 1; }
+  env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 DATABASE_URL=sqlite:///:memory: PYTHONDONTWRITEBYTECODE=1 \
+    .venv/bin/python -m pytest -q --tb=no >"$output" 2>&1 || rc=$?
+  # Export only fixed-schema test identities, not traceback, assertion values or raw output.
+  .venv/bin/python -I -c '
+import re,sys
+from pathlib import Path
+raw=Path(sys.argv[1]).read_text(errors="replace")
+for line in raw.splitlines():
+    m=re.fullmatch(r"FAILED (tests/[A-Za-z0-9_/]{1,120}\.py)::([A-Za-z_][A-Za-z0-9_]{0,79})(?:::([A-Za-z_][A-Za-z0-9_]{0,79}))?(?:\[[^\r\n]*\])?(?: - .*)?",line)
+    if m:
+        print(m[1]+"::"+m[2]+("::"+m[3] if m[3] else ""))
+' "$output" > "$output.safe" || { rm -f "$output" "$output.safe"; return 1; }
+  if test "$rc" != 0; then
+    local identity
+    while IFS= read -r identity; do
+      record_operation host_test_case_failed "$sha" "$identity"
+    done < "$output.safe"
+    log "Host pytest failed (exit $rc); see structured test identities"
+  fi
+  rm -f "$output" "$output.safe"
+  test "$rc" = 0 || return "$rc"
+  env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 .venv/bin/python -m compileall -q app
+}
 build() {
   command -v npm >/dev/null || return 1
   node -e 'let [a,b]=process.versions.node.split(".").map(Number);process.exit(((a===20&&b>=19)||(a===22&&b>=12)||a>=24)?0:1)' || return 1

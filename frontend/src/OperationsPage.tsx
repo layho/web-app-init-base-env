@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { ScreenshotPicker } from './ScreenshotPicker'
 import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Input, Image, List, Modal, Space, Table, Tag, Typography } from 'antd'
 
-type Operation = { at: string; code: string; sha: string }
+type Operation = { at: string; code: string; sha: string; detail?: string }
 type ReleaseNote = { version: string; title: string; changes: string[]; validation?: string; date?: string; summary?: string; acceptance_required?: boolean; acceptance_status?: string; validation_steps?: string[]; validation_note?: string; reference_url?: string }
 export type ReleaseHistory = {
   version: string
@@ -14,6 +14,7 @@ export type ReleaseHistory = {
 export type SystemLogs = { events: Operation[] }
 
 const labels: Record<string, string> = {
+  host_test_case_failed: '宿主测试用例失败',
   startup_ok: '启动自检通过',
   schema_check_failed: '数据库迁移检查失败',
   frontend_missing: '缺少前端构建产物',
@@ -46,6 +47,7 @@ function OperationTable({ records, loading, onDetails }: { records: Operation[];
       { title: '事件', dataIndex: 'code', render: (code: string) => <Tag color={
         code.endsWith('_ok') ? 'success' : 'warning'
       }>{labels[code] ?? code}</Tag> },
+      { title: '错误详情', render: (_,row) => row.detail ? <Typography.Text code copyable>{row.detail}</Typography.Text> : '—' },
       { title: '关联提交', dataIndex: 'sha', width: 120, render: (sha: string) => <code title={sha}>{sha.slice(0, 10)}</code> },
       ...(onDetails ? [{ title: '操作', key: 'action', width: 80, render: (_: unknown, row: Operation) => <Button type="link" onClick={() => onDetails(row)}>详情</Button> }] : []),
     ]}

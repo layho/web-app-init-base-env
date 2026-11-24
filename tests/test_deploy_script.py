@@ -391,3 +391,14 @@ test "$(fetch_reason 'Could not resolve proxy')" = proxy
     assert result.returncode == 0, result.stderr
     assert "update_fetch_retry" in result.stdout
     assert "secret-example-token" not in result.stdout + result.stderr
+
+
+def test_host_test_failure_detail_is_allowlisted(tmp_path):
+    from app import operations
+    path=tmp_path/"operations.tsv"
+    sha="a"*40
+    path.write_text("2026-11-24T22:55:18Z\thost_test_case_failed\t"+sha+"\ttests/test_pr_draft_controls.py::test_mark_ready_uses_dedicated_pull_request_token\n"+"2026-11-24T22:55:19Z\thost_test_case_failed\t"+sha+"\tBearer secret-example\n")
+    rows=operations.recent_operations(path)
+    assert "detail" not in rows[0]
+    assert rows[1]["detail"].startswith("tests/test_pr_draft_controls.py::")
+    assert "secret-example" not in str(rows)

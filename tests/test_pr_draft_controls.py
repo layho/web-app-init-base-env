@@ -102,7 +102,7 @@ def test_non_owner_review_token_does_not_unlock(github, monkeypatch):
 
 
 def test_mark_ready_uses_dedicated_pull_request_token(monkeypatch):
-    from types import SimpleNamespace
+    monkeypatch.delenv("APP_GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN", "issues-only-token")
     monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "owner-pull-request-token")
     captured = []
@@ -121,6 +121,7 @@ def test_mark_ready_uses_dedicated_pull_request_token(monkeypatch):
 
 
 def test_graphql_permission_denial_does_not_claim_success(monkeypatch):
+    monkeypatch.delenv("APP_GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("APP_GITHUB_PR_TOKEN", "test-only")
     class FakeOpener:
         def open(self, request, timeout=None):
