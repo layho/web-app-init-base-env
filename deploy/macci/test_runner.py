@@ -108,3 +108,17 @@ class RunnerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReportTests(unittest.TestCase):
+    def test_safe_failure_summary(self):
+        raw="FAILED tests/test_demo.py::test_login - SECRET_TOKEN=ghp_secret\nFAILED /tmp/private.py::test_x - private\n"
+        result=runner.failure_summary(raw,"pytest-failed")
+        self.assertEqual(result,[{"file":"tests/test_demo.py","test":"test_login","category":"pytest_failure"}])
+        self.assertNotIn("SECRET",str(result))
+    def test_ts_error_only(self):
+        result=runner.failure_summary("src/main.tsx(12,3): error TS2552: private details","frontend-failed")
+        self.assertEqual(result,[{"file":"frontend/src/main.tsx","line":12,"column":3,"category":"TS2552"}])
+    def test_bounded_report(self):
+        raw="\\n".join("FAILED tests/test_x.py::test_"+str(i) for i in range(30))
+        self.assertLessEqual(len(runner.failure_summary(raw,"pytest-failed")),12)

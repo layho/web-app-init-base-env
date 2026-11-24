@@ -212,6 +212,98 @@ def test_candidate(repo, pr, log):
                     except (OSError, subprocess.SubprocessError):
                         pass
 
+REPORT_MARKER = "[MACCI_REPORT] "
+REPORT_PHASES = {"setup-failed","fetch-failed","context-failed","dependencies-failed",
+                 "pytest-failed","compile-failed","frontend-failed","test-failed","ref-changed","passed"}
+
+
+def failure_summary(raw, phase):
+    """Return only bounded, grammar-checked test identifiers / compiler codes.
+    Never include arbitrary error messages, environment or raw log lines.
+    Candidate-controlled output is diagnostic, not an authorization receipt.
+    """
+    result = []
+    for line in raw.splitlines():
+        if len(line) > 512:
+            continue
+        if phase == "pytest-failed":
+            match = re.fullmatch(r"FAILED (tests/[A-Za-z0-9_/]{1,120}\\.py)::([A-Za-z_][A-Za-z0-9_]{0,79})(?:::(?:([A-Za-z_][A-Za-z0-9_]{0,79})))?(?:\\[[^\\r\\n]*\\])?(?: - .*)?",line)
+            if match:
+                row = {"file":match[1],"test":match[2]+("::"+match[3] if match[3] else ""),"category":"pytest_failure"}
+            else:
+                continue
+        elif phase == "frontend-failed":
+            match = re.fullmatch(r"(?:frontend/)?(src/[A-Za-z0-9_/-]{1,120}\\.tsx?)\\((\\d{1,6}),(\\d{1,6})\\): error (TS\\d{4}):.*",line)
+            if not match:
+                continue
+            row = {"file":"frontend/"+match[1],"line":int(match[2]),"column":int(match[3]),"category":match[4]}
+        else:
+            continue
+        if row not in result:
+            result.append(row)
+        if len(result) >= 12:
+            break
+    return result
+
+
+def save_report(report):
+    from tempfile import NamedTemporaryFile
+    folder = ROOT / "report-outbox"
+    folder.mkdir(mode=0o700,exist_ok=True)
+    info=folder.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise ValueError("Unsafe report outbox")
+    path=folder/(report["run_id"]+".json")
+    with NamedTemporaryFile(mode="w",dir=folder,delete=False,encoding="utf-8") as stream:
+        temp=Path(stream.name)
+        try:
+            json.dump(report,stream,ensure_ascii=True,separators=(",",":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            os.replace(temp,path)
+        finally:
+            temp.unlink(missing_ok=True)
+    return path
+
+
+def flush_reports(token):
+    folder=ROOT/"report-outbox"
+    if not folder.exists():
+        return
+    info=folder.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise ValueError("Unsafe report outbox")
+    for path in sorted(folder.glob("*.json"))[:20]:
+        try:
+            fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            with os.fdopen(fd,"r",encoding="utf-8") as stream:
+                info=os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>12000:
+                    raise ValueError("Unsafe report")
+                report=json.load(stream)
+            if report.get("repository") not in REPOS or type(report.get("pr")) is not int or report["pr"]<=0 or not re.fullmatch(r"[0-9a-f]{32}",report.get("run_id","")) or path.stem!=report["run_id"] or any(not SHA.fullmatch(str(report.get(k,""))) for k in ("head","base","merge")) or report.get("phase") not in REPORT_PHASES:
+                raise ValueError("Invalid report")
+            endpoint=f"/repos/{report['repository']}/issues/{report['pr']}/comments"
+            # Compare the exact serialized report before retrying a lost POST.
+            body=REPORT_MARKER+json.dumps(report,sort_keys=True,separators=(",",":"))
+            found=False
+            for page in range(1,11):
+                comments=api(token,endpoint+f"?per_page=100&page={page}")
+                if any(c.get("body")==body and c.get("author_association")=="OWNER" for c in comments):
+                    found=True
+                    break
+                if len(comments)<100:
+                    break
+            else:
+                raise ValueError("Report dedup pagination limit")
+            if not found:
+                api(token,endpoint,{"body":body})
+            path.unlink()
+        except (OSError,ValueError,KeyError,TypeError):
+            print("MacCI report delivery pending; will retry",flush=True)
+
+
 def status(token, repo, head, base, merge, state, detail=None):
     api(token, f'/repos/{repo}/statuses/{head}', {'state': state, 'context': CONTEXT,
         'description': description(base, merge, detail or state)})
@@ -297,6 +389,7 @@ def main():
     subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
     try:
         with (lock() if args.lock_fd is None else inherited_lock(args.lock_fd)):
+            flush_reports(token)
             for repo in ([args.repo] if args.repo else REPOS):
                 if args.pr:
                     prs = [api(token, f'/repos/{repo}/pulls/{args.pr}')]
@@ -327,8 +420,15 @@ def main():
                     print(f'Testing {repo} PR #{pr["number"]}: {head} against {base}', flush=True)
                     status(token, repo, head, base, None, 'pending')
                     logfile = ROOT / f'{repo.replace("/", "--")}-{pr["number"]}-{head[:12]}-{base[:12]}.log'
+                    run_id=uuid.uuid4().hex
+                    started=time.time()
                     with logfile.open('a', encoding='utf-8') as log:
+                        offset=log.tell()
                         state, merge, detail = test_candidate(repo, pr, log)
+                    # Restrict extraction to this attempt and a bounded tail.
+                    with logfile.open('rb') as stream:
+                        stream.seek(max(offset,logfile.stat().st_size-262144))
+                        diagnostic=failure_summary(stream.read(262144).decode("utf-8",errors="replace"),detail)
                     try:
                         latest = api(token, f'/repos/{repo}/pulls/{pr["number"]}')
                         unchanged = current_candidate(token, repo, latest) == candidate
@@ -336,6 +436,15 @@ def main():
                         unchanged = False
                     if not unchanged or (state == 'success' and merge != expected_merge):
                         state, detail = 'error', 'ref-changed'
+                    if state != "success":
+                        report={"schema":1,"repository":repo,"pr":pr["number"],"head":head,"base":base,"merge":expected_merge,
+                                "run_id":run_id,"state":state,"phase":detail,"started_at":int(started),
+                                "finished_at":int(time.time()),"failures":diagnostic if detail!="ref-changed" else []}
+                        try:
+                            save_report(report)
+                            flush_reports(token)
+                        except (OSError,ValueError,TypeError):
+                            print("MacCI report unavailable; local test log retained",flush=True)
                     status(token, repo, head, base, expected_merge, state, detail)
                     print(f'{state}: {logfile}', flush=True)
                     return 0 if state == 'success' else 1

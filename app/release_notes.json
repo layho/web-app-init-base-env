@@ -8,7 +8,8 @@
       "显式受阻状态优先于历史 PR，关闭 PR 不再计入开发中。",
       "统一宿主 GitHub 凭据文件可显式启用，兼容旧文件；提供只读一致性核对及原子无覆盖迁移，保留原配置。",
       "统一凭据迁移必须以现有一致的宿主凭据为源，并核对基座有效配置；不自动选择旧 Web PR Token。",
-      "HTML 入口禁止缓存，部署检查前端构建 SHA，旧页面提示保存表单后重新加载。"
+      "HTML 入口禁止缓存，部署检查前端构建 SHA，旧页面提示保存表单后重新加载。",
+      "MacCI 失败报告：绑定精确候选及运行 ID，仅提取限长测试标识或 TypeScript 错误码，私有 outbox 重试回写 GitHub。"
     ],
     "acceptance_required": true,
     "acceptance_status": "pending",
