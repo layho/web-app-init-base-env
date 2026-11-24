@@ -207,3 +207,26 @@ def test_unknown_deployment_is_not_success():
          "test": {"state": "success"}, "deployment": {"state": "unknown"}}
     ]})
     assert rows[0]["delivery_status"] == "代码已合并 · 部署待核验"
+
+
+def test_force_issue_refresh_uses_verified_repository_and_bypasses_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    calls = []
+    def request(method, path):
+        calls.append((method, path))
+        assert method == "GET"
+        assert path.startswith("/repos/owner/verified/")
+        if "/comments?" in path:
+            return [{"id": 1, "author_association": "OWNER",
+                     "user": {"login": "owner"},
+                     "created_at": "2026-11-24T00:00:00Z",
+                     "updated_at": "2026-11-24T00:00:00Z",
+                     "body": '[APP_PROGRESS] {"status":"claimed","agent":"Codex"}'}]
+        return [{**ISSUE, "comments": 1}]
+    sync_development_tasks.sync(force=True, repository="owner/verified", request=request)
+    assert development_tasks.snapshot()["tasks"][0]["owner"] == "Codex"
+    assert development_tasks.snapshot()["tasks"][0]["url"] == "https://github.com/owner/verified/issues/42"
+    sync_development_tasks.sync(repository="owner/verified", request=request)
+    assert len(calls) == 2
+    sync_development_tasks.sync(force=True, repository="owner/verified", request=request)
+    assert len(calls) == 4
