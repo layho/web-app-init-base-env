@@ -98,7 +98,35 @@ dependencies() {
   .venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
 }
 check_schema() { .venv/bin/python -m scripts.apply_migrations --check; }
-test_app() { .venv/bin/python -m pytest -q && .venv/bin/python -m compileall -q app; }
+test_app() {
+  # Never inherit application secrets or production database settings into tests.
+  local sha output rc=0
+  sha="$(git rev-parse HEAD)" || return 1
+  output="$(mktemp "$ROOT/logs/.test-output.XXXXXX")" || return 1
+  chmod 600 "$output" || { rm -f "$output"; return 1; }
+  env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 DATABASE_URL=sqlite:///:memory: PYTHONDONTWRITEBYTECODE=1 \
+    .venv/bin/python -m pytest -q --tb=no >"$output" 2>&1 || rc=$?
+  # Export only fixed-schema test identities, not traceback, assertion values or raw output.
+  .venv/bin/python -I -c '
+import re,sys
+from pathlib import Path
+raw=Path(sys.argv[1]).read_text(errors="replace")
+for line in raw.splitlines():
+    m=re.fullmatch(r"FAILED (tests/[A-Za-z0-9_/]{1,120}\.py)::([A-Za-z_][A-Za-z0-9_]{0,79})(?:::([A-Za-z_][A-Za-z0-9_]{0,79}))?(?:\[[^\r\n]*\])?(?: - .*)?",line)
+    if m:
+        print(m[1]+"::"+m[2]+("::"+m[3] if m[3] else ""))
+' "$output" > "$output.safe" || { rm -f "$output" "$output.safe"; return 1; }
+  if test "$rc" != 0; then
+    local identity
+    while IFS= read -r identity; do
+      record_operation host_test_case_failed "$sha" "$identity"
+    done < "$output.safe"
+    log "Host pytest failed (exit $rc); see structured test identities"
+  fi
+  rm -f "$output" "$output.safe"
+  test "$rc" = 0 || return "$rc"
+  env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 .venv/bin/python -m compileall -q app
+}
 build() {
   command -v npm >/dev/null || return 1
   node -e 'let [a,b]=process.versions.node.split(".").map(Number);process.exit(((a===20&&b>=19)||(a===22&&b>=12)||a>=24)?0:1)' || return 1
@@ -121,7 +149,11 @@ health_once() {
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
   .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" else 1)' 2>/dev/null &&
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/" | grep -q '/assets/' &&
-  test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected" &&
+  { if git show "$expected:deploy/macmini/manage.sh" | grep -q VITE_BUILD_SHA; then
+      test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected"
+    else
+      test ! -f frontend/dist/build-sha.txt || test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected"
+    fi; } &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/v1/feedback")" = "401" &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/session")" = "401"
 }
@@ -423,7 +455,12 @@ update() {
   fi
   UPDATE_FAILURE=update_test_build_failed
   record_operation update_test_build "$new"
-  if ! test_app || ! build; then
+  if ! test_app; then
+    UPDATE_DETAIL=host_test_failed
+    rollback "$old" "$new"; exit 1
+  fi
+  if ! build; then
+    UPDATE_DETAIL=frontend_build_failed
     rollback "$old" "$new"; exit 1
   fi
   UPDATE_FAILURE=update_restart_failed

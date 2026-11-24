@@ -11,7 +11,7 @@ import stat
 OPERATIONS_LOG = Path(__file__).resolve().parents[1] / "logs" / "operations.tsv"
 
 EVENT_CODES = {
-    "startup_ok", "schema_check_failed", "frontend_missing",
+    "host_test_case_failed", "startup_ok", "schema_check_failed", "frontend_missing",
     "install_ok", "install_failed", "update_ok", "update_blocked",
     "rollback", "rollback_ok", "rollback_failed", "feedback_ok", "feedback_failed",
     "update_started", "update_candidate", "update_dependencies", "update_test_build", "update_restarting",
@@ -44,6 +44,10 @@ def recent_operations(path: Path, *, deployments_only: bool = False) -> list[dic
                 continue
             event = {"at": instant.isoformat(), "code": code, "sha": sha}
             if len(fields) == 4 and code in {"update_fetch_failed", "update_fetch_retry"} and fields[3] in {"proxy", "authentication", "repository_access", "dns", "timeout", "network", "unknown"}:
+                event["detail"] = fields[3]
+            if len(fields) == 4 and code == "host_test_case_failed" and re.fullmatch(r"tests/[A-Za-z0-9_/]{1,120}\.py::[A-Za-z_][A-Za-z0-9_]{0,79}(?:::[A-Za-z_][A-Za-z0-9_]{0,79})?",fields[3]):
+                event["detail"] = fields[3]
+            if len(fields) == 4 and code == "update_test_build_failed" and fields[3] in {"host_test_failed","frontend_build_failed"}:
                 event["detail"] = fields[3]
             events.append(event)
     return list(reversed(events))

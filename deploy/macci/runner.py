@@ -397,6 +397,88 @@ def token_file():
     return shared_token_path() or ROOT / 'github-token'
 
 
+DEPLOY_CONTEXT = "macmini/deployment-v1"
+DEPLOY_TERMINAL = {"update_ok","update_test_build_failed","update_restart_failed",
+                   "update_dependencies_failed","update_schema_failed","update_preflight_failed",
+                   "install_failed"}
+
+
+def deployment_events(raw):
+    """Recover terminal attempts from the existing durable operations journal.
+    No raw details, credentials, or log paths are transmitted."""
+    attempt = None
+    reports = []
+    for line in raw.splitlines():
+        cols=line.split("\t")
+        if len(cols)<3:
+            continue
+        stamp,code,sha=cols[:3]
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",stamp) or not SHA.fullmatch(sha):
+            continue
+        if code=="update_started":
+            attempt={"started":stamp,"previous":sha,"candidate":None,"rollback":"unknown","failures":[]}
+        elif attempt is not None:
+            if code=="update_candidate":
+                attempt["candidate"]=sha
+            elif code=="host_test_case_failed" and sha==attempt["candidate"] and len(cols)==4:
+                identity=cols[3]
+                if re.fullmatch(r"tests/[A-Za-z0-9_/]{1,120}\.py::[A-Za-z_][A-Za-z0-9_]{0,79}(?:::[A-Za-z_][A-Za-z0-9_]{0,79})?",identity) and identity not in attempt["failures"] and len(attempt["failures"])<12:
+                    attempt["failures"].append(identity)
+            elif code=="rollback_ok" and sha==attempt["previous"]:
+                attempt["rollback"]="ok"
+            elif code=="rollback_failed" and sha==attempt["candidate"]:
+                attempt["rollback"]="failed"
+            elif code in DEPLOY_TERMINAL and sha==attempt["candidate"]:
+                reports.append({**attempt,"finished":stamp,"code":code,"detail":cols[3] if len(cols)>3 and cols[3] in {"host_test_failed","frontend_build_failed"} else ""})
+                attempt=None
+            elif code in {"update_no_change","update_held"}:
+                attempt=None
+    return reports
+
+
+def report_base_deployments(token):
+    # Scope initial rollout to the known foundation preview checkout.
+    # A future registry is needed for downstream installations.
+    repo="layho/web-app-init-base-env"
+    checkout=Path.home()/"web-app-init-base-env-preview"
+    path=checkout/"logs/operations.tsv"
+    try:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,"rb") as stream:
+            info=os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:
+                return
+            stream.seek(max(0,info.st_size-1048576))
+            raw=stream.read(1048576).decode("utf-8",errors="replace")
+        for row in deployment_events(raw)[-12:]:
+            sha=row["candidate"]
+            # Status is scoped to the immutable candidate. No merge authority.
+            state="success" if row["code"]=="update_ok" else "failure"
+            detail=(row["detail"] or row["code"])+" rollback="+row["rollback"]+" at="+row["finished"]
+            statuses=api(token,f"/repos/{repo}/commits/{sha}/statuses?per_page=100")
+            existing=next((s for s in statuses if s.get("context")==DEPLOY_CONTEXT and
+                           (s.get("creator") or {}).get("login")=="layho"),None)
+            if not existing or (existing.get("description")!=detail and
+                str(existing.get("description","")).rsplit(" at=",1)[-1]<=row["finished"]):
+                api(token,f"/repos/{repo}/statuses/{sha}",{"state":state,"context":DEPLOY_CONTEXT,"description":detail})
+            # Stable event identity: a lost acknowledgement cannot create another issue.
+            if state=="failure":
+                title=f"[BASE-DEPLOY-FAILURE {sha}]"
+                found=None
+                for page in range(1,11):
+                    issues=api(token,f"/repos/{repo}/issues?state=all&per_page=100&page={page}")
+                    found=next((i for i in issues if i.get("title")==title and "pull_request" not in i and (i.get("user") or {}).get("login")=="layho"),None)
+                    if found or len(issues)<100:
+                        break
+                else:
+                    raise ValueError("Deployment failure issue pagination exhausted")
+                if not found:
+                    body="[BASE_DEPLOY_FAILURE] "+json.dumps({"schema":1,"candidate_sha":sha,**row},sort_keys=True,separators=(",",":"))
+                    api(token,f"/repos/{repo}/issues",{"title":title,"body":body})
+    except (OSError,ValueError,KeyError,TypeError):
+        print("Deployment journal delivery pending; will retry",flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--configure', action='store_true')
@@ -434,6 +516,7 @@ def main():
     subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
     try:
         with (lock() if args.lock_fd is None else inherited_lock(args.lock_fd)):
+            report_base_deployments(token)
             flush_reports(token)
             for repo in ([args.repo] if args.repo else REPOS):
                 if args.pr:
