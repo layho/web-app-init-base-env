@@ -305,21 +305,29 @@ mkdir logs
 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 assert_main() { :; }
 load_env() { :; }
+sleep() { :; }
 git() {
+    while test "$1" = -c; do shift 2; done
     if test "$1" = rev-parse; then echo "$sha"; return 0; fi
-    if test "$1" = fetch; then return "$fetch_rc"; fi
+    if test "$1" = fetch; then
+        test "$2" = --quiet && test "$3" = origin && test "$4" = "${TRACK_BRANCH:-main}" || return 98
+        echo attempt >> fetch-attempts
+        return "$fetch_rc"
+    fi
     return 99
 }
 fetch_rc=0
 (update)
 grep -q "$(printf '\tupdate_no_change\t%s' "$sha")" logs/operations.tsv
 test ! -d "$LOCK"
+test "$(wc -l < fetch-attempts | tr -d ' ')" = 1
 fetch_rc=7
 set +e
 (set -e; update)
 rc=$?
 set -e
 test "$rc" = 7
+test "$(wc -l < fetch-attempts | tr -d ' ')" = 4
 grep -q "$(printf '\tupdate_fetch_failed\t%s' "$sha")" logs/operations.tsv
 test ! -d "$LOCK"
 '''
@@ -351,3 +359,32 @@ def test_read_only_update_check_unavailable_on_bad_git_response(monkeypatch):
                         SimpleNamespace(stdout="bad-sha\trefs/heads/main\n"))
     assert operations.check_available_update("a" * 40)["state"] == "unavailable"
     assert operations.check_available_update("unknown")["state"] == "unavailable"
+
+
+def test_fetch_error_classification_and_retry_without_secret_leak(tmp_path):
+    script = SCRIPT.read_text()
+    funcs = script[script.index("fetch_reason() {"):script.index("finish_update() {")]
+    program = funcs + r'''
+set -euo pipefail
+UPDATE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+UPDATE_DETAIL=
+log() { echo "$*"; }
+record_operation() { echo "$*"; }
+sleep() { :; }
+git() {
+  if ! test -e attempted; then
+    touch attempted
+    echo 'Connection reset secret-example-token' >&2
+    return 1
+  fi
+  return 0
+}
+fetch_with_retry
+test "$(fetch_reason 'Permission denied (publickey)')" = authentication
+test "$(fetch_reason 'Could not resolve host')" = dns
+test "$(fetch_reason 'Could not resolve proxy')" = proxy
+'''
+    result = subprocess.run(["bash","-c",program],cwd=tmp_path,capture_output=True,text=True)
+    assert result.returncode == 0, result.stderr
+    assert "update_fetch_retry" in result.stdout
+    assert "secret-example-token" not in result.stdout + result.stderr

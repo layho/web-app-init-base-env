@@ -59,7 +59,7 @@ class MergeTests(unittest.TestCase):
             content = base64.b64encode(json.dumps([note]).encode()).decode()
             return {"encoding": "base64", "content": content}
 
-        with patch.object(m, "api", side_effect=api), patch.object(m, "git") as git:
+        with patch.object(m, "api", side_effect=api), patch.object(m, "git") as git, patch.object(m,"authorization",return_value=None):
             self.assertFalse(m.merge_one("fake", 54))
             git.assert_not_called()
             amended["changes"] = old["changes"]
@@ -144,14 +144,29 @@ class MergeTests(unittest.TestCase):
     @patch.object(m,"git")
     @patch.object(m,"authorization",return_value=(H,B,C,B))
     @patch.object(m,"preview_frozen",side_effect=[False,True])
-    def test_freeze_appears_during_merge_no_push(self,frozen,auth,git,verify,api):
+    @patch.object(m,"replacement_allowed",return_value=False)
+    def test_freeze_appears_during_merge_no_push(self,replacement,frozen,auth,git,verify,api):
         self.assertFalse(m.merge_one("fake",7))
         self.assertFalse(any(call.args[1] == "push" for call in git.call_args_list))
 
     @patch.object(m,"git")
-    @patch.object(m,"authorization")
+    @patch.object(m,"authorization",return_value=(H,B,C,B))
     @patch.object(m,"preview_frozen",return_value=True)
-    def test_frozen_candidate_never_calls_authorization_or_git(self,frozen,auth,git):
+    @patch.object(m,"replacement_allowed",return_value=False)
+    def test_frozen_candidate_without_replacement_never_pushes(self,replacement,frozen,auth,git):
         self.assertFalse(m.merge_one("fake",7))
-        auth.assert_not_called()
         git.assert_not_called()
+
+    def test_replacement_requires_exact_rejection_and_exact_repair_review(self):
+        issue={"number":130,"title":f"[BASE-REJECTION {B}]","author_association":"OWNER",
+               "user":{"login":m.OWNER},"body":"[BASE_REJECTION] "+json.dumps(
+                   {"schema":1,"candidate_sha":B,"reason":"regression found"})}
+        review={"id":1,"author_association":"OWNER","user":{"login":m.OWNER},
+                "body":"[BASE_REPAIR_REVIEW] "+json.dumps({"schema":1,"head":H,
+                    "rejected_sha":B,"rejection_issue":130,"decision":"approved"})}
+        def api(token,path):
+            return {"commit":{"sha":B if path.endswith("preview") else D}}
+        with patch.object(m,"api",side_effect=api),patch.object(m,"all_pages",side_effect=lambda _,path:[review] if "comments" in path else [issue]),patch.object(m,"latest_release",side_effect=[((0,1,37),True),((0,1,38),True)]):
+            self.assertTrue(m.replacement_allowed("fake",7,B,H,C))
+        with patch.object(m,"api",side_effect=api),patch.object(m,"all_pages",side_effect=lambda _,path:[review] if "comments" in path else []):
+            self.assertFalse(m.replacement_allowed("fake",7,B,H,C))

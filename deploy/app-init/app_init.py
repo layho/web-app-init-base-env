@@ -94,7 +94,7 @@ def copy_foundation(source, target, repository, title, domain, port, label):
         "app/development_tasks.py", "app/foundation_version.py", "app/upgrade_status.py", "app/feedback_progress.py",
         "app/admin_settings.py", "app/feedback_delivery.py", "app/manual_pr_actions.py",
         "app/pr_conflict_controls.py", "app/pr_draft_controls.py",
-        "app/pr_tracking.py", "app/release_acceptance.py", "app/main.py", "app/models.py", "app/operations.py",
+        "app/pr_tracking.py", "app/feedback_attachments.py", "app/release_acceptance.py", "app/main.py", "app/models.py", "app/operations.py",
         "migrations/002_admin_sessions.sql", "migrations/003_feedback.sql",
         "scripts/apply_migrations.py", "scripts/hash_admin_password.py", "scripts/sync_feedback.py",
         "scripts/sync_development_tasks.py", "deploy/macmini/manage.sh", "deploy/macmini/acceptance.py",

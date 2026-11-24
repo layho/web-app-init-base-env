@@ -318,3 +318,30 @@ def test_task_displays_exact_frontend_failure_even_if_issue_not_synced():
     assert rows[0]["test_state"] == "failure"
     assert rows[0]["test_failures"][0]["phase"] == "frontend-failed"
     assert rows[0]["test_failures"][0]["head"] == "a"*40
+
+
+def test_closed_unmerged_pr_not_active_failure_or_waiting_merge():
+    issue = development_tasks.parse_issue({**ISSUE, "number":42}, "owner/repo")
+    result = development_tasks.unified_tasks([issue], {"prs": [
+        {"number":16,"linked_issues":[42],"merge_state":"closed","test":{"state":"failure","phase":"dependencies-failed"}}
+    ]})[0]
+    assert result["merge_state"] == "closed"
+    assert result["delivery_status"] == "关联 PR 已关闭 · 待重新开发"
+    assert result["test_failures"] == []
+    assert result["historical_test_failures"][0]["number"] == 16
+
+def test_active_snapshot_overlays_new_pr_without_waiting_for_history(tmp_path,monkeypatch):
+    from app import pr_tracking
+    import json
+    from datetime import datetime,timezone
+    monkeypatch.setattr(pr_tracking,"CACHE",tmp_path/"pr.json")
+    monkeypatch.setattr(pr_tracking,"target",lambda:("owner/repo","main"))
+    stamp=datetime.now(timezone.utc).isoformat()
+    old={"repository":"owner/repo","branch":"main","synced_at":"2026-01-01T00:00:00Z",
+         "prs":[{"number":129,"merge_state":"merged"}]}
+    (tmp_path/"pr-active.json").write_text(json.dumps({"repository":"owner/repo","branch":"main",
+         "synced_at":stamp,"prs":[{"number":132,"merge_state":"draft"}]}))
+    result=pr_tracking.active_snapshot(old)
+    assert [p["number"] for p in result["prs"]]==[132,129]
+    assert result["active_synced_at"]==stamp
+    assert result["history_synced_at"]==old["synced_at"]

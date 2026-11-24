@@ -2,6 +2,7 @@
 
 The web service intentionally has no Contents-write or PR-merge credential.
 """
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -140,6 +141,9 @@ def state(sha):
         if not receipt:
             return {"enabled": True, "state": "not_requested"}
         issue = receipt.get("issue")
+        if receipt.get("decision") == "rejected":
+            return {"enabled": True, "state": "rejected", "issue": issue,
+                    "reason": receipt.get("reason"), "attachments": receipt.get("attachments", [])}
         if contains(sha, ref("main")):
             return {"enabled": True, "state": "published", "issue": issue}
         if type(issue) is int and issue > 0:
@@ -218,5 +222,110 @@ def submit(sha, version, deployed):
         issue = found.get("number")
         if type(issue) is not int or issue <= 0:
             raise AcceptanceError("GitHub 未返回有效验收单号")
-        save_receipt(sha, {"issue": issue})
+        save_receipt(sha, {"issue": issue, "decision": "accepted", "at": found.get("created_at") or datetime.now(timezone.utc).isoformat(), "test_head": evidence["test_head"]})
         return {"enabled": True, "state": "queued", "issue": issue}
+
+def reject(sha, version, reason, images):
+    from app import feedback_attachments
+    if not enabled() or sha != os.getenv("APP_RUNNING_SHA") or not valid_sha(sha) or len(reason)<5:
+        raise AcceptanceError("拒绝理由或候选SHA无效")
+    RECEIPTS.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (RECEIPTS/"request.lock").open("a") as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        old=load_receipt(sha)
+        if old and old.get("decision") != "rejected":
+            raise AcceptanceError("已经提交验收通过，不能并发拒绝")
+        if ref("preview") != sha or contains(sha,ref("main")):
+            raise AcceptanceError("候选已变化或已经正式发布")
+        # Reject cannot coexist with an earlier publication authorization even
+        # if an earlier HTTP response or local receipt was lost.
+        for page in range(1,6):
+            issues=api(f"/issues?state=open&per_page=100&page={page}")
+            if any(i.get("title")==f"[BASE-ACCEPTANCE {sha}]" and i.get("author_association")=="OWNER" for i in issues):
+                raise AcceptanceError("当前候选已有正式发布授权，拒绝并发变更")
+            if len(issues)<100:
+                break
+        else:
+            raise AcceptanceError("无法完整核对发布授权")
+        if old:
+            return state(sha)
+        title=f"[BASE-REJECTION {sha}]"
+        existing=feedback_attachments.listing("rejection",sha)
+        attachments=existing or (feedback_attachments.save("rejection",sha,images) if images else [])
+        # GitHub gets the reason and authenticated evidence locator, never image bytes.
+        payload="[BASE_REJECTION] "+json.dumps({"schema":1,"candidate_sha":sha,"version":version,"reason":reason,
+                    "attachments":[{"id":x["id"],"url": "https://base.layho.com"+x["url"]} for x in attachments]},ensure_ascii=False,sort_keys=True)
+        found=find_issue(title,payload)
+        if ref("preview") != sha or contains(sha,ref("main")):
+            raise AcceptanceError("候选已变化，拒绝记录未授权任何合并")
+        if not found:
+            found=api("/issues",{"title":title,"body":payload})
+        issue=found.get("number")
+        if type(issue) is not int or issue<=0:
+            raise AcceptanceError("GitHub 未返回修复任务编号")
+        save_receipt(sha,{"decision":"rejected","issue":issue,"reason":reason,"attachments":attachments,"at":found.get("created_at") or datetime.now(timezone.utc).isoformat()})
+        return state(sha)
+
+def local_decision(sha, head):
+    """Fast local evidence only. Legacy receipts are recovered by the worker."""
+    if not enabled() or not valid_sha(sha) or not valid_sha(head):
+        return None
+    try:
+        receipt = load_receipt(sha)
+        if not receipt or not isinstance(receipt.get("at"), str):
+            return None
+        if receipt.get("decision") == "accepted" and receipt.get("test_head") == head:
+            return {"decision":"accepted","at":receipt["at"],"issue":receipt.get("issue"),"candidate_sha":sha}
+        if receipt.get("decision") == "rejected":
+            return {"decision":"rejected","at":receipt["at"],"issue":receipt.get("issue"),"candidate_sha":sha}
+    except (AcceptanceError, OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def collect_release_evidence(issue, comments):
+    """Validate an owner-authored exact-candidate acceptance/rejection issue."""
+    if issue.get("author_association") != "OWNER" or (issue.get("user") or {}).get("login") != "layho":
+        return None
+    title = re.fullmatch(r"\[BASE-(ACCEPTANCE|REJECTION) ([0-9a-f]{40})\]", issue.get("title") or "")
+    if not title:
+        return None
+    kind, sha = title.groups()
+    marker = "[BASE_ACCEPTANCE] " if kind == "ACCEPTANCE" else "[BASE_REJECTION] "
+    body = issue.get("body") or ""
+    if not body.startswith(marker):
+        return None
+    try:
+        data = json.loads(body[len(marker):])
+        at = datetime.fromisoformat(issue["created_at"].replace("Z","+00:00"))
+        if at.tzinfo is None:
+            return None
+        if not isinstance(data,dict) or data.get("schema") != 1 or data.get("candidate_sha") != sha:
+            return None
+        if type(issue.get("number")) is not int:
+            return None
+        out={"decision":"accepted" if kind=="ACCEPTANCE" else "rejected","candidate_sha":sha,
+             "at":at.isoformat(),"issue":issue["number"]}
+        if kind=="REJECTION":
+            return out if isinstance(data.get("reason"),str) and len(data["reason"].strip())>=5 else None
+        keys={"schema","candidate_sha","expected_main_sha","version","test_head","test_base","tested_merge","tree"}
+        if set(data)!=keys or not all(valid_sha(data[k]) for k in keys-{"schema","version"}):
+            return None
+        out["test_head"]=data["test_head"]
+        # Publication has a separate trusted receipt and must match the candidate.
+        for c in comments:
+            if c.get("author_association")!="OWNER" or (c.get("user") or {}).get("login")!="layho":
+                continue
+            if c.get("updated_at")!=c.get("created_at"):
+                continue
+            text=c.get("body") or ""
+            if not text.startswith("[BASE_PUBLISHED] "):
+                continue
+            event=json.loads(text[len("[BASE_PUBLISHED] "):])
+            if event=={"candidate_sha":sha,"main_sha":sha,"executor":"macci-main-publish"}:
+                stamp=datetime.fromisoformat(c["created_at"].replace("Z","+00:00"))
+                if stamp.tzinfo and stamp>=at:
+                    out["published_at"]=stamp.isoformat()
+        return out
+    except (ValueError,KeyError,TypeError,AttributeError):
+        return None

@@ -147,3 +147,37 @@ def test_feedback_developer_reply_refresh_preserves_last_good_state(client, monk
     assert after["overall_status"] == "claimed"
     assert after["developer_reply"] == "已领取"
     assert after["progress_stale"]
+
+def test_private_attachment_roundtrip(client,monkeypatch,tmp_path):
+    import base64, io
+    from PIL import Image
+    from app import feedback_attachments
+    monkeypatch.setattr(feedback_attachments,"ROOT",tmp_path/"images")
+    out=io.BytesIO()
+    Image.new("RGB",(12,12),"red").save(out,"PNG")
+    screenshot=base64.b64encode(out.getvalue()).decode()
+    origin={"Origin":"https://app.example.com"}
+    login=client.post("/api/login",headers=origin,json={"username":"admin","password":"secure-password-for-tests-123"})
+    headers={**origin,"X-CSRF-Token":login.json()["csrf_token"]}
+    payload={"category":"bug","message":"Screenshot evidence test","screenshots":[screenshot]}
+    assert client.post("/api/v1/feedback",headers=headers,json=payload).status_code==200
+    url=client.get("/api/v1/feedback").json()[0]["attachments"][0]["url"]
+    r=client.get(url)
+    assert r.status_code==200 and r.headers["content-type"]=="image/jpeg"
+    assert client.post("/api/v1/feedback",headers=headers,json={**payload,"screenshots":["invalid"]}).status_code==422
+    client.post("/api/logout",headers=headers)
+    assert client.get(url).status_code==401
+
+
+def test_attachment_rejects_aggregate_before_decode(monkeypatch):
+    from app import feedback_attachments as a
+    monkeypatch.setattr(a, "MAX_TOTAL", 12)
+    monkeypatch.setattr(a, "MAX_ENCODED", 32)
+    with pytest.raises(ValueError,match="总大小"):
+        a.normalize(["A"*32,"A"*32])
+
+def test_attachment_rejects_oversized_encoded_input(monkeypatch):
+    from app import feedback_attachments as a
+    monkeypatch.setattr(a,"MAX_ENCODED",16)
+    with pytest.raises(ValueError,match="单张"):
+        a.normalize(["A"*20])

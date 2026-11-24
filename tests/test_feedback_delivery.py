@@ -225,3 +225,20 @@ def test_current_head_failure_visible_even_with_old_submission_receipt():
         "phase": "frontend-failed", "at": "2026-11-24T12:09:38Z"}]
     assert row["evidence"]["pr"] is None
     assert row["steps"][5]["state"] == "pending"
+
+def test_exact_release_acceptance_and_publication_are_distinct():
+    pr={"number":19,"head":SHA,"merge_state":"merged","merge_sha":"b"*40,
+        "release_acceptance_enabled":True,"test":{"state":"success","finished_at":"2026-11-23T01:10:00Z"},
+        "merged_at":"2026-11-23T01:12:00Z","deployment":{"state":"running","at":"2026-11-23T01:14:00Z"},
+        "acceptance":{"decision":"accepted","at":"2026-11-23T01:15:00Z","issue":131}}
+    row=delivery.timeline(BASE,[pr])
+    assert row["steps"][8]["state"]=="complete"
+    assert row["current_stage"]=="published"
+    assert row["steps"][9]["state"]=="pending"
+    pr["acceptance"]["published_at"]="2026-11-23T01:16:00Z"
+    assert delivery.timeline(BASE,[pr])["current_stage"]=="complete"
+    pr["acceptance"]={"decision":"rejected","at":"2026-11-23T01:15:00Z"}
+    row=delivery.timeline(BASE,[pr])
+    assert row["current_stage"]=="rejected"
+    assert row["steps"][8]["state"]=="failed"
+    assert row["steps"][9]["state"]=="pending"

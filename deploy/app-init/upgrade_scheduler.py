@@ -129,6 +129,7 @@ def record(repo, mode, target, app_sha, state, **extra):
 
 def tick_app(repo, entry, target, force=False):
     mode = entry["mode"]
+    auto_merge.deny("not_checked")
     try:
         app_sha = upgrade.remote_ref("git@github.com:" + repo + ".git", "refs/heads/main")
         if not app_sha:
@@ -163,7 +164,7 @@ def tick_app(repo, entry, target, force=False):
                 return record(repo, mode, target, app_sha, "upgrade_merged",
                               pr_url=url, merged_now=True, promoted_target_sha=pending_target)
             return record(repo, mode, target, app_sha, "upgrade_waiting_verification",
-                          pr_url=url, pending_target_sha=pending_target)
+                          pr_url=url, pending_target_sha=pending_target, reason=auto_merge.last_reason)
         previous = read_json(status_path(repo), {})
         if (not force and previous.get("state") in TERMINAL and previous.get("app_sha") == app_sha
                 and previous.get("target_sha") == target and previous.get("mode") == mode
@@ -195,9 +196,9 @@ def tick_app(repo, entry, target, force=False):
         return record(repo, mode, target, app_sha, state, pr_url=url, review_count=len(flagged),
                       blocked_files=flagged if state == "blocked" else [],
                       legacy_base=entry.get("legacy_base"))
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         # Never log raw subprocess stderr or credentials; retry transient errors.
-        return record(repo, mode, target, locals().get("app_sha"), "error")
+        return record(repo, mode, target, locals().get("app_sha"), "error", reason=type(exc).__name__, promotion_reason=auto_merge.last_reason if locals().get("pending") else None)
 
 
 def tick(force=False):
@@ -208,12 +209,15 @@ def tick(force=False):
     updater = ROOT / "runtime" / "upgrade_runtime_auto.py"
     if updater.is_file() and not updater.is_symlink():
         try:
-            subprocess.run([sys.executable, "-B", str(updater)],
+            update_result = subprocess.run([sys.executable, "-B", str(updater)],
                            check=False, timeout=360,
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            print(json.dumps({"event":"runtime_update","exit_code":update_result.returncode,
+                "checked_at":datetime.now(timezone.utc).isoformat()}),flush=True)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(json.dumps({"event":"runtime_update","reason":type(exc).__name__,
+                "checked_at":datetime.now(timezone.utc).isoformat()}),flush=True)
     # LaunchAgent must never ask for credentials or access an interactive terminal.
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
     os.environ["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"

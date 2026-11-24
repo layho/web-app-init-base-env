@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from . import admin_settings, auth, development_tasks, feedback_progress, feedback_delivery, foundation_version, operations, pr_tracking, pr_conflict_controls, manual_pr_actions, release_acceptance, pr_draft_controls
 from .db import get_db
+from . import feedback_attachments
 from .models import UserFeedback
 
 RELEASE_NOTES = Path(__file__).with_name("release_notes.json")
@@ -96,15 +97,35 @@ def health():
 class FeedbackIn(BaseModel):
     category: str = Field(pattern="^(bug|suggestion|acceptance)$")
     message: str = Field(min_length=5, max_length=2000)
+    screenshots: list[str] = Field(default_factory=list, max_length=9)
 
 @app.post("/api/v1/feedback", dependencies=[Depends(authorize)])
 def submit_feedback(req: FeedbackIn, db: Session = Depends(get_db)):
     row = UserFeedback(category=req.category, message=req.message.strip(), status="pending")
     if len(row.message) < 5:
         raise HTTPException(422, "Feedback too short")
+    try:
+        images = feedback_attachments.normalize(req.screenshots)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     db.add(row)
+    db.flush()
+    if images:
+        try:
+            feedback_attachments.save("feedback", row.id, images)
+        except (OSError, ValueError):
+            db.rollback()
+            raise HTTPException(503, "截图保存失败，反馈未提交") from None
     db.commit()
     return {"id": row.id, "status": row.status}
+
+@app.get("/api/v1/attachments/{scope}/{key}/{attachment_id}", dependencies=[Depends(authorize)])
+def get_attachment(scope: str, key: str, attachment_id: str):
+    try:
+        data = feedback_attachments.read(scope, key, attachment_id)
+    except (OSError, ValueError):
+        raise HTTPException(404, "截图不存在") from None
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control":"private, no-store", "X-Content-Type-Options":"nosniff"})
 
 @app.get("/api/v1/feedback", dependencies=[Depends(authorize)])
 def list_feedback(response: Response, db: Session = Depends(get_db)):
@@ -120,6 +141,7 @@ def list_feedback(response: Response, db: Session = Depends(get_db)):
                  **feedback_progress.feedback_details(progress, x.id, x.github_issue_number)
              }, prs),
              "id": x.id, "category": x.category, "message": x.message, "status": x.status,
+             "attachments": feedback_attachments.listing("feedback", x.id),
              "github_issue_number": x.github_issue_number,
              "created_at": x.created_at.isoformat() if x.created_at else None,
              "synced_at": x.synced_at.isoformat() if x.synced_at else None,
@@ -165,6 +187,28 @@ class ReleaseAcceptanceIn(BaseModel):
     sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     version: str = Field(min_length=1, max_length=40)
 
+
+class ReleaseRejectIn(ReleaseAcceptanceIn):
+    reason: str = Field(min_length=5, max_length=2000)
+    screenshots: list[str] = Field(default_factory=list, max_length=9)
+
+@app.post("/api/v1/releases/reject")
+def reject_release(req: ReleaseRejectIn, request: Request, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    if request.headers.get("origin") != os.getenv("APP_PUBLIC_ORIGIN") or not request.headers.get("origin"):
+        raise HTTPException(403, "请在基座验收站提交拒绝")
+    notes = json.loads(RELEASE_NOTES.read_text(encoding="utf-8"))
+    if notes[0]["version"] != req.version or not notes[0].get("acceptance_required"):
+        raise HTTPException(409, "当前版本不匹配或无需验收")
+    if not release_acceptance.enabled() or req.version != app.version or req.sha != os.getenv("APP_RUNNING_SHA"):
+        raise HTTPException(409, "仅允许拒绝当前基座候选版本")
+    try:
+        images = feedback_attachments.normalize(req.screenshots)
+        return release_acceptance.reject(req.sha, req.version, req.reason.strip(), images)
+    except (ValueError, release_acceptance.AcceptanceError) as exc:
+        raise HTTPException(409, str(exc)) from None
+    except OSError:
+        raise HTTPException(503, "验收拒绝记录保存失败") from None
 
 @app.post("/api/v1/releases/accept")
 def accept_release(req: ReleaseAcceptanceIn, request: Request, response: Response, db: Session = Depends(get_db)):
@@ -226,6 +270,7 @@ def list_development_tasks(response: Response, refresh: bool = False):
                                        or result["refresh_status"].get("state") in {"failed", "interrupted"})
         except (OSError, ValueError, TypeError, KeyError):
             pass
+        result["pr_tracking"] = pr_tracking.active_snapshot(result["pr_tracking"])
         # Draft authority differs by repository, but the shared manual
         # MacCI toolbar is available to explicitly allowlisted app workers.
         result["pr_tracking"]["manual_actions_available"] = manual_pr_actions.configured()
@@ -235,6 +280,23 @@ def list_development_tasks(response: Response, refresh: bool = False):
         result["stale"] = result["stale"] or result["pr_tracking"].get("stale", True)
     return result
 
+
+@app.post("/api/v1/development-tasks/active-refresh", status_code=202)
+def request_active_refresh(request: Request, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    if not pr_tracking.enabled():
+        raise HTTPException(503, "No verified repository")
+    import sys
+    folder=development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True,exist_ok=True)
+    try:
+        with (folder/"pr-active-worker.log").open("ab") as log:
+            subprocess.Popen([sys.executable,"-m","scripts.sync_development_tasks","--active"],
+                             cwd=str(Path(__file__).resolve().parents[1]),stdin=subprocess.DEVNULL,
+                             stdout=log,stderr=log,start_new_session=True)
+    except OSError:
+        raise HTTPException(503,"活跃PR同步进程启动失败") from None
+    return {"state":"requested"}
 
 @app.post("/api/v1/development-tasks/refresh", status_code=202)
 def request_task_refresh(request: Request, db: Session = Depends(get_db)):

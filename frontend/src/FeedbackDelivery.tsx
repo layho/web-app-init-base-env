@@ -5,6 +5,9 @@ export type DeliveryStep = { key: string; label: string; state: 'complete' | 'pe
 export type Delivery = {
   steps: DeliveryStep[]
   current_stage: string
+  release_acceptance?: {decision?:string;at?:string;published_at?:string;issue?:number;candidate_sha?:string}
+  developer_agent?: string|null
+  developer_actor?: string|null
   test_failures?: {number:number; head?:string; phase?:string; at?:string}[]
   submission_diagnostic?: 'verified' | 'awaiting_receipt' | 'awaiting_pr_sync' | 'head_mismatch'
   reported_pr?: number | null
@@ -24,10 +27,11 @@ const date = (input: string | null | undefined) => input
 export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; issueBase: string}) {
   if (!delivery) return <Alert type="info" showIcon message="旧版反馈尚未生成交付进度快照，请刷新同步" />
   const current = delivery.steps.find(step => step.key === delivery.current_stage)
-  const owner = delivery.executor.name ?? '未取得执行负责人信息'
+  const owner = delivery.developer_agent ?? (delivery.developer_actor ? 'GitHub: '+delivery.developer_actor : '未取得开发负责人信息')
   const missingHistory = delivery.steps.filter(step => step.state === 'unrecorded').length
   const currentState = delivery.current_stage === 'blocked' ? '当前受阻'
     : delivery.current_stage === 'failed' ? '测试或部署失败'
+    : delivery.current_stage === 'rejected' ? '验收不通过 · 待修复'
     : current ? '等待：' + current.label : '交付链路已完成'
   const submissionLabels = {verified: '提交已核验', awaiting_receipt: '等待开发提交回执', awaiting_pr_sync: '已收到提交回执 · 等待 PR 同步', head_mismatch: 'PR HEAD 已变更 · 等待最新交付回执'}
   const diagnostic = delivery.submission_diagnostic
@@ -37,6 +41,7 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
       <Typography.Paragraph type="secondary" style={{marginBottom: 12}}>
         只显示有真实证据的进度。MacCI 测试、合并、部署和验收分别核实，不能互相代替。
       </Typography.Paragraph>
+      {delivery.release_acceptance?.issue && <Alert style={{marginBottom:12}} showIcon type={delivery.release_acceptance.decision==='rejected'?'error':'success'} message={delivery.release_acceptance.decision==='rejected'?'用户验收不通过':'用户验收通过'} description={<a href={issueBase+'/'+delivery.release_acceptance.issue} target="_blank" rel="noreferrer">查看真实验收回执 #{delivery.release_acceptance.issue}</a>}/>}
       {delivery.test_failures?.map(f => <Alert key={f.number} type="error" showIcon style={{marginBottom:12}}
         message={`PR #${f.number} · ${failureLabels[f.phase ?? ''] ?? 'MacCI 测试失败'}`}
         description={`HEAD: ${f.head ?? '未记录'}；时间：${date(f.at)}；错误代码：${f.phase ?? '未记录'}。此为当前 PR 的失败证据，不代表旧提交回执已核验。`}/>)}

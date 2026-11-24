@@ -54,6 +54,8 @@ def timeline(feedback, prs=None):
                  "at": (row.get("test") or {}).get("finished_at")}
                 for row in related if (row.get("test") or {}).get("state") in {"failure", "error"}]
     deployment = linked.get("deployment", {}) if linked else {}
+    acceptance = linked.get("acceptance") or {} if linked else {}
+    decision = acceptance.get("decision")
     events = {
         "submitted": feedback.get("created_at"),
         "synced": feedback.get("synced_at") if feedback.get("github_issue_number") else None,
@@ -65,10 +67,12 @@ def timeline(feedback, prs=None):
         "deployed": deployment.get("at") if deployment.get("state") in ("running", "deployed") else None,
         # An explicit trusted accepted milestone is necessary; a closed
         # GitHub issue or deployed SHA must never masquerade as user acceptance.
-        "accepted": feedback.get("accepted_at") if feedback.get("overall_status") == "accepted" else None,
+        "accepted": acceptance.get("at") if decision == "accepted" else feedback.get("accepted_at") if feedback.get("overall_status") == "accepted" and decision != "rejected" else None,
     }
     steps = []
-    for code in STAGES:
+    stages = (*STAGES, "published") if linked and linked.get("release_acceptance_enabled") else STAGES
+    events["published"] = acceptance.get("published_at") if decision == "accepted" else None
+    for code in stages:
         at = events[code]
         state = "complete" if isinstance(at, str) and at else "pending"
         if code == "tests" and linked and tested.get("state") in ("failure", "error"):
@@ -77,7 +81,9 @@ def timeline(feedback, prs=None):
         if code == "deployed" and deployment.get("state") == "failed":
             state = "failed"
             at = deployment.get("at")
-        steps.append({"key": code, "label": LABELS[code], "state": state, "at": at})
+        if code == "accepted" and decision == "rejected":
+            state, at = "failed", acceptance.get("at")
+        steps.append({"key": code, "label": LABELS.get(code, "正式发布"), "state": state, "at": at})
     # Missing historical milestones must stay explicitly unverified, without
     # hiding a real later PR or MacCI event behind "waiting to start coding".
     # No date is inferred and no milestone is marked completed by implication.
@@ -86,12 +92,14 @@ def timeline(feedback, prs=None):
     for i, row in enumerate(steps):
         if i < last_verified and row["state"] == "pending":
             row["state"] = "unrecorded"
-    if feedback.get("overall_status") == "blocked":
+    if decision == "rejected":
+        phase = "rejected"
+    elif feedback.get("overall_status") == "blocked":
         phase = "blocked"
     elif any(x["state"] == "failed" for x in steps):
         phase = "failed"
     else:
-        phase = next((x["key"] for x in steps if x["state"] == "pending"), "accepted")
+        phase = next((x["key"] for x in steps if x["state"] == "pending"), "complete")
     # An owner-authored GitHub execution receipt is a declared executor
     # status, not an independent platform heartbeat. Expire stale "started"
     # evidence rather than silently claiming ongoing activity.
@@ -115,7 +123,9 @@ def timeline(feedback, prs=None):
                      schedule_source="GitHub Issue OWNER execution receipt")
     return {
         "steps": steps, "current_stage": phase,
+        "developer_agent": feedback.get("developer_agent"), "developer_actor": feedback.get("developer_actor"),
         "test_failures": failures,
+        "release_acceptance": acceptance,
         "submission_diagnostic": diagnostic,
         "reported_pr": primary_number if has_receipt else None,
         "reported_head": feedback.get("delivered_sha") if has_receipt else None,

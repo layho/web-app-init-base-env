@@ -153,6 +153,17 @@ class PromotionTests(unittest.TestCase):
             self.assertTrue(m.promote(REPO, {"number": 9}, BASE, TARGET))
             graphql.assert_not_called()
 
+    def test_diagnostic_identifies_failed_macci_and_graphql(self):
+        pr, _, statuses, api = fixture()
+        with patch.object(m, "api", side_effect=api), patch.object(m.upgrade,"remote_ref",return_value=TARGET):
+            statuses[0]["state"]="failure"
+            self.assertFalse(m.promote(REPO,{"number":9},BASE,TARGET))
+            self.assertEqual(m.last_reason,"macci_not_success_or_untrusted")
+            statuses[0]["state"]="success"
+            with patch.object(m,"graphql_ready",return_value=False):
+                self.assertFalse(m.promote(REPO,{"number":9},BASE,TARGET))
+                self.assertEqual(m.last_reason,"graphql_ready_failed")
+
     def test_changed_source_never_marks_ready(self):
         _, _, _, api = fixture()
         with patch.object(m, "api", side_effect=api), \

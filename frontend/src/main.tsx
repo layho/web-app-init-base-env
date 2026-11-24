@@ -2,7 +2,7 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { AppstoreOutlined, CommentOutlined, HistoryOutlined, ProfileOutlined, CloudDownloadOutlined, UnorderedListOutlined, ProjectOutlined } from '@ant-design/icons'
-import { Alert, Button, Card, ConfigProvider, Descriptions, Drawer, Empty, Form, Input, Layout, Modal, Select, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, ConfigProvider, Descriptions, Drawer, Empty, Form, Image, Input, Layout, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import 'antd/dist/reset.css'
 import { ReleasePage, SystemLogPage } from './OperationsPage'
@@ -12,11 +12,13 @@ import type { TaskSnapshot } from './DevelopmentTasksPage'
 import { ProjectInfoPage } from './ProjectInfoPage'
 import type { ProjectInfo } from './ProjectInfoPage'
 import { WorkspaceShell } from './WorkspaceShell'
+import { ScreenshotPicker } from './ScreenshotPicker'
 import { FeedbackDelivery } from './FeedbackDelivery'
 import type { Delivery } from './FeedbackDelivery'
 
-type DeployStatus = { state: string; event: {at: string; code: string; sha: string} | null; locked: boolean; age_seconds: number | null; requested_at: string | null; running_sha: string; rollback_failed: boolean }
-const deployLabels: Record<string, string> = { request_waiting: "已登记请求，等待更新器领取", request_unacknowledged: "更新器未确认请求，请检查服务或锁", update_started: "更新器已开始检查", update_candidate: "已取得目标提交", update_dependencies: "检查依赖", update_test_build: "测试及构建中", update_restarting: "服务重启及健康验证中", update_ok: "本机部署成功", update_no_change: "已检查，无新提交", update_held: "目标提交被失败保护拦截", update_preflight_failed: "更新前置条件失败", update_fetch_failed: "拉取失败", update_dependencies_failed: "依赖检查失败", update_schema_failed: "数据库结构检查失败", update_test_build_failed: "测试或构建失败", update_restart_failed: "重启或健康检查失败", update_interrupted: "更新进程未完成", running_sha_mismatch: "运行版本与更新记录不一致", unknown: "尚无更新器回执" }
+type DeployStatus = { state: string; event: {at: string; code: string; sha: string; detail?: string} | null; last_successful_deployment?: {at:string; sha:string} | null; locked: boolean; age_seconds: number | null; requested_at: string | null; running_sha: string; rollback_failed: boolean }
+const fetchReasonLabels: Record<string,string> = {proxy:'代理连接异常',authentication:'Git / SSH 认证或主机密钥校验失败',repository_access:'仓库访问失败',dns:'DNS 解析失败',timeout:'连接超时',network:'网络或远端服务异常',unknown:'原因未分类'}
+const deployLabels: Record<string, string> = { request_waiting: "已登记请求，等待更新器领取", request_unacknowledged: "更新器未确认请求，请检查服务或锁", update_started: "更新器已开始检查", update_candidate: "已取得目标提交", update_dependencies: "检查依赖", update_test_build: "测试及构建中", update_restarting: "服务重启及健康验证中", update_ok: "本机部署成功", update_no_change: "已检查，无新提交", update_held: "目标提交被失败保护拦截", update_preflight_failed: "更新前置条件失败", update_fetch_failed: "更新检查拉取失败", update_fetch_retry: "Git 拉取重试中", update_dependencies_failed: "依赖检查失败", update_schema_failed: "数据库结构检查失败", update_test_build_failed: "测试或构建失败", update_restart_failed: "重启或健康检查失败", update_interrupted: "更新进程未完成", running_sha_mismatch: "运行版本与更新记录不一致", unknown: "尚无更新器回执" }
 
 type AppBranding = { workspace_name: string; reference_name: string }
 type UpdateCheck = { state: 'available' | 'current' | 'unavailable'; branch: string; running_sha?: string; remote_sha?: string; reason?: string }
@@ -30,6 +32,8 @@ type Feedback = FeedbackInput & {
   development_finished_at?: string | null; development_submitted_at?: string | null
   overall_status?: string; developer_reply?: string; delivered_sha?: string | null
   developer_pr?: number | null; progress_synced_at?: string | null; progress_stale?: boolean
+  developer_agent?: string | null; developer_actor?: string | null
+  attachments?: {id:string;url:string}[]
   delivery?: Delivery
 }
 const feedbackStatus: Record<string, { label: string; color: string }> = {
@@ -44,7 +48,7 @@ const feedbackStatus: Record<string, { label: string; color: string }> = {
   blocked: { label: '受阻', color: 'error' },
 }
 function FeedbackStatus({ row }: { row: Feedback }) {
-  const state = row.overall_status ?? (row.status === 'synced' ? 'awaiting_claim' : 'pending_sync')
+  const state = row.delivery?.release_acceptance?.decision === 'accepted' ? 'accepted' : row.delivery?.release_acceptance?.decision === 'rejected' ? 'blocked' : row.overall_status ?? (row.status === 'synced' ? 'awaiting_claim' : 'pending_sync')
   const info = feedbackStatus[state] ?? { label: '状态未记录', color: 'default' }
   return <Space size={4} wrap><Tag color={info.color}>{info.label}</Tag>{row.progress_stale && <Tag>待刷新</Tag>}</Space>
 }
@@ -102,6 +106,7 @@ function App() {
   const [page, setPage] = useState<Page>('workspace')
   const [records, setRecords] = useState<Feedback[]>([])
   const [feedbackOpen, setFeedbackOpen] = useState(false)
+  const [screenshots,setScreenshots]=useState<string[]>([])
   const [selectedFeedbackId, setSelectedFeedbackId] = useState<number | null>(null)
   const [feedbackLoading, setFeedbackLoading] = useState(false)
   const selectedFeedback = records.find(row => row.id === selectedFeedbackId)
@@ -351,9 +356,10 @@ function App() {
     setNotice(null)
     try {
       const result = await api<Pick<Feedback, 'id' | 'status'>>(
-        '/api/v1/feedback', { method: 'POST', body: JSON.stringify(values) }, session?.csrf_token,
+        '/api/v1/feedback', { method: 'POST', body: JSON.stringify({...values,screenshots}) }, session?.csrf_token,
       )
       form.resetFields()
+      setScreenshots([])
       setFeedbackOpen(false)
       setNotice({ type: 'success', text: `反馈 #${result.id} 已保存，等待同步到 GitHub。` })
       await loadFeedback()
@@ -368,10 +374,15 @@ function App() {
     if (!signedIn || page !== 'tasks') return
     let active = true
     let pending = false
+    let lastActiveRequest = 0
     const timer = window.setInterval(async () => {
       if (pending) return
       pending = true
       try {
+        if(session && Date.now()-lastActiveRequest>=30000){
+          lastActiveRequest=Date.now()
+          await api('/api/v1/development-tasks/active-refresh',{method:'POST'},session.csrf_token).catch(()=>undefined)
+        }
         const result = await api<TaskSnapshot>('/api/v1/development-tasks')
         if (active) setDevelopmentTasks(result)
       } catch { /* retain last visible snapshot */ }
@@ -387,7 +398,10 @@ function App() {
       if (key === 'releases') setReleaseHistory(await api<ReleaseHistory>('/api/release-notes'))
       else if (key === 'logs') setSystemLogs(await api<SystemLogs>('/api/v1/system-logs'))
       else if (key === 'tasks') {
-        if (refresh && session) await api('/api/v1/development-tasks/refresh', {method:'POST'}, session.csrf_token)
+        if (refresh && session) {
+          await api('/api/v1/development-tasks/active-refresh',{method:'POST'},session.csrf_token)
+          await api('/api/v1/development-tasks/refresh', {method:'POST'}, session.csrf_token)
+        }
         setDevelopmentTasks(await api<TaskSnapshot>('/api/v1/development-tasks'))
       }
       else setProjectInfo(await api<ProjectInfo>(refresh ? '/api/v1/project-info?refresh=true' : '/api/v1/project-info'))
@@ -454,7 +468,12 @@ function App() {
         style={{ marginBottom: 12 }}
         type={deployStatus.rollback_failed || /failed|held|unacknowledged|interrupted|mismatch/.test(deployStatus.state) ? 'warning' : deployStatus.state === 'update_ok' || deployStatus.state === 'update_no_change' ? 'success' : 'info'}
         message={deployStatus.rollback_failed ? '回滚后服务恢复未确认，请查看系统日志' : (deployLabels[deployStatus.state] || '更新状态待核实')}
-        description={deployStatus.event ? (new Date(deployStatus.event.at).toLocaleString() + ' · ' + deployStatus.event.sha.slice(0, 8) + (deployStatus.locked ? ' · 更新锁占用' : '')) : '等待本机更新器回执'} />}
+        description={deployStatus.event ? <Space direction="vertical" size={0}>
+           <span>{new Date(deployStatus.event.at).toLocaleString()} · {deployStatus.event.sha.slice(0,8)}{deployStatus.locked ? ' · 更新锁占用' : ''}</span>
+           {deployStatus.event.detail && <span>原因：{fetchReasonLabels[deployStatus.event.detail] ?? '未分类'}</span>}
+           {deployStatus.state === 'update_fetch_failed' && <span>本次更新检查失败，不等于已运行版本部署失败；当前运行 SHA：{deployStatus.running_sha.slice(0,8)}。更新器后续将重试。</span>}
+           {deployStatus.last_successful_deployment && <span>最近成功部署：{new Date(deployStatus.last_successful_deployment.at).toLocaleString()} · {deployStatus.last_successful_deployment.sha.slice(0,8)}</span>}
+         </Space> : '等待本机更新器回执'} />}
       <Modal title="确认立即部署" open={deployConfirm} onCancel={() => setDeployConfirm(false)}
         onOk={() => void requestUpdate()} okText="确认部署" confirmLoading={requestingUpdate}
         okButtonProps={{ disabled: requestingUpdate || updateCheck?.state !== 'available' ||
@@ -529,6 +548,10 @@ function App() {
         </Space>
       ) : page === 'releases' ? (
         <ReleasePage data={releaseHistory} loading={loadingOperations === 'releases'} onRefresh={() => void loadOperations('releases')}
+          onReject={async (sha,version,reason,screenshots)=>{
+            await api('/api/v1/releases/reject',{method:'POST',body:JSON.stringify({sha,version,reason,screenshots})},session.csrf_token)
+            await loadOperations('releases')
+          }}
           onAccept={async (sha, version) => {
             await api('/api/v1/releases/accept', { method: 'POST', body: JSON.stringify({ sha, version }) }, session.csrf_token)
             await loadOperations('releases')
@@ -555,7 +578,7 @@ function App() {
                   }</Typography.Text></Space> },
                 { title: '执行情况', key: 'executor', width: 220, render: (_, row) =>
                   <Space direction="vertical" size={0}>
-                    <Typography.Text>{row.delivery?.executor.name ?? '负责人未关联'}</Typography.Text>
+                    <Typography.Text>{row.developer_agent ?? (row.developer_actor ? 'GitHub: '+row.developer_actor : '负责人未关联')}</Typography.Text>
                     <Typography.Text type="secondary" style={{fontSize:12}}>{row.delivery?.executor.running === true ? '执行中（有心跳）' :
                       row.delivery?.executor.running === false ? '当前未执行' : '未接通执行器状态'}</Typography.Text>
                   </Space> },
@@ -581,6 +604,7 @@ function App() {
               <Form.Item name="message" label="详细说明" rules={[{ required: true, whitespace: true, min: 5, max: 2000 }]}>
                 <Input.TextArea rows={6} maxLength={2000} showCount placeholder="描述操作步骤、实际结果与预期效果，请勿填写密码或密钥" />
               </Form.Item>
+              <Form.Item label="问题截图"><ScreenshotPicker value={screenshots} onChange={setScreenshots} disabled={busy}/></Form.Item>
               <Space style={{ display: 'flex', justifyContent: 'flex-end' }}>
                 <Button disabled={busy} onClick={() => setFeedbackOpen(false)}>取消</Button>
                 <Button type="primary" htmlType="submit" loading={busy}>提交意见</Button>
@@ -610,6 +634,7 @@ function App() {
                   : '尚未同步' },
               ]} />
               <Card size="small" title="你的意见"><Typography.Paragraph style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginBottom: 0 }}>{selectedFeedback.message}</Typography.Paragraph></Card>
+              {selectedFeedback.attachments?.length ? <Card size="small" title="截图附件"><Space wrap>{selectedFeedback.attachments.map(x=><Image key={x.id} width={120} src={x.url}/>)}</Space></Card> : null}
               <Card size="small" title="开发处理结果">
                 {selectedFeedback.developer_reply ? <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginBottom: 0 }}>{selectedFeedback.developer_reply}</Typography.Paragraph> : <Typography.Text type="secondary">尚无已同步的开发回复。已同步不代表已完成。</Typography.Text>}
                 {selectedFeedback.progress_stale && <Alert type="warning" showIcon message="开发状态尚未刷新，请稍后重试" style={{ marginTop: 12 }} />}
