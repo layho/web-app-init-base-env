@@ -201,27 +201,31 @@ def project_info(response: Response, refresh: bool = False):
 @app.get("/api/v1/development-tasks", dependencies=[Depends(authorize)])
 def list_development_tasks(response: Response, refresh: bool = False):
     response.headers["Cache-Control"] = "no-store"
-    if refresh and pr_tracking.enabled():
-        # Explicit UI refresh bypasses the five-minute local snapshot, but
-        # uses the trusted instance's repository and only GitHub GET reads.
-        # Never show an old snapshot as if the manual refresh succeeded.
-        try:
-            from scripts.sync_development_tasks import sync as sync_issues
-            target = pr_tracking.target()
-            if target is None:
-                raise ValueError("No verified application repository")
-            def read_github(method, path):
-                if method != "GET":
-                    raise ValueError("Read-only task refresh")
-                return release_acceptance.github(path)
-            sync_issues(force=True, repository=target[0], request=read_github)
-            pr_tracking.sync(read_github, force=True)
-        except (release_acceptance.AcceptanceError, OSError, ValueError,
-                TypeError, KeyError):
-            raise HTTPException(503, "GitHub 实时同步失败；仍可查看上次同步记录") from None
+    from scripts.sync_development_tasks import refresh_status
     result = development_tasks.snapshot()
     if pr_tracking.enabled():
+        result["refresh_status"] = refresh_status()
         result["pr_tracking"] = pr_tracking.snapshot()
+        # A completed combined snapshot is authoritative for Issue/PR
+        # association. Deployment state is still calculated from live local
+        # operation evidence by pr_tracking.snapshot.
+        try:
+            combined = json.loads((development_tasks.CACHE_PATH.parent / "task-sync-combined.json").read_text())
+            target = pr_tracking.target()
+            if (target and combined["issues"]["repository"] == target[0]
+                    and (combined["tracking"]["repository"], combined["tracking"]["branch"]) == target):
+                from datetime import datetime, timezone
+                stamp = pr_tracking.instant(combined["issues"]["synced_at"])
+                if (stamp and combined["tracking"]["synced_at"] == combined["issues"]["synced_at"]
+                        and isinstance(combined["issues"]["tasks"], list)
+                        and isinstance(combined["tracking"]["prs"], list)):
+                    result["tasks"] = combined["issues"]["tasks"]
+                    result["synced_at"] = combined["issues"]["synced_at"]
+                    result["pr_tracking"] = pr_tracking.snapshot(combined["tracking"])
+                    result["stale"] = ((datetime.now(timezone.utc) - stamp).total_seconds() > 600
+                                       or result["refresh_status"].get("state") in {"failed", "interrupted"})
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
         # Draft authority differs by repository, but the shared manual
         # MacCI toolbar is available to explicitly allowlisted app workers.
         result["pr_tracking"]["manual_actions_available"] = manual_pr_actions.configured()
@@ -230,6 +234,15 @@ def list_development_tasks(response: Response, refresh: bool = False):
         result["unified"] = True
         result["stale"] = result["stale"] or result["pr_tracking"].get("stale", True)
     return result
+
+
+@app.post("/api/v1/development-tasks/refresh", status_code=202)
+def request_task_refresh(request: Request, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    if not pr_tracking.enabled():
+        raise HTTPException(503, "No verified repository")
+    from scripts.sync_development_tasks import enqueue_refresh
+    return enqueue_refresh()
 
 
 class DraftReleaseIn(BaseModel):

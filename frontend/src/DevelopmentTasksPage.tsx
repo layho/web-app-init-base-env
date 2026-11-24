@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Table, Tabs, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Space, Table, Tabs, Tag, Typography } from 'antd'
 
-type LinkedPR = {number: number; title?: string; url?: string; owner?: string; test?: {state?: string; started_at?: string; finished_at?: string}; merge_state?: string; merged_at?: string | null; merge_sha?: string | null; deployment?: {state?: string; at?: string | null}; conflict?: {blocked?: boolean}}
+type LinkedPR = {number: number; title?: string; url?: string; owner?: string; test?: {state?: string; started_at?: string; finished_at?: string; phase?: string}; merge_state?: string; merged_at?: string | null; merge_sha?: string | null; deployment?: {state?: string; at?: string | null}; conflict?: {blocked?: boolean}}
 type DevelopmentTask = {
   owner?: string
   origin?: string
@@ -15,6 +15,7 @@ type DevelopmentTask = {
   pr_number?: number | null
   delivery_status?: string
   test_state?: string | null
+  test_failures?: {number:number; head?:string; phase?:string; at?:string}[]
   merge_state?: string | null
   deployment_state?: string | null
   number: number
@@ -29,7 +30,7 @@ type DevelopmentTask = {
 
 type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
 type PRTracking = { running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
-export type TaskSnapshot = { synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
+export type TaskSnapshot = { refresh_status?: {state: string; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string; token_health?: Record<string, {state:string; reason?:string; login?:string; permission?:string; remaining?:number; limit?:number; permissions?:Record<string,boolean>; elapsed_seconds?:number}>}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
 const statusColors: Record<string, string> = {
   开发中: 'processing',
@@ -220,7 +221,25 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
 }) {
   const [taskSelected, setTaskSelected] = useState<string | null>(null)
   const selectedTask = data?.tasks.find(task => (task.key ?? 'issue-' + task.number) === taskSelected)
+  const sync = data?.refresh_status
+  const syncing = sync?.state === 'queued' || sync?.state === 'running'
   const tasks = <Flex vertical gap="middle">
+      {sync && sync.state !== 'unknown' && <Alert showIcon
+        type={sync.state === 'failed' || sync.state === 'interrupted' ? 'warning' : sync.state === 'success' ? 'success' : 'info'}
+        message={syncing ? '后台同步中 · 可继续操作' : sync.state === 'success' ? '最近同步成功' : '同步未完成 · 保留已有记录'}
+        description={`阶段：${sync.phase ?? '等待领取'}；GitHub 请求：${sync.requests ?? 0}；耗时：${sync.elapsed_seconds ?? 0}秒${sync.reason ? '；原因：' + sync.reason : ''}`}/>}
+
+      {sync?.token_health && Object.keys(sync.token_health).length > 0 && <Card size="small" title="GitHub Token 健康检测 · 最近手动同步">
+        <Descriptions size="small" column={1} items={Object.entries(sync.token_health).map(([key, item])=>({
+          key, label: ({identity:'REST 身份',rate_limit:'API 额度',repository:'仓库读取权限',graphql:'GraphQL 读取'} as Record<string,string>)[key] ?? key,
+          children: <Space wrap><Tag color={item.state==='ok'?'success':'error'}>{item.state==='ok'?'通过':'失败'}</Tag>
+            {item.login ?? item.permission ?? item.reason ?? ''}
+            {item.remaining != null ? `${item.remaining}/${item.limit}` : ''}
+            {item.permissions ? Object.entries(item.permissions).map(([k,v])=>`${k}:${v?'是':'否'}`).join('；') : ''}
+            {item.elapsed_seconds != null ? `${item.elapsed_seconds}秒` : ''}</Space>
+        }))}/>
+        <Typography.Text type="secondary">只读检测，不代表已验证写入或合并授权；点击立即同步可重新检测。</Typography.Text>
+      </Card>}
       {data?.stale && <Alert type="warning" showIcon message={
         data?.synced_at ? '同步已延迟，以下为上次成功获取的记录。' : '等待从 GitHub 同步开发任务。'
       } />}
@@ -245,8 +264,11 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
             <Tag>{task.source === 'pr' ? '代码任务' : task.origin === 'feedback' ? '意见反馈' : '需求任务'}</Tag> },
           { title: '当前阶段', width: 205, render: (_, task: DevelopmentTask) =>
             <Tag color={statusColors[task.status] ?? 'default'}>{task.delivery_status ?? task.status}</Tag> },
-          { title: '测试', width: 92, render: (_, task: DevelopmentTask) =>
-            task.test_state ? ciTag(task.test_state) : '—' },
+          { title: '测试', width: 220, render: (_, task: DevelopmentTask) =>
+            task.test_failures?.length ? <Flex vertical gap={4}>{task.test_failures.map(f=><div key={f.number}>
+              <Tag color="error">#{f.number} {phaseLabels[f.phase ?? ''] ?? '测试失败'}</Tag>
+              <Typography.Text type="secondary">{formatDate(f.at ?? null)} · {f.head?.slice(0,7) ?? 'SHA 未记录'}</Typography.Text>
+            </div>)}</Flex> : task.test_state ? ciTag(task.test_state) : '—' },
           { title: '合并', width: 100, render: (_, task: DevelopmentTask) =>
             task.merge_state ? <Tag>{mergeLabels[task.merge_state] ?? task.merge_state}</Tag> : '—' },
           { title: '部署', width: 115, render: (_, task: DevelopmentTask) =>
@@ -256,7 +278,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
         ]}
       />
     </Flex>
-  return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading}>刷新列表</Button>}>
+  return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading} disabled={syncing}>{syncing ? "同步中" : "立即同步"}</Button>}>
     {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'统一任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage tasks={data.tasks} data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
     <Drawer title={selectedTask ? '#' + selectedTask.number + ' · 完整交付链路' : '交付链路'}
       open={taskSelected !== null} onClose={() => setTaskSelected(null)} width="min(720px, 100vw)">
@@ -277,6 +299,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
           <Descriptions size="small" column={1} items={[
             {key:'dev',label:'开发负责人',children:pr.owner || '未指定'},
             {key:'ci',label:'MacCI 测试',children:ciLabels[pr.test?.state || 'unknown'] || '尚未核实'},
+            {key:'phase',label:'测试阶段',children:phaseLabels[pr.test?.phase ?? ''] ?? '未记录'},
             {key:'start',label:'测试开始',children:formatDate(pr.test?.started_at ?? null)},
             {key:'end',label:'测试结束',children:formatDate(pr.test?.finished_at ?? null)},
             {key:'branch',label:'开发分支',children:data?.pr_tracking?.prs.find(r=>r.number===pr.number)?.head_branch ?? '未记录'},

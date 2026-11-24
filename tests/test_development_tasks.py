@@ -230,3 +230,91 @@ def test_force_issue_refresh_uses_verified_repository_and_bypasses_cache(tmp_pat
     assert len(calls) == 2
     sync_development_tasks.sync(force=True, repository="owner/verified", request=request)
     assert len(calls) == 4
+
+
+def test_incremental_sync_reuses_only_unchanged_same_repo_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    calls = []
+    issue = {**ISSUE, "comments": 1, "updated_at": "2026-11-24T00:00:00Z"}
+    def request(method, path):
+        calls.append(path)
+        if "/comments?" in path:
+            return [{"id": 1, "author_association": "OWNER",
+                     "user": {"login": "owner"},
+                     "created_at": "2026-11-24T00:00:00Z",
+                     "updated_at": "2026-11-24T00:00:00Z",
+                     "body": '[APP_PROGRESS] {"status":"claimed","agent":"Codex"}'}]
+        return [issue]
+    def run(repo):
+        sync_development_tasks.sync(force=True, repository=repo, request=request, incremental=True)
+    run("owner/one")
+    assert len(calls) == 2
+    run("owner/one")
+    assert len(calls) == 3
+    assert development_tasks.snapshot()["tasks"][0]["owner"] == "Codex"
+    issue["updated_at"] = "2026-11-24T00:01:00Z"
+    run("owner/one")
+    assert len(calls) == 5
+    run("owner/two")
+    assert len(calls) == 7
+    assert development_tasks.snapshot()["tasks"][0]["url"].startswith("https://github.com/owner/two/")
+
+
+def test_enqueue_refresh_deduplicates_and_reports_spawn_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    calls = []
+    def spawn(*args, **kwargs):
+        calls.append(args)
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", spawn)
+    assert sync_development_tasks.enqueue_refresh()["state"] == "queued"
+    assert sync_development_tasks.enqueue_refresh()["state"] == "queued"
+    assert len(calls) == 1
+    sync_development_tasks.write_status({"state": "success"})
+    def fail(*args, **kwargs):
+        raise OSError("spawn failed")
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", fail)
+    assert sync_development_tasks.enqueue_refresh()["state"] == "failed"
+
+
+def test_missing_issue_is_visible_and_not_misrepresented_as_independent_pr():
+    rows = development_tasks.unified_tasks([], {"repository": "owner/repo", "prs": [
+        {"number": 129, "linked_issues": [128], "merge_state": "draft",
+         "test": {"state": "success"}}]})
+    assert len(rows) == 1
+    assert rows[0]["number"] == 128
+    assert rows[0]["issue_missing"] is True
+    assert rows[0]["owner"] == "待同步"
+    assert rows[0]["pr_numbers"] == [129]
+    assert rows[0]["delivery_status"] == "关联 Issue 待同步"
+
+
+def test_token_health_uses_read_queries_and_sanitized_results(monkeypatch):
+    from app import release_acceptance
+    def request(method, path):
+        assert method == "GET"
+        if path == "/user":
+            return {"login": "owner", "token": "secret"}
+        if path == "/rate_limit":
+            return {"resources": {"core": {"remaining": 123, "limit": 5000}}}
+        return {"permissions": {"pull": True, "push": False}}
+    def graphql(path, data):
+        assert path == "/graphql"
+        assert data["query"].startswith("query(")
+        assert data["variables"] == {"owner":"owner", "name":"repo"}
+        return {"data":{"repository":{"viewerPermission":"READ"}}}
+    monkeypatch.setattr(release_acceptance, "github", graphql)
+    result = sync_development_tasks.token_health("owner/repo", request)
+    assert all(x["state"] == "ok" for x in result.values())
+    assert result["rate_limit"]["remaining"] == 123
+    assert result["graphql"]["permission"] == "READ"
+    assert "secret" not in str(result)
+
+
+def test_task_displays_exact_frontend_failure_even_if_issue_not_synced():
+    rows = development_tasks.unified_tasks([], {"repository":"owner/repo", "prs":[
+        {"number":129, "linked_issues":[128], "head":"a"*40, "merge_state":"draft",
+         "test":{"state":"failure", "phase":"frontend-failed", "finished_at":"2026-11-24T12:09:38Z"}}]})
+    assert rows[0]["number"] == 128
+    assert rows[0]["test_state"] == "failure"
+    assert rows[0]["test_failures"][0]["phase"] == "frontend-failed"
+    assert rows[0]["test_failures"][0]["head"] == "a"*40
