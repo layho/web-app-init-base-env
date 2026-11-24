@@ -10,19 +10,21 @@ from app import development_tasks, pr_tracking
 from scripts.sync_feedback import REPO, github
 
 
-def sync() -> None:
+def sync(*, force=False, repository=None, request=None) -> None:
+    repository = repository or REPO
+    request = request or github
     cache = development_tasks.CACHE_PATH
     now = datetime.now(timezone.utc)
     previous = development_tasks.snapshot()
-    if previous["synced_at"] and now - datetime.fromisoformat(previous["synced_at"]) < development_tasks.REFRESH_INTERVAL:
+    if not force and previous["synced_at"] and now - datetime.fromisoformat(previous["synced_at"]) < development_tasks.REFRESH_INTERVAL:
         return
 
     tasks = []
     page = 1
     page_size = 100
     while True:
-        query = urlencode({"state": "all", "per_page": page_size, "page": page, "sort": "updated"})
-        issues = github("GET", f"/repos/{REPO}/issues?{query}")
+        query = urlencode({"state": "all", "per_page": page_size, "page": page, "sort": "created", "direction": "asc"})
+        issues = request("GET", f"/repos/{repository}/issues?{query}")
         if not isinstance(issues, list):
             raise ValueError("Unexpected issue page")
         for issue in issues:
@@ -35,14 +37,14 @@ def sync() -> None:
             if type(issue.get("comments")) is int and issue["comments"] > 0:
                 comment_page = 1
                 while True:
-                    batch = github("GET", f"/repos/{REPO}/issues/{issue['number']}/comments?per_page=100&page={comment_page}")
+                    batch = request("GET", f"/repos/{repository}/issues/{issue['number']}/comments?per_page=100&page={comment_page}")
                     if not isinstance(batch, list):
                         raise ValueError("Unexpected Issue comments")
                     comments.extend(batch)
                     if len(batch) < 100:
                         break
                     comment_page += 1
-            task = development_tasks.parse_issue(issue, REPO, comments)
+            task = development_tasks.parse_issue(issue, repository, comments)
             if task:
                 tasks.append(task)
         if len(issues) < page_size:
