@@ -284,8 +284,25 @@ def valid_token(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_]{20,300}", value) is not None
 
 
+def shared_token_path():
+    """Explicit opt-in: a private, same-user host credential; never use a symlink."""
+    root = Path.home() / ".local/share/macmini-github"
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("Unsafe shared GitHub credential directory")
+    path = root / "github-token"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    return path
+
+
 def read_token():
-    fd = os.open(TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = os.open(shared_token_path() or TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "r", encoding="ascii") as f:
         info = os.fstat(f.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()

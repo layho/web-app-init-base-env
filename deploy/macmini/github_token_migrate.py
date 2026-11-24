@@ -17,6 +17,75 @@ NAMES = ("APP_GITHUB_TOKEN", "APP_GITHUB_PR_TOKEN", "APP_GITHUB_FEEDBACK_TOKEN")
 KEY = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
 
 
+def private_read(path, limit):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > limit:
+            raise ValueError("凭据文件权限或大小不安全")
+        return stream.read()
+
+
+def shared_migrate(root, apply=False):
+    """Inspect and stage a canonical token, never overwrite legacy consumers."""
+    from hmac import compare_digest
+    root = root.resolve()
+    values = {}
+    for line in private_read(root / ".env", 1024*1024).splitlines():
+        match = KEY.fullmatch(line)
+        if not match or match[1] not in (*NAMES, "APP_PUBLIC_ORIGIN"):
+            continue
+        name, raw = match.groups()
+        if name in values:
+            raise ValueError("重复配置项")
+        parts = shlex.split(raw, comments=True)
+        if len(parts) != 1:
+            raise ValueError("配置格式无效")
+        values[name] = parts[0]
+    if values.get("APP_PUBLIC_ORIGIN") != "https://base.layho.com":
+        raise ValueError("仅支持基座验收站")
+    token = next((values[name] for name in NAMES if values.get(name)), "")
+    if not re.fullmatch(r"[A-Za-z0-9_]{20,300}", token):
+        raise ValueError("基座 Token 格式无效")
+    home = Path.home() / ".local/share"
+    destination = home / "macmini-github"
+    for label, file in (("MacCI",home/"macmini-pr-tests/github-token"),
+                        ("升级调度器",home/"macmini-foundation-upgrades/github-token"),
+                        ("统一凭据",destination/"github-token")):
+        try:
+            old = private_read(file,512).strip()
+        except FileNotFoundError:
+            print(label + "：未配置")
+        else:
+            print(label + ("：与基座一致" if compare_digest(old,token) else "：与基座不同"))
+    if not apply:
+        print("只读检查结束；不代表 GraphQL 写权限已验证")
+        return
+    # Explicit activation only; never replace a different existing canonical token.
+    destination.mkdir(mode=0o700, exist_ok=True)
+    info = destination.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode)!=0o700:
+        raise ValueError("统一凭据目录权限不安全")
+    path = destination/"github-token"
+    try:
+        existing = private_read(path,512).strip()
+    except FileNotFoundError:
+        fd, temp = tempfile.mkstemp(prefix=".github-token-", dir=destination)
+        try:
+            with os.fdopen(fd,"w",encoding="ascii") as stream:
+                stream.write(token+"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Atomic no-overwrite publication, even if another migration runs.
+            os.link(temp,path)
+        finally:
+            os.unlink(temp)
+    else:
+        if not compare_digest(existing,token):
+            raise ValueError("已有不同统一凭据，拒绝覆盖")
+    print("统一凭据已准备；原文件未修改。新版服务启用后需逐项验证真实写权限。")
+
+
 def migrate(root: Path, apply: bool = False) -> Path | None:
     root = root.resolve()
     env = root / ".env"
@@ -87,9 +156,13 @@ def migrate(root: Path, apply: bool = False) -> Path | None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--shared", action="store_true", help="核对或准备统一宿主凭据")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     args = parser.parse_args()
     try:
-        migrate(args.root, args.apply)
+        if args.shared:
+            shared_migrate(args.root, args.apply)
+        else:
+            migrate(args.root, args.apply)
     except (ValueError, OSError) as exc:
         raise SystemExit("安全停止：" + str(exc))

@@ -239,8 +239,25 @@ def inherited_lock(fd):
         yield
 
 
+def shared_token_path():
+    """Explicit opt-in: a private, same-user host credential; never use a symlink."""
+    root = Path.home() / ".local/share/macmini-github"
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("Unsafe shared GitHub credential directory")
+    path = root / "github-token"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    return path
+
+
 def token_file():
-    return ROOT / 'github-token'
+    return shared_token_path() or ROOT / 'github-token'
 
 
 def main():
@@ -268,9 +285,14 @@ def main():
     if args.lock_fd is not None and (args.configure or args.pr is None or not args.force):
         parser.error('--lock-fd requires an explicit forced PR test')
     path = token_file()
-    if path.is_symlink() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
-        raise SystemExit('Unsafe token file permissions')
-    token = path.read_text().strip()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "r", encoding="ascii") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 512:
+            raise SystemExit("Unsafe token file permissions")
+        token = stream.read().strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,300}", token):
+        raise SystemExit("Invalid credential format")
     docker_command()
     subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
     try:
