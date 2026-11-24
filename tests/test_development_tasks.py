@@ -274,3 +274,15 @@ def test_enqueue_refresh_deduplicates_and_reports_spawn_failure(tmp_path, monkey
         raise OSError("spawn failed")
     monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", fail)
     assert sync_development_tasks.enqueue_refresh()["state"] == "failed"
+
+
+def test_missing_issue_is_visible_and_not_misrepresented_as_independent_pr():
+    rows = development_tasks.unified_tasks([], {"repository": "owner/repo", "prs": [
+        {"number": 129, "linked_issues": [128], "merge_state": "draft",
+         "test": {"state": "success"}}]})
+    assert len(rows) == 1
+    assert rows[0]["number"] == 128
+    assert rows[0]["issue_missing"] is True
+    assert rows[0]["owner"] == "待同步"
+    assert rows[0]["pr_numbers"] == [129]
+    assert rows[0]["delivery_status"] == "关联 Issue 待同步"

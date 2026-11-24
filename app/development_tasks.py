@@ -119,6 +119,16 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
     real_issues = [t for t in issue_tasks if isinstance(t, dict)
                    and type(t.get("number")) is int and t["number"] > 0]
     known_issue_numbers = {t["number"] for t in real_issues}
+    # An explicit reference must remain visible even when the Issue cache
+    # is older than the PR cache. These placeholders are not Issue evidence.
+    missing = sorted({n for p in prs for n in pr_linked_issues(p)} - known_issue_numbers)
+    repo = tracking.get("repository") if isinstance(tracking, dict) else None
+    if isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        for n in missing:
+            real_issues.append({"number": n, "title": "关联 Issue 待同步",
+                "url": f"https://github.com/{repo}/issues/{n}", "owner": "待同步",
+                "status": "待同步", "issue_missing": True, "completed_steps": 0,
+                "total_steps": 0, "updated_at": None, "note": "PR 已存在，Issue 尚未核实"})
     attached: set[int] = set()
     result = []
     for task in real_issues:
@@ -130,7 +140,9 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
         tests = [p.get("test", {}).get("state", "unknown") for p in linked]
         merges = [p.get("merge_state", "unknown") for p in linked]
         deploys = [(p.get("deployment") or {}).get("state", "unverified") for p in linked]
-        if not linked:
+        if task.get("issue_missing"):
+            stage = "关联 Issue 待同步"
+        elif not linked:
             stage = task.get("status", "未记录开发状态")
         elif any((p.get("conflict") or {}).get("blocked") for p in linked):
             stage = "关联代码存在冲突"

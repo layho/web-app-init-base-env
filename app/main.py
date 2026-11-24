@@ -206,6 +206,19 @@ def list_development_tasks(response: Response, refresh: bool = False):
     if pr_tracking.enabled():
         result["refresh_status"] = refresh_status()
         result["pr_tracking"] = pr_tracking.snapshot()
+        # A completed combined snapshot is authoritative for Issue/PR
+        # association. Deployment state is still calculated from live local
+        # operation evidence by pr_tracking.snapshot.
+        try:
+            combined = json.loads((development_tasks.CACHE_PATH.parent / "task-sync-combined.json").read_text())
+            target = pr_tracking.target()
+            if (target and combined["issues"]["repository"] == target[0]
+                    and (combined["tracking"]["repository"], combined["tracking"]["branch"]) == target):
+                result["tasks"] = combined["issues"]["tasks"]
+                result["synced_at"] = combined["issues"]["synced_at"]
+                result["stale"] = result["stale"] or result["refresh_status"].get("state") == "failed"
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
         # Draft authority differs by repository, but the shared manual
         # MacCI toolbar is available to explicitly allowlisted app workers.
         result["pr_tracking"]["manual_actions_available"] = manual_pr_actions.configured()

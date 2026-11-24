@@ -14,7 +14,7 @@ from app import development_tasks, pr_tracking
 from scripts.sync_feedback import REPO, github
 
 
-def sync(*, force=False, repository=None, request=None, incremental=False) -> None:
+def sync(*, force=False, repository=None, request=None, incremental=False, collect_only=False):
     repository = repository or REPO
     request = request or github
     cache = development_tasks.CACHE_PATH
@@ -43,29 +43,47 @@ def sync(*, force=False, repository=None, request=None, incremental=False) -> No
                     and old.get("comment_count") == issue.get("comments")):
                 tasks.append(old)
                 continue
-            comments = []
-            if type(issue.get("comments")) is int and issue["comments"] > 0:
-                comment_page = 1
-                while True:
-                    batch = request("GET", f"/repos/{repository}/issues/{issue['number']}/comments?per_page=100&page={comment_page}")
-                    if not isinstance(batch, list):
-                        raise ValueError("Unexpected Issue comments")
-                    comments.extend(batch)
-                    if len(batch) < 100:
-                        break
-                    comment_page += 1
-            task = development_tasks.parse_issue(issue, repository, comments)
+            task = fetch_task(issue, repository, request)
             if task:
-                task['comment_count'] = issue.get('comments')
                 tasks.append(task)
         if len(issues) < page_size:
             break
         page += 1
 
+    data = {"synced_at": datetime.now(timezone.utc).isoformat(), "repository": repository, "tasks": tasks}
+    if collect_only:
+        return data
+    write_json(cache, data)
+
+
+def fetch_task(issue, repository, request):
+    comments = []
+    if type(issue.get("comments")) is int and issue["comments"] > 0:
+        page = 1
+        seen = set()
+        while True:
+            batch = request("GET", f"/repos/{repository}/issues/{issue['number']}/comments?per_page=100&page={page}")
+            if not isinstance(batch, list):
+                raise ValueError("Unexpected Issue comments")
+            ids = {x["id"] for x in batch}
+            if len(batch) == 100 and not (ids - seen):
+                raise ValueError("Issue comment pagination did not advance")
+            seen.update(ids)
+            comments.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+    task = development_tasks.parse_issue(issue, repository, comments)
+    if task:
+        task["comment_count"] = issue.get("comments")
+    return task
+
+
+def write_json(cache, data):
     cache.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache.parent, delete=False) as temp:
         try:
-            json.dump({"synced_at": datetime.now(timezone.utc).isoformat(), "repository": repository, "tasks": tasks}, temp, ensure_ascii=False)
+            json.dump(data, temp, ensure_ascii=False)
             temp.close()
             os.replace(temp.name, cache)
         finally:
@@ -156,10 +174,35 @@ def run_refresh(force=False):
         try:
             if target is None:
                 raise ValueError("No verified repository")
-            sync(force=True, repository=target[0], request=request, incremental=not force)
+            issues = sync(force=True, repository=target[0], request=request,
+                          incremental=not force, collect_only=True)
             state["phase"] = "pulls"
             write_status(state)
-            pr_tracking.sync(request, force=True)
+            cached = {} if force else {p["number"]: p for p in tracking.get("prs", [])}
+            prs = pr_tracking.collect(request, *target, cached=cached)
+            state["phase"] = "reconcile"
+            write_status(state)
+            known = {t["number"] for t in issues["tasks"]}
+            missing = {n for p in prs for n in development_tasks.pr_linked_issues(p)} - known
+            for n in sorted(missing):
+                try:
+                    issue = request("GET", f"/repos/{target[0]}/issues/{n}")
+                except release_acceptance.AcceptanceError as exc:
+                    if str(exc).startswith("GH-REST-404"):
+                        continue
+                    raise
+                if issue.get("number") != n or "pull_request" in issue:
+                    continue
+                task = fetch_task(issue, target[0], request)
+                if task:
+                    issues["tasks"].append(task)
+            stamp = datetime.now(timezone.utc).isoformat()
+            issues["synced_at"] = stamp
+            pr_data = {"synced_at": stamp, "repository": target[0], "branch": target[1], "prs": prs}
+            # One atomic publication is authoritative for the unified page.
+            write_json(folder / "task-sync-combined.json", {"issues": issues, "tracking": pr_data})
+            write_json(development_tasks.CACHE_PATH, issues)
+            write_json(pr_tracking.CACHE, pr_data)
             state["state"] = "success"
         except (release_acceptance.AcceptanceError, OSError, ValueError, TypeError, KeyError) as exc:
             state["state"] = "failed"

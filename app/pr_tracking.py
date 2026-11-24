@@ -191,7 +191,7 @@ def list_all_prs(github, prefix):
         page += 1
 
 
-def collect(github, repo=None, branch=None):
+def collect(github, repo=None, branch=None, *, cached=None):
     current = target() if repo is None else (repo, branch or "main")
     if current is None or not valid_repository(current[0]):
         raise ValueError("No verified application repository")
@@ -204,6 +204,7 @@ def collect(github, repo=None, branch=None):
     if not valid_sha(latest_sha):
         raise ValueError("Invalid current branch")
     rows = []
+    cached = cached or {}
     for listing in prs:
         number = listing["number"]
         # GitHub's list endpoint may omit mergeable/mergeable_state. Refresh
@@ -232,18 +233,32 @@ def collect(github, repo=None, branch=None):
             base = latest_sha
         merged = bool(pr.get("merged_at"))
         merge = pr.get("merge_commit_sha") if merged else None
-        if merged and valid_sha(merge):
+        old = cached.get(number, {})
+        # The merge object is immutable. Reuse only exact verified parents;
+        # status receipts remain live and must be fetched for open PRs.
+        if merged and valid_sha(merge) and old.get("merge_sha") == merge and old.get("head") == head and valid_sha(old.get("base")):
+            base = old["base"]
+        elif merged and valid_sha(merge):
             commit = github("GET", prefix + "/git/commits/" + merge)
             parents = [p["sha"] for p in commit["parents"]]
             # Closed PR base ref may advance. Use the actual merged parents.
             base = parents[0] if len(parents) == 2 and parents[1] == head and valid_sha(parents[0]) else None
+        if (merged and old.get("merge_sha") == merge and old.get("head") == head
+                and old.get("github_updated_at") == pr.get("updated_at")
+                and pr.get("updated_at") and old.get("base") == base
+                and old.get("test", {}).get("state") == "success"):
+            # Historical success is display evidence, never merge authority.
+            # Manual refresh bypasses this cache.
+            rows.append({**old, "title": str(pr.get("title", ""))[:300],
+                         "linked_issues": explicit_issue_refs(pr.get("body"))})
+            continue
         statuses = github("GET", prefix + "/commits/" + head + "/statuses?per_page=100")
         if not isinstance(statuses, list):
             raise ValueError("Invalid statuses")
         test = evidence(statuses, base) if valid_sha(base) else {"state": "unknown"}
         log = log_summary(number, head, base, test, repo)
         rows.append({"number": number, "title": str(pr.get("title", ""))[:300],
-                     "created_at": pr.get("created_at"),
+                     "created_at": pr.get("created_at"), "github_updated_at": pr.get("updated_at"),
                      "url": "https://github.com/" + repo + "/pull/" + str(number),
                      "owner": str((pr.get("user") or {}).get("login") or "未指定")[:100],
                      "linked_issues": explicit_issue_refs(pr.get("body")),
