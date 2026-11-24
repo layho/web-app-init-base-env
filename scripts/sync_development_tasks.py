@@ -33,9 +33,15 @@ def sync() -> None:
             # Do not fabricate ownership from the GitHub account alone.
             comments = []
             if type(issue.get("comments")) is int and issue["comments"] > 0:
-                comments = github("GET", f"/repos/{REPO}/issues/{issue['number']}/comments?per_page=100")
-                if not isinstance(comments, list):
-                    raise ValueError("Unexpected Issue comments")
+                comment_page = 1
+                while True:
+                    batch = github("GET", f"/repos/{REPO}/issues/{issue['number']}/comments?per_page=100&page={comment_page}")
+                    if not isinstance(batch, list):
+                        raise ValueError("Unexpected Issue comments")
+                    comments.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    comment_page += 1
             task = development_tasks.parse_issue(issue, REPO, comments)
             if task:
                 tasks.append(task)
