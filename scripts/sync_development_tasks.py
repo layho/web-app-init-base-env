@@ -11,7 +11,7 @@ from tempfile import NamedTemporaryFile
 from urllib.error import URLError
 from urllib.parse import urlencode
 
-from app import development_tasks, pr_tracking
+from app import development_tasks, pr_tracking, release_acceptance
 from scripts.sync_feedback import REPO, github
 
 
@@ -41,7 +41,8 @@ def sync(*, force=False, repository=None, request=None, incremental=False, colle
             # Do not fabricate ownership from the GitHub account alone.
             old = cached.get(issue["number"])
             if (old and issue.get("updated_at") and old.get("updated_at") == issue["updated_at"]
-                    and old.get("comment_count") == issue.get("comments")):
+                    and old.get("comment_count") == issue.get("comments")
+                    and (not issue.get("title","").startswith("[BASE-") or "release_evidence" in old)):
                 tasks.append(old)
                 continue
             task = fetch_task(issue, repository, request)
@@ -75,6 +76,8 @@ def fetch_task(issue, repository, request):
                 break
             page += 1
     task = development_tasks.parse_issue(issue, repository, comments)
+    if task and repository == release_acceptance.REPO:
+        task["release_evidence"] = release_acceptance.collect_release_evidence(issue, comments)
     if task:
         task["comment_count"] = issue.get("comments")
     return task
@@ -234,7 +237,14 @@ def run_refresh(force=False):
                     issues["tasks"].append(task)
             stamp = datetime.now(timezone.utc).isoformat()
             issues["synced_at"] = stamp
-            pr_data = {"synced_at": stamp, "repository": target[0], "branch": target[1], "prs": prs}
+            evidence = {}
+            for task in issues["tasks"]:
+                event = task.get("release_evidence")
+                if event:
+                    previous = evidence.get(event["candidate_sha"])
+                    if previous is None or event["at"] > previous["at"]:
+                        evidence[event["candidate_sha"]] = event
+            pr_data = {"synced_at": stamp, "repository": target[0], "branch": target[1], "prs": prs, "release_evidence": evidence}
             # One atomic publication is authoritative for the unified page.
             write_json(development_tasks.CACHE_PATH, issues)
             write_json(pr_tracking.CACHE, pr_data)

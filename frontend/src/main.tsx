@@ -48,7 +48,7 @@ const feedbackStatus: Record<string, { label: string; color: string }> = {
   blocked: { label: '受阻', color: 'error' },
 }
 function FeedbackStatus({ row }: { row: Feedback }) {
-  const state = row.overall_status ?? (row.status === 'synced' ? 'awaiting_claim' : 'pending_sync')
+  const state = row.delivery?.release_acceptance?.decision === 'accepted' ? 'accepted' : row.delivery?.release_acceptance?.decision === 'rejected' ? 'blocked' : row.overall_status ?? (row.status === 'synced' ? 'awaiting_claim' : 'pending_sync')
   const info = feedbackStatus[state] ?? { label: '状态未记录', color: 'default' }
   return <Space size={4} wrap><Tag color={info.color}>{info.label}</Tag>{row.progress_stale && <Tag>待刷新</Tag>}</Space>
 }

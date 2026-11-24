@@ -321,7 +321,7 @@ def test_task_displays_exact_frontend_failure_even_if_issue_not_synced():
 
 
 def test_closed_unmerged_pr_not_active_failure_or_waiting_merge():
-    issue = development_tasks.parse_issue(ISSUE, "owner/repo")
+    issue = development_tasks.parse_issue({**ISSUE, "number":42}, "owner/repo")
     result = development_tasks.unified_tasks([issue], {"prs": [
         {"number":16,"linked_issues":[42],"merge_state":"closed","test":{"state":"failure","phase":"dependencies-failed"}}
     ]})[0]

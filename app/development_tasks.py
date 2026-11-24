@@ -168,6 +168,10 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             stage = "部署失败"
         elif any(x not in {"running", "deployed"} for x in deploys):
             stage = "代码已合并 · 部署待核验"
+        elif active and all((p.get("acceptance") or {}).get("decision") == "accepted" for p in active):
+            stage = "用户验收通过 · 已正式发布" if all((p.get("acceptance") or {}).get("published_at") for p in active) else "用户验收通过 · 待正式发布"
+        elif any((p.get("acceptance") or {}).get("decision") == "rejected" for p in active):
+            stage = "验收不通过 · 待修复"
         else:
             stage = "代码已部署 · 待验收确认"
         result.append({
@@ -213,4 +217,4 @@ def pr_detail(pr: dict) -> dict:
     return {key: pr.get(key) for key in
             ("number", "title", "url", "owner", "head", "base", "test",
              "merge_state", "merge_sha", "merged_at", "deployment", "conflict",
-             "linked_issues", "review_state", "reviewed_at", "accepted_at")}
+             "linked_issues", "review_state", "reviewed_at", "accepted_at", "acceptance")}

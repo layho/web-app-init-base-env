@@ -2,6 +2,7 @@
 
 The web service intentionally has no Contents-write or PR-merge credential.
 """
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -221,7 +222,7 @@ def submit(sha, version, deployed):
         issue = found.get("number")
         if type(issue) is not int or issue <= 0:
             raise AcceptanceError("GitHub 未返回有效验收单号")
-        save_receipt(sha, {"issue": issue})
+        save_receipt(sha, {"issue": issue, "decision": "accepted", "at": found.get("created_at") or datetime.now(timezone.utc).isoformat(), "test_head": evidence["test_head"]})
         return {"enabled": True, "state": "queued", "issue": issue}
 
 def reject(sha, version, reason, images):
@@ -262,5 +263,69 @@ def reject(sha, version, reason, images):
         issue=found.get("number")
         if type(issue) is not int or issue<=0:
             raise AcceptanceError("GitHub 未返回修复任务编号")
-        save_receipt(sha,{"decision":"rejected","issue":issue,"reason":reason,"attachments":attachments})
+        save_receipt(sha,{"decision":"rejected","issue":issue,"reason":reason,"attachments":attachments,"at":found.get("created_at") or datetime.now(timezone.utc).isoformat()})
         return state(sha)
+
+def local_decision(sha, head):
+    """Fast local evidence only. Legacy receipts are recovered by the worker."""
+    if not enabled() or not valid_sha(sha) or not valid_sha(head):
+        return None
+    try:
+        receipt = load_receipt(sha)
+        if not receipt or not isinstance(receipt.get("at"), str):
+            return None
+        if receipt.get("decision") == "accepted" and receipt.get("test_head") == head:
+            return {"decision":"accepted","at":receipt["at"],"issue":receipt.get("issue"),"candidate_sha":sha}
+        if receipt.get("decision") == "rejected":
+            return {"decision":"rejected","at":receipt["at"],"issue":receipt.get("issue"),"candidate_sha":sha}
+    except (AcceptanceError, OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def collect_release_evidence(issue, comments):
+    """Validate an owner-authored exact-candidate acceptance/rejection issue."""
+    if issue.get("author_association") != "OWNER" or (issue.get("user") or {}).get("login") != "layho":
+        return None
+    title = re.fullmatch(r"\[BASE-(ACCEPTANCE|REJECTION) ([0-9a-f]{40})\]", issue.get("title") or "")
+    if not title:
+        return None
+    kind, sha = title.groups()
+    marker = "[BASE_ACCEPTANCE] " if kind == "ACCEPTANCE" else "[BASE_REJECTION] "
+    body = issue.get("body") or ""
+    if not body.startswith(marker):
+        return None
+    try:
+        data = json.loads(body[len(marker):])
+        at = datetime.fromisoformat(issue["created_at"].replace("Z","+00:00"))
+        if at.tzinfo is None:
+            return None
+        if not isinstance(data,dict) or data.get("schema") != 1 or data.get("candidate_sha") != sha:
+            return None
+        if type(issue.get("number")) is not int:
+            return None
+        out={"decision":"accepted" if kind=="ACCEPTANCE" else "rejected","candidate_sha":sha,
+             "at":at.isoformat(),"issue":issue["number"]}
+        if kind=="REJECTION":
+            return out if isinstance(data.get("reason"),str) and len(data["reason"].strip())>=5 else None
+        keys={"schema","candidate_sha","expected_main_sha","version","test_head","test_base","tested_merge","tree"}
+        if set(data)!=keys or not all(valid_sha(data[k]) for k in keys-{"schema","version"}):
+            return None
+        out["test_head"]=data["test_head"]
+        # Publication has a separate trusted receipt and must match the candidate.
+        for c in comments:
+            if c.get("author_association")!="OWNER" or (c.get("user") or {}).get("login")!="layho":
+                continue
+            if c.get("updated_at")!=c.get("created_at"):
+                continue
+            text=c.get("body") or ""
+            if not text.startswith("[BASE_PUBLISHED] "):
+                continue
+            event=json.loads(text[len("[BASE_PUBLISHED] "):])
+            if event=={"candidate_sha":sha,"main_sha":sha,"executor":"macci-main-publish"}:
+                stamp=datetime.fromisoformat(c["created_at"].replace("Z","+00:00"))
+                if stamp.tzinfo and stamp>=at:
+                    out["published_at"]=stamp.isoformat()
+        return out
+    except (ValueError,KeyError,TypeError,AttributeError):
+        return None
