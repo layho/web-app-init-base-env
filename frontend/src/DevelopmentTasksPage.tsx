@@ -30,7 +30,7 @@ type DevelopmentTask = {
   note: string
 }
 
-type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null; failure_report?: {run_id:string; failures:{file:string;category:string;test?:string;line?:number;column?:number}[]}|null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
+type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null; progress?: {phase:string;heartbeat_at:string;heartbeat_stale:boolean;elapsed_seconds:number}|null; failure_report?: {run_id:string; failures:{file:string;category:string;test?:string;line?:number;column?:number}[]}|null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
 type PRTracking = { active_synced_at?: string; history_synced_at?: string|null; running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
 export type TaskSnapshot = { refresh_status?: {state: string; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string; token_health?: Record<string, {state:string; reason?:string; login?:string; permission?:string; remaining?:number; limit?:number; permissions?:Record<string,boolean>; elapsed_seconds?:number}>}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
@@ -50,6 +50,7 @@ const ciLabels: Record<string, string> = { success: '通过', pending: '测试�
 const mergeLabels: Record<string, string> = { merged: '已合并', draft: '草稿 · 等待开发审查', open: '待合并', closed: '已关闭' }
 const deployLabels: Record<string, string> = { running: '当前运行', deployed: '曾成功部署', failed: '部署失败 / 回退', unverified: '待核验', not_merged: '尚未合并' }
 const phaseLabels: Record<string, string> = { pending: '正在测试', passed: '后端测试、编译及前端构建通过', 'setup-failed': '环境准备失败', 'fetch-failed': '候选代码拉取失败', 'context-failed': '构建上下文失败', 'dependencies-failed': '依赖安装 / 镜像构建失败', 'pytest-failed': '后端测试失败', 'compile-failed': 'Python 编译失败', 'frontend-failed': '前端构建失败', 'test-failed': '容器测试失败', 'ref-changed': '分支已变更，回执无效' }
+const progressLabels: Record<string,string>={setup:'准备环境',fetch:'拉取精确候选',context:'准备构建上下文',dependencies:'依赖安装 / 镜像构建',test:'隔离容器测试及构建',cleanup:'清理测试环境'}
 function duration(seconds?: number | null) { return seconds == null ? '未记录' : seconds < 60 ? seconds + '秒' : Math.floor(seconds / 60) + '分' + seconds % 60 + '秒' }
 function passRate(row: PRRecord) {
   const c = row.log?.pytest
@@ -139,10 +140,10 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
           ? <Tag color="error" title="GitHub 已记录本 HEAD 的 MacCI 异常，精确测试回执尚未核实">异常 · 精确回执待核对</Tag>
           : row.test.state === 'unknown' && row.head_status?.state === 'success'
           ? <Tag color="warning" title="GitHub 显示 success，但缺少与当前 base/merge 匹配的可信测试回执">成功信号 · 基线未核实</Tag>
-          : <Flex vertical gap={2}>{ciTag(row.test.state)}{row.test.phase&&<Typography.Text type="secondary">{phaseLabels[row.test.phase]??row.test.phase}</Typography.Text>}</Flex>},
+          : <Flex vertical gap={2}>{ciTag(row.test.state)}{row.test.phase&&<Typography.Text type="secondary">{progressLabels[row.test.progress?.phase??'']??phaseLabels[row.test.phase]??row.test.phase}</Typography.Text>}{row.test.progress?.heartbeat_stale && <Tag color="warning">心跳超时 · 待核查</Tag>}</Flex>},
       {title: '测试开始', width: 165, render: (_,row) => formatDate(row.test.started_at ?? null)},
       {title: '测试结束', width: 165, render: (_,row) => formatDate(row.test.finished_at ?? null)},
-      {title: '耗时', width: 95, render: (_,row) => duration(row.test.duration_seconds)},
+      {title: '耗时', width: 95, render: (_,row) => duration(row.test.progress?.elapsed_seconds ?? row.test.duration_seconds)},
       {title: '通过率', width: 95, render: (_,row) => passRate(row)},
       {title: '合并', width: 122, render: (_,row) => row.conflict?.blocked ?
         <Tag color="error" title="Draft 已解除，但与当前 preview 存在冲突，MacCI/自动合并将暂停">存在冲突 · 待修复</Tag> :
@@ -203,10 +204,11 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
         <Descriptions bordered size="small" column={1} items={[
           {key:'status',label:'测试状态',children: selected.conflict?.blocked ? <Tag color="error">冲突阻止测试</Tag> : ciTag(selected.test.state)},
           {key:'conflict',label:'合并门禁',children:selected.conflict?.blocked ? <Button danger onClick={() => {setSelectedNumber(null);setRepairNumber(selected.number)}}>查看并处理冲突</Button> : '未确认冲突'},
-          {key:'stage',label:'测试阶段',children:phaseLabels[selected.test.phase ?? ''] ?? '未记录'},
+          {key:'stage',label:'测试阶段',children:progressLabels[selected.test.progress?.phase??'']??phaseLabels[selected.test.phase ?? ''] ?? '未记录'},
+          {key:'heartbeat',label:'最近心跳',children:selected.test.progress ? <Space>{formatDate(selected.test.progress.heartbeat_at)}{selected.test.progress.heartbeat_stale&&<Tag color="warning">超时 · 待核查</Tag>}</Space> : '未记录'},
           {key:'start',label:'开始时间',children:formatDate(selected.test.started_at ?? null)},
           {key:'end',label:'结束时间',children:formatDate(selected.test.finished_at ?? null)},
-          {key:'duration',label:'测试耗时',children:duration(selected.test.duration_seconds)},
+          {key:'duration',label:'测试耗时',children:duration(selected.test.progress?.elapsed_seconds ?? selected.test.duration_seconds)},
           {key:'rate',label:'Pytest 通过率',children:passRate(selected)},
           {key:'head',label:'PR HEAD',children:<Typography.Text copyable code style={{overflowWrap:'anywhere'}}>{selected.head}</Typography.Text>},
           {key:'base',label:'测试基线',children:selected.base ?? '未记录'},

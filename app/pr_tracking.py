@@ -96,6 +96,33 @@ def evidence(statuses, base):
             "phase": match[3], "tested_merge": match[2] if valid_sha(match[2]) else None}
 
 
+def advisory_progress(statuses, base, candidate, test, owner, now=None):
+    """Advisory heartbeat must belong to the current pending attempt."""
+    if test.get("state") != "pending" or not valid_sha(candidate):
+        return None
+    started = instant(test.get("started_at"))
+    if not started:
+        return None
+    now = now or datetime.now(timezone.utc)
+    rows = []
+    for item in statuses:
+        if (item.get("context") != "macmini/progress-v1" or item.get("state")!="pending"
+                or (item.get("creator") or {}).get("login")!=owner):
+            continue
+        match=STATUS.fullmatch(item.get("description") or "")
+        at=instant(item.get("created_at"))
+        if (match and match[1]==base and match[2]==candidate and
+            match[3] in {"setup","fetch","context","dependencies","test","cleanup"}
+            and at and started<=at<=now):
+            rows.append((at,match[3]))
+    if not rows:
+        return None
+    at,phase=max(rows,key=lambda x:x[0])
+    return {"phase":phase,"heartbeat_at":at.isoformat(),
+            "heartbeat_stale":(now-at).total_seconds()>120,
+            "elapsed_seconds":max(0,int((now-started).total_seconds()))}
+
+
 def head_status_diagnostic(statuses):
     """Describe latest GitHub MacCI signal separately from exact-base evidence.
 
@@ -309,6 +336,8 @@ def collect(github, repo=None, branch=None, *, cached=None, listings=None):
         if not isinstance(statuses, list):
             raise ValueError("Invalid statuses")
         test = evidence(statuses, base) if valid_sha(base) else {"state": "unknown"}
+        if pr.get("state") == "open":
+            test["progress"] = advisory_progress(statuses,base,pr.get("merge_commit_sha"),test,repo.split("/")[0])
         log = log_summary(number, head, base, test, repo)
         if test.get("state") in {"failure","error"} and test.get("tested_merge"):
             comments = github("GET", prefix + "/issues/" + str(number) + "/comments?per_page=100")

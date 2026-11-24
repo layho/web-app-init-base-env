@@ -12,6 +12,7 @@ import subprocess
 import stat
 import tarfile
 import time
+import threading
 from tempfile import TemporaryDirectory
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 import uuid
@@ -167,7 +168,7 @@ def docker_command():
     return endpoint
 
 
-def test_candidate(repo, pr, log):
+def test_candidate(repo, pr, log, progress=lambda phase: None):
     head, base = identity(pr)
     job = 'macci-' + uuid.uuid4().hex
     image = job + ':test'
@@ -183,6 +184,7 @@ def test_candidate(repo, pr, log):
             with TemporaryDirectory(prefix='macci-') as folder:
                 gitdir, context = Path(folder) / 'repo.git', Path(folder) / 'context.tar'
                 phase = 'fetch'
+                progress(phase)
                 run(['git', 'init', '--bare', str(gitdir)], log)
                 env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes'}
                 fetch_merge_ref(gitdir, repo, pr["number"], log, env)
@@ -191,11 +193,14 @@ def test_candidate(repo, pr, log):
                 if merge != pr['merge_commit_sha']:
                     raise RuntimeError('Candidate SHA changed before testing')
                 phase = 'context'
+                progress(phase)
                 make_context(gitdir, merge, context)
                 phase = 'dependencies'
+                progress(phase)
                 with context.open('rb') as source:
                     run(docker + ['build', '--file', '.macci.Dockerfile', '--tag', image, '-'], log, timeout=1800, stdin=source, env=docker_env)
                 phase = 'test'
+                progress(phase)
                 run(docker + ['run', '--name', job, '--network', 'none', '--cap-drop', 'ALL',
                      '--security-opt', 'no-new-privileges', '--pids-limit', '256', '--memory', '3g', '--cpus', '2', image], log, timeout=1200, env=docker_env)
             return 'success', merge, 'passed'
@@ -302,6 +307,46 @@ def flush_reports(token):
             path.unlink()
         except (OSError,ValueError,KeyError,TypeError):
             print("MacCI report delivery pending; will retry",flush=True)
+
+
+PROGRESS_CONTEXT = "macmini/progress-v1"
+PROGRESS_PHASES = {"setup","fetch","context","dependencies","test","cleanup"}
+
+
+class Progress:
+    """Independent advisory status. Never replace the authoritative test context."""
+    def __init__(self, token, repo, head, base, merge):
+        self.token, self.repo, self.head = token, repo, head
+        self.base, self.merge = base, merge
+        self.phase = "setup"
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.heartbeat, daemon=True)
+
+    def send(self):
+        try:
+            api(self.token,f"/repos/{self.repo}/statuses/{self.head}",{
+                "state":"pending","context":PROGRESS_CONTEXT,
+                "description":description(self.base,self.merge,self.phase)})
+        except (OSError,ValueError,TypeError):
+            print("MacCI advisory progress unavailable",flush=True)
+
+    def update(self, phase):
+        if phase in PROGRESS_PHASES:
+            self.phase=phase
+            self.send()
+
+    def heartbeat(self):
+        while not self.stop.wait(30):
+            self.send()
+
+    def __enter__(self):
+        self.send()
+        self.thread.start()
+        return self
+
+    def __exit__(self,*args):
+        self.stop.set()
+        self.thread.join(timeout=35)
 
 
 def status(token, repo, head, base, merge, state, detail=None):
@@ -424,7 +469,8 @@ def main():
                     started=time.time()
                     with logfile.open('a', encoding='utf-8') as log:
                         offset=log.tell()
-                        state, merge, detail = test_candidate(repo, pr, log)
+                        with Progress(token,repo,head,base,expected_merge) as progress:
+                            state, merge, detail = test_candidate(repo, pr, log, progress.update)
                     # Restrict extraction to this attempt and a bounded tail.
                     with logfile.open('rb') as stream:
                         stream.seek(max(offset,logfile.stat().st_size-262144))

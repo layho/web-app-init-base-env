@@ -121,5 +121,15 @@ class ReportTests(unittest.TestCase):
         raw="\n".join("FAILED tests/test_x.py::test_"+str(i) for i in range(30))
         self.assertLessEqual(len(runner.failure_summary(raw,"pytest-failed")),12)
 
+class ProgressTests(unittest.TestCase):
+    def test_progress_uses_separate_context(self):
+        with patch.object(runner,"api") as api:
+            progress=runner.Progress("fake",REPO,HEAD,BASE,MERGE)
+            progress.update("dependencies")
+            payload=api.call_args.args[2]
+            self.assertEqual(payload["context"],"macmini/progress-v1")
+            self.assertEqual(payload["state"],"pending")
+            self.assertIn("dependencies",payload["description"])
+
 if __name__ == "__main__":
     unittest.main()
