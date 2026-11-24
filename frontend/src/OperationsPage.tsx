@@ -133,7 +133,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
       okButtonProps={{danger:true,disabled:!canReject||reason.trim().length<5}} onOk={async()=>{
         if(!data||!canReject||rejecting||!rejectTarget||data.running_sha!==rejectTarget.sha||data.version!==rejectTarget.version){setRejectError('候选已变化，请重新打开验收窗口');return}
         setRejecting(true);setRejectError('')
-        try{await onReject(rejectTarget.sha,rejectTarget.version,reason,screenshots);setRejectOpen(false);setReason('');setScreenshots([])}
+        try{await onReject(rejectTarget.sha,rejectTarget.version,reason,screenshots);setRejectTarget(null);setReason('');setScreenshots([])}
         catch(e){setRejectError(e instanceof Error?e.message:'提交失败')}
         finally{setRejecting(false)}
       }}>
