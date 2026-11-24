@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.1.36",
+    "title": "统一开发任务与反馈交付证据",
+    "summary": "将意见反馈纳入任务清单，展示开发 Agent、关联 Issue/PR、领取时间和交付 SHA，区分提交回执缺失、PR 同步等待及 HEAD 不匹配。",
+    "changes": [
+      "统一可信 APP_PROGRESS 回执解析与 Agent 声明，保留真实 GitHub 作者。",
+      "测试追踪展示关联开发任务，交付详情展示领取时间及代码 SHA。",
+      "反馈交付诊断区分回执缺失、PR 未同步、版本变更，保持精确 SHA 测试和部署门禁。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对 Issue #122 与 PR #125 对应关系、负责人及历史回执时间。",
+      "验证最新 HEAD/base/merge MacCI、前端构建、同步诊断和旧 SHA 拒绝。",
+      "实际部署后核对运行 SHA，再人工验收发布 main。"
+    ],
+    "validation_note": "候选版本；未确认完整 MacCI、合并、部署或验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/122"
+  },
+  {
     "version": "0.1.35",
     "title": "基座与衍生应用统一任务追踪及手动 MacCI 操作",
     "summary": "修复衍生应用虽复用基座同样代码却因基座专属能力门禁隐藏手动立即执行的问题；将手动测试和安全合并指向当前应用受保护的独立 MacCI 服务，并支持明确刷新 GitHub 的 PR 状态，防止刚合并后仍显示待合并。",
