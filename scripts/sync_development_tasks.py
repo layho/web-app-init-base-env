@@ -4,6 +4,7 @@ import fcntl
 import time
 import subprocess
 import sys
+import re
 import json
 import os
 from tempfile import NamedTemporaryFile
@@ -145,6 +146,35 @@ def enqueue_refresh():
             return refresh_status()
 
 
+def token_health(repository, request):
+    """Read-only checks using the actual server credential; no secret is returned."""
+    from app import release_acceptance
+    result = {}
+    def check(label, call, extract):
+        started = time.monotonic()
+        try:
+            obj = call()
+            result[label] = {"state": "ok", **extract(obj)}
+        except (release_acceptance.AcceptanceError, OSError, ValueError, KeyError, TypeError) as exc:
+            result[label] = {"state": "failed", "reason": str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else type(exc).__name__}
+        result[label]["elapsed_seconds"] = round(time.monotonic() - started, 2)
+    check("identity", lambda: request("GET", "/user"), lambda o: {"login": o["login"]})
+    check("rate_limit", lambda: request("GET", "/rate_limit"),
+          lambda o: {"remaining": o["resources"]["core"]["remaining"], "limit": o["resources"]["core"]["limit"]})
+    check("repository", lambda: request("GET", "/repos/" + repository),
+          lambda o: {"permissions": {k: v for k, v in o.get("permissions", {}).items()
+                                     if k in {"admin", "maintain", "push", "triage", "pull"} and type(v) is bool}})
+    owner, name = repository.split("/")
+    # GraphQL POST carries a fixed read query, never a mutation.
+    query = 'query($owner:String!,$name:String!){viewer{login} repository(owner:$owner,name:$name){viewerPermission}}'
+    def graphql_fields(o):
+        if o.get("errors") or not o.get("data", {}).get("repository"):
+            raise ValueError("GraphQL read failed")
+        return {"permission": o["data"]["repository"]["viewerPermission"]}
+    check("graphql", lambda: release_acceptance.github("/graphql", {"query": query, "variables": {"owner": owner, "name": name}}), graphql_fields)
+    return result
+
+
 def run_refresh(force=False):
     from app import release_acceptance
     folder = development_tasks.CACHE_PATH.parent
@@ -163,6 +193,7 @@ def run_refresh(force=False):
                 return 0
         start = time.monotonic()
         state = {"state": "running", "phase": "issues", "requests": 0,
+                 "token_health": refresh_status().get("token_health", {}),
                  "started_at": datetime.now(timezone.utc).isoformat()}
         write_status(state)
         def request(method, path):
@@ -174,6 +205,11 @@ def run_refresh(force=False):
         try:
             if target is None:
                 raise ValueError("No verified repository")
+            if force:
+                state["phase"] = "token_health"
+                state["token_health"] = token_health(target[0], request)
+                state["phase"] = "issues"
+                write_status(state)
             issues = sync(force=True, repository=target[0], request=request,
                           incremental=not force, collect_only=True)
             state["phase"] = "pulls"
@@ -200,9 +236,9 @@ def run_refresh(force=False):
             issues["synced_at"] = stamp
             pr_data = {"synced_at": stamp, "repository": target[0], "branch": target[1], "prs": prs}
             # One atomic publication is authoritative for the unified page.
-            write_json(folder / "task-sync-combined.json", {"issues": issues, "tracking": pr_data})
             write_json(development_tasks.CACHE_PATH, issues)
             write_json(pr_tracking.CACHE, pr_data)
+            write_json(folder / "task-sync-combined.json", {"issues": issues, "tracking": pr_data})
             state["state"] = "success"
         except (release_acceptance.AcceptanceError, OSError, ValueError, TypeError, KeyError) as exc:
             state["state"] = "failed"

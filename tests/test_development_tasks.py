@@ -286,3 +286,25 @@ def test_missing_issue_is_visible_and_not_misrepresented_as_independent_pr():
     assert rows[0]["owner"] == "待同步"
     assert rows[0]["pr_numbers"] == [129]
     assert rows[0]["delivery_status"] == "关联 Issue 待同步"
+
+
+def test_token_health_uses_read_queries_and_sanitized_results(monkeypatch):
+    from app import release_acceptance
+    def request(method, path):
+        assert method == "GET"
+        if path == "/user":
+            return {"login": "owner", "token": "secret"}
+        if path == "/rate_limit":
+            return {"resources": {"core": {"remaining": 123, "limit": 5000}}}
+        return {"permissions": {"pull": True, "push": False}}
+    def graphql(path, data):
+        assert path == "/graphql"
+        assert data["query"].startswith("query(")
+        assert data["variables"] == {"owner":"owner", "name":"repo"}
+        return {"data":{"repository":{"viewerPermission":"READ"}}}
+    monkeypatch.setattr(release_acceptance, "github", graphql)
+    result = sync_development_tasks.token_health("owner/repo", request)
+    assert all(x["state"] == "ok" for x in result.values())
+    assert result["rate_limit"]["remaining"] == 123
+    assert result["graphql"]["permission"] == "READ"
+    assert "secret" not in str(result)

@@ -298,10 +298,11 @@ def sync(github, *, force=False):
                 os.unlink(out.name)
 
 
-def snapshot():
+def snapshot(data=None):
     current = target()
     try:
-        data = json.loads(CACHE.read_text(encoding="utf-8"))
+        if data is None:
+            data = json.loads(CACHE.read_text(encoding="utf-8"))
         dt = instant(data["synced_at"])
         if (current is None or data.get("repository") != current[0]
                 or data.get("branch") != current[1]

@@ -214,9 +214,16 @@ def list_development_tasks(response: Response, refresh: bool = False):
             target = pr_tracking.target()
             if (target and combined["issues"]["repository"] == target[0]
                     and (combined["tracking"]["repository"], combined["tracking"]["branch"]) == target):
-                result["tasks"] = combined["issues"]["tasks"]
-                result["synced_at"] = combined["issues"]["synced_at"]
-                result["stale"] = result["stale"] or result["refresh_status"].get("state") == "failed"
+                from datetime import datetime, timezone
+                stamp = pr_tracking.instant(combined["issues"]["synced_at"])
+                if (stamp and combined["tracking"]["synced_at"] == combined["issues"]["synced_at"]
+                        and isinstance(combined["issues"]["tasks"], list)
+                        and isinstance(combined["tracking"]["prs"], list)):
+                    result["tasks"] = combined["issues"]["tasks"]
+                    result["synced_at"] = combined["issues"]["synced_at"]
+                    result["pr_tracking"] = pr_tracking.snapshot(combined["tracking"])
+                    result["stale"] = ((datetime.now(timezone.utc) - stamp).total_seconds() > 600
+                                       or result["refresh_status"].get("state") in {"failed", "interrupted"})
         except (OSError, ValueError, TypeError, KeyError):
             pass
         # Draft authority differs by repository, but the shared manual
