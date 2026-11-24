@@ -247,7 +247,8 @@ def collect(github, repo=None, branch=None):
                      "url": "https://github.com/" + repo + "/pull/" + str(number),
                      "owner": str((pr.get("user") or {}).get("login") or "未指定")[:100],
                      "linked_issues": explicit_issue_refs(pr.get("body")),
-                     "head": head, "base": base, "test": test, "log": log,
+                     "head": head, "base": base, "head_branch": pr["head"].get("ref"),
+                     "base_branch": pr["base"].get("ref"), "test": test, "log": log,
                      "head_status": head_status_diagnostic(statuses),
                      "merge_state": "merged" if merged else "closed" if pr.get("state") == "closed" else "draft" if pr.get("draft") else "open",
                      "merge_blocked": blocked,
@@ -302,5 +303,6 @@ def snapshot():
                              "running" if sha and sha == running and event and event["code"] in {"install_ok", "update_ok"} else
                              "deployed" if event and event["code"] in {"install_ok", "update_ok"} else
                              "failed" if event else "unverified", "at": event["at"] if event else None}
-    return {**data, "can_release_draft": current == (REPO, "preview"),
+    return {**data, "running_sha": running if valid_sha(running) else None,
+            "can_release_draft": current == (REPO, "preview"),
             "stale": (datetime.now(timezone.utc) - dt).total_seconds() > 600}
