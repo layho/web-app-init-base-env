@@ -15,7 +15,7 @@ EVENT_CODES = {
     "install_ok", "install_failed", "update_ok", "update_blocked",
     "rollback", "rollback_ok", "rollback_failed", "feedback_ok", "feedback_failed",
     "update_started", "update_candidate", "update_dependencies", "update_test_build", "update_restarting",
-    "update_locked", "update_no_change", "update_held", "update_preflight_failed", "update_fetch_failed",
+    "update_locked", "update_no_change", "update_held", "update_preflight_failed", "update_fetch_failed", "update_fetch_retry",
     "update_dependencies_failed", "update_schema_failed", "update_test_build_failed", "update_restart_failed",
 }
 
@@ -29,9 +29,9 @@ def recent_operations(path: Path, *, deployments_only: bool = False) -> list[dic
     with stream:
         for line in stream:
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != 3:
+            if len(fields) not in (3, 4):
                 continue
-            timestamp, code, sha = fields
+            timestamp, code, sha = fields[:3]
             if code not in EVENT_CODES or not re.fullmatch(r"[0-9a-f]{40}", sha):
                 continue
             if deployments_only and code not in {"install_ok", "update_ok"}:
@@ -42,7 +42,10 @@ def recent_operations(path: Path, *, deployments_only: bool = False) -> list[dic
                 continue
             if instant.tzinfo is None:
                 continue
-            events.append({"at": instant.isoformat(), "code": code, "sha": sha})
+            event = {"at": instant.isoformat(), "code": code, "sha": sha}
+            if len(fields) == 4 and code in {"update_fetch_failed", "update_fetch_retry"} and fields[3] in {"proxy", "authentication", "repository_access", "dns", "timeout", "network", "unknown"}:
+                event["detail"] = fields[3]
+            events.append(event)
     return list(reversed(events))
 
 
@@ -88,7 +91,7 @@ def request_update(target: str):
     )
 
 
-UPDATE_PROGRESS = {"update_started", "update_candidate", "update_dependencies", "update_test_build", "update_restarting"}
+UPDATE_PROGRESS = {"update_fetch_retry", "update_started", "update_candidate", "update_dependencies", "update_test_build", "update_restarting"}
 UPDATE_TERMINAL = {"update_ok", "update_no_change", "update_held", "update_preflight_failed",
                    "update_fetch_failed", "update_dependencies_failed", "update_schema_failed",
                    "update_test_build_failed", "update_restart_failed"}
@@ -126,4 +129,5 @@ def deploy_status(running_sha):
     return {"state": state, "event": last, "locked": locked, "age_seconds": age,
             "requested_at": datetime.fromtimestamp(requested, timezone.utc).isoformat() if requested is not None else None,
             "running_sha": running_sha,
+            "last_successful_deployment": next((e for e in events if e["code"] in {"install_ok", "update_ok"}), None),
             "rollback_failed": bool(rollback_failed and rollback_failed["code"] == "rollback_failed")}

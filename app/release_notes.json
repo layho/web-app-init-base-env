@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.1.38",
+    "title": "验收修复：任务状态、筛选及更新器诊断",
+    "summary": "针对 V0.1.37 验收未通过的问题修正历史 PR 状态与任务操作体验，并增加 Git 拉取重试和安全故障分类。",
+    "changes": [
+      "最新任务优先，支持状态筛选与任务/PR/负责人搜索。",
+      "关闭未合并的 PR 不再显示待合并或作为当前失败；历史证据仍保留。",
+      "Git 拉取失败分级分类，临时异常有限重试；当前运行版本与更新检查分别展示。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对 #128 负责人及 #129 合并部署证据，#16 已关闭历史记录。",
+      "验证筛选搜索及临时拉取失败后自动恢复。",
+      "MacCI 通过后，按拒绝候选的安全替换流程部署，重新人工验收。"
+    ],
+    "validation_note": "V0.1.37 未通过验收；不得发布旧候选。当前版本尚未测试或部署。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/130"
+  },
+  {
     "version": "0.1.37",
     "title": "任务列表后台刷新与同步状态",
     "summary": "将全量 GitHub 同步移出网页请求，显示后台真实状态并防止重复执行。",

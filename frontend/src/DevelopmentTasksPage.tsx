@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Space, Table, Tabs, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Select, Input, Space, Table, Tabs, Tag, Typography } from 'antd'
 
 type LinkedPR = {number: number; title?: string; url?: string; owner?: string; test?: {state?: string; started_at?: string; finished_at?: string; phase?: string}; merge_state?: string; merged_at?: string | null; merge_sha?: string | null; deployment?: {state?: string; at?: string | null}; conflict?: {blocked?: boolean}}
 type DevelopmentTask = {
   owner?: string
+  issue_state?: string
   origin?: string
   github_actor?: string
   claimed_at?: string
@@ -16,6 +17,7 @@ type DevelopmentTask = {
   delivery_status?: string
   test_state?: string | null
   test_failures?: {number:number; head?:string; phase?:string; at?:string}[]
+  historical_test_failures?: {number:number; head?:string; phase?:string; at?:string}[]
   merge_state?: string | null
   deployment_state?: string | null
   number: number
@@ -220,6 +222,20 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   onRequestRepair: (number: number, head: string, base: string) => Promise<{url: string; created: boolean}>
 }) {
   const [taskSelected, setTaskSelected] = useState<string | null>(null)
+  const [filter, setFilter] = useState('all')
+  const [search, setSearch] = useState('')
+  const category = (t: DevelopmentTask) => {
+    if (t.status === '已完成') return 'done'
+    if (t.status === '已关闭' || (t.source === 'pr' && t.merge_state === 'closed')) return 'closed'
+    if (t.test_failures?.length || t.status === '受阻' || t.delivery_status?.includes('冲突') || t.delivery_status?.includes('失败')) return 'blocked'
+    if (t.merge_state === 'merged' || (t.status === '待验收' && t.test_state === 'success')) return 'review'
+    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.status === '开发中') return 'active'
+    return 'todo'
+  }
+  const visibleTasks = [...(data?.tasks ?? [])].filter(t =>
+    (filter === 'all' || category(t) === filter) &&
+    (!search.trim() || [t.number, t.title, t.owner, ...(t.pr_numbers ?? [])].join(' ').toLowerCase().includes(search.trim().replace(/^#/, '').toLowerCase()))
+  ).sort((a,b)=>b.number-a.number)
   const selectedTask = data?.tasks.find(task => (task.key ?? 'issue-' + task.number) === taskSelected)
   const sync = data?.refresh_status
   const syncing = sync?.state === 'queued' || sync?.state === 'running'
@@ -244,11 +260,20 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
         data?.synced_at ? '同步已延迟，以下为上次成功获取的记录。' : '等待从 GitHub 同步开发任务。'
       } />}
       {data?.synced_at && <Typography.Text type="secondary">GitHub 最近同步 {formatDate(data.synced_at)}</Typography.Text>}
+      <Space wrap>
+        <Input.Search allowClear placeholder="搜索任务、PR 或负责人" value={search} onChange={e=>setSearch(e.target.value)} style={{width:240}}/>
+        <Select value={filter} onChange={setFilter} style={{width:155}} options={[
+          {value:'all',label:'全部任务'},{value:'todo',label:'待开发'},{value:'active',label:'开发中'},
+          {value:'blocked',label:'受阻 / 失败'},{value:'review',label:'待验收 / 发布'},
+          {value:'done',label:'已完成'},{value:'closed',label:'已关闭'}
+        ]}/>
+        <Typography.Text type="secondary">{visibleTasks.length} 条 · 最新编号优先</Typography.Text>
+      </Space>
       <Table
         rowKey={task => task.key ?? 'issue-' + task.number}
         size="small"
         loading={loading}
-        dataSource={data?.tasks ?? []}
+        dataSource={visibleTasks}
         scroll={{ x: 1600 }}
         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={
           data?.synced_at ? '暂无开发任务或 PR 记录' : '暂无同步记录'
@@ -268,7 +293,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
             task.test_failures?.length ? <Flex vertical gap={4}>{task.test_failures.map(f=><div key={f.number}>
               <Tag color="error">#{f.number} {phaseLabels[f.phase ?? ''] ?? '测试失败'}</Tag>
               <Typography.Text type="secondary">{formatDate(f.at ?? null)} · {f.head?.slice(0,7) ?? 'SHA 未记录'}</Typography.Text>
-            </div>)}</Flex> : task.test_state ? ciTag(task.test_state) : '—' },
+            </div>)}</Flex> : task.historical_test_failures?.length ? <Tag>历史失败 · 已关闭 PR</Tag> : task.test_state ? ciTag(task.test_state) : '—' },
           { title: '合并', width: 100, render: (_, task: DevelopmentTask) =>
             task.merge_state ? <Tag>{mergeLabels[task.merge_state] ?? task.merge_state}</Tag> : '—' },
           { title: '部署', width: 115, render: (_, task: DevelopmentTask) =>

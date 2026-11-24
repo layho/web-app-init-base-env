@@ -351,3 +351,32 @@ def test_read_only_update_check_unavailable_on_bad_git_response(monkeypatch):
                         SimpleNamespace(stdout="bad-sha\trefs/heads/main\n"))
     assert operations.check_available_update("a" * 40)["state"] == "unavailable"
     assert operations.check_available_update("unknown")["state"] == "unavailable"
+
+
+def test_fetch_error_classification_and_retry_without_secret_leak(tmp_path):
+    script = SCRIPT.read_text()
+    funcs = script[script.index("fetch_reason() {"):script.index("finish_update() {")]
+    program = funcs + r'''
+set -euo pipefail
+UPDATE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+UPDATE_DETAIL=
+log() { echo "$*"; }
+record_operation() { echo "$*"; }
+sleep() { :; }
+git() {
+  if ! test -e attempted; then
+    touch attempted
+    echo 'Connection reset secret-example-token' >&2
+    return 1
+  fi
+  return 0
+}
+fetch_with_retry
+test "$(fetch_reason 'Permission denied (publickey)')" = authentication
+test "$(fetch_reason 'Could not resolve host')" = dns
+test "$(fetch_reason 'Could not resolve proxy')" = proxy
+'''
+    result = subprocess.run(["bash","-c",program],cwd=tmp_path,capture_output=True,text=True)
+    assert result.returncode == 0, result.stderr
+    assert "update_fetch_retry" in result.stdout
+    assert "secret-example-token" not in result.stdout + result.stderr

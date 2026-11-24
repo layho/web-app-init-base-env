@@ -54,7 +54,7 @@ def parse_issue(issue: dict, repository: str, comments: list[dict] | None = None
         "number": number,
         "title": issue["title"],
         "url": f"https://github.com/{repository}/issues/{number}",
-        "status": state,
+        "status": state, "issue_state": issue.get("state"),
         "completed_steps": sum(mark != " " for mark in checks),
         "total_steps": len(checks),
         "updated_at": issue.get("updated_at"),
@@ -144,14 +144,21 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
         referenced |= {p["number"] for p in prs if number in pr_linked_issues(p)}
         linked = [by_number[n] for n in sorted(referenced) if n in by_number]
         attached.update(p["number"] for p in linked)
-        tests = [p.get("test", {}).get("state", "unknown") for p in linked]
-        merges = [p.get("merge_state", "unknown") for p in linked]
-        deploys = [(p.get("deployment") or {}).get("state", "unverified") for p in linked]
+        # Closed, unmerged attempts remain in the drawer but no longer
+        # participate in active delivery gates.
+        active = [p for p in linked if p.get("merge_state") != "closed"]
+        tests = [p.get("test", {}).get("state", "unknown") for p in active]
+        merges = [p.get("merge_state", "unknown") for p in active]
+        deploys = [(p.get("deployment") or {}).get("state", "unverified") for p in active]
         if task.get("issue_missing"):
             stage = "关联 Issue 待同步"
+        elif task.get("status") in {"已完成", "已关闭"}:
+            stage = task["status"]
+        elif linked and not active:
+            stage = "关联 PR 已关闭 · 待重新开发"
         elif not linked:
             stage = task.get("status", "未记录开发状态")
-        elif any((p.get("conflict") or {}).get("blocked") for p in linked):
+        elif any((p.get("conflict") or {}).get("blocked") for p in active):
             stage = "关联代码存在冲突"
         elif any(x in {"failure", "error"} for x in tests):
             stage = "关联代码测试失败"
@@ -168,11 +175,12 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             "pr_number": None, "pr_numbers": [p["number"] for p in linked],
             "prs": [pr_detail(p) for p in linked], "owner": task.get("owner") or "未指定",
             "delivery_status": stage,
-            "test_failures": test_failures(linked),
+            "test_failures": test_failures(active),
+            "historical_test_failures": test_failures([p for p in linked if p.get("merge_state") == "closed"]),
             "test_state": "failure" if any(x in {"failure", "error"} for x in tests) else "pending" if "pending" in tests else
                           "success" if tests and all(x == "success" for x in tests) else None,
             "merge_state": "merged" if merges and all(x == "merged" for x in merges) else
-                           "open" if merges else None,
+                           "draft" if "draft" in merges else "open" if merges else "closed" if linked else None,
             "deployment_state": "running" if deploys and all(x == "running" for x in deploys) else
                                 "unverified" if deploys else None,
         })
@@ -192,7 +200,8 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             "completed_steps": 0, "total_steps": 0,
             "updated_at": pr.get("merged_at") or test.get("finished_at") or test.get("started_at"),
             "note": stage, "test_state": test.get("state", "unknown"),
-            "test_failures": test_failures([pr]),
+            "test_failures": test_failures([pr]) if pr.get("merge_state") != "closed" else [],
+            "historical_test_failures": test_failures([pr]) if pr.get("merge_state") == "closed" else [],
             "merge_state": pr.get("merge_state", "unknown"),
             "deployment_state": deploy, "head": pr.get("head"), "base": pr.get("base"),
         })

@@ -38,9 +38,13 @@ FEEDBACK="$LABEL_PREFIX.feedback"
 LOCK="$ROOT/.webapp-deploy.lock"
 mkdir -p "$ROOT/logs"
 record_operation() {
-  local code="$1" sha="$2" stamp
+  local code="$1" sha="$2" stamp detail="${3:-}"
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 0
   stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if test -n "$detail"; then
+    printf '%s\t%s\t%s\t%s\n' "$stamp" "$code" "$sha" "$detail" >> logs/operations.tsv || log 'Could not write operation detail'
+    return 0
+  fi
   printf '%s\t%s\t%s\n' "$stamp" "$code" "$sha" >> logs/operations.tsv ||
     log "Could not write operation record: $code"
 }
@@ -303,10 +307,42 @@ rollback() {
   log "ROLLBACK_FAILED $old; inspect system/$WEB and health; manual recovery required"
   return 1
 }
+# Classify the captured error without ever writing raw Git stderr to the UI.
+fetch_reason() {
+  local message
+  message="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$message" in
+    *"proxy"*|*"connect tunnel"*) echo proxy;;
+    *"permission denied"*|*"authentication failed"*|*"could not read username"*|*"host key verification failed"*) echo authentication;;
+    *"repository not found"*|*"access denied"*|*"403"*|*"401"*) echo repository_access;;
+    *"could not resolve"*|*"name or service not known"*) echo dns;;
+    *"timed out"*|*"timeout"*) echo timeout;;
+    *"connection reset"*|*"connection refused"*|*"failed to connect"*|*"network is unreachable"*|*"remote end hung up"*|*"early eof"*|*"502"*|*"503"*|*"504"*) echo network;;
+    *) echo unknown;;
+  esac
+}
+fetch_with_retry() {
+  local attempt=1 err reason
+  while test "$attempt" -le 3; do
+    if err="$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2' git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=20 fetch --quiet origin "${TRACK_BRANCH:-main}" 2>&1)"; then
+      return 0
+    fi
+    reason="$(fetch_reason "$err")"
+    UPDATE_DETAIL="$reason"
+    log "Git fetch attempt $attempt/3 failed: $reason"
+    case "$reason" in authentication|repository_access) return 1;; esac
+    if test "$attempt" -lt 3; then
+      record_operation update_fetch_retry "$UPDATE_SHA" "$reason"
+      sleep "$((attempt * 2))"
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
 finish_update() {
   local rc="$1"
   if test "$rc" != 0; then
-    record_operation "$UPDATE_FAILURE" "$UPDATE_SHA"
+    record_operation "$UPDATE_FAILURE" "$UPDATE_SHA" "${UPDATE_DETAIL:-}"
   fi
   rmdir "$LOCK" 2>/dev/null || true
 }
@@ -319,11 +355,13 @@ update() {
   fi
   UPDATE_SHA="$old"
   UPDATE_FAILURE=update_preflight_failed
+  UPDATE_DETAIL=""
   trap 'finish_update "$?"' EXIT
   record_operation update_started "$old"
   assert_main; load_env
   UPDATE_FAILURE=update_fetch_failed
-  GIT_TERMINAL_PROMPT=0 git fetch --quiet origin "${TRACK_BRANCH:-main}"
+  fetch_with_retry || exit 1
+  UPDATE_DETAIL=""
   new="$(git rev-parse "origin/${TRACK_BRANCH:-main}")"
   UPDATE_SHA="$new"
   if test "$old" = "$new"; then

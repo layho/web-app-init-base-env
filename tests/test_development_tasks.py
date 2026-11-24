@@ -318,3 +318,14 @@ def test_task_displays_exact_frontend_failure_even_if_issue_not_synced():
     assert rows[0]["test_state"] == "failure"
     assert rows[0]["test_failures"][0]["phase"] == "frontend-failed"
     assert rows[0]["test_failures"][0]["head"] == "a"*40
+
+
+def test_closed_unmerged_pr_not_active_failure_or_waiting_merge():
+    issue = development_tasks.parse_issue(ISSUE, "owner/repo")
+    result = development_tasks.unified_tasks([issue], {"prs": [
+        {"number":16,"linked_issues":[42],"merge_state":"closed","test":{"state":"failure","phase":"dependencies-failed"}}
+    ]})[0]
+    assert result["merge_state"] == "closed"
+    assert result["delivery_status"] == "关联 PR 已关闭 · 待重新开发"
+    assert result["test_failures"] == []
+    assert result["historical_test_failures"][0]["number"] == 16
