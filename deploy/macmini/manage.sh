@@ -121,7 +121,11 @@ health_once() {
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
   .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" else 1)' 2>/dev/null &&
   curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/" | grep -q '/assets/' &&
-  { test ! -f frontend/dist/build-sha.txt || test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected"; } &&
+  { if git show "$expected:deploy/macmini/manage.sh" | grep -q VITE_BUILD_SHA; then
+      test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected"
+    else
+      test ! -f frontend/dist/build-sha.txt || test "$(curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$PORT/build-sha.txt")" = "$expected"
+    fi; } &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/v1/feedback")" = "401" &&
   test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/api/session")" = "401"
 }

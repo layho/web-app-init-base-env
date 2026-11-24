@@ -13,7 +13,10 @@ def test_schema_gate_is_retryable_and_real_failures_are_held():
     assert 'if ! check_schema; then' in script
     assert 'rollback "$old" "$new" retryable' in script
     assert 'if test "${3:-hold}" = "hold"; then' in script
-    assert 'if ! test_app || ! build; then' in script
+    assert 'if ! test_app; then' in script
+    assert 'if ! build; then' in script
+    assert 'UPDATE_DETAIL=host_test_failed' in script
+    assert 'UPDATE_DETAIL=frontend_build_failed' in script
     assert 'rollback "$old" "$new"; exit 1' in script
     assert 'git merge-base --is-ancestor "$old" "$new"' in script
 

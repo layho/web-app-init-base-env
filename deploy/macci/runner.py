@@ -425,7 +425,7 @@ def deployment_events(raw):
             elif code=="rollback_failed" and sha==attempt["candidate"]:
                 attempt["rollback"]="failed"
             elif code in DEPLOY_TERMINAL and sha==attempt["candidate"]:
-                reports.append({**attempt,"finished":stamp,"code":code})
+                reports.append({**attempt,"finished":stamp,"code":code,"detail":cols[3] if len(cols)>3 and cols[3] in {"host_test_failed","frontend_build_failed"} else ""})
                 attempt=None
             elif code in {"update_no_change","update_held"}:
                 attempt=None
@@ -450,7 +450,7 @@ def report_base_deployments(token):
             sha=row["candidate"]
             # Status is scoped to the immutable candidate. No merge authority.
             state="success" if row["code"]=="update_ok" else "failure"
-            detail=row["code"]+" rollback="+row["rollback"]+" at="+row["finished"]
+            detail=(row["detail"] or row["code"])+" rollback="+row["rollback"]+" at="+row["finished"]
             statuses=api(token,f"/repos/{repo}/commits/{sha}/statuses?per_page=100")
             existing=next((s for s in statuses if s.get("context")==DEPLOY_CONTEXT and
                            (s.get("creator") or {}).get("login")=="layho"),None)
