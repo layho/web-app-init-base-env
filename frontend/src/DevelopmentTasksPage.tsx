@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Table, Tabs, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Space, Table, Tabs, Tag, Typography } from 'antd'
 
-type LinkedPR = {number: number; title?: string; url?: string; owner?: string; test?: {state?: string; started_at?: string; finished_at?: string}; merge_state?: string; merged_at?: string | null; merge_sha?: string | null; deployment?: {state?: string; at?: string | null}; conflict?: {blocked?: boolean}}
+type LinkedPR = {number: number; title?: string; url?: string; owner?: string; test?: {state?: string; started_at?: string; finished_at?: string; phase?: string}; merge_state?: string; merged_at?: string | null; merge_sha?: string | null; deployment?: {state?: string; at?: string | null}; conflict?: {blocked?: boolean}}
 type DevelopmentTask = {
   owner?: string
   origin?: string
@@ -15,6 +15,7 @@ type DevelopmentTask = {
   pr_number?: number | null
   delivery_status?: string
   test_state?: string | null
+  test_failures?: {number:number; head?:string; phase?:string; at?:string}[]
   merge_state?: string | null
   deployment_state?: string | null
   number: number
@@ -263,8 +264,11 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
             <Tag>{task.source === 'pr' ? '代码任务' : task.origin === 'feedback' ? '意见反馈' : '需求任务'}</Tag> },
           { title: '当前阶段', width: 205, render: (_, task: DevelopmentTask) =>
             <Tag color={statusColors[task.status] ?? 'default'}>{task.delivery_status ?? task.status}</Tag> },
-          { title: '测试', width: 92, render: (_, task: DevelopmentTask) =>
-            task.test_state ? ciTag(task.test_state) : '—' },
+          { title: '测试', width: 220, render: (_, task: DevelopmentTask) =>
+            task.test_failures?.length ? <Flex vertical gap={4}>{task.test_failures.map(f=><div key={f.number}>
+              <Tag color="error">#{f.number} {phaseLabels[f.phase ?? ''] ?? '测试失败'}</Tag>
+              <Typography.Text type="secondary">{formatDate(f.at ?? null)} · {f.head?.slice(0,7) ?? 'SHA 未记录'}</Typography.Text>
+            </div>)}</Flex> : task.test_state ? ciTag(task.test_state) : '—' },
           { title: '合并', width: 100, render: (_, task: DevelopmentTask) =>
             task.merge_state ? <Tag>{mergeLabels[task.merge_state] ?? task.merge_state}</Tag> : '—' },
           { title: '部署', width: 115, render: (_, task: DevelopmentTask) =>
@@ -295,6 +299,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
           <Descriptions size="small" column={1} items={[
             {key:'dev',label:'开发负责人',children:pr.owner || '未指定'},
             {key:'ci',label:'MacCI 测试',children:ciLabels[pr.test?.state || 'unknown'] || '尚未核实'},
+            {key:'phase',label:'测试阶段',children:phaseLabels[pr.test?.phase ?? ''] ?? '未记录'},
             {key:'start',label:'测试开始',children:formatDate(pr.test?.started_at ?? null)},
             {key:'end',label:'测试结束',children:formatDate(pr.test?.finished_at ?? null)},
             {key:'branch',label:'开发分支',children:data?.pr_tracking?.prs.find(r=>r.number===pr.number)?.head_branch ?? '未记录'},

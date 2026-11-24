@@ -308,3 +308,13 @@ def test_token_health_uses_read_queries_and_sanitized_results(monkeypatch):
     assert result["rate_limit"]["remaining"] == 123
     assert result["graphql"]["permission"] == "READ"
     assert "secret" not in str(result)
+
+
+def test_task_displays_exact_frontend_failure_even_if_issue_not_synced():
+    rows = development_tasks.unified_tasks([], {"repository":"owner/repo", "prs":[
+        {"number":129, "linked_issues":[128], "head":"a"*40, "merge_state":"draft",
+         "test":{"state":"failure", "phase":"frontend-failed", "finished_at":"2026-11-24T12:09:38Z"}}]})
+    assert rows[0]["number"] == 128
+    assert rows[0]["test_state"] == "failure"
+    assert rows[0]["test_failures"][0]["phase"] == "frontend-failed"
+    assert rows[0]["test_failures"][0]["head"] == "a"*40

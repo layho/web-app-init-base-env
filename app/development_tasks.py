@@ -107,6 +107,13 @@ def pr_stage(pr: dict) -> tuple[str, str]:
     return "等待测试", "开发中"
 
 
+def test_failures(prs):
+    return [{"number": p["number"], "head": p.get("head"),
+             "phase": (p.get("test") or {}).get("phase"),
+             "at": (p.get("test") or {}).get("finished_at")}
+            for p in prs if (p.get("test") or {}).get("state") in {"failure", "error"}]
+
+
 def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
     """Issue is primary; each PR belongs to an explicit Issue or its own record.
 
@@ -146,7 +153,7 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             stage = task.get("status", "未记录开发状态")
         elif any((p.get("conflict") or {}).get("blocked") for p in linked):
             stage = "关联代码存在冲突"
-        elif any(x == "failure" for x in tests):
+        elif any(x in {"failure", "error"} for x in tests):
             stage = "关联代码测试失败"
         elif any(x != "merged" for x in merges):
             stage = "代码开发与合并中"
@@ -161,7 +168,8 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             "pr_number": None, "pr_numbers": [p["number"] for p in linked],
             "prs": [pr_detail(p) for p in linked], "owner": task.get("owner") or "未指定",
             "delivery_status": stage,
-            "test_state": "failure" if "failure" in tests else "pending" if "pending" in tests else
+            "test_failures": test_failures(linked),
+            "test_state": "failure" if any(x in {"failure", "error"} for x in tests) else "pending" if "pending" in tests else
                           "success" if tests and all(x == "success" for x in tests) else None,
             "merge_state": "merged" if merges and all(x == "merged" for x in merges) else
                            "open" if merges else None,
@@ -184,6 +192,7 @@ def unified_tasks(issue_tasks: list[dict], tracking: dict) -> list[dict]:
             "completed_steps": 0, "total_steps": 0,
             "updated_at": pr.get("merged_at") or test.get("finished_at") or test.get("started_at"),
             "note": stage, "test_state": test.get("state", "unknown"),
+            "test_failures": test_failures([pr]),
             "merge_state": pr.get("merge_state", "unknown"),
             "deployment_state": deploy, "head": pr.get("head"), "base": pr.get("base"),
         })

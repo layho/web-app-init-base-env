@@ -47,6 +47,12 @@ def timeline(feedback, prs=None):
     else:
         diagnostic = "head_mismatch"
     tested = linked.get("test", {}) if linked else {}
+    # Current PR failure is independent diagnostic evidence. Never use a
+    # mismatched HEAD to complete the submitted candidate's milestones.
+    failures = [{"number": row["number"], "head": row.get("head"),
+                 "phase": (row.get("test") or {}).get("phase"),
+                 "at": (row.get("test") or {}).get("finished_at")}
+                for row in related if (row.get("test") or {}).get("state") in {"failure", "error"}]
     deployment = linked.get("deployment", {}) if linked else {}
     events = {
         "submitted": feedback.get("created_at"),
@@ -109,6 +115,7 @@ def timeline(feedback, prs=None):
                      schedule_source="GitHub Issue OWNER execution receipt")
     return {
         "steps": steps, "current_stage": phase,
+        "test_failures": failures,
         "submission_diagnostic": diagnostic,
         "reported_pr": primary_number if has_receipt else None,
         "reported_head": feedback.get("delivered_sha") if has_receipt else None,

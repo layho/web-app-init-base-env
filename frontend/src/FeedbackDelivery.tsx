@@ -5,6 +5,7 @@ export type DeliveryStep = { key: string; label: string; state: 'complete' | 'pe
 export type Delivery = {
   steps: DeliveryStep[]
   current_stage: string
+  test_failures?: {number:number; head?:string; phase?:string; at?:string}[]
   submission_diagnostic?: 'verified' | 'awaiting_receipt' | 'awaiting_pr_sync' | 'head_mismatch'
   reported_pr?: number | null
   reported_head?: string | null
@@ -15,6 +16,7 @@ export type Delivery = {
   last_verified_at: string | null
   stale: boolean
 }
+const failureLabels: Record<string,string> = {'setup-failed':'环境准备失败','fetch-failed':'拉取失败','context-failed':'构建上下文失败','dependencies-failed':'依赖安装失败','pytest-failed':'后端测试失败','compile-failed':'Python 编译失败','frontend-failed':'前端构建失败','test-failed':'容器测试失败','ref-changed':'分支变更'}
 const date = (input: string | null | undefined) => input
   ? new Date(input).toLocaleString('zh-CN', {hour12: false})
   : '尚无可信回执'
@@ -35,6 +37,9 @@ export function FeedbackDelivery({delivery, issueBase}: {delivery?: Delivery; is
       <Typography.Paragraph type="secondary" style={{marginBottom: 12}}>
         只显示有真实证据的进度。MacCI 测试、合并、部署和验收分别核实，不能互相代替。
       </Typography.Paragraph>
+      {delivery.test_failures?.map(f => <Alert key={f.number} type="error" showIcon style={{marginBottom:12}}
+        message={`PR #${f.number} · ${failureLabels[f.phase ?? ''] ?? 'MacCI 测试失败'}`}
+        description={`HEAD: ${f.head ?? '未记录'}；时间：${date(f.at)}；错误代码：${f.phase ?? '未记录'}。此为当前 PR 的失败证据，不代表旧提交回执已核验。`}/>)}
       {diagnostic && diagnostic !== 'verified' && <Alert showIcon type={diagnostic === 'head_mismatch' ? 'warning' : 'info'}
         message={submissionLabels[diagnostic]}
         description="提交回执、PR 实际 HEAD 必须一致才确认交付；不会借用旧版本测试或部署结果。" style={{marginBottom:12}}/>}

@@ -214,3 +214,14 @@ def test_submission_diagnostic_distinguishes_receipt_sync_and_head_change():
     assert changed["steps"][5]["state"] == "pending"
     verified = delivery.timeline(BASE, [{"number": 19, "head": SHA}])
     assert verified["submission_diagnostic"] == "verified"
+
+
+def test_current_head_failure_visible_even_with_old_submission_receipt():
+    pr = {"number": 19, "head": "f"*40, "test": {"state": "failure",
+          "phase": "frontend-failed", "finished_at": "2026-11-24T12:09:38Z"}}
+    row = delivery.timeline(BASE, [pr])
+    assert row["submission_diagnostic"] == "head_mismatch"
+    assert row["test_failures"] == [{"number": 19, "head": "f"*40,
+        "phase": "frontend-failed", "at": "2026-11-24T12:09:38Z"}]
+    assert row["evidence"]["pr"] is None
+    assert row["steps"][5]["state"] == "pending"
