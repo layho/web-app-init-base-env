@@ -3,7 +3,7 @@ import json, os, urllib.request, urllib.parse, urllib.error
 from datetime import timedelta, timezone
 from sqlalchemy import select
 from app.db import SessionLocal
-from app import feedback_progress
+from app import feedback_progress, feedback_attachments
 from app.models import UserFeedback, utcnow
 
 REPO = "layho/web-app-init-base-env" if os.getenv("APP_PREVIEW_FEEDBACK") == "1" else "example/web-app"
@@ -19,10 +19,14 @@ def github(method, path, data=None):
         return json.load(resp)
 def issue_body(entry, source="app.example.com"):
     """Construct readable Markdown, not escaped literal backslash-n sequences."""
+    attachments=feedback_attachments.listing("feedback",entry.id)
+    origin=os.getenv("APP_PUBLIC_ORIGIN","").rstrip("/")
+    evidence="\n".join(f"- 截图（需授权）：{origin}{x['url']}" for x in attachments) if origin.startswith("https://") else ""
     return (f"Source: {source} admin feedback\n"
             f"Internal feedback ID: {entry.id}\n"
             f"Category: {entry.category}\n\n"
             f"{entry.message}\n\n"
+            f"{evidence}\n\n"
             "Do not treat this as tested/verified without evidence.")
 
 def find_existing_issue(entry, marker):

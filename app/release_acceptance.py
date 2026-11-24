@@ -140,6 +140,9 @@ def state(sha):
         if not receipt:
             return {"enabled": True, "state": "not_requested"}
         issue = receipt.get("issue")
+        if receipt.get("decision") == "rejected":
+            return {"enabled": True, "state": "rejected", "issue": issue,
+                    "reason": receipt.get("reason"), "attachments": receipt.get("attachments", [])}
         if contains(sha, ref("main")):
             return {"enabled": True, "state": "published", "issue": issue}
         if type(issue) is int and issue > 0:
@@ -220,3 +223,34 @@ def submit(sha, version, deployed):
             raise AcceptanceError("GitHub 未返回有效验收单号")
         save_receipt(sha, {"issue": issue})
         return {"enabled": True, "state": "queued", "issue": issue}
+
+def reject(sha, version, reason, images):
+    from app import feedback_attachments
+    if not enabled() or sha != os.getenv("APP_RUNNING_SHA") or not valid_sha(sha) or len(reason)<5:
+        raise AcceptanceError("拒绝理由或候选SHA无效")
+    RECEIPTS.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (RECEIPTS/"request.lock").open("a") as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        old=load_receipt(sha)
+        if old and old.get("decision") != "rejected":
+            raise AcceptanceError("已经提交验收通过，不能并发拒绝")
+        if ref("preview") != sha or contains(sha,ref("main")):
+            raise AcceptanceError("候选已变化或已经正式发布")
+        if old:
+            return state(sha)
+        title=f"[BASE-REJECTION {sha}]"
+        existing=feedback_attachments.listing("rejection",sha)
+        attachments=existing or (feedback_attachments.save("rejection",sha,images) if images else [])
+        # GitHub gets the reason and authenticated evidence locator, never image bytes.
+        payload="[BASE_REJECTION] "+json.dumps({"schema":1,"candidate_sha":sha,"version":version,"reason":reason,
+                    "attachments":[{"id":x["id"],"url": "https://base.layho.com"+x["url"]} for x in attachments]},ensure_ascii=False,sort_keys=True)
+        found=find_issue(title,payload)
+        if ref("preview") != sha or contains(sha,ref("main")):
+            raise AcceptanceError("候选已变化，拒绝记录未授权任何合并")
+        if not found:
+            found=api("/issues",{"title":title,"body":payload})
+        issue=found.get("number")
+        if type(issue) is not int or issue<=0:
+            raise AcceptanceError("GitHub 未返回修复任务编号")
+        save_receipt(sha,{"decision":"rejected","issue":issue,"reason":reason,"attachments":attachments})
+        return state(sha)

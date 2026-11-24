@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from . import admin_settings, auth, development_tasks, feedback_progress, feedback_delivery, foundation_version, operations, pr_tracking, pr_conflict_controls, manual_pr_actions, release_acceptance, pr_draft_controls
 from .db import get_db
+from . import feedback_attachments
 from .models import UserFeedback
 
 RELEASE_NOTES = Path(__file__).with_name("release_notes.json")
@@ -96,15 +97,35 @@ def health():
 class FeedbackIn(BaseModel):
     category: str = Field(pattern="^(bug|suggestion|acceptance)$")
     message: str = Field(min_length=5, max_length=2000)
+    screenshots: list[str] = Field(default_factory=list, max_length=9)
 
 @app.post("/api/v1/feedback", dependencies=[Depends(authorize)])
 def submit_feedback(req: FeedbackIn, db: Session = Depends(get_db)):
     row = UserFeedback(category=req.category, message=req.message.strip(), status="pending")
     if len(row.message) < 5:
         raise HTTPException(422, "Feedback too short")
+    try:
+        images = feedback_attachments.normalize(req.screenshots)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     db.add(row)
+    db.flush()
+    if images:
+        try:
+            feedback_attachments.save("feedback", row.id, images)
+        except (OSError, ValueError):
+            db.rollback()
+            raise HTTPException(503, "截图保存失败，反馈未提交") from None
     db.commit()
     return {"id": row.id, "status": row.status}
+
+@app.get("/api/v1/attachments/{scope}/{key}/{attachment_id}", dependencies=[Depends(authorize)])
+def get_attachment(scope: str, key: str, attachment_id: str):
+    try:
+        data = feedback_attachments.read(scope, key, attachment_id)
+    except (OSError, ValueError):
+        raise HTTPException(404, "截图不存在") from None
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control":"private, no-store", "X-Content-Type-Options":"nosniff"})
 
 @app.get("/api/v1/feedback", dependencies=[Depends(authorize)])
 def list_feedback(response: Response, db: Session = Depends(get_db)):
@@ -120,6 +141,7 @@ def list_feedback(response: Response, db: Session = Depends(get_db)):
                  **feedback_progress.feedback_details(progress, x.id, x.github_issue_number)
              }, prs),
              "id": x.id, "category": x.category, "message": x.message, "status": x.status,
+             "attachments": feedback_attachments.listing("feedback", x.id),
              "github_issue_number": x.github_issue_number,
              "created_at": x.created_at.isoformat() if x.created_at else None,
              "synced_at": x.synced_at.isoformat() if x.synced_at else None,
@@ -165,6 +187,23 @@ class ReleaseAcceptanceIn(BaseModel):
     sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     version: str = Field(min_length=1, max_length=40)
 
+
+class ReleaseRejectIn(ReleaseAcceptanceIn):
+    reason: str = Field(min_length=5, max_length=2000)
+    screenshots: list[str] = Field(default_factory=list, max_length=9)
+
+@app.post("/api/v1/releases/reject")
+def reject_release(req: ReleaseRejectIn, request: Request, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    if not release_acceptance.enabled() or req.version != app.version or req.sha != os.getenv("APP_RUNNING_SHA"):
+        raise HTTPException(409, "仅允许拒绝当前基座候选版本")
+    try:
+        images = feedback_attachments.normalize(req.screenshots)
+        return release_acceptance.reject(req.sha, req.version, req.reason.strip(), images)
+    except (ValueError, release_acceptance.AcceptanceError) as exc:
+        raise HTTPException(409, str(exc)) from None
+    except OSError:
+        raise HTTPException(503, "验收拒绝记录保存失败") from None
 
 @app.post("/api/v1/releases/accept")
 def accept_release(req: ReleaseAcceptanceIn, request: Request, response: Response, db: Session = Depends(get_db)):
