@@ -5,9 +5,7 @@
     "summary": "修复测试已结束但进度仍 pending 阻塞下游升级。",
     "changes": [
       "仅依据最新可信精确候选测试终态关闭 advisory 进度状态；历史残留自动恢复，发送失败后重试。",
-      "保留原测试与升级合并门禁，不将 advisory 作为测试授权。",
-      "独立 MacCI 恢复通道：显式首次启用、固定官方仓库、精确候选及可信测试、独立审查授权、本机锁/备份/测试、安装回执；不依赖应用正式发布。",
-      "独立 launchd 恢复服务、私有安装回执待发送文件、统一宿主凭据选择、并发锁及安装错误回滚；增加授权撤销、断网补送及错误 SHA 回归测试。"
+      "保留原测试与升级合并门禁，不将 advisory 作为测试授权。"
     ],
     "acceptance_required": true,
     "acceptance_status": "pending",
@@ -15,7 +13,7 @@
       "验证 Panel #12 残留进度自动收敛及升级恢复",
       "验证成功、失败、过期候选、不可信回执及网络重试"
     ],
-    "validation_note": "待独立运行时测试与部署。",
+    "validation_note": "仅交付进度终态收敛；宿主自动安装通道延后至 #145 安全加固。待 MacCI 测试与实机部署。",
     "reference_url": "https://github.com/layho/web-app-init-base-env/issues/143"
   },
   {
