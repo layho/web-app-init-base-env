@@ -3,7 +3,21 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": {"dev": "vite --host 127.0.0.1", "build": "tsc -b && vite build"},
-  "dependencies": {"antd": "^5.22.0", "@ant-design/icons": "^5.5.0", "react": "^18.3.1", "react-dom": "^18.3.1"},
-  "devDependencies": {"@types/react": "^18.3.0", "@types/react-dom": "^18.3.0", "typescript": "~5.6.3", "vite": "^5.4.0"}
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "npm test && tsc -b && vite build",
+    "test": "node --test src/module-sdk/registry.test.mjs src/module-sdk/host/open.test.mjs src/module-sdk/host/ModuleOutlet.test.mjs"
+  },
+  "dependencies": {
+    "antd": "^5.22.0",
+    "@ant-design/icons": "^5.5.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "typescript": "~5.6.3",
+    "vite": "^5.4.0"
+  }
 }
