@@ -7,7 +7,7 @@
 .v2-board-version strong { font-size: 14px; font-weight: 600; }
 .v2-board-body { display: grid; grid-template-columns: 228px minmax(0, 1fr); }
 .v2-board-nav { display: flex; flex-direction: column; gap: 4px; padding: 16px 12px; background: #fff; border-right: 1px solid #e6edf5; }
-.v2-board-nav div { display: flex; align-items: center; gap: 10px; border-radius: 8px; padding: 10px 12px; }
+.v2-board-nav div { display: flex; align-items: center; gap: 10px; border-radius: 8px; padding: 10px 12px; white-space: nowrap; }
 .v2-board-nav svg { font-size: 16px; }
 .v2-board-nav .is-current { background: #1677ff; color: #fff; font-weight: 600; }
 .v2-board-nav p { margin: 12px 4px 0; }
