@@ -220,6 +220,9 @@ def test_candidate(repo, pr, log, progress=lambda phase: None):
 REPORT_MARKER = "[MACCI_REPORT] "
 REPORT_PHASES = {"setup-failed","fetch-failed","context-failed","dependencies-failed",
                  "pytest-failed","compile-failed","frontend-failed","test-failed","ref-changed","passed"}
+MAX_REPORT_SIZE = 12000
+MAX_OUTBOX_REPORTS = 100
+MAX_OUTBOX_BYTES = 1200000
 
 
 def failure_summary(raw, phase):
@@ -259,14 +262,43 @@ def save_report(report):
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
         raise ValueError("Unsafe report outbox")
     path=folder/(report["run_id"]+".json")
-    with NamedTemporaryFile(mode="w",dir=folder,delete=False,encoding="utf-8") as stream:
+    payload=json.dumps(report,ensure_ascii=True,separators=(",",":")).encode("utf-8")
+    if len(payload)>MAX_REPORT_SIZE:
+        raise ValueError("MacCI report exceeds size limit")
+    reports=[]
+    total=0
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            item=entry.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(item.st_mode) or item.st_uid!=os.getuid()
+                    or item.st_mode&0o077 or item.st_size>MAX_REPORT_SIZE):
+                raise ValueError("Unsafe queued MacCI report")
+            reports.append(entry.name)
+            total+=item.st_size
+    if path.name in reports:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,"rb") as existing:
+            if existing.read(MAX_REPORT_SIZE+1)==payload:
+                return path
+        raise ValueError("Conflicting MacCI report id")
+    if len(reports)>=MAX_OUTBOX_REPORTS or total+len(payload)>MAX_OUTBOX_BYTES:
+        raise ValueError("MacCI report outbox capacity reached")
+    with NamedTemporaryFile(mode="wb",dir=folder,delete=False) as stream:
         temp=Path(stream.name)
         try:
-            json.dump(report,stream,ensure_ascii=True,separators=(",",":"))
+            os.fchmod(stream.fileno(),0o600)
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
             stream.close()
             os.replace(temp,path)
+            dfd=os.open(folder,os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         finally:
             temp.unlink(missing_ok=True)
     return path

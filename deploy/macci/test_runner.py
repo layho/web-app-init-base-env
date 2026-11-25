@@ -171,6 +171,64 @@ class DeploymentJournalTests(unittest.TestCase):
 
 
 class ReceiptAvailabilityTests(unittest.TestCase):
+    def test_report_outbox_retries_lost_ack_without_duplicate_comment(self):
+        import json
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = {
+                "schema": 1, "repository": REPO, "pr": 14,
+                "head": HEAD, "base": BASE, "merge": MERGE,
+                "run_id": "d"*32, "state": "failure", "phase": "pytest-failed",
+                "started_at": 1, "finished_at": 2, "failures": [],
+            }
+            with patch.object(runner, "ROOT", root):
+                path = runner.save_report(report)
+                body = runner.REPORT_MARKER + json.dumps(report, sort_keys=True, separators=(",", ":"))
+                api = Mock(side_effect=[[], OSError("lost acknowledgement"),
+                                        [{"body": body, "author_association": "OWNER"}]])
+                with patch.object(runner, "api", api):
+                    self.assertFalse(runner.flush_reports("token"))
+                    self.assertTrue(path.exists())
+                    self.assertTrue(runner.flush_reports("token"))
+                self.assertEqual(api.call_count, 3)
+                self.assertFalse(path.exists())
+
+    def test_failure_report_outbox_is_bounded_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = lambda run_id: {
+                "schema": 1, "repository": REPO, "pr": 14,
+                "head": HEAD, "base": BASE, "merge": MERGE,
+                "run_id": run_id, "state": "failure", "phase": "pytest-failed",
+                "started_at": 1, "finished_at": 2, "failures": [],
+            }
+            with patch.object(runner, "ROOT", root), \
+                 patch.object(runner, "MAX_OUTBOX_REPORTS", 2), \
+                 patch.object(runner, "MAX_OUTBOX_BYTES", 100000):
+                first = runner.save_report(report("1"*32))
+                self.assertEqual(runner.save_report(report("1"*32)), first)
+                runner.save_report(report("2"*32))
+                with self.assertRaisesRegex(ValueError, "capacity"):
+                    runner.save_report(report("3"*32))
+                self.assertEqual(sorted(p.name for p in (root/"report-outbox").glob("*.json")),
+                                 ["1"*32+".json", "2"*32+".json"])
+                self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+
+    def test_failure_report_outbox_byte_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = {
+                "schema": 1, "repository": REPO, "pr": 14,
+                "head": HEAD, "base": BASE, "merge": MERGE,
+                "run_id": "a"*32, "state": "failure", "phase": "pytest-failed",
+                "started_at": 1, "finished_at": 2, "failures": [],
+            }
+            with patch.object(runner, "ROOT", Path(tmp)), \
+                 patch.object(runner, "MAX_OUTBOX_BYTES", 1):
+                with self.assertRaisesRegex(ValueError, "capacity"):
+                    runner.save_report(report)
+                self.assertFalse((Path(tmp)/"report-outbox"/("a"*32+".json")).exists())
+
     def test_receipts_precede_docker_failure(self):
         from unittest.mock import Mock, call
         from contextlib import nullcontext
