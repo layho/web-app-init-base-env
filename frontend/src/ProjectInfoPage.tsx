@@ -1,5 +1,6 @@
 import { Alert, Button, Card, Descriptions, Flex, List, Skeleton, Table, Tabs, Tag, Typography, theme } from 'antd'
 import { ArrowDownOutlined } from '@ant-design/icons'
+import { GuideOverview } from './guide/GuideOverview.tsx'
 
 type ArchitectureLayer = { layer: string; technology: string; role: string }
 type WorkflowStage = { title: string; description: string }
@@ -139,7 +140,7 @@ export function ProjectInfoPage({ data, loading, issueBase, onOpenTasks, onRefre
   if (!data) return loading ? <Card><Skeleton active /></Card> : null
 
   return <Card title={data.name}>
-    <Typography.Paragraph type="secondary">{data.summary}</Typography.Paragraph>
+    <GuideOverview source={data} />
     <Tabs items={[
       {
         key: 'architecture',
