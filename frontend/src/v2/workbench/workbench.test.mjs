@@ -81,3 +81,11 @@ test('workbench uses the shared task classifier and excludes stale snapshots', a
   assert.equal(workbenchMetrics({...snapshot, stale: true}), null)
   assert.equal(workbenchMetrics(null), null)
 })
+
+test('overview evidence does not infer public or worker health from a PR snapshot',()=>{
+  const result=facts.overviewEvidence({stale:false,synced_at:'2026-11-25',pr_tracking:{stale:false,synced_at:'2026-11-25',prs:[{merge_state:'open',test:{state:'pending'}}]}},null,[{at:'2026-11-25T00:00:00Z',code:'update_ok',sha:'a'.repeat(40)}])
+  assert.equal(result.health.public,undefined)
+  assert.equal(result.health.macci.state,'unknown')
+  assert.equal(result.activity.length,1)
+  assert.equal(facts.overviewEvidence(null,null,null).activity.length,0)
+})

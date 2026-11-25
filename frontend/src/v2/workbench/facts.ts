@@ -86,3 +86,24 @@ export function versionText(versions: WorkbenchVersions | null | undefined) {
 }
 
 export { METRICS }
+
+type OverviewSnapshot = {stale: boolean; synced_at: string | null; pr_tracking?: {stale: boolean; synced_at: string | null; prs: {merge_state:string; test:{state:string}}[]}}
+type OverviewDeploy = {state:string; locked:boolean; rollback_failed:boolean; last_successful_deployment?: {at:string;sha:string}|null}
+type OverviewEvent = {at:string;code:string;sha:string}
+export function overviewEvidence(snapshot: OverviewSnapshot | null, deploy: OverviewDeploy | null, events: OverviewEvent[] | null) {
+  const health: WorkbenchHealth = {}
+  if (snapshot?.synced_at) health.github = snapshot.stale ? {state:'warn',detail:'同步记录已过期'} : {state:'ok',detail:'任务同步记录有效'}
+  const tracking = snapshot?.pr_tracking
+  if (tracking?.synced_at && !tracking.stale) {
+    const active = tracking.prs.filter(row=>row.merge_state==='open')
+    const pending = active.filter(row=>row.test.state==='pending').length
+    const failed = active.filter(row=>['failure','error'].includes(row.test.state)).length
+    health.macci = {state:failed?'warn':'unknown',detail:`待测试/测试中 ${pending} · 失败 ${failed}（PR 回执）`}
+  }
+  if (deploy) {
+    const bad = deploy.rollback_failed || /failed|held|unacknowledged|interrupted|mismatch/.test(deploy.state)
+    health.deploy = {state:bad?'warn':deploy.state==='update_ok'?'ok':'unknown',detail:deploy.locked?'更新锁占用':deploy.state}
+  }
+  const activity = (events ?? []).filter(row=>Number.isFinite(Date.parse(row.at))).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at)).slice(0,6).map(row=>({at:new Date(row.at).toLocaleString('zh-CN',{hour12:false}),text:row.code + (row.sha ? ' · '+row.sha.slice(0,8) : '')}))
+  return {health,activity}
+}

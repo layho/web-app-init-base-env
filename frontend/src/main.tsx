@@ -13,6 +13,7 @@ import { ProjectInfoPage } from './ProjectInfoPage'
 import type { ProjectInfo } from './ProjectInfoPage'
 import { UsageGuidePage } from './v2/usage-guide/UsageGuidePage'
 import { WorkbenchPage } from './v2/workbench/WorkbenchPage'
+import { overviewEvidence } from './v2/workbench/facts'
 import { WorkspaceShell } from './WorkspaceShell'
 import { ScreenshotPicker } from './ScreenshotPicker'
 import { FeedbackDelivery } from './FeedbackDelivery'
@@ -400,13 +401,15 @@ function App() {
       if (pending) return
       pending = true
       try {
-        const [tasks, project] = await Promise.allSettled([
+        const [tasks, project, logs] = await Promise.allSettled([
           api<TaskSnapshot>('/api/v1/development-tasks'),
           api<ProjectInfo>('/api/v1/project-info'),
+          api<SystemLogs>('/api/v1/system-logs'),
         ])
         if (!active) return
         setDevelopmentTasks(tasks.status === 'fulfilled' ? tasks.value : null)
         setProjectInfo(project.status === 'fulfilled' ? project.value : null)
+        setSystemLogs(logs.status === 'fulfilled' ? logs.value : null)
       } finally { pending = false }
     }
     void refreshOverview()
@@ -527,7 +530,7 @@ function App() {
       </Modal>
       {page === 'workspace' ? (
         <Space direction="vertical" size="middle" style={{width:'100%'}}>
-          <WorkbenchPage embedded metrics={workbenchMetrics(developmentTasks)} project={projectInfo} running={versionUnavailable ? null : runningVersion} versions={{running: versionUnavailable ? null : runningVersion?.version}} />
+          <WorkbenchPage embedded {...overviewEvidence(developmentTasks,deployStatus,systemLogs?.events ?? null)} metrics={workbenchMetrics(developmentTasks)} project={projectInfo} running={versionUnavailable ? null : runningVersion} versions={{running: versionUnavailable ? null : runningVersion?.version}} />
           <Space wrap><Button type="primary" onClick={() => navigate('tasks')}>开发任务</Button><Button onClick={() => {navigate('feedback');setFeedbackOpen(true)}}>提交需求</Button><Button onClick={() => navigate('releases')}>更新记录</Button><Button onClick={() => navigate('logs')}>运行诊断</Button></Space>
         </Space>
       ) : page === 'project' ? (
