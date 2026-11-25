@@ -234,6 +234,30 @@ def token_health(repository, request):
     return result
 
 
+def publication_history(request, repository, main_sha, tracking, prs):
+    """Reuse positive ancestry evidence only across a verified forward move."""
+    from app import release_acceptance
+    previous = tracking.get("published_main_sha")
+    old = tracking.get("published_commits", {})
+    prefix = "/repos/" + repository + "/compare/"
+    def contains(ancestor, descendant):
+        if ancestor == descendant:
+            return True
+        result = request("GET", prefix + ancestor + "..." + descendant)
+        return (result.get("status") in {"ahead", "identical"}
+                and (result.get("merge_base_commit") or {}).get("sha") == ancestor)
+    if not isinstance(old, dict) or not release_acceptance.valid_sha(previous) or not contains(previous, main_sha):
+        old = {}
+    published = {}
+    for pr in prs:
+        candidate = pr.get("merge_sha")
+        if pr.get("merge_state") != "merged" or not release_acceptance.valid_sha(candidate):
+            continue
+        if candidate not in published:
+            published[candidate] = candidate == main_sha or old.get(candidate) is True or contains(candidate, main_sha)
+    return published
+
+
 def run_refresh(force=False):
     from app import release_acceptance
     folder = development_tasks.CACHE_PATH.parent
@@ -264,11 +288,11 @@ def run_refresh(force=False):
         def request(method, path):
             if method != "GET":
                 raise ValueError("Read-only task sync")
-            state["requests"] += 1
-            write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
             held = cooldown()
             if held:
                 raise release_acceptance.AcceptanceError(held["reason"])
+            state["requests"] += 1
+            write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
             try:
                 return release_acceptance.github(path)
             except release_acceptance.AcceptanceError as exc:
@@ -319,7 +343,7 @@ def run_refresh(force=False):
                         evidence[event["candidate_sha"]] = event
             # Publication is a distinct fact from per-PR user acceptance.
             # Prove historical commits by ancestry of actual official main.
-            # Keep only immutable positive results while the observed main is unchanged.
+            # Reuse positive results only if previous main is proven an ancestor.
             published = {}
             main_sha = None
             if target == (release_acceptance.REPO, "preview"):
@@ -328,17 +352,7 @@ def run_refresh(force=False):
                 main_sha = request("GET", "/repos/" + target[0] + "/branches/main")["commit"]["sha"]
                 if not release_acceptance.valid_sha(main_sha):
                     raise ValueError("Invalid official main")
-                old = tracking.get("published_commits", {}) if tracking.get("published_main_sha") == main_sha else {}
-                for pr in prs:
-                    candidate = pr.get("merge_sha")
-                    if pr.get("merge_state") != "merged" or not release_acceptance.valid_sha(candidate):
-                        continue
-                    if candidate == main_sha or old.get(candidate) is True:
-                        published[candidate] = True
-                    elif candidate not in published:
-                        result = request("GET", "/repos/" + target[0] + "/compare/" + candidate + "..." + main_sha)
-                        published[candidate] = (result.get("status") in {"ahead","identical"} and
-                            (result.get("merge_base_commit") or {}).get("sha") == candidate)
+                published = publication_history(request, target[0], main_sha, tracking, prs)
             pr_data = {"synced_at": stamp, "repository": target[0], "branch": target[1], "prs": prs, "release_evidence": evidence,
                        "published_main_sha":main_sha, "published_commits":published}
             # One atomic publication is authoritative for the unified page.
