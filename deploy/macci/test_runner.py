@@ -211,5 +211,51 @@ class ReceiptAvailabilityTests(unittest.TestCase):
                 docker.assert_not_called()
                 test.assert_not_called()
 
+
+    def test_receipts_only_runs_while_worker_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token = root / "github-token"
+            token.write_text("a"*40)
+            token.chmod(0o600)
+            with patch.object(runner, "ROOT", root), \
+                 patch.object(runner, "token_file", return_value=token), \
+                 patch.object(runner, "report_base_deployments") as deploy, \
+                 patch.object(runner, "flush_reports") as flush, \
+                 patch.object(runner, "docker_command") as docker, \
+                 patch("sys.argv", ["runner.py", "--receipts-only"]):
+                with runner.lock():
+                    self.assertEqual(runner.main(), 0)
+                deploy.assert_called_once_with("a"*40)
+                flush.assert_called_once_with("a"*40)
+                docker.assert_not_called()
+
+    def test_concurrent_receipt_sender_defers_without_duplicate_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(runner, "ROOT", Path(tmp)), \
+                 patch.object(runner, "report_base_deployments") as deploy, \
+                 patch.object(runner, "flush_reports") as flush:
+                with runner.receipt_lock():
+                    runner.deliver_pending_reports("fake")
+                deploy.assert_not_called()
+                flush.assert_not_called()
+                runner.deliver_pending_reports("fake")
+                deploy.assert_called_once_with("fake")
+                flush.assert_called_once_with("fake")
+
+    def test_unsafe_receipt_lock_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "other"
+            target.write_text("unchanged")
+            (root / "receipt-delivery.lock").symlink_to(target)
+            with patch.object(runner, "ROOT", root), \
+                 patch.object(runner, "report_base_deployments") as deploy, \
+                 patch.object(runner, "flush_reports") as flush:
+                runner.deliver_pending_reports("fake")
+                deploy.assert_not_called()
+                flush.assert_not_called()
+            self.assertEqual(target.read_text(), "unchanged")
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@
     "changes": [
       "仅依据最新可信精确候选测试终态关闭 advisory 进度状态；历史残留自动恢复，发送失败后重试。",
       "保留原测试与升级合并门禁，不将 advisory 作为测试授权。",
-      "Docker 不可用时仍尝试发送既有部署和测试失败回执；新增仅回执模式，暂复用 worker 锁。"
+      "Docker 不可用时仍尝试发送既有部署和测试失败回执；新增仅回执模式及专用发送锁，测试占锁时仍可独立发送；独立宿主调度尚待部署验证。"
     ],
     "acceptance_required": true,
     "acceptance_status": "pending",

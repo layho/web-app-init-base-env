@@ -511,13 +511,32 @@ def report_base_deployments(token):
         print("Deployment journal delivery pending; will retry",flush=True)
 
 
+@contextmanager
+def receipt_lock():
+    # Serialize senders, not tests. Never follow symlinks or accept shared locks.
+    fd = os.open(ROOT / "receipt-delivery.lock",
+                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(fd, "r+") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("Unsafe receipt delivery lock")
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
 def deliver_pending_reports(token):
-    # A failure in one delivery channel must not block the other.
-    for deliver in (report_base_deployments, flush_reports):
-        try:
-            deliver(token)
-        except (OSError, ValueError, KeyError, TypeError):
-            print('Receipt delivery deferred; retry next tick', flush=True)
+    try:
+        with receipt_lock():
+            # A failure in one delivery channel must not block the other.
+            for deliver in (report_base_deployments, flush_reports):
+                try:
+                    deliver(token)
+                except (OSError, ValueError, KeyError, TypeError):
+                    print('Receipt delivery deferred; retry next tick', flush=True)
+    except BlockingIOError:
+        print('Another receipt sender is active; retry next tick', flush=True)
+    except (OSError, ValueError):
+        print('Receipt delivery lock unavailable; retry next tick', flush=True)
 
 
 def main():
@@ -556,11 +575,12 @@ def main():
         token = stream.read().strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,300}", token):
         raise SystemExit("Invalid credential format")
+    # Receipt-only invocations never acquire the test worker lock.
+    deliver_pending_reports(token)
+    if args.receipts_only:
+        return 0
     try:
         with (lock() if args.lock_fd is None else inherited_lock(args.lock_fd)):
-            deliver_pending_reports(token)
-            if args.receipts_only:
-                return 0
             try:
                 docker_command()
                 subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
@@ -627,7 +647,7 @@ def main():
                                 "finished_at":int(time.time()),"failures":diagnostic if detail!="ref-changed" else []}
                         try:
                             save_report(report)
-                            flush_reports(token)
+                            deliver_pending_reports(token)
                         except (OSError,ValueError,TypeError):
                             print("MacCI report unavailable; local test log retained",flush=True)
                     print(f'{state}: {logfile}', flush=True)
