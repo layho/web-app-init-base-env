@@ -312,12 +312,13 @@ def flush_reports(token):
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
         raise ValueError("Unsafe report outbox")
     delivered = True
-    for path in sorted(folder.glob("*.json"))[:20]:
+    pending=sorted(folder.glob("*.json"),key=lambda p:(p.lstat().st_mtime_ns,p.name))
+    for path in pending[:20]:
         try:
             fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
             with os.fdopen(fd,"r",encoding="utf-8") as stream:
                 info=os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>12000:
+                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>MAX_REPORT_SIZE:
                     raise ValueError("Unsafe report")
                 report=json.load(stream)
             if report.get("repository") not in REPOS or type(report.get("pr")) is not int or report["pr"]<=0 or not re.fullmatch(r"[0-9a-f]{32}",report.get("run_id","")) or path.stem!=report["run_id"] or any(not SHA.fullmatch(str(report.get(k,""))) for k in ("head","base","merge")) or report.get("phase") not in REPORT_PHASES:
@@ -341,6 +342,12 @@ def flush_reports(token):
         except (OSError,ValueError,KeyError,TypeError):
             delivered = False
             print("MacCI report delivery pending; will retry",flush=True)
+            # Persist a retry timestamp so a permanent failure cannot occupy
+            # the first batch forever and starve later reports.
+            try:
+                os.utime(path,None,follow_symlinks=False)
+            except OSError:
+                pass
     return delivered and not any(folder.glob("*.json"))
 
 
@@ -517,35 +524,45 @@ def report_base_deployments(token):
                 raise ValueError("Unsafe deployment journal")
             stream.seek(max(0,info.st_size-1048576))
             raw=stream.read(1048576).decode("utf-8",errors="replace")
-        for row in deployment_events(raw)[-12:]:
-            sha=row["candidate"]
-            # Status is scoped to the immutable candidate. No merge authority.
-            state="success" if row["code"]=="update_ok" else "failure"
-            detail=(row["detail"] or row["code"])+" rollback="+row["rollback"]+" at="+row["finished"]
+    except (OSError,ValueError,KeyError,TypeError):
+        print("Deployment journal delivery unavailable; will retry",flush=True)
+        return False
+    delivered=True
+    for row in deployment_events(raw)[-12:]:
+        sha=row["candidate"]
+        # Status is scoped to the immutable candidate. No merge authority.
+        state="success" if row["code"]=="update_ok" else "failure"
+        detail=(row["detail"] or row["code"])+" rollback="+row["rollback"]+" at="+row["finished"]
+        try:
             statuses=api(token,f"/repos/{repo}/commits/{sha}/statuses?per_page=100")
             existing=next((s for s in statuses if s.get("context")==DEPLOY_CONTEXT and
                            (s.get("creator") or {}).get("login")=="layho"),None)
             if not existing or (existing.get("description")!=detail and
                 str(existing.get("description","")).rsplit(" at=",1)[-1]<=row["finished"]):
                 api(token,f"/repos/{repo}/statuses/{sha}",{"state":state,"context":DEPLOY_CONTEXT,"description":detail})
+        except (OSError,ValueError,KeyError,TypeError):
+            delivered=False
+            print("Deployment status delivery pending; will retry",flush=True)
+        if state!="failure":
+            continue
+        try:
             # Stable event identity: a lost acknowledgement cannot create another issue.
-            if state=="failure":
-                title=f"[BASE-DEPLOY-FAILURE {sha}]"
-                found=None
-                for page in range(1,11):
-                    issues=api(token,f"/repos/{repo}/issues?state=all&per_page=100&page={page}")
-                    found=next((i for i in issues if i.get("title")==title and "pull_request" not in i and (i.get("user") or {}).get("login")=="layho"),None)
-                    if found or len(issues)<100:
-                        break
-                else:
-                    raise ValueError("Deployment failure issue pagination exhausted")
-                if not found:
-                    body="[BASE_DEPLOY_FAILURE] "+json.dumps({"schema":1,"candidate_sha":sha,**row},sort_keys=True,separators=(",",":"))
-                    api(token,f"/repos/{repo}/issues",{"title":title,"body":body})
-        return True
-    except (OSError,ValueError,KeyError,TypeError):
-        print("Deployment journal delivery unavailable; will retry",flush=True)
-        return False
+            title=f"[BASE-DEPLOY-FAILURE {sha}]"
+            found=None
+            for page in range(1,11):
+                issues=api(token,f"/repos/{repo}/issues?state=all&per_page=100&page={page}")
+                found=next((i for i in issues if i.get("title")==title and "pull_request" not in i and (i.get("user") or {}).get("login")=="layho"),None)
+                if found or len(issues)<100:
+                    break
+            else:
+                raise ValueError("Deployment failure issue pagination exhausted")
+            if not found:
+                body="[BASE-DEPLOY_FAILURE] "+json.dumps({"schema":1,"candidate_sha":sha,**row},sort_keys=True,separators=(",",":"))
+                api(token,f"/repos/{repo}/issues",{"title":title,"body":body})
+        except (OSError,ValueError,KeyError,TypeError):
+            delivered=False
+            print("Deployment failure issue delivery pending; will retry",flush=True)
+    return delivered
 
 
 @contextmanager
