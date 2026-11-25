@@ -138,19 +138,20 @@ def state(sha):
         return {"enabled": False, "state": "unavailable"}
     try:
         receipt = load_receipt(sha)
+        main = ref("main")
+        publication = {"main_sha": main, "is_published": contains(sha, main)}
         if not receipt:
-            return {"enabled": True, "state": "not_requested"}
+            return {"enabled": True, "state": "not_requested", **publication}
         issue = receipt.get("issue")
         if receipt.get("decision") == "rejected":
             return {"enabled": True, "state": "rejected", "issue": issue,
-                    "reason": receipt.get("reason"), "attachments": receipt.get("attachments", [])}
-        main = ref("main")
-        if contains(sha, main):
-            return {"enabled": True, "state": "published", "issue": issue, "main_sha": main}
+                    "reason": receipt.get("reason"), "attachments": receipt.get("attachments", []), **publication}
+        if publication["is_published"]:
+            return {"enabled": True, "state": "published", "issue": issue, **publication}
         if type(issue) is int and issue > 0:
             current = api(f"/issues/{issue}")
-            return {"enabled": True, "state": "blocked" if current.get("state") == "closed" else "queued", "issue": issue, "main_sha": main}
-        return {"enabled": True, "state": "blocked"}
+            return {"enabled": True, "state": "blocked" if current.get("state") == "closed" else "queued", "issue": issue, **publication}
+        return {"enabled": True, "state": "blocked", **publication}
     except (AcceptanceError, KeyError, TypeError, OSError):
         return {"enabled": True, "state": "unknown"}
 
@@ -205,8 +206,8 @@ def submit(sha, version, deployed):
             raise AcceptanceError("preview 已有新候选，请检查更新并重新验收")
         main = ref("main")
         if contains(sha, main):
-            save_receipt(sha, {"issue": None})
-            return {"enabled": True, "state": "published", "issue": None}
+            save_receipt(sha, {"issue": None, "decision": "accepted", "at": datetime.now(timezone.utc).isoformat()})
+            return {"enabled": True, "state": "published", "issue": None, "main_sha": main, "is_published": True}
         if not contains(main, sha):
             raise AcceptanceError("main 与候选存在分歧，禁止直接发布")
         evidence = test_evidence(sha)

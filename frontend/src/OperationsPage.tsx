@@ -9,7 +9,7 @@ export type ReleaseHistory = {
   running_sha: string
   releases: ReleaseNote[]
   deployments: Operation[]
-  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown' | 'rejected'; attachments?: {id:string;url:string}[]; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string; main_sha?: string }
+  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown' | 'rejected'; attachments?: {id:string;url:string}[]; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string; main_sha?: string; is_published?: boolean }
 }
 export type SystemLogs = { events: Operation[] }
 
@@ -95,7 +95,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
   const [screenshots,setScreenshots]=useState<string[]>([])
   const [rejectError,setRejectError]=useState('')
   const acceptance = data?.acceptance
-  const canReject=Boolean(acceptance?.enabled&&acceptance.state==='not_requested'&&data&&/^[0-9a-f]{40}$/.test(data.running_sha)&&data.releases[0]?.acceptance_required)
+  const canReject=Boolean(acceptance?.enabled&&acceptance.state==='not_requested'&&acceptance.ready===true&&acceptance.is_published===false&&data&&/^[0-9a-f]{40}$/.test(data.running_sha)&&data.releases[0]?.acceptance_required)
   const canAccept = Boolean(acceptance?.enabled && acceptance.state === 'not_requested' && acceptance.ready === true && data && /^[0-9a-f]{40}$/.test(data.running_sha) && data.releases[0]?.acceptance_required && data.releases[0]?.version === data.version)
   const gateWarning = acceptance?.enabled && (Boolean(acceptance.reason) || (acceptance.state === 'not_requested' && !canAccept))
   function requestAcceptance() {
@@ -144,7 +144,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
         ['最近成功部署',evidence.deployedAt,evidence.deployedSha],
       ].map(([label,value,sha])=><Card key={label} size="small"><Typography.Text type="secondary">{label}</Typography.Text><Typography.Title level={4} style={{margin:'8px 0',overflowWrap:'anywhere'}}>{value}</Typography.Title><Typography.Text code style={{overflowWrap:'anywhere'}}>{sha}</Typography.Text></Card>)}
     </div>
-    <Card title="当前运行版本" extra={<Space wrap>{awaitingAcceptance && <Tag color="warning">待验收 v{data?.version}</Tag>}{acceptanceAction()}{canReject&&<Button danger onClick={()=>{setRejectError('');setRejectTarget(data?{sha:data.running_sha,version:data.version}:null)}}>验收不通过</Button>}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
+    <Card title="当前运行版本" extra={<Space wrap>{acceptance?.is_published && acceptance.state==='not_requested' && <Tag color="blue">已发布 · 待补验收</Tag>}{awaitingAcceptance && <Tag color="warning">待验收 v{data?.version}</Tag>}{acceptanceAction()}{canReject&&<Button danger onClick={()=>{setRejectError('');setRejectTarget(data?{sha:data.running_sha,version:data.version}:null)}}>验收不通过</Button>}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
       {data ? <Flex wrap gap="small" align="center">
         <Tag color="blue">{data.version}</Tag>
         <Typography.Text copyable code style={{ overflowWrap: 'anywhere' }}>{data.running_sha === 'unknown' ? '未上报 Git SHA' : data.running_sha}</Typography.Text>
@@ -153,6 +153,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
     {gateWarning ?
       <Alert type="warning" showIcon message="当前页面暂不可验收" description={acceptance.reason || '正在核对 preview 和本机部署，请刷新后重试。'} /> :
       <Alert type="info" showIcon message="代码已提交不等于线上已验收" description={acceptance?.enabled ? '仅在最新 preview 与运行 SHA 和部署记录一致时允许验收。' : '请核对当前运行版本和 Git SHA，以实际验证结果为准。'} />}
+    {acceptance?.is_published && acceptance.state==='not_requested' && <Alert type="info" showIcon message="正式发布与功能验收独立记录" description="当前版本已经发布；如发现问题，请通过开发任务提交需求或问题反馈，不使用未发布候选的拒绝流程。" />}
     {acceptance?.issue && <Typography.Link href={`https://github.com/layho/web-app-init-base-env/issues/${acceptance.issue}`} target="_blank" rel="noopener noreferrer">{acceptance.state==='rejected'?'查看修复任务':'查看正式发布任务'} #{acceptance.issue}</Typography.Link>}
     {acceptance?.state==='rejected'&&<Alert type="error" showIcon message="当前候选验收不通过" description={<Space direction="vertical"><span>{acceptance.reason}</span><Space wrap>{acceptance.attachments?.map(x=><Image key={x.id} width={100} src={x.url}/>)}</Space></Space>}/>}
     <Modal title="提交验收不通过" open={rejectTarget!==null} onCancel={()=>{if(!rejecting)setRejectTarget(null)}} confirmLoading={rejecting} okText="提交不通过" cancelText="取消"
@@ -170,8 +171,8 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
         {rejectError&&<Alert type="error" message={rejectError}/>}
       </Space>
     </Modal>
-    <Modal title="确认验收并正式发布" open={confirm !== null} onCancel={() => { if (!accepting) setConfirm(null) }} onOk={() => void confirmAcceptance()} okText="验收通过，提交发布" cancelText="取消" confirmLoading={accepting} okButtonProps={{ disabled: !canAccept || loading }} closable={!accepting} maskClosable={!accepting} cancelButtonProps={{ disabled: accepting }}>
-      <Typography.Paragraph>确认已体验以下候选版本，授权将该版本发布至正式 main 分支。系统会再次核验测试结果和分支 SHA。</Typography.Paragraph>
+    <Modal title={acceptance?.is_published ? "补录功能验收" : "确认验收并正式发布"} open={confirm !== null} onCancel={() => { if (!accepting) setConfirm(null) }} onOk={() => void confirmAcceptance()} okText={acceptance?.is_published ? "确认验收通过" : "验收通过，提交发布"} cancelText="取消" confirmLoading={accepting} okButtonProps={{ disabled: !canAccept || loading }} closable={!accepting} maskClosable={!accepting} cancelButtonProps={{ disabled: accepting }}>
+      <Typography.Paragraph>{acceptance?.is_published ? "确认已体验当前正式运行版本，仅补录功能验收，不重复发布。" : "确认已体验以下候选版本，授权将该版本发布至正式 main 分支。系统会再次核验测试结果和分支 SHA。"}</Typography.Paragraph>
       <Typography.Paragraph strong>v{confirm?.version}</Typography.Paragraph>
       <Typography.Paragraph code style={{ overflowWrap: 'anywhere' }}>{confirm?.sha}</Typography.Paragraph>
       {acceptError && <Alert type="error" showIcon message={acceptError} />}

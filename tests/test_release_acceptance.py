@@ -163,3 +163,21 @@ def test_active_deployment_overrides_previous_success(github, monkeypatch, tmp_p
                             request, Response(), None)
     assert error.value.status_code == 409
     assert not github[2]
+
+
+def test_published_without_receipt_reports_main_without_claiming_acceptance(github):
+    refs, _, issues, _ = github
+    refs["main"] = RUNNING
+    result = acceptance.state(RUNNING)
+    assert result == {"enabled": True, "state": "not_requested", "main_sha": RUNNING, "is_published": True}
+    assert acceptance.load_receipt(RUNNING) is None
+    assert acceptance.submit(RUNNING, "0.2.0", True)["state"] == "published"
+    assert acceptance.load_receipt(RUNNING)["decision"] == "accepted"
+    assert not issues
+
+
+def test_unpublished_without_receipt_reports_main(github):
+    result = acceptance.state(RUNNING)
+    assert result["main_sha"] == MAIN
+    assert result["is_published"] is False
+    assert result["state"] == "not_requested"
