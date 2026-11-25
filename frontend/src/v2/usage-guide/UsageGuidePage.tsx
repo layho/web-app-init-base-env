@@ -1,4 +1,19 @@
+import {
+  AppstoreOutlined,
+  AuditOutlined,
+  CheckCircleOutlined,
+  CloudUploadOutlined,
+  CodeOutlined,
+  ExperimentOutlined,
+  FileTextOutlined,
+  HistoryOutlined,
+  HomeOutlined,
+  ReadOutlined,
+  RightOutlined,
+  ThunderboltOutlined,
+} from '@ant-design/icons'
 import { Collapse } from 'antd'
+import type { ComponentType } from 'react'
 import type { ProjectInfo } from '../../ProjectInfoPage'
 import {
   GUIDE_FAQ,
@@ -11,6 +26,24 @@ import {
 } from './content.ts'
 import { readGuideFacts, type RunningVersionFacts } from './facts.ts'
 import './usage-guide.css'
+
+const NAV_ICONS: Record<(typeof LIGHT_NAV)[number]['key'], ComponentType> = {
+  workspace: HomeOutlined,
+  guide: ReadOutlined,
+  tasks: CodeOutlined,
+  releases: HistoryOutlined,
+  diagnostics: ThunderboltOutlined,
+}
+
+const MODULE_ICONS: Record<(typeof GUIDE_MODULES)[number]['key'], ComponentType> = {
+  workspace: AppstoreOutlined,
+  guide: ReadOutlined,
+  tasks: CodeOutlined,
+  releases: HistoryOutlined,
+  diagnostics: ThunderboltOutlined,
+}
+
+const LOOP_ICONS = [FileTextOutlined, CodeOutlined, ExperimentOutlined, AuditOutlined, CloudUploadOutlined, CheckCircleOutlined]
 
 export function UsageGuidePage({
   project,
@@ -28,15 +61,20 @@ export function UsageGuidePage({
   return <div className="v2-guide" data-shell="unwired">
     <header className="v2-guide-top">
       <div className="v2-guide-brand"><strong>基座验收中心</strong><span>Web App Init Base Env</span></div>
-      <div className="v2-guide-top-meta">
-        <span>当前版本 {facts.version}</span>
+      <div className="v2-guide-version">
+        <span>当前版本</span>
+        <strong>{facts.version}</strong>
         <span>SHA {facts.sha}</span>
-        <span>{user}</span>
       </div>
+      <span className="v2-guide-user">{user}</span>
     </header>
     <div className="v2-guide-body">
       <nav className="v2-guide-nav" aria-label="使用指南预览导航">
-        {LIGHT_NAV.map(item => <div key={item.key} className={item.key === 'guide' ? 'is-current' : ''} aria-current={item.key === 'guide' ? 'page' : undefined}>{item.label}</div>)}
+        {LIGHT_NAV.map(item => {
+          const Icon = NAV_ICONS[item.key]
+          const current = item.key === 'guide'
+          return <div key={item.key} className={current ? 'is-current' : ''} aria-current={current ? 'page' : undefined}><Icon aria-hidden="true" /><span>{item.label}</span></div>
+        })}
         <p>浅色导航预览，尚未接入现有壳。</p>
       </nav>
       <main className="v2-guide-main">
@@ -56,34 +94,48 @@ export function UsageGuidePage({
           </section>
           <div className="v2-guide-columns">
             <div>
-              <section aria-label="快速开始">
+              <section className="v2-guide-card" aria-label="快速开始">
                 <h2>快速开始</h2>
                 <ol className="v2-guide-steps">
-                  {GUIDE_STEPS.map((step, index) => <li key={step.title}><b>{index + 1}</b><div><strong>{step.title}</strong><p>{step.detail}</p></div></li>)}
+                  {GUIDE_STEPS.map((step, index) => <li key={step.title}>
+                    <div className="v2-guide-step-title"><b>{index + 1}</b><strong>{step.title}</strong></div>
+                    <p>{step.detail}</p>
+                  </li>)}
                 </ol>
               </section>
-              <section aria-label="功能模块说明">
+              <section className="v2-guide-card" aria-label="功能模块说明">
                 <h2>功能模块说明</h2>
                 <div className="v2-guide-modules">
-                  {GUIDE_MODULES.map(item => <article key={item.key}><h3>{item.title}</h3><p>{item.detail}</p></article>)}
+                  {GUIDE_MODULES.map(item => {
+                    const Icon = MODULE_ICONS[item.key]
+                    return <article key={item.key}><Icon aria-hidden="true" /><h3>{item.title}</h3><p>{item.detail}</p></article>
+                  })}
                 </div>
               </section>
-              <section aria-label="开发闭环流程">
+              <section className="v2-guide-card" aria-label="开发闭环流程">
                 <h2>开发闭环流程</h2>
                 <p className="v2-guide-order">发布顺序是{RELEASE_ORDER}。</p>
                 <ol className="v2-guide-loop">
-                  {RELEASE_LOOP.map(item => <li key={item.title}><strong>{item.title}</strong><span>{item.detail}</span></li>)}
+                  {RELEASE_LOOP.map((item, index) => {
+                    const Icon = LOOP_ICONS[index]
+                    return <li key={item.title}>
+                      <Icon aria-hidden="true" />
+                      <strong>{item.title}</strong>
+                      <span>{item.detail}</span>
+                      {index < RELEASE_LOOP.length - 1 && <RightOutlined className="v2-guide-arrow" aria-hidden="true" />}
+                    </li>
+                  })}
                 </ol>
               </section>
             </div>
             <aside>
-              <section>
-                <h2>基座升级指南</h2>
+              <section className="v2-guide-card">
+                <h2><ThunderboltOutlined aria-hidden="true" />基座升级指南</h2>
                 <ol className="v2-guide-upgrade">
                   {UPGRADE_STEPS.map((step, index) => <li key={step.title}><b>{index + 1}</b><div><strong>{step.title}</strong><p>{step.detail}</p></div></li>)}
                 </ol>
               </section>
-              <section>
+              <section className="v2-guide-card v2-guide-faq">
                 <h2>常见问题</h2>
                 <Collapse items={GUIDE_FAQ.map(item => ({ key: item.key, label: item.question, children: <p>{item.answer}</p> }))} />
               </section>
