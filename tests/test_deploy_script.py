@@ -1,6 +1,7 @@
 """Deployment control-flow regression without starting macOS services."""
 from pathlib import Path
 import subprocess
+import sys
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "macmini" / "manage.sh"
 
@@ -10,12 +11,14 @@ def test_macmini_shell_syntax():
 
 def test_dependencies_rebuilds_broken_venv_without_losing_previous(tmp_path):
     script = SCRIPT.read_text()
-    function = script[script.index("dependencies() {"):script.index("\\ncheck_schema() {")]
+    function = script[script.index("replace_path_entry() {"):script.index("\\ncheck_schema() {")]
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     python3 = fake_bin / "python3"
     python3.write_text("""#!/bin/bash
 set -e
+if test "$1" = --version; then echo 'Python 3.13.0'; exit 0; fi
+if test "$1" = -c; then exec "$REAL_PYTHON3" "$@"; fi
 test "$1" = -m && test "$2" = venv
 mkdir -p "$3/bin"
 cat > "$3/bin/python" <<'PY'
@@ -23,15 +26,21 @@ cat > "$3/bin/python" <<'PY'
 if [[ "${1:-}" = -m && "${2:-}" = pip && "${3:-}" = install && "${FAIL_INSTALL:-0}" = 1 ]]; then exit 19; fi
 exit 0
 PY
+printf '#!%s/bin/python\\nexit 0\\n' "$3" > "$3/bin/uvicorn"
+chmod +x "$3/bin/uvicorn"
 chmod +x "$3/bin/python"
 """)
     python3.chmod(0o755)
+    (tmp_path / "requirements.txt").write_text("first-version\\n")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "scripts").mkdir()
+    root = tmp_path.resolve()
     (tmp_path / ".venv/bin").mkdir(parents=True)
     old_python = tmp_path / ".venv/bin/python"
     old_python.write_text("#!/bin/bash\\nexit 1\\n")
     old_python.chmod(0o755)
     (tmp_path / ".venv/old-marker").write_text("keep")
-    program = function + "\\nPATH='" + str(fake_bin) + "':\\"$PATH\\"\\nset -e\\nif FAIL_INSTALL=1 dependencies; then exit 31; fi\\ntest -f .venv/old-marker\\ntest ! -e .venv.next.$\\ndependencies\\ntest -x .venv/bin/python\\ntest ! -e .venv/old-marker\\n"
+    program = function + "\\nPATH='" + str(fake_bin) + "':\\"$PATH\\"\\nexport REAL_PYTHON3='" + sys.executable + "'\\nROOT='" + str(root) + "'\\nset -e\\nif FAIL_INSTALL=1 dependencies; then exit 31; fi\\ntest -f .venv/old-marker\\ndependencies\\ntest -L .venv\\nfirst=$(readlink .venv)\\ntest -x .venv/bin/python\\ntest -x .venv/bin/uvicorn\\ntest \"$(head -n 1 .venv/bin/uvicorn)\" = \"#!$ROOT/$first/bin/python\"\\ntest -f .venv.previous/old-marker\\ncommit_dependencies\\nprintf 'second-version\\\\n' > requirements.txt\\ndependencies\\nsecond=$(readlink .venv)\\ntest \"$first\" != \"$second\"\\ntest \"$(readlink .venv.previous)\" = \"$first\"\\nprintf 'first-version\\\\n' > requirements.txt\\nrestore_dependencies\\ntest \"$(readlink .venv)\" = \"$first\"\\ntest ! -e .venv.previous\\n"
     result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -50,7 +59,7 @@ def test_schema_gate_is_retryable_and_real_failures_are_held():
 def test_reinstall_preserves_previous_assets_until_healthy():
     script = SCRIPT.read_text()
     install_body = script.split("install() {", 1)[1].split("\nfeedback() {", 1)[0]
-    assert "if test -d frontend/dist; then mv frontend/dist frontend/dist.previous; fi" in install_body
+    assert "if test -d frontend/dist; then mv frontend/dist frontend/dist.previous ||" in install_body
     assert "mv frontend/dist.next frontend/dist" in install_body
     assert "if ! agents || ! health" in install_body
     assert "if test -d frontend/dist.previous; then mv frontend/dist.previous frontend/dist; fi" in install_body
