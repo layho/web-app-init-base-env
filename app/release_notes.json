@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.2.2",
+    "title": "精确测试与辅助状态解耦",
+    "summary": "协调器独立验证辅助进度 Pending，保持正式测试、审查、候选父提交与冻结门禁。",
+    "changes": [
+      "仅允许可信且匹配当前候选的辅助 Pending，其他失败或未完成检查继续阻塞。",
+      "手动入口允许唤醒协调器检查 unstable 候选；增加脱敏门禁原因码。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证协调器实机安装及精确候选自动合并",
+      "验证其他失败检查仍阻塞"
+    ],
+    "validation_note": "宿主独立协调器需要另行升级，仓库发布不代表宿主脚本已替换。"
+  },
+  {
     "version": "0.2.1",
     "title": "正式发布证据与补验收状态修复",
     "summary": "独立展示正式分支 SHA，区分已发布与已验收。",
