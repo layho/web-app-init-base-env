@@ -169,5 +169,47 @@ class DeploymentJournalTests(unittest.TestCase):
         self.assertEqual(result[0]["previous"],BASE)
         self.assertEqual(runner.deployment_events(raw.split("rollback_ok")[0]),[])
 
+
+class ReceiptAvailabilityTests(unittest.TestCase):
+    def test_receipts_precede_docker_failure(self):
+        from unittest.mock import Mock, call
+        from contextlib import nullcontext
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token = root / "github-token"
+            token.write_text("a" * 40)
+            token.chmod(0o600)
+            events = Mock()
+            events.docker.side_effect = RuntimeError("unavailable")
+            with patch.object(runner, "ROOT", root), \
+                 patch.object(runner, "token_file", return_value=token), \
+                 patch.object(runner, "lock", return_value=nullcontext()), \
+                 patch.object(runner, "report_base_deployments", events.deploy), \
+                 patch.object(runner, "flush_reports", events.flush), \
+                 patch.object(runner, "docker_command", events.docker), \
+                 patch("sys.argv", ["runner.py"]):
+                self.assertEqual(runner.main(), 1)
+            self.assertEqual(events.mock_calls, [call.deploy("a"*40), call.flush("a"*40), call.docker()])
+
+    def test_receipts_only_never_accesses_docker_or_candidates(self):
+        from contextlib import nullcontext
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token = root / "github-token"
+            token.write_text("a"*40)
+            token.chmod(0o600)
+            with patch.object(runner, "ROOT", root), \
+                 patch.object(runner, "token_file", return_value=token), \
+                 patch.object(runner, "lock", return_value=nullcontext()), \
+                 patch.object(runner, "report_base_deployments", side_effect=OSError("offline")), \
+                 patch.object(runner, "flush_reports") as flush, \
+                 patch.object(runner, "docker_command") as docker, \
+                 patch.object(runner, "test_candidate") as test, \
+                 patch("sys.argv", ["runner.py", "--receipts-only"]):
+                self.assertEqual(runner.main(), 0)
+                flush.assert_called_once_with("a"*40)
+                docker.assert_not_called()
+                test.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

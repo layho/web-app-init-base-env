@@ -511,14 +511,26 @@ def report_base_deployments(token):
         print("Deployment journal delivery pending; will retry",flush=True)
 
 
+def deliver_pending_reports(token):
+    # A failure in one delivery channel must not block the other.
+    for deliver in (report_base_deployments, flush_reports):
+        try:
+            deliver(token)
+        except (OSError, ValueError, KeyError, TypeError):
+            print('Receipt delivery deferred; retry next tick', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--configure', action='store_true')
+    parser.add_argument('--receipts-only', action='store_true', help='Attempt pending receipt delivery without Docker or candidate tests')
     parser.add_argument('--repo', choices=REPOS)
     parser.add_argument('--pr', type=int)
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--lock-fd', type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.receipts_only and (args.configure or args.repo or args.pr is not None or args.force or args.lock_fd is not None):
+        parser.error('--receipts-only cannot be combined with test or configuration options')
     os.umask(0o077)
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.configure:
@@ -544,12 +556,17 @@ def main():
         token = stream.read().strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,300}", token):
         raise SystemExit("Invalid credential format")
-    docker_command()
-    subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
     try:
         with (lock() if args.lock_fd is None else inherited_lock(args.lock_fd)):
-            report_base_deployments(token)
-            flush_reports(token)
+            deliver_pending_reports(token)
+            if args.receipts_only:
+                return 0
+            try:
+                docker_command()
+                subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                print('Docker unavailable; tests deferred, receipt delivery attempted', flush=True)
+                return 1
             for repo in ([args.repo] if args.repo else REPOS):
                 if args.pr:
                     prs = [api(token, f'/repos/{repo}/pulls/{args.pr}')]
