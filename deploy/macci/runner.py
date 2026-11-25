@@ -532,7 +532,8 @@ def report_base_deployments(token):
         sha=row["candidate"]
         # Status is scoped to the immutable candidate. No merge authority.
         state="success" if row["code"]=="update_ok" else "failure"
-        detail=(row["detail"] or row["code"])+" rollback="+row["rollback"]+" at="+row["finished"]
+        rollback_target=row["previous"] if row["rollback"]=="ok" else "unknown"
+        detail=(row["detail"] or row["code"])+" rollback="+rollback_target+" at="+row["finished"]
         try:
             statuses=api(token,f"/repos/{repo}/commits/{sha}/statuses?per_page=100")
             existing=next((s for s in statuses if s.get("context")==DEPLOY_CONTEXT and

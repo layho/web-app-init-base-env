@@ -153,7 +153,11 @@ def deployment_replacement_allowed(token, number, base, head, merge, main):
     if not receipt or receipt.get("state") != "failure" or (receipt.get("creator") or {}).get("login") != OWNER:
         return False
     description = receipt.get("description") or ""
-    if not re.fullmatch(r"(?:update_test_build_failed|update_restart_failed|update_dependencies_failed|host_test_failed|frontend_build_failed) rollback=ok at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", description):
+    receipt_match = re.fullmatch(
+        r"(?:update_test_build_failed|update_restart_failed|update_dependencies_failed|host_test_failed|frontend_build_failed) rollback=([0-9a-f]{40}) at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+        description,
+    )
+    if not receipt_match or receipt_match.group(1) != main:
         return False
     # Check the host's actual held candidate and checkout, not GitHub alone.
     checkout = Path.home() / "web-app-init-base-env-preview"

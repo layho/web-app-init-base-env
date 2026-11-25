@@ -176,7 +176,7 @@ class MergeTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
         status={"context":"macmini/deployment-v1","state":"failure","creator":{"login":m.OWNER},
-                "description":"host_test_failed rollback=ok at=2026-11-24T22:55:18Z"}
+                "description":f"host_test_failed rollback={D} at=2026-11-24T22:55:18Z"}
         review={"id":1,"author_association":"OWNER","user":{"login":m.OWNER},
                 "body":"[BASE_DEPLOY_REPAIR_REVIEW] "+json.dumps({"schema":1,"head":H,"failed_sha":B,"rollback_sha":D,"decision":"approved"})}
         with tempfile.TemporaryDirectory() as folder:
@@ -190,5 +190,9 @@ class MergeTests(unittest.TestCase):
                 self.assertTrue(m.deployment_replacement_allowed("fake",7,B,H,C,D))
                 held.write_text(C)
                 self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
+                held.write_text(B+"\\n")
+                wrong_target={**status,"description":f"host_test_failed rollback={B} at=2026-11-24T22:55:18Z"}
+                with patch.object(m,"api",return_value=[wrong_target]):
+                    self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
             with patch.object(m,"api",return_value=[{**status,"state":"success"}]):
                 self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))

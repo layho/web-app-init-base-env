@@ -169,6 +169,37 @@ class DeploymentJournalTests(unittest.TestCase):
         self.assertEqual(result[0]["previous"],BASE)
         self.assertEqual(runner.deployment_events(raw.split("rollback_ok")[0]),[])
 
+    def test_deployment_status_binds_successful_rollback_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            journal=root/"web-app-init-base-env-preview"/"logs"/"operations.tsv"
+            journal.parent.mkdir(parents=True)
+            journal.write_text("\n".join([
+                f"2026-11-25T00:00:00Z\tupdate_started\t{BASE}",
+                f"2026-11-25T00:00:01Z\tupdate_candidate\t{MERGE}",
+                f"2026-11-25T00:00:02Z\tupdate_test_build\t{MERGE}",
+                f"2026-11-25T00:00:03Z\trollback\t{MERGE}",
+                f"2026-11-25T00:00:04Z\trollback_ok\t{BASE}",
+                f"2026-11-25T00:00:05Z\tupdate_test_build_failed\t{MERGE}",
+            ])+"\n")
+            status_payload=[]
+            def api(_token,endpoint,data=None):
+                if endpoint.endswith("/statuses?per_page=100"):
+                    return []
+                if endpoint.endswith(f"/statuses/{MERGE}"):
+                    status_payload.append(data)
+                    return {}
+                if "/issues?state=all&" in endpoint:
+                    return []
+                if endpoint.endswith("/issues"):
+                    return {}
+                raise AssertionError(endpoint)
+            with patch.object(runner.Path,"home",return_value=root), \
+                 patch.object(runner,"api",side_effect=api):
+                self.assertTrue(runner.report_base_deployments("fake"))
+            self.assertEqual(len(status_payload),1)
+            self.assertIn(f"rollback={BASE}",status_payload[0]["description"])
+
 
 class ReceiptAvailabilityTests(unittest.TestCase):
     def test_report_outbox_retries_lost_ack_without_duplicate_comment(self):
