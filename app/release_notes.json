@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.2.8",
+    "title": "API 请求体与慢上传保护",
+    "summary": "在 JSON 解析前限制实际请求体字节数及截图并发，限制慢速请求读取时长。",
+    "changes": [
+      "普通 JSON 64 KiB，截图按附件总量计算上限，支持分块计数。",
+      "每 worker 两个截图请求，读取总时限 30 秒，超时释放槽位。",
+      "初始化同步复制中间件及回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证超限 413、慢上传 408、正常截图提交"
+    ],
+    "validation_note": "限制按 worker 生效；未引入全局限流，不替代网关保护。"
+  },
+  {
     "version": "0.2.7",
     "title": "会话刷新 CSRF 稳定性修复",
     "summary": "同一有效会话使用稳定派生令牌，避免多标签页刷新使写操作失效。",
