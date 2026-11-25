@@ -9,7 +9,7 @@ export type ReleaseHistory = {
   running_sha: string
   releases: ReleaseNote[]
   deployments: Operation[]
-  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown' | 'rejected'; attachments?: {id:string;url:string}[]; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string }
+  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown' | 'rejected'; attachments?: {id:string;url:string}[]; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string; main_sha?: string }
 }
 export type SystemLogs = { events: Operation[] }
 
@@ -70,7 +70,20 @@ function safeReference(value?: string) {
   } catch { return undefined }
 }
 
+export function releaseEvidence(data: ReleaseHistory | null) {
+  const valid = (value?: string) => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value) ? value : '未记录'
+  const running = valid(data?.running_sha)
+  const preview = valid(data?.acceptance?.preview_sha)
+  // A published acceptance proves the accepted running SHA, not an independently refreshed main head.
+  const main = valid(data?.acceptance?.main_sha)
+  const success = (data?.deployments ?? []).filter(row =>
+    ['update_ok','install_ok'].includes(row.code) && valid(row.sha) !== '未记录' && Number.isFinite(Date.parse(row.at))
+  ).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at))[0]
+  return {running,preview,main,deployedAt:success ? new Date(success.at).toLocaleString('zh-CN',{hour12:false}) : '未记录',deployedSha:valid(success?.sha)}
+}
+
 export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: RefreshProps & { data: ReleaseHistory | null; onAccept: (sha: string, version: string) => Promise<void>; onReject:(sha:string,version:string,reason:string,screenshots:string[])=>Promise<void> }) {
+  const [releaseQuery,setReleaseQuery] = useState('')
   const [selectedVersion, setSelectedVersion] = useState<string | null>(null)
   const [deployment, setDeployment] = useState<Operation | null>(null)
   const [accepting, setAccepting] = useState(false)
@@ -119,7 +132,18 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
   }
   const selected = data?.releases.find(release => release.version === selectedVersion)
   const awaitingAcceptance = Boolean(data?.releases[0]?.acceptance_required && acceptance?.state === 'not_requested' && acceptance.ready)
+  const evidence = releaseEvidence(data)
+  const visibleReleases = (data?.releases ?? []).filter(row=>[row.version,row.title,row.summary,...(row.changes ?? [])].some(value=>String(value ?? '').toLowerCase().includes(releaseQuery.trim().toLowerCase())))
   return <Flex vertical gap="middle">
+    <div><Typography.Title level={3} style={{margin:'0 0 4px'}}>更新记录</Typography.Title><Typography.Text type="secondary">版本、部署证据与用户验收记录</Typography.Text></div>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(min(220px,100%),1fr))',gap:12}}>
+      {[
+        ['运行版本',data?.version || '未记录',evidence.running],
+        ['Preview 候选','候选 SHA',evidence.preview],
+        ['Main 正式发布','正式 SHA',evidence.main],
+        ['最近成功部署',evidence.deployedAt,evidence.deployedSha],
+      ].map(([label,value,sha])=><Card key={label} size="small"><Typography.Text type="secondary">{label}</Typography.Text><Typography.Title level={4} style={{margin:'8px 0',overflowWrap:'anywhere'}}>{value}</Typography.Title><Typography.Text code style={{overflowWrap:'anywhere'}}>{sha}</Typography.Text></Card>)}
+    </div>
     <Card title="当前运行版本" extra={<Space wrap>{awaitingAcceptance && <Tag color="warning">待验收 v{data?.version}</Tag>}{acceptanceAction()}{canReject&&<Button danger onClick={()=>{setRejectError('');setRejectTarget(data?{sha:data.running_sha,version:data.version}:null)}}>验收不通过</Button>}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
       {data ? <Flex wrap gap="small" align="center">
         <Tag color="blue">{data.version}</Tag>
@@ -152,7 +176,8 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
       <Typography.Paragraph code style={{ overflowWrap: 'anywhere' }}>{confirm?.sha}</Typography.Paragraph>
       {acceptError && <Alert type="error" showIcon message={acceptError} />}
     </Modal>
-    {data?.releases.length ? data.releases.map(release =>
+    <Card size="small"><Space wrap><Typography.Text strong>版本时间线</Typography.Text><Input.Search allowClear value={releaseQuery} onChange={event=>setReleaseQuery(event.target.value)} placeholder="搜索版本、标题、更新内容" style={{maxWidth:'100%',width:280}}/><Typography.Text type="secondary">{visibleReleases.length} / {data?.releases.length ?? 0} 个版本</Typography.Text></Space></Card>
+    {visibleReleases.length ? visibleReleases.map(release =>
       <Card key={release.version}
         title={<Space wrap><Typography.Text strong>v{release.version}</Typography.Text><span>{release.title}</span></Space>}
         extra={<Space wrap><Typography.Text type="secondary">{release.date || '日期未记录'}</Typography.Text>{release.version === data?.version && acceptance?.state === 'published' ? <Tag color="success">已验收</Tag> : acceptanceTag(release)}{release.version === data?.version ? acceptanceAction() : null}<Button type="link" onClick={() => setSelectedVersion(release.version)}>详情</Button></Space>}>
@@ -166,7 +191,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
         </div> : <Typography.Paragraph type="secondary" style={{ margin: '12px 0 0' }}>{release.validation_note || release.validation || '暂无验收说明'}</Typography.Paragraph>}
         {safeReference(release.reference_url) && <Typography.Link href={safeReference(release.reference_url)} target="_blank" rel="noopener noreferrer">查看 GitHub 记录</Typography.Link>}
       </Card>
-    ) : <Card><Empty description={loading ? '正在读取更新记录…' : '暂无更新记录'} /></Card>}
+    ) : <Card><Empty description={loading ? '正在读取更新记录…' : releaseQuery ? '未找到匹配版本' : '暂无更新记录'} /></Card>}
     <Card title="本机发布记录">
       <OperationTable records={data?.deployments ?? []} loading={loading} onDetails={setDeployment} />
     </Card>
