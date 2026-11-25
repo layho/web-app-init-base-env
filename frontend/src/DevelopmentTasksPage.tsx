@@ -1,4 +1,6 @@
 import { useState } from 'react'
+import { AppstoreOutlined, UnorderedListOutlined, ReloadOutlined, UserOutlined, BranchesOutlined, ClockCircleOutlined, RightOutlined } from '@ant-design/icons'
+import './task-board.css'
 import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Modal, Select, Input, Space, Table, Tabs, Tag, Typography } from 'antd'
 
 type LinkedPR = {number: number; title?: string; url?: string; owner?: string; test?: {state?: string; started_at?: string; finished_at?: string; phase?: string}; merge_state?: string; merged_at?: string | null; merge_sha?: string | null; deployment?: {state?: string; at?: string | null}; conflict?: {blocked?: boolean}}
@@ -241,6 +243,11 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   const [filter, setFilter] = useState('current')
   const [search, setSearch] = useState('')
   const [order,setOrder]=useState('work')
+  const [view,setView]=useState<'board'|'list'>('board')
+  const [owner,setOwner]=useState('all')
+  const [urgency,setUrgency]=useState('all')
+  const [healthOpen,setHealthOpen]=useState(false)
+  const [expanded,setExpanded]=useState<Record<string,number>>({})
   const category = (t: DevelopmentTask) => {
     const stage=t.delivery_status ?? ''
     if (t.status === '已关闭' || (t.source === 'pr' && t.merge_state === 'closed')) return 'closed'
@@ -249,16 +256,19 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
     if (/待验收确认|待正式发布/.test(stage) || (t.status==='待验收' && t.merge_state==='merged' && t.deployment_state==='running')) return 'review'
     if (stage === '关联代码已正式发布 · 需求待结项') return 'review'
     if (t.merge_state === 'merged') return 'review'
+    if (t.test_state === 'pending' || t.prs?.some(p=>p.test?.state==='pending' && p.merge_state!=='closed' && p.merge_state!=='merged')) return 'testing'
     if (t.merge_state === 'open' || t.merge_state === 'draft' || t.status === '开发中') return 'active'
     return 'todo'
   }
-  const priority:Record<string,number>={blocked:0,review:1,active:2,todo:3,done:4,closed:5}
+  const priority:Record<string,number>={blocked:0,review:1,testing:2,active:3,todo:4,done:5,closed:6}
+  const lanes=[{key:'blocked',label:'受阻 / 失败'},{key:'todo',label:'待开发'},{key:'active',label:'开发中'},{key:'testing',label:'测试中'},{key:'review',label:'待验收 / 发布'},{key:'done',label:'已完成'},{key:'closed',label:'已关闭'}]
+  const urgencyOf=(t:DevelopmentTask)=>/\bP[0-3]\b/i.exec(t.title)?.[0].toUpperCase() ?? '未标记'
   const allTasks=data?.tasks ?? []
   const counts=allTasks.reduce<Record<string,number>>((acc,t)=>{const key=category(t);acc[key]=(acc[key]??0)+1;return acc},{})
   const timestamp=(t:DevelopmentTask)=>{const ts=Date.parse(t.updated_at ?? '');return Number.isFinite(ts)?ts:0}
   const visibleTasks = [...allTasks].filter(t => {
     const c=category(t)
-    return (filter==='all' || (filter==='current' && c!=='done' && c!=='closed') || filter===c) &&
+    return (owner==='all' || (t.owner || '未指定')===owner) && (urgency==='all' || urgencyOf(t)===urgency) && (filter==='all' || (filter==='current' && c!=='done' && c!=='closed') || filter===c) &&
       matchesSearch(search,[t.number,t.title,t.owner,t.github_actor,t.note,t.status,t.delivery_status,...(t.pr_numbers??[]),...(t.prs??[]).flatMap(p=>[p.number,p.title,p.merge_sha,phaseLabels[p.test?.phase??'']]),...(data?.pr_tracking?.prs??[]).filter(p=>t.pr_numbers?.includes(p.number)).flatMap(p=>[p.head,p.base,p.head_branch,p.title,ciLabels[p.test.state],phaseLabels[p.test.phase??'']])])
   }).sort((a,b)=>{
     if(order==='number_desc')return b.number-a.number
@@ -272,13 +282,18 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   const selectedTask = data?.tasks.find(task => (task.key ?? 'issue-' + task.number) === taskSelected)
   const sync = data?.refresh_status
   const syncing = sync?.state === 'queued' || sync?.state === 'running'
-  const tasks = <Flex vertical gap="middle">
+  const healthBad=Object.values(sync?.token_health ?? {}).some(item=>item.state!=='ok')
+  const owners=[...new Set(allTasks.map(t=>t.owner || '未指定'))].sort()
+  const taskKey=(t:DevelopmentTask)=>t.key ?? 'issue-'+t.number
+  const shownLanes=lanes.filter(l=>filter==='all'||filter===l.key||(filter==='current'&&!['done','closed'].includes(l.key)))
+  const tasks = <Flex vertical gap="middle" className="task-dashboard">
       {sync && sync.state !== 'unknown' && <Alert showIcon
         type={sync.state === 'failed' || sync.state === 'interrupted' ? 'warning' : sync.state === 'success' ? 'success' : 'info'}
         message={syncing ? '后台同步中 · 可继续操作' : sync.state === 'success' ? '最近同步成功' : '同步未完成 · 保留已有记录'}
         description={`阶段：${sync.phase ?? '等待领取'}；GitHub 请求：${sync.requests ?? 0}；耗时：${sync.elapsed_seconds ?? 0}秒${sync.reason ? '；原因：' + sync.reason : ''}`}/>}
 
-      {sync?.token_health && Object.keys(sync.token_health).length > 0 && <Card size="small" title="GitHub Token 健康检测 · 最近手动同步">
+      {sync?.token_health && Object.keys(sync.token_health).length > 0 && <Card size="small" className="task-health" title={<Button type="text" onClick={()=>setHealthOpen(!healthOpen)} aria-expanded={healthOpen || healthBad}>GitHub Token 健康检测 · {healthBad ? "存在异常" : "只读检测通过"} {healthOpen || healthBad ? "▾" : "▸"}</Button>}>
+        {(healthOpen || healthBad) && <>
         <Descriptions size="small" column={1} items={Object.entries(sync.token_health).map(([key, item])=>({
           key, label: ({identity:'REST 身份',rate_limit:'API 额度',repository:'仓库读取权限',graphql:'GraphQL 读取'} as Record<string,string>)[key] ?? key,
           children: <Space wrap><Tag color={item.state==='ok'?'success':'error'}>{item.state==='ok'?'通过':'失败'}</Tag>
@@ -287,29 +302,54 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
             {item.permissions ? Object.entries(item.permissions).map(([k,v])=>`${k}:${v?'是':'否'}`).join('；') : ''}
             {item.elapsed_seconds != null ? `${item.elapsed_seconds}秒` : ''}</Space>
         }))}/>
-        <Typography.Text type="secondary">只读检测，不代表已验证写入或合并授权；点击立即同步可重新检测。</Typography.Text>
+        <Typography.Text type="secondary">只读检测，不代表已验证写入或合并授权；点击立即同步可重新检测。</Typography.Text></>}
       </Card>}
       {data?.stale && <Alert type="warning" showIcon message={
         data?.synced_at ? '同步已延迟，以下为上次成功获取的记录。' : '等待从 GitHub 同步开发任务。'
       } />}
       {data?.synced_at && <Typography.Text type="secondary">GitHub 最近同步 {formatDate(data.synced_at)}</Typography.Text>}
-      <Space wrap>
-        <Input.Search allowClear placeholder="搜索任务、PR、负责人、版本或状态" value={search} onChange={e=>setSearch(e.target.value)} style={{width:310}}/>
+      <div className="task-kpis">{lanes.map(l=><button key={l.key} type="button" className={"task-kpi task-tone-"+l.key+(filter===l.key?" is-selected":"")} aria-pressed={filter===l.key} onClick={()=>setFilter(filter===l.key?"current":l.key)}><span>{l.label}</span><strong>{counts[l.key]??0}</strong></button>)}</div>
+      <Space wrap className="task-toolbar">
+        <Input.Search allowClear placeholder="搜索任务、PR、负责人、版本或状态" value={search} onChange={e=>setSearch(e.target.value)} className="task-search"/>
         <Select value={filter} onChange={setFilter} style={{width:155}} options={[
           {value:'current',label:'当前任务'},{value:'all',label:'全部任务'},{value:'todo',label:'待开发'},{value:'active',label:'开发中'},
-          {value:'blocked',label:'受阻 / 失败'},{value:'review',label:'待验收 / 发布'},
+          {value:'blocked',label:'受阻 / 失败'},{value:'testing',label:'测试中'},{value:'review',label:'待验收 / 发布'},
           {value:'done',label:'已完成'},{value:'closed',label:'已关闭'}
         ]}/>
         <Select value={order} onChange={setOrder} style={{width:155}} options={[
           {value:'work',label:'当前工作优先'},{value:'updated',label:'最近更新优先'},
           {value:'number_desc',label:'编号从新到旧'},{value:'number_asc',label:'编号从旧到新'}
         ]}/>
+        <Select aria-label="负责人" value={owner} onChange={setOwner} style={{minWidth:130}} options={[{value:"all",label:"全部负责人"},...owners.map(v=>({value:v,label:v}))]}/>
+        <Select aria-label="优先级" value={urgency} onChange={setUrgency} style={{minWidth:110}} options={[{value:"all",label:"全部优先级"},...["P0","P1","P2","P3","未标记"].map(v=>({value:v,label:v}))]}/>
+        <Space.Compact><Button aria-pressed={view==="board"} type={view==="board"?"primary":"default"} icon={<AppstoreOutlined/>} onClick={()=>setView("board")}>看板</Button><Button aria-pressed={view==="list"} type={view==="list"?"primary":"default"} icon={<UnorderedListOutlined/>} onClick={()=>setView("list")}>列表</Button></Space.Compact>
         <Typography.Text type="secondary">{visibleTasks.length} / {allTasks.length} 条</Typography.Text>
       </Space>
-      <Space wrap>{([{key:'blocked',label:'受阻'},{key:'review',label:'待验收 / 发布'},{key:'active',label:'开发中'},{key:'todo',label:'待开发'},{key:'done',label:'已完成'},{key:'closed',label:'已关闭'}]).map(x=><Button key={x.key} size="small" type={filter===x.key?'primary':'default'} onClick={()=>setFilter(filter===x.key?'current':x.key)}>{x.label} {counts[x.key]??0}</Button>)}
-        {filter==='current'&&<Typography.Text type="secondary">历史任务已隐藏，可切换查看</Typography.Text>}
-      </Space>
-      <Table
+      {filter==='current'&&<Typography.Text type="secondary">历史任务已隐藏，可通过统计卡片或筛选查看。</Typography.Text>}
+      {view==='board' ? <div className="task-board" aria-label="开发任务看板">
+        {shownLanes.map(l=>{
+          const items=visibleTasks.filter(t=>category(t)===l.key)
+          const limit=expanded[l.key]??12
+          return <section className={"task-lane task-tone-"+l.key} key={l.key}>
+            <header><span>{l.label}</span><strong>{items.length}</strong></header>
+            <div className="task-lane-body">
+              {!items.length&&<Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无任务"/>}
+              {items.slice(0,limit).map(t=><article className="task-tile" key={taskKey(t)}>
+                <Typography.Link className="task-tile-title" href={t.url} target="_blank" rel="noreferrer">#{t.number} {t.title}</Typography.Link>
+                <Space size={[4,4]} wrap>{urgencyOf(t)!=='未标记'&&<Tag color={urgencyOf(t)==='P0'?'error':'default'}>{urgencyOf(t)}</Tag>}<Tag>{t.source==='pr'?'代码任务':t.origin==='feedback'?'意见反馈':'需求任务'}</Tag></Space>
+                {l.key==='blocked'&&<div className="task-blocked">{t.delivery_status??t.status}{t.test_failures?.length? ' · '+t.test_failures.map(f=>'#'+f.number+' '+(phaseLabels[f.phase??'']??'测试失败')).join('、'):''}</div>}
+                <div className="task-meta"><UserOutlined/> <span>{t.owner||'未指定'}</span></div>
+                <div className="task-meta"><BranchesOutlined/> <span>{t.pr_numbers?.slice(0,3).map(n=>'#'+n).join('、')||'暂无关联 PR'}{(t.pr_numbers?.length??0)>3&&' +'+((t.pr_numbers?.length??0)-3)}</span></div>
+                <div className="task-meta"><ClockCircleOutlined/> <span>{formatDate(t.updated_at)}</span></div>
+                <div className="task-stage">{t.delivery_status??t.status}</div>
+                <div className="task-pipeline"><span>测试 {t.test_failures?.length?<Tag color="error">失败</Tag>:t.test_state?ciTag(t.test_state):'—'}</span><span>合并 <Tag color={t.merge_state==='merged'?'success':'default'}>{mergeLabels[t.merge_state??'']??'未记录'}</Tag></span><span>部署 <Tag color={['running','deployed'].includes(t.deployment_state??'')?'success':t.deployment_state==='failed'?'error':'default'}>{deployLabels[t.deployment_state??'']??'未记录'}</Tag></span></div>
+                <div className="task-tile-footer"><Button type="link" size="small" onClick={()=>setTaskSelected(taskKey(t))}>查看详情 <RightOutlined/></Button></div>
+              </article>)}
+              {items.length>limit&&<Button block onClick={()=>setExpanded(v=>({...v,[l.key]:limit+12}))}>加载更多（剩余 {items.length-limit}）</Button>}
+            </div>
+          </section>
+        })}
+      </div> :       <Table
         rowKey={task => task.key ?? 'issue-' + task.number}
         size="small"
         loading={loading}
@@ -322,7 +362,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
           { title: '任务', dataIndex: 'title', width: 310, render: (title: string, task: DevelopmentTask) =>
             <Typography.Link href={task.url} target="_blank" rel="noreferrer">#{task.number} {title}</Typography.Link> },
           { title: '负责人', width: 110, render: (_, task: DevelopmentTask) => task.owner || '未指定' },
-          { title: '关联 PR', width: 110, render: (_, task: DevelopmentTask) => task.pr_numbers?.length ? task.pr_numbers.map(n => '#' + n).join('、') : '—' },
+          { title: '关联 PR', width: 110, render: (_, task: DevelopmentTask) => task.pr_numbers?.length ? task.pr_numbers.slice(0,3).map(n => '#' + n).join('、') + (task.pr_numbers.length>3? ' +'+(task.pr_numbers.length-3):'') : '—' },
           { title: '操作', width: 84, render: (_, task: DevelopmentTask) => <Button type="link" size="small"
             onClick={() => setTaskSelected(task.key ?? 'issue-' + task.number)}>查看链路</Button> },
           { title: '来源', width: 85, render: (_, task: DevelopmentTask) =>
@@ -341,9 +381,9 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
           { title: '最新进展', dataIndex: 'note', render: (note: string) => note || '—' },
           { title: '更新时间', dataIndex: 'updated_at', width: 168, render: formatDate },
         ]}
-      />
+      />}
     </Flex>
-  return <Card title="开发任务" extra={<Button onClick={onRefresh} loading={loading} disabled={syncing}>{syncing ? "同步中" : "立即同步"}</Button>}>
+  return <Card className="task-page" title={<div className="task-heading"><strong>开发任务</strong><small>追踪开发、测试、验收与发布的完整交付链路</small></div>} extra={<Button icon={<ReloadOutlined/>} onClick={onRefresh} loading={loading} disabled={syncing}>{syncing ? "同步中" : "立即同步"}</Button>}>
     {data?.pr_tracking ? <Tabs items={[{key:'tasks',label:'统一任务清单',children:tasks},{key:'tracking',label:'测试与发布追踪',children:<PRTrackingPage tasks={data.tasks} data={data.pr_tracking} onReleaseDraft={onReleaseDraft} onRequestRepair={onRequestRepair}/>}]} /> : tasks}
     <Drawer title={selectedTask ? '#' + selectedTask.number + ' · 完整交付链路' : '交付链路'}
       open={taskSelected !== null} onClose={() => setTaskSelected(null)} width="min(720px, 100vw)">
