@@ -13,7 +13,7 @@ export const LIGHT_NAV = [
 
 export const GUIDE_STEPS = [
   { title: '查看工作台', detail: '了解当前运行状态和待处理事项。没有数据时显示未记录。' },
-  { title: '提交需求', detail: '需求、问题和验收意见仍从现有意见反馈进入。本页不提供提交按钮。' },
+  { title: '提交需求', detail: '在开发任务中使用提交需求入口，保留原有反馈记录和同步机制。' },
   { title: '跟踪开发', detail: '在开发任务查看进度、测试结果和合并状态。' },
   { title: '验收版本', detail: '候选先部署到 preview，由用户验收。未验收不得进入 main。' },
   { title: '排查问题', detail: '在运行诊断查看真实异常。没有诊断记录时显示未记录。' },
@@ -47,7 +47,7 @@ export const GUIDE_FAQ = [
   {
     key: 'submit',
     question: '如何提交一个新的开发需求？',
-    answer: '使用现有意见反馈。使用指南不新增提交按钮，也不另建任务池。',
+    answer: '进入开发任务，点击提交需求。原有反馈记录与交付链路继续保留。',
   },
   {
     key: 'accept',

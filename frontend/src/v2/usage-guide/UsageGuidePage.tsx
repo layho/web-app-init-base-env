@@ -51,12 +51,14 @@ export function UsageGuidePage({
   loading = false,
   username,
   running,
+  onNavigate,
 }: {
   project: ProjectInfo | null
   embedded?: boolean
   loading?: boolean
   username?: string | null
   running?: RunningVersionFacts | null
+  onNavigate?: (key: (typeof GUIDE_MODULES)[number]['key']) => void
 }) {
   const facts = readGuideFacts(project, running)
   const user = typeof username === 'string' && username.trim() ? username.trim() : '未记录'
@@ -110,7 +112,7 @@ export function UsageGuidePage({
                 <div className="v2-guide-modules">
                   {GUIDE_MODULES.map(item => {
                     const Icon = MODULE_ICONS[item.key]
-                    return <article key={item.key}><Icon aria-hidden="true" /><h3>{item.title}</h3><p>{item.detail}</p></article>
+                    return <article key={item.key}>{onNavigate ? <button type="button" className="v2-guide-module-link" onClick={() => onNavigate(item.key)}><Icon aria-hidden="true" /><strong>{item.title}</strong><span>{item.detail}</span></button> : <><Icon aria-hidden="true" /><h3>{item.title}</h3><p>{item.detail}</p></>}</article>
                   })}
                 </div>
               </section>

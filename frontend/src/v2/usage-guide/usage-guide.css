@@ -81,3 +81,9 @@
 .v2-guide[data-shell="embedded"] .v2-guide-loop li { flex: 1 1 120px; }
 .v2-guide[data-shell="embedded"] .v2-guide-arrow { display: none; }
 .v2-guide[data-shell="embedded"] .v2-guide-step-title strong,.v2-guide[data-shell="embedded"] .v2-guide-modules h3,.v2-guide[data-shell="embedded"] .v2-guide-loop strong { white-space: normal; overflow-wrap: anywhere; }
+
+.v2-guide-module-link { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; width: 100%; height: 100%; padding: 0; text-align: left; color: inherit; border: 0; background: transparent; cursor: pointer; font: inherit; }
+.v2-guide-module-link strong { font-size: 16px; }
+.v2-guide-module-link span { overflow-wrap: anywhere; }
+.v2-guide-module-link:hover strong { color: #1677ff; }
+.v2-guide-module-link:focus-visible { outline: 2px solid #1677ff; outline-offset: 4px; border-radius: 4px; }

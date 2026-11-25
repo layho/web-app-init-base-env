@@ -531,7 +531,7 @@ function App() {
           <Space wrap><Button type="primary" onClick={() => navigate('tasks')}>开发任务</Button><Button onClick={() => {navigate('feedback');setFeedbackOpen(true)}}>提交需求</Button><Button onClick={() => navigate('releases')}>更新记录</Button><Button onClick={() => navigate('logs')}>运行诊断</Button></Space>
         </Space>
       ) : page === 'project' ? (
-        <Space direction="vertical" size="middle" style={{width:'100%'}}><UsageGuidePage embedded project={projectInfo} loading={loadingOperations === 'project'} running={versionUnavailable ? null : runningVersion} /><Card title="详细配置与原操作指南"><ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} /></Card></Space>
+        <Space direction="vertical" size="middle" style={{width:'100%'}}><UsageGuidePage embedded onNavigate={key => navigate(key === 'guide' ? 'project' : key === 'diagnostics' ? 'logs' : key)} project={projectInfo} loading={loadingOperations === 'project'} running={versionUnavailable ? null : runningVersion} /><Card title="详细配置与原操作指南"><ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} /></Card></Space>
       ) : page === 'tasks' ? (
         <Space direction="vertical" size="middle" style={{width:'100%'}}>
           <Space wrap><Button type="primary" onClick={() => {navigate('feedback');setFeedbackOpen(true)}}>提交需求</Button><Button onClick={() => navigate('feedback')}>需求与反馈记录</Button></Space>
