@@ -11,7 +11,7 @@ def test_macmini_shell_syntax():
 
 def test_dependencies_rebuilds_broken_venv_without_losing_previous(tmp_path):
     script = SCRIPT.read_text()
-    function = script[script.index("replace_path_entry() {"):script.index("\\ncheck_schema() {")]
+    function = script[script.index("replace_path_entry() {"):script.index("\ncheck_schema() {")]
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     python3 = fake_bin / "python3"
@@ -31,16 +31,40 @@ chmod +x "$3/bin/uvicorn"
 chmod +x "$3/bin/python"
 """)
     python3.chmod(0o755)
-    (tmp_path / "requirements.txt").write_text("first-version\\n")
+    (tmp_path / "requirements.txt").write_text("first-version\n")
     (tmp_path / "app").mkdir()
     (tmp_path / "scripts").mkdir()
     root = tmp_path.resolve()
     (tmp_path / ".venv/bin").mkdir(parents=True)
     old_python = tmp_path / ".venv/bin/python"
-    old_python.write_text("#!/bin/bash\\nexit 1\\n")
+    old_python.write_text("#!/bin/bash\nexit 1\n")
     old_python.chmod(0o755)
     (tmp_path / ".venv/old-marker").write_text("keep")
-    program = function + "\\nPATH='" + str(fake_bin) + "':\\"$PATH\\"\\nexport REAL_PYTHON3='" + sys.executable + "'\\nROOT='" + str(root) + "'\\nset -e\\nif FAIL_INSTALL=1 dependencies; then exit 31; fi\\ntest -f .venv/old-marker\\ndependencies\\ntest -L .venv\\nfirst=$(readlink .venv)\\ntest -x .venv/bin/python\\ntest -x .venv/bin/uvicorn\\ntest \"$(head -n 1 .venv/bin/uvicorn)\" = \"#!$ROOT/$first/bin/python\"\\ntest -f .venv.previous/old-marker\\ncommit_dependencies\\nprintf 'second-version\\\\n' > requirements.txt\\ndependencies\\nsecond=$(readlink .venv)\\ntest \"$first\" != \"$second\"\\ntest \"$(readlink .venv.previous)\" = \"$first\"\\nprintf 'first-version\\\\n' > requirements.txt\\nrestore_dependencies\\ntest \"$(readlink .venv)\" = \"$first\"\\ntest ! -e .venv.previous\\n"
+    program = """@FUNCTION@
+PATH='@FAKE_BIN@':"$PATH"
+export REAL_PYTHON3='@REAL_PYTHON3@'
+ROOT='@ROOT@'
+set -e
+if FAIL_INSTALL=1 dependencies; then exit 31; fi
+test -f .venv/old-marker
+dependencies
+test -L .venv
+first=$(readlink .venv)
+test -x .venv/bin/python
+test -x .venv/bin/uvicorn
+test "$(head -n 1 .venv/bin/uvicorn)" = "#!$ROOT/$first/bin/python"
+test -f .venv.previous/old-marker
+commit_dependencies
+printf 'second-version\\n' > requirements.txt
+dependencies
+second=$(readlink .venv)
+test "$first" != "$second"
+test "$(readlink .venv.previous)" = "$first"
+printf 'first-version\\n' > requirements.txt
+restore_dependencies
+test "$(readlink .venv)" = "$first"
+test ! -e .venv.previous
+""".replace("@FUNCTION@", function).replace("@FAKE_BIN@", str(fake_bin)).replace("@REAL_PYTHON3@", sys.executable).replace("@ROOT@", str(root))
     result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
 
