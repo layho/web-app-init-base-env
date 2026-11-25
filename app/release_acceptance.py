@@ -144,11 +144,12 @@ def state(sha):
         if receipt.get("decision") == "rejected":
             return {"enabled": True, "state": "rejected", "issue": issue,
                     "reason": receipt.get("reason"), "attachments": receipt.get("attachments", [])}
-        if contains(sha, ref("main")):
-            return {"enabled": True, "state": "published", "issue": issue}
+        main = ref("main")
+        if contains(sha, main):
+            return {"enabled": True, "state": "published", "issue": issue, "main_sha": main}
         if type(issue) is int and issue > 0:
             current = api(f"/issues/{issue}")
-            return {"enabled": True, "state": "blocked" if current.get("state") == "closed" else "queued", "issue": issue}
+            return {"enabled": True, "state": "blocked" if current.get("state") == "closed" else "queued", "issue": issue, "main_sha": main}
         return {"enabled": True, "state": "blocked"}
     except (AcceptanceError, KeyError, TypeError, OSError):
         return {"enabled": True, "state": "unknown"}

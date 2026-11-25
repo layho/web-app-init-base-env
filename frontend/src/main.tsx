@@ -1,16 +1,19 @@
 /// <reference types="vite/client" />
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { AppstoreOutlined, CommentOutlined, HistoryOutlined, ProfileOutlined, CloudDownloadOutlined, UnorderedListOutlined, ProjectOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, HistoryOutlined, ProfileOutlined, CloudDownloadOutlined, UnorderedListOutlined, ProjectOutlined } from '@ant-design/icons'
 import { Alert, Button, Card, ConfigProvider, Descriptions, Drawer, Empty, Form, Image, Input, Layout, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import 'antd/dist/reset.css'
 import { ReleasePage, SystemLogPage } from './OperationsPage'
 import type { ReleaseHistory, SystemLogs } from './OperationsPage'
-import { DevelopmentTasksPage } from './DevelopmentTasksPage'
+import { DevelopmentTasksPage, workbenchMetrics } from './DevelopmentTasksPage'
 import type { TaskSnapshot } from './DevelopmentTasksPage'
 import { ProjectInfoPage } from './ProjectInfoPage'
 import type { ProjectInfo } from './ProjectInfoPage'
+import { UsageGuidePage } from './v2/usage-guide/UsageGuidePage'
+import { WorkbenchPage } from './v2/workbench/WorkbenchPage'
+import { overviewEvidence } from './v2/workbench/facts'
 import { WorkspaceShell } from './WorkspaceShell'
 import { ScreenshotPicker } from './ScreenshotPicker'
 import { FeedbackDelivery } from './FeedbackDelivery'
@@ -57,14 +60,13 @@ const basePreview = import.meta.env.VITE_BASE_PREVIEW === "1"
 const appName = basePreview ? "基座验收中心" : "Web App Foundation"
 const navigation = [
   { key: 'workspace', label: '工作台', icon: <AppstoreOutlined /> },
-  { key: 'project', label: '项目信息', icon: <ProjectOutlined /> },
+  { key: 'project', label: '使用指南', icon: <ProjectOutlined /> },
   { key: 'tasks', label: '开发任务', icon: <UnorderedListOutlined /> },
   { key: 'releases', label: '更新记录', icon: <HistoryOutlined /> },
-  { key: 'logs', label: '系统日志', icon: <ProfileOutlined /> },
-  { key: 'feedback', label: '意见反馈', icon: <CommentOutlined /> },
+  { key: 'logs', label: '运行诊断', icon: <ProfileOutlined /> },
 ] as const
 
-type Page = (typeof navigation)[number]['key']
+type Page = (typeof navigation)[number]['key'] | 'feedback'
 const githubIssues = basePreview ? 'https://github.com/layho/web-app-init-base-env/issues' : 'https://github.com/example/web-app/issues'
 
 class ApiError extends Error {
@@ -179,7 +181,7 @@ function App() {
     return () => { active = false }
   }, [])
   useEffect(() => {
-    document.title = `${navigation.find(item => item.key === page)?.label ?? '工作台'} · ${branding.reference_name}`
+    document.title = `${navigation.find(item => item.key === (page === 'feedback' ? 'tasks' : page))?.label ?? '工作台'} · ${branding.reference_name}`
   }, [branding.reference_name, page])
   useEffect(() => {
     if (!signedIn) return
@@ -391,6 +393,30 @@ function App() {
     return () => { active = false; window.clearInterval(timer) }
   }, [signedIn, page])
 
+  useEffect(() => {
+    if (!signedIn || page !== 'workspace') return
+    let active = true
+    let pending = false
+    async function refreshOverview() {
+      if (pending) return
+      pending = true
+      try {
+        const [tasks, project, logs] = await Promise.allSettled([
+          api<TaskSnapshot>('/api/v1/development-tasks'),
+          api<ProjectInfo>('/api/v1/project-info'),
+          api<SystemLogs>('/api/v1/system-logs'),
+        ])
+        if (!active) return
+        setDevelopmentTasks(tasks.status === 'fulfilled' ? tasks.value : null)
+        setProjectInfo(project.status === 'fulfilled' ? project.value : null)
+        setSystemLogs(logs.status === 'fulfilled' ? logs.value : null)
+      } finally { pending = false }
+    }
+    void refreshOverview()
+    const timer = window.setInterval(() => void refreshOverview(), 30000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [signedIn, page])
+
   async function loadOperations(key: 'releases' | 'logs' | 'tasks' | 'project', refresh = false) {
     setLoadingOperations(key)
     setNotice(null)
@@ -441,7 +467,7 @@ function App() {
       appName={branding.workspace_name}
       brandMark="应用"
       username={session.username}
-      activePage={page}
+      activePage={page === 'feedback' ? 'tasks' : page}
       navigation={navigation}
       onNavigate={navigate}
       onLogout={logout}
@@ -503,15 +529,15 @@ function App() {
         </Form>}
       </Modal>
       {page === 'workspace' ? (
-        <Card>
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="空应用，暂无业务模块">
-            <Button type="primary" onClick={() => navigate('feedback')}>提交需求</Button>
-          </Empty>
-        </Card>
+        <Space direction="vertical" size="middle" style={{width:'100%'}}>
+          <WorkbenchPage embedded {...overviewEvidence(developmentTasks,deployStatus,systemLogs?.events ?? null)} metrics={workbenchMetrics(developmentTasks)} project={projectInfo} running={versionUnavailable ? null : runningVersion} versions={{running: versionUnavailable ? null : runningVersion?.version}} />
+          <Space wrap><Button type="primary" onClick={() => navigate('tasks')}>开发任务</Button><Button onClick={() => {navigate('feedback');setFeedbackOpen(true)}}>提交需求</Button><Button onClick={() => navigate('releases')}>更新记录</Button><Button onClick={() => navigate('logs')}>运行诊断</Button></Space>
+        </Space>
       ) : page === 'project' ? (
-        <ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} />
+        <Space direction="vertical" size="middle" style={{width:'100%'}}><UsageGuidePage embedded onNavigate={key => navigate(key === 'guide' ? 'project' : key === 'diagnostics' ? 'logs' : key)} project={projectInfo} loading={loadingOperations === 'project'} running={versionUnavailable ? null : runningVersion} /><Card title="详细配置与原操作指南"><ProjectInfoPage data={projectInfo} loading={loadingOperations === 'project'} issueBase={githubIssues} onOpenTasks={() => navigate('tasks')} onRefresh={() => void loadOperations('project', true)} /></Card></Space>
       ) : page === 'tasks' ? (
         <Space direction="vertical" size="middle" style={{width:'100%'}}>
+          <Space wrap><Button type="primary" onClick={() => {navigate('feedback');setFeedbackOpen(true)}}>提交需求</Button><Button onClick={() => navigate('feedback')}>需求与反馈记录</Button></Space>
           {developmentTasks?.pr_tracking?.manual_actions_available && <Card title="手动立即执行 · 不必等待定时任务">
             <Space wrap>
               <Select placeholder="选择要处理的 PR" style={{minWidth:250}}
@@ -561,7 +587,8 @@ function App() {
         <SystemLogPage data={systemLogs} loading={loadingOperations === 'logs'} onRefresh={() => void loadOperations('logs')} />
       ) : (
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-          <Card title="意见反馈" extra={<Space wrap>
+          <Card title="开发任务 · 需求与反馈记录" extra={<Space wrap>
+            <Button onClick={() => navigate('tasks')}>返回任务看板</Button>
             <Button onClick={() => void loadFeedback()} loading={feedbackLoading}>刷新状态</Button>
             <Button type="primary" onClick={() => setFeedbackOpen(true)}>提交反馈</Button>
           </Space>}>
@@ -652,12 +679,12 @@ createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConfigProvider locale={zhCN} theme={{
       token: {
-        colorPrimary: '#3979ec',
+        colorPrimary: '#1677ff',
         borderRadius: 9,
         fontFamily: '-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif',
       },
       components: {
-        Layout: { siderBg: '#fff', headerBg: '#fff', bodyBg: '#f6f8fc' },
+        Layout: { siderBg: '#fff', headerBg: '#fff', bodyBg: '#f3f6fa' },
         Menu: { itemSelectedBg: '#eaf2ff' },
       },
     }}>
