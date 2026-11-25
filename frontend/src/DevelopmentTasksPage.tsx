@@ -34,7 +34,7 @@ type DevelopmentTask = {
 
 type PRRecord = { head_branch?: string | null; base_branch?: string | null; number: number; title: string; url: string; head: string; base: string | null; test: {state: string; started_at?: string; finished_at?: string; duration_seconds?: number | null; phase?: string; tested_merge?: string | null; progress?: {phase:string;heartbeat_at:string;heartbeat_stale:boolean;elapsed_seconds:number}|null; failure_report?: {run_id:string; failures:{file:string;category:string;test?:string;line?:number;column?:number}[]}|null}; head_status?: {state: string; at: string | null}; log?: {pytest: Record<string, number> | null; phase: string} | null; merge_state: string; merge_blocked?: boolean; mergeability?: string; conflict?: {blocked: boolean; base_sha: string; candidate_files: string[]; file_scope: string; reason: string | null}; merged_at: string | null; merge_sha: string | null; deployment: {state: string; at: string | null} }
 type PRTracking = { active_synced_at?: string; history_synced_at?: string|null; running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
-export type TaskSnapshot = { refresh_status?: {state: string; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string; token_health?: Record<string, {state:string; reason?:string; login?:string; permission?:string; remaining?:number; limit?:number; permissions?:Record<string,boolean>; elapsed_seconds?:number}>}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
+export type TaskSnapshot = { refresh_status?: {state: string; token_health_checked_at?: string | null; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string; token_health?: Record<string, {state:string; reason?:string; login?:string; permission?:string; remaining?:number; limit?:number; permissions?:Record<string,boolean>; elapsed_seconds?:number}>}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
 export function taskCategory(t: DevelopmentTask) {
     const stage=t.delivery_status ?? ''
@@ -297,7 +297,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   const selectedTask = data?.tasks.find(task => (task.key ?? 'issue-' + task.number) === taskSelected)
   const sync = data?.refresh_status
   const syncing = sync?.state === 'queued' || sync?.state === 'running'
-  const healthBad=Object.values(sync?.token_health ?? {}).some(item=>item.state!=='ok')
+  const healthBad=sync?.state==='failed'||sync?.state==='interrupted'||Object.values(sync?.token_health ?? {}).some(item=>item.state!=='ok')
   const owners=[...new Set(allTasks.map(t=>t.owner || '未指定'))].sort()
   const taskKey=(t:DevelopmentTask)=>t.key ?? 'issue-'+t.number
   const shownLanes=lanes.filter(l=>filter==='all'||filter===l.key||(filter==='current'&&!['done','closed'].includes(l.key)))
@@ -307,17 +307,17 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
         message={syncing ? '后台同步中 · 可继续操作' : sync.state === 'success' ? '最近同步成功' : '同步未完成 · 保留已有记录'}
         description={`阶段：${sync.phase ?? '等待领取'}；GitHub 请求：${sync.requests ?? 0}；耗时：${sync.elapsed_seconds ?? 0}秒${sync.reason ? '；原因：' + sync.reason : ''}`}/>}
 
-      {sync?.token_health && Object.keys(sync.token_health).length > 0 && <Card size="small" className="task-health" title={<Button type="text" onClick={()=>setHealthOpen(!healthOpen)} aria-expanded={healthOpen || healthBad}>GitHub Token 健康检测 · {healthBad ? "存在异常" : "只读检测通过"} {healthOpen || healthBad ? "▾" : "▸"}</Button>}>
+      {sync?.token_health && Object.keys(sync.token_health).length > 0 && <Card size="small" className="task-health" title={<Button type="text" onClick={()=>setHealthOpen(!healthOpen)} aria-expanded={healthOpen || healthBad}>GitHub Token 健康检测 · {healthBad ? "存在异常" : sync?.token_health_checked_at ? "上次只读检测通过" : "历史检测记录"} {healthOpen || healthBad ? "▾" : "▸"}</Button>}>
         {(healthOpen || healthBad) && <>
         <Descriptions size="small" column={1} items={Object.entries(sync.token_health).map(([key, item])=>({
-          key, label: ({identity:'REST 身份',rate_limit:'API 额度',repository:'仓库读取权限',graphql:'GraphQL 读取'} as Record<string,string>)[key] ?? key,
+          key, label: ({identity:'REST 身份',rate_limit:'API 额度',repository:'仓库读取权限',graphql:'GraphQL 读取',issues:'Issues 接口',pulls:'Pull Requests 接口'} as Record<string,string>)[key] ?? key,
           children: <Space wrap><Tag color={item.state==='ok'?'success':'error'}>{item.state==='ok'?'通过':'失败'}</Tag>
             {item.login ?? item.permission ?? item.reason ?? ''}
             {item.remaining != null ? `${item.remaining}/${item.limit}` : ''}
             {item.permissions ? Object.entries(item.permissions).map(([k,v])=>`${k}:${v?'是':'否'}`).join('；') : ''}
             {item.elapsed_seconds != null ? `${item.elapsed_seconds}秒` : ''}</Space>
         }))}/>
-        <Typography.Text type="secondary">只读检测，不代表已验证写入或合并授权；点击立即同步可重新检测。</Typography.Text></>}
+        <Typography.Text type="secondary">检测时间：{formatDate(sync.token_health_checked_at ?? null)}。只读检测不代表写入或合并授权；实际同步错误优先显示。</Typography.Text></>}
       </Card>}
       {data?.stale && <Alert type="warning" showIcon message={
         data?.synced_at ? '同步已延迟，以下为上次成功获取的记录。' : '等待从 GitHub 同步开发任务。'
