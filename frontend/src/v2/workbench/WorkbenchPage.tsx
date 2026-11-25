@@ -53,6 +53,8 @@ export function WorkbenchPage({
   health,
   activity,
   versions,
+  snapshotAt,
+  snapshotStale = false,
 }: {
   project: ProjectInfo | null
   embedded?: boolean
@@ -64,6 +66,8 @@ export function WorkbenchPage({
   health?: WorkbenchHealth | null
   activity?: WorkbenchActivity[] | null
   versions?: WorkbenchVersions | null
+  snapshotAt?: string | null
+  snapshotStale?: boolean
 }) {
   const header = readHeader(project, running)
   const user = typeof username === 'string' && username.trim() ? username.trim() : '未记录'
@@ -93,6 +97,7 @@ export function WorkbenchPage({
             <h1>工作台</h1>
             <p>系统运行总览、开发交付进度、版本状态与关键指标一目了然</p>
           </header>
+          {snapshotStale && <div role="status" style={{padding:12,background:'#fffbe6',border:'1px solid #ffe58f',borderRadius:8}}>任务同步异常或已过期，{snapshotAt ? '以下为上次成功同步的缓存：'+new Date(snapshotAt).toLocaleString('zh-CN',{hour12:false}) : '尚无可用缓存'}。请查看系统健康或刷新任务。</div>}
           <section className="v2-board-metrics" aria-label="关键指标">
             {METRICS.map(item => {
               const Icon = METRIC_ICONS[item.key]

@@ -87,23 +87,27 @@ export function versionText(versions: WorkbenchVersions | null | undefined) {
 
 export { METRICS }
 
-type OverviewSnapshot = {stale: boolean; synced_at: string | null; pr_tracking?: {stale: boolean; synced_at: string | null; prs: {merge_state:string; test:{state:string}}[]}}
+type OverviewSnapshot = {stale: boolean; synced_at: string | null; refresh_status?: {state:string;phase?:string;reason?:string}; pr_tracking?: {stale: boolean; synced_at: string | null; prs: {merge_state:string; test:{state:string}}[]}}
 type OverviewDeploy = {state:string; locked:boolean; rollback_failed:boolean; last_successful_deployment?: {at:string;sha:string}|null}
 type OverviewEvent = {at:string;code:string;sha:string}
 export function overviewEvidence(snapshot: OverviewSnapshot | null, deploy: OverviewDeploy | null, events: OverviewEvent[] | null) {
   const health: WorkbenchHealth = {}
-  if (snapshot?.synced_at) health.github = snapshot.stale ? {state:'warn',detail:'同步记录已过期'} : {state:'ok',detail:'任务同步记录有效'}
+  const sync = snapshot?.refresh_status
+  if (sync?.state === 'failed' || sync?.state === 'interrupted') health.github = {state:'error',detail:'同步失败'+(sync.phase ? ' · '+sync.phase : '')+(sync.reason ? ' · '+sync.reason : '')}
+  else if (sync?.state === 'running' || sync?.state === 'queued') health.github = {state:'warn',detail:'正在同步任务'}
+  else if (snapshot?.synced_at) health.github = snapshot.stale ? {state:'warn',detail:'同步记录已过期'} : {state:'ok',detail:'任务同步记录有效'}
   const tracking = snapshot?.pr_tracking
-  if (tracking?.synced_at && !tracking.stale) {
+  if (tracking?.synced_at) {
     const active = tracking.prs.filter(row=>row.merge_state==='open')
     const pending = active.filter(row=>row.test.state==='pending').length
     const failed = active.filter(row=>['failure','error'].includes(row.test.state)).length
-    health.macci = {state:failed?'warn':'unknown',detail:`待测试/测试中 ${pending} · 失败 ${failed}（PR 回执）`}
+    health.macci = {state:failed?'warn':'unknown',detail:`待测试/测试中 ${pending} · 失败 ${failed}（${tracking.stale?'历史缓存':'PR 回执'}）`}
   }
+  const eventLabels: Record<string,string> = {feedback_failed:'反馈同步失败',feedback_ok:'反馈同步完成',update_ok:'部署成功',install_ok:'初始化成功',startup_ok:'启动自检通过',update_restarting:'服务重启中',update_no_change:'已是最新版本',update_started:'开始检查更新',update_test_build_failed:'部署测试或构建失败',update_restart_failed:'重启失败',rollback_ok:'回滚成功',rollback_failed:'回滚失败'}
   if (deploy) {
     const bad = deploy.rollback_failed || /failed|held|unacknowledged|interrupted|mismatch/.test(deploy.state)
-    health.deploy = {state:bad?'warn':deploy.state==='update_ok'?'ok':'unknown',detail:deploy.locked?'更新锁占用':deploy.state}
+    health.deploy = {state:bad?'warn':deploy.state==='update_ok'?'ok':'unknown',detail:deploy.locked?'更新锁占用':(eventLabels[deploy.state] ?? deploy.state)}
   }
-  const activity = (events ?? []).filter(row=>Number.isFinite(Date.parse(row.at))).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at)).slice(0,6).map(row=>({at:new Date(row.at).toLocaleString('zh-CN',{hour12:false}),text:row.code + (row.sha ? ' · '+row.sha.slice(0,8) : '')}))
+  const activity = (events ?? []).filter(row=>Number.isFinite(Date.parse(row.at))).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at)).slice(0,6).map(row=>({at:new Date(row.at).toLocaleString('zh-CN',{hour12:false}),text:(eventLabels[row.code] ?? row.code) + (row.sha ? ' · '+row.sha.slice(0,8) : '')}))
   return {health,activity}
 }

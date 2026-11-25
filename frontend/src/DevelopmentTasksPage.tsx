@@ -50,7 +50,7 @@ export function taskCategory(t: DevelopmentTask) {
 }
 
 export function workbenchMetrics(snapshot: TaskSnapshot | null) {
-  if (!snapshot || snapshot.stale || !snapshot.synced_at) return null
+  if (!snapshot || !snapshot.synced_at) return null
   const counts = {tasks: 0, active: 0, review: 0, done: 0, blocked: 0}
   for (const task of snapshot.tasks) {
     const stage = taskCategory(task)
