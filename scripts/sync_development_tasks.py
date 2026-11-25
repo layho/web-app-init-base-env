@@ -125,6 +125,47 @@ def write_status(data):
                 os.unlink(out.name)
 
 
+def retry_deadline(reason, now):
+    """Only classified rate limits trigger a shared cooldown; no raw API body."""
+    if not isinstance(reason, str):
+        return None
+    if "GitHub API 主额度耗尽" in reason:
+        match = re.search(r"恢复时间 ([^；]+)$", reason)
+        if match:
+            try:
+                stamp = datetime.fromisoformat(match[1])
+                if stamp.tzinfo is not None:
+                    return max(now + timedelta(seconds=60), stamp + timedelta(seconds=5))
+            except ValueError:
+                pass
+        return now + timedelta(minutes=5)
+    if "GitHub 请求限流" in reason:
+        match = re.search(r"建议等待 ([0-9]{1,6}) 秒", reason)
+        return now + timedelta(seconds=max(60, int(match[1]) if match else 60))
+    return None
+
+
+def cooldown(reason=None):
+    """Share a durable retry deadline across manual, history and active workers."""
+    folder = development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "task-sync-cooldown.json"
+    now = datetime.now(timezone.utc)
+    with (folder / "task-sync-cooldown.lock").open("a") as gate:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        try:
+            saved = json.loads(path.read_text())
+            until = pr_tracking.instant(saved.get("retry_at"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            saved, until = {}, None
+        candidate = retry_deadline(reason, now)
+        if candidate and (until is None or candidate > until):
+            until = candidate
+            saved = {"retry_at": until.isoformat(), "reason": reason}
+            write_json(path, saved)
+        return saved if until and until > now else None
+
+
 def enqueue_refresh():
     folder = development_tasks.CACHE_PATH.parent
     folder.mkdir(parents=True, exist_ok=True)
@@ -136,6 +177,11 @@ def enqueue_refresh():
             except BlockingIOError:
                 return refresh_status()
             if refresh_status().get("state") == "queued":
+                return refresh_status()
+            held = cooldown()
+            if held:
+                write_status({**refresh_status(), "state": "failed", "phase": "rate_limit", "requests": 0,
+                              "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
                 return refresh_status()
             write_status({"state": "queued", "requests": 0})
             try:
@@ -160,6 +206,10 @@ def token_health(repository, request):
             result[label] = {"state": "ok", **extract(obj)}
         except (release_acceptance.AcceptanceError, OSError, ValueError, KeyError, TypeError) as exc:
             result[label] = {"state": "failed", "reason": str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else type(exc).__name__}
+            if isinstance(exc, release_acceptance.AcceptanceError):
+                # Stop remaining diagnostic probes when quota is exhausted.
+                if retry_deadline(str(exc), datetime.now(timezone.utc)):
+                    raise
         result[label]["elapsed_seconds"] = round(time.monotonic() - started, 2)
     check("identity", lambda: request("GET", "/user"), lambda o: {"login": o["login"]})
     check("rate_limit", lambda: request("GET", "/rate_limit"),
@@ -194,6 +244,11 @@ def run_refresh(force=False):
         except BlockingIOError:
             return 0
         force = force or refresh_status().get("state") == "queued"
+        held = cooldown()
+        if held:
+            write_status({**refresh_status(), "state": "failed", "phase": "rate_limit", "requests": 0,
+                          "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
+            return 1
         target = pr_tracking.target()
         previous = development_tasks.snapshot()
         tracking = pr_tracking.snapshot() if target else {}
@@ -211,7 +266,14 @@ def run_refresh(force=False):
                 raise ValueError("Read-only task sync")
             state["requests"] += 1
             write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
-            return release_acceptance.github(path)
+            held = cooldown()
+            if held:
+                raise release_acceptance.AcceptanceError(held["reason"])
+            try:
+                return release_acceptance.github(path)
+            except release_acceptance.AcceptanceError as exc:
+                cooldown(str(exc))
+                raise
         try:
             if target is None:
                 raise ValueError("No verified repository")
@@ -219,6 +281,9 @@ def run_refresh(force=False):
                 state["phase"] = "token_health"
                 state["token_health"] = token_health(target[0], request)
                 state["token_health_checked_at"] = datetime.now(timezone.utc).isoformat()
+                held = cooldown()
+                if held:
+                    raise release_acceptance.AcceptanceError(held["reason"])
                 state["phase"] = "issues"
                 write_status(state)
             issues = sync(force=True, repository=target[0], request=request,
@@ -285,6 +350,9 @@ def run_refresh(force=False):
             state["state"] = "failed"
             # AcceptanceError messages are already sanitized by the REST client.
             state["reason"] = str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else type(exc).__name__
+            held = cooldown(state["reason"])
+            if held:
+                state["reason"] = held["reason"] + "；下次重试 " + held["retry_at"]
             if state["phase"] in {"issues", "pulls"} and isinstance(exc, release_acceptance.AcceptanceError):
                 state["token_health"] = {**state["token_health"], state["phase"]: {"state": "failed", "reason": state["reason"]}}
         write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
@@ -309,12 +377,21 @@ def refresh_active():
         except (OSError,ValueError):
             old={}
         stamp=pr_tracking.instant(old.get("synced_at"))
+        if cooldown():
+            return 1
         if stamp and (old.get("repository"),old.get("branch"))==target and (datetime.now(timezone.utc)-stamp).total_seconds()<25:
             return 0
         def request(method,path):
             if method!="GET":
                 raise ValueError("Read only")
-            return release_acceptance.github(path)
+            held = cooldown()
+            if held:
+                raise release_acceptance.AcceptanceError(held["reason"])
+            try:
+                return release_acceptance.github(path)
+            except release_acceptance.AcceptanceError as exc:
+                cooldown(str(exc))
+                raise
         try:
             repo,branch=target
             prefix="/repos/"+repo

@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.2.11",
+    "title": "GitHub 任务同步限流自动恢复",
+    "summary": "任务同步两个后台通道共享持久化冷却期限，避免强制刷新绕过限流。",
+    "changes": [
+      "识别主额度恢复时间和次级 Retry-After；限流期间保留缓存且阻止手动/定时任务重复请求。",
+      "健康探测遇限流立即终止；显示下一次重试时间。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "模拟 403/429 限流并检查手动刷新、后台刷新和缓存保留"
+    ],
+    "validation_note": "冷却仅覆盖任务同步两个通道，不覆盖其他 GitHub 客户端；旧缓存及强制刷新完整历史语义保留。"
+  },
+  {
     "version": "0.2.10",
     "title": "MacCI 可信宿主安装器隔离",
     "summary": "将候选代码作为不可执行数据读取，禁止在宿主执行候选测试。",

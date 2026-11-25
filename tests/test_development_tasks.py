@@ -365,3 +365,26 @@ def test_blocked_issue_overrides_historical_published_pr():
 
 def test_closed_pr_with_old_conflict_is_not_active():
     assert development_tasks.pr_stage({"merge_state":"closed","conflict":{"blocked":True}})==("已关闭","已关闭")
+
+
+def test_rate_limit_cooldown_shared_and_manual_refresh_respects_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    reason = "GH-REST-429：GitHub 请求限流；建议等待 120 秒"
+    held = sync_development_tasks.cooldown(reason)
+    assert held["reason"] == reason
+    assert sync_development_tasks.cooldown() == held
+    assert sync_development_tasks.cooldown("GH-REST-403：请求被禁止") == held
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", lambda *a, **k: pytest.fail("must not spawn"))
+    status = sync_development_tasks.enqueue_refresh()
+    assert status["state"] == "failed"
+    assert status["phase"] == "rate_limit"
+    assert "下次重试" in status["reason"]
+    assert sync_development_tasks.run_refresh(force=True) == 1
+
+
+def test_rate_limit_deadline_uses_reset_and_not_permission_errors():
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    stamp = now + timedelta(minutes=10)
+    assert sync_development_tasks.retry_deadline("GH-REST-403：GitHub API 主额度耗尽；恢复时间 " + stamp.isoformat(), now) == stamp + timedelta(seconds=5)
+    assert sync_development_tasks.retry_deadline("GH-REST-403：请求被禁止", now) is None
