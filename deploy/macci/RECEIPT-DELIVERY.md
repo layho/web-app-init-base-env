@@ -1,6 +1,6 @@
 # Independent MacCI receipt delivery
 
-After the MacCI runtime containing `--receipts-only` has passed trusted review and has been installed, run `bash deploy/macci/install-receipt-delivery.sh` once from the reviewed checkout. The installer verifies the installed runner and same-user private credential, then creates a separate LaunchAgent. It does not replace or restart the test worker.
+After the MacCI runtime containing `--receipts-only` has passed trusted review and has been installed, obtain the SHA-256 of `runner.py` from an independently verified, reviewed checkout (not from the untrusted installed file), then run `bash deploy/macci/install-receipt-delivery.sh <verified-sha256>` once. Python 3.10+ is required. The installer refuses an existing plist; inspect existing services before retrying. This is an operator-controlled installation, not an automatic update or an independent trust anchor. The installer verifies the installed runner and same-user private credential, then creates a separate LaunchAgent. It does not replace or restart the test worker.
 
 The receipt agent invokes `runner.py --receipts-only` every 60 seconds. It uses the receipt-delivery lock, so it can send pending deployment and failure reports while candidate tests hold the worker lock; it does not invoke Docker or run candidate tests. A delivery failure returns nonzero and remains queued for retry.
 
