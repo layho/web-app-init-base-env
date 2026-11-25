@@ -2,13 +2,14 @@
 No arbitrary shell commands, no production changes, no self-modification of this trust anchor.
 """
 import json
+import fcntl
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
 import sys
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, NamedTemporaryFile
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 ROOT=Path.home()/".local/share/macmini-pr-tests"
@@ -41,6 +42,21 @@ def private_read(path,limit=512):
         if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode&0o077 or st.st_size>limit:
             raise ValueError("Unsafe private file")
         return stream.read().strip()
+
+def token_path():
+    root=Path.home()/".local/share/macmini-github"
+    try:
+        info=root.lstat()
+    except FileNotFoundError:
+        return ROOT/"github-token"
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise ValueError("Unsafe shared credential directory")
+    path=root/"github-token"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return ROOT/"github-token"
+    return path
 
 def authorized(token,number):
     pr=api(token,f"/pulls/{number}")
@@ -86,9 +102,38 @@ def authorized(token,number):
             return expected if data==expected else None
     return None
 
+def save_receipt(head,merge):
+    with NamedTemporaryFile(dir=ROOT,mode="w",encoding="ascii",delete=False) as out:
+        path=Path(out.name)
+        try:
+            os.fchmod(out.fileno(),0o600)
+            json.dump({"head":head,"merge":merge},out)
+            out.flush()
+            os.fsync(out.fileno())
+            out.close()
+            os.replace(path,ROOT/"runtime-receipt.pending")
+        finally:
+            path.unlink(missing_ok=True)
+
+def flush_receipt(token):
+    try:
+        item=json.loads(private_read(ROOT/"runtime-receipt.pending"))
+    except FileNotFoundError:
+        return
+    if not isinstance(item,dict) or set(item)!={"head","merge"} or not all(isinstance(x,str) and SHA.fullmatch(x) for x in item.values()):
+        raise ValueError("Invalid receipt")
+    if private_read(ROOT/"runtime-installed-sha")!=item["merge"]:
+        raise ValueError("Receipt does not match installed runtime")
+    desc=f'runtime={item["merge"]} installed'
+    rows=api(token,"/commits/"+item["head"]+"/statuses?per_page=100")
+    if not any(s.get("context")==CONTEXT and s.get("state")=="success" and s.get("description")==desc and (s.get("creator") or {}).get("login")==OWNER for s in rows):
+        api(token,"/statuses/"+item["head"],{"state":"success","context":CONTEXT,"description":desc})
+    (ROOT/"runtime-receipt.pending").unlink()
+
 def run(token):
     if private_read(ROOT/"runtime-recovery.enabled")!="enabled":
         return
+    flush_receipt(token)
     # Fixed explicit PR authorization, not execution of arbitrary issue text.
     rows=api(token,"/pulls?state=open&base=preview&per_page=100")
     if len(rows)>=100:
@@ -103,6 +148,8 @@ def run(token):
         head,merge,tree=(approval[k] for k in ("head","merge","tree"))
         try:
             if private_read(ROOT/"runtime-installed-sha")==merge:
+                save_receipt(head,merge)
+                flush_receipt(token)
                 continue
         except FileNotFoundError:
             pass
@@ -122,17 +169,24 @@ def run(token):
             installer=ROOT/"runtime-installer.py"
             private_read(installer,65536)
             subprocess.run([sys.executable,"-B",str(installer),"--source",str(source/"deploy/macci"),"--sha",merge,"--apply"],check=True,timeout=180,env=env)
-        api(token,"/statuses/"+head,{"state":"success","context":CONTEXT,"description":f"runtime={merge} installed"})
+        save_receipt(head,merge)
+        flush_receipt(token)
         return
 
 def main():
     if sys.platform!="darwin":
         return 1
     try:
-        token=private_read(ROOT/"github-token")
+        token=private_read(token_path())
         if not re.fullmatch(r"[A-Za-z0-9_-]{20,300}",token):
             raise ValueError("Invalid credential")
-        run(token)
+        fd=os.open(ROOT/"runtime-recovery.lock",os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+        with os.fdopen(fd,"r+") as lock:
+            st=os.fstat(lock.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode&0o077:
+                raise ValueError("Unsafe recovery lock")
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            run(token)
         return 0
     except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError):
         print("MacCI recovery unavailable; retry next tick",flush=True)

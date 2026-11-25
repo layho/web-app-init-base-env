@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Update only existing reviewed MacCI runtime modules, without restart."""
 import argparse
+import plistlib
 from contextlib import ExitStack
 import fcntl
 import os
@@ -39,6 +40,34 @@ def replace_file(path, content):
             temp.unlink(missing_ok=True)
 
 
+def recovery_plist():
+    return plistlib.dumps({
+        "Label":"com.layho.macci-runtime-recovery",
+        "ProgramArguments":[sys.executable,"-B",str(ROOT/"runtime-recovery.py")],
+        "RunAtLoad":True,"StartInterval":60,
+        "StandardOutPath":str(ROOT/"runtime-recovery.log"),
+        "StandardErrorPath":str(ROOT/"runtime-recovery.err"),
+        "EnvironmentVariables":{"PATH":"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
+        "WorkingDirectory":str(ROOT),
+    })
+
+def install_service():
+    label="com.layho.macci-runtime-recovery"
+    folder=Path.home()/"Library/LaunchAgents"
+    if not folder.is_dir() or folder.is_symlink() or folder.stat().st_uid!=os.getuid():
+        raise ValueError("Existing user LaunchAgents directory required")
+    path=folder/(label+".plist")
+    content=recovery_plist()
+    if path.exists() or path.is_symlink():
+        if not owned_private(path) or path.read_bytes()!=content:
+            raise ValueError("Existing recovery service differs")
+    else:
+        replace_file(path,content)
+    domain=f"gui/{os.getuid()}"
+    if subprocess.run(["launchctl","print",domain+"/"+label],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
+        subprocess.run(["launchctl","bootstrap",domain,str(path)],check=True)
+    subprocess.run(["launchctl","print",domain+"/"+label],stdout=subprocess.DEVNULL,check=True)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=SOURCE)
@@ -60,10 +89,10 @@ def main():
         raise SystemExit("MacCI source checkout contains changes; refuse upgrade")
     if not owned_private(ROOT, False):
         raise SystemExit("Existing private MacCI data directory required")
-    for name in (*NAMES, "publish_main.py", "github-token"):
+    for name in (*NAMES, "publish_main.py"):
         if not owned_private(ROOT / name):
             raise SystemExit("Unsafe or missing existing file: " + name)
-    subprocess.run([sys.executable,"-B","-m","unittest","-v","test_runner","test_merge_preview","test_publish_main"],
+    subprocess.run([sys.executable,"-B","-m","unittest","-v","test_runner","test_merge_preview","test_publish_main","test_runtime_recovery"],
                    cwd=source,check=True)
     if args.check:
         print("Host source tests passed; no runtime changes")
@@ -81,6 +110,12 @@ def main():
                 fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:
                 raise SystemExit("MacCI job active; no files changed; retry when idle")
+        anchors=(("runtime-installer.py",source/"upgrade-runtime.py"),("runtime-recovery.py",source/"runtime_recovery.py"))
+        if args.enable_recovery:
+            for name,origin in anchors:
+                if (ROOT/name).exists() or (ROOT/name).is_symlink():
+                    if not owned_private(ROOT/name) or (ROOT/name).read_bytes()!=origin.read_bytes():
+                        raise SystemExit("Existing recovery trust anchor differs; refuse replacement")
         previous={name:(ROOT/name).read_bytes() for name in NAMES}
         desired={name:(source/name).read_bytes() for name in NAMES}
         if previous == desired:
@@ -90,23 +125,28 @@ def main():
         backup.mkdir(mode=0o700)
         for name,content in previous.items():
             replace_file(backup/name, content)
+        old_marker=(ROOT/"runtime-installed-sha")
+        prior_marker=old_marker.read_bytes() if old_marker.exists() and owned_private(old_marker) else None
         try:
             for name,content in desired.items():
-                replace_file(ROOT/name, content)
-        except OSError:
+                replace_file(ROOT/name,content)
+            if args.enable_recovery:
+                for name,origin in anchors:
+                    if not (ROOT/name).exists():
+                        replace_file(ROOT/name,origin.read_bytes())
+                # Enable only after launchd registration succeeds.
+                install_service()
+            replace_file(old_marker,(actual+"\n").encode())
+            if args.enable_recovery:
+                replace_file(ROOT/"runtime-recovery.enabled",b"enabled\n")
+        except (OSError,ValueError,subprocess.SubprocessError):
             for name,content in previous.items():
                 replace_file(ROOT/name,content)
+            if prior_marker is None:
+                old_marker.unlink(missing_ok=True)
+            else:
+                replace_file(old_marker,prior_marker)
             raise
-        if args.enable_recovery:
-            # Explicit one-time enablement. Never auto-replace the trust anchor.
-            for name,origin in (("runtime-installer.py",source/"upgrade-runtime.py"),("runtime-recovery.py",source/"runtime_recovery.py")):
-                if (ROOT/name).exists():
-                    if not owned_private(ROOT/name) or (ROOT/name).read_bytes()!=origin.read_bytes():
-                        raise SystemExit("Existing recovery trust anchor differs; refuse replacement")
-                else:
-                    replace_file(ROOT/name,origin.read_bytes())
-            replace_file(ROOT/"runtime-recovery.enabled",b"enabled\n")
-        replace_file(ROOT/"runtime-installed-sha",(actual+"\n").encode())
         print("Runtime updated to reviewed SHA",actual)
         print("Backup:",backup)
         print("Existing launchd services will use new scripts on their next invocation.")
