@@ -18,7 +18,10 @@ def test_dependencies_rebuilds_broken_venv_without_losing_previous(tmp_path):
     python3.write_text("""#!/bin/bash
 set -e
 if test "$1" = --version; then echo 'Python 3.13.0'; exit 0; fi
-if test "$1" = -c; then exec "$REAL_PYTHON3" "$@"; fi
+if test "$1" = -c; then
+  if [[ "$2" = *os.replace* && "${FAIL_SWITCH:-0}" = 1 ]]; then exit 23; fi
+  exec "$REAL_PYTHON3" "$@"
+fi
 test "$1" = -m && test "$2" = venv
 mkdir -p "$3/bin"
 cat > "$3/bin/python" <<'PY'
@@ -47,6 +50,9 @@ ROOT='@ROOT@'
 set -e
 if FAIL_INSTALL=1 dependencies; then exit 31; fi
 test -f .venv/old-marker
+if FAIL_SWITCH=1 dependencies; then exit 32; fi
+test -f .venv/old-marker
+test ! -e .venv.previous
 dependencies
 test -L .venv
 first=$(readlink .venv)
@@ -134,7 +140,14 @@ printf previous > frontend/dist/index.html
 # Run the real updater and rollback with fake app gates and process supervision.
 source ../functions.sh
 load_env() { :; }
-dependencies() { :; }
+dependencies() {
+    if ! test -e switched-environment; then
+      ln -s "$(readlink .venv)" .venv.previous
+      ln -s .venvs/candidate .venv.next
+      python3 -c 'import os,sys; os.replace(sys.argv[1],sys.argv[2])' .venv.next .venv
+      touch switched-environment
+    fi
+}
 check_schema() { :; }
 test_app() { :; }
 build() {
@@ -154,9 +167,11 @@ health() {
     touch health-checked
     return 1
 }
-mkdir -p .venv/bin
-printf '#!/bin/bash\nexit 0\n' > .venv/bin/python
-chmod +x .venv/bin/python
+mkdir -p .venvs/old/bin .venvs/candidate/bin
+printf '#!/bin/bash\nexit 0\n' > .venvs/old/bin/python
+printf '#!/bin/bash\nexit 0\n' > .venvs/candidate/bin/python
+chmod +x .venvs/old/bin/python .venvs/candidate/bin/python
+ln -s .venvs/old .venv
 ROOT=$PWD
 LOCK=$ROOT/.webapp-deploy.lock
 WEB=local-test
@@ -171,6 +186,8 @@ grep -q "$(printf '\trollback_ok\t%s' "$old")" logs/operations.tsv
 if grep -q $'\tupdate_ok\t' logs/operations.tsv; then exit 2; fi
 test "$(git rev-parse HEAD)" = "$old"
 test "$(cat frontend/dist/index.html)" = previous
+test "$(readlink .venv)" = .venvs/old
+test ! -e .venv.previous
 test "$(cat .webapp-failed-sha)" = "$new"
 test "$(cat restarts)" = "$(printf '%s\n%s' "$new" "$old")"
 test ! -d frontend/dist.previous
