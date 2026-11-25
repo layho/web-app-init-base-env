@@ -6,7 +6,7 @@ import fcntl
 import os
 from pathlib import Path
 import re
-import shutil
+import hashlib
 import stat
 import subprocess
 import sys
@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 SOURCE = Path(__file__).resolve().parent
 ROOT = Path.home() / ".local/share/macmini-pr-tests"
 NAMES = ("runner.py", "merge_preview.py")
-LOCKS = ("worker.lock", "preview-merge.lock", "main-publish.lock")
+LOCKS = ("worker.lock", "preview-merge.lock", "main-publish.lock", "receipt-delivery.lock")
+MAX_MODULE_BYTES = 1024 * 1024
 
 
 def owned_private(path, file=True):
@@ -39,9 +40,46 @@ def replace_file(path, content):
             temp.unlink(missing_ok=True)
 
 
+def read_candidate_modules(source, sha):
+    """Read immutable Git blobs as data; never import or run candidate modules."""
+    result = {}
+    for name in NAMES:
+        path = "deploy/macci/" + name
+        entry = subprocess.check_output(
+            ["git", "-C", str(source), "ls-tree", sha, "--", path], timeout=30
+        ).decode("ascii").rstrip("\n")
+        if not re.fullmatch(r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(path), entry):
+            raise ValueError("Candidate module is not a regular Git blob: " + name)
+        obj = entry.split()[2]
+        size = int(subprocess.check_output(
+            ["git", "-C", str(source), "cat-file", "-s", obj], timeout=30))
+        if not 0 < size <= MAX_MODULE_BYTES:
+            raise ValueError("Candidate module size rejected: " + name)
+        data = subprocess.check_output(
+            ["git", "-C", str(source), "cat-file", "blob", obj], timeout=30)
+        if len(data) != size:
+            raise ValueError("Candidate module size changed: " + name)
+        # Compile for syntax only. No execution, imports, or bytecode files.
+        compile(data, name, "exec", dont_inherit=True)
+        result[name] = data
+    return result
+
+
+def verify_reviewed_digests(modules, runner_digest, merge_digest):
+    expected = {"runner.py": runner_digest, "merge_preview.py": merge_digest}
+    for name in NAMES:
+        digest = expected[name]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("Independent reviewed SHA-256 required for " + name)
+        if hashlib.sha256(modules[name]).hexdigest() != digest:
+            raise ValueError("Reviewed module digest mismatch: " + name)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sha", required=True, help="exact reviewed source commit")
+    parser.add_argument("--runner-sha256", help="independently reviewed runner.py digest")
+    parser.add_argument("--merge-sha256", help="independently reviewed merge_preview.py digest")
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--check", action="store_true")
     modes.add_argument("--apply", action="store_true")
@@ -60,11 +98,13 @@ def main():
     for name in (*NAMES, "publish_main.py", "github-token"):
         if not owned_private(ROOT / name):
             raise SystemExit("Unsafe or missing existing file: " + name)
-    subprocess.run([sys.executable,"-B","-m","unittest","-v","test_runner","test_merge_preview","test_publish_main"],
-                   cwd=SOURCE,check=True)
+    desired = read_candidate_modules(SOURCE, args.sha)
     if args.check:
-        print("Host source tests passed; no runtime changes")
+        print("Candidate module syntax checked only; no runtime changes or test approval")
         return 0
+    # This explicit gate is not a substitute for independent MacCI evidence or authorization.
+    # Only a locally trusted installer and independently reviewed digests may be used.
+    verify_reviewed_digests(desired, args.runner_sha256, args.merge_sha256)
     if sys.platform != "darwin":
         raise SystemExit("Apply is restricted to existing macOS runtime")
     with ExitStack() as stack:
@@ -79,7 +119,6 @@ def main():
             except BlockingIOError:
                 raise SystemExit("MacCI job active; no files changed; retry when idle")
         previous={name:(ROOT/name).read_bytes() for name in NAMES}
-        desired={name:(SOURCE/name).read_bytes() for name in NAMES}
         if previous == desired:
             print("Runtime already matches reviewed source; no changes")
             return 0
