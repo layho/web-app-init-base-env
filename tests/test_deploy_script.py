@@ -8,6 +8,33 @@ def test_macmini_shell_syntax():
     result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
+def test_dependencies_rebuilds_broken_venv_without_losing_previous(tmp_path):
+    script = SCRIPT.read_text()
+    function = script[script.index("dependencies() {"):script.index("\\ncheck_schema() {")]
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    python3 = fake_bin / "python3"
+    python3.write_text("""#!/bin/bash
+set -e
+test "$1" = -m && test "$2" = venv
+mkdir -p "$3/bin"
+cat > "$3/bin/python" <<'PY'
+#!/bin/bash
+if [[ "${1:-}" = -m && "${2:-}" = pip && "${3:-}" = install && "${FAIL_INSTALL:-0}" = 1 ]]; then exit 19; fi
+exit 0
+PY
+chmod +x "$3/bin/python"
+""")
+    python3.chmod(0o755)
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    old_python = tmp_path / ".venv/bin/python"
+    old_python.write_text("#!/bin/bash\\nexit 1\\n")
+    old_python.chmod(0o755)
+    (tmp_path / ".venv/old-marker").write_text("keep")
+    program = function + "\\nPATH='" + str(fake_bin) + "':\\"$PATH\\"\\nset -e\\nif FAIL_INSTALL=1 dependencies; then exit 31; fi\\ntest -f .venv/old-marker\\ntest ! -e .venv.next.$\\ndependencies\\ntest -x .venv/bin/python\\ntest ! -e .venv/old-marker\\n"
+    result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
 def test_schema_gate_is_retryable_and_real_failures_are_held():
     script = SCRIPT.read_text()
     assert 'if ! check_schema; then' in script
