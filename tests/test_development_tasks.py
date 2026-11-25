@@ -484,3 +484,50 @@ def test_recovery_respects_live_worker_lock(tmp_path, monkeypatch):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert sync_development_tasks.run_refresh() == 0
     assert sync_development_tasks.refresh_status()["state"] == "running"
+
+
+@pytest.mark.parametrize("origin", ["queued", "expired_queue", "manual_cooldown", "spawn_failure", "explicit_force"])
+def test_force_request_survives_cooldown_and_recovery(tmp_path, monkeypatch, origin):
+    from app import pr_tracking
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    monkeypatch.setattr(pr_tracking, "CACHE", tmp_path / "prs.json")
+    monkeypatch.setattr(pr_tracking, "target", lambda: ("owner/repo", "main"))
+    stamp = datetime.now(timezone.utc).isoformat()
+    snapshot = {"synced_at": stamp, "stale": False, "repository": "owner/repo", "tasks": []}
+    monkeypatch.setattr(development_tasks, "snapshot", lambda: snapshot)
+    monkeypatch.setattr(pr_tracking, "snapshot", lambda: {**snapshot, "prs": []})
+    hold = {"reason": "rate limit", "retry_at": stamp}
+    monkeypatch.setattr(sync_development_tasks, "cooldown", lambda *a: hold)
+    if origin == "queued":
+        sync_development_tasks.write_status({"state": "queued"})
+    elif origin == "expired_queue":
+        (tmp_path / "task-sync-status.json").write_text(json.dumps({
+            "state": "queued", "updated_at": (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()
+        }))
+    elif origin == "manual_cooldown":
+        assert sync_development_tasks.enqueue_refresh()["force_requested"] is True
+    elif origin == "spawn_failure":
+        monkeypatch.setattr(sync_development_tasks, "cooldown", lambda *a: None)
+        def fail_spawn(*a, **kw):
+            raise OSError("spawn failed")
+        monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", fail_spawn)
+        assert sync_development_tasks.enqueue_refresh()["force_requested"] is True
+        monkeypatch.setattr(sync_development_tasks, "cooldown", lambda *a: hold)
+    assert sync_development_tasks.run_refresh(force=origin == "explicit_force") == 1
+    assert sync_development_tasks.refresh_status()["force_requested"] is True
+    monkeypatch.setattr(sync_development_tasks, "cooldown", lambda *a: None)
+    calls = []
+    def health(*args):
+        calls.append("health")
+        return {}
+    def collect_issues(**kwargs):
+        calls.append(kwargs["incremental"])
+        return {"tasks": []}
+    monkeypatch.setattr(sync_development_tasks, "token_health", health)
+    monkeypatch.setattr(sync_development_tasks, "sync", collect_issues)
+    monkeypatch.setattr(pr_tracking, "collect", lambda *args, **kwargs: [])
+    assert sync_development_tasks.run_refresh() == 0
+    assert calls == ["health", False]
+    assert sync_development_tasks.refresh_status()["force_requested"] is False
+    assert sync_development_tasks.run_refresh() == 0
+    assert calls == ["health", False]
