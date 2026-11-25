@@ -349,6 +349,36 @@ class Progress:
         self.thread.join(timeout=35)
 
 
+def finish_progress(token, repo, head, base, merge, state):
+    """Close advisory context only after the authoritative receipt is written."""
+    if state not in {"success", "failure", "error"}:
+        return
+    try:
+        api(token, f"/repos/{repo}/statuses/{head}", {
+            "state": state, "context": PROGRESS_CONTEXT,
+            "description": description(base, merge, "finished")})
+    except (OSError, ValueError, TypeError):
+        print("MacCI advisory terminal delivery pending; retry next tick", flush=True)
+
+
+def reconcile_progress(token, repo, head, base, merge, statuses):
+    """Repair stranded progress without executing or inventing a test result."""
+    receipt = next((s for s in statuses if s.get("context") == CONTEXT), None)
+    advisory = next((s for s in statuses if s.get("context") == PROGRESS_CONTEXT), None)
+    if not receipt or not advisory:
+        return
+    if any((s.get("creator") or {}).get("login") != "layho" for s in (receipt, advisory)):
+        return
+    state = receipt.get("state")
+    valid_details = {"passed"} if state == "success" else REPORT_PHASES - {"passed", "ref-changed"}
+    if state not in {"success", "failure", "error"} or not any(
+            receipt.get("description") == description(base, merge, detail) for detail in valid_details):
+        return
+    if (advisory.get("state") == "pending" and any(
+            advisory.get("description") == description(base, merge, phase) for phase in PROGRESS_PHASES)):
+        finish_progress(token, repo, head, base, merge, state)
+
+
 def status(token, repo, head, base, merge, state, detail=None):
     api(token, f'/repos/{repo}/statuses/{head}', {'state': state, 'context': CONTEXT,
         'description': description(base, merge, detail or state)})
@@ -544,6 +574,7 @@ def main():
                     pr = {**pr, 'base': {**pr['base'], 'sha': base}, 'merge_commit_sha': expected_merge}
                     statuses = api(token, f'/repos/{repo}/commits/{head}/statuses?per_page=100')
                     if completed(statuses, base, expected_merge) and not args.force:
+                        reconcile_progress(token, repo, head, base, expected_merge, statuses)
                         continue
                     print(f'Testing {repo} PR #{pr["number"]}: {head} against {base}', flush=True)
                     status(token, repo, head, base, None, 'pending')
@@ -566,6 +597,8 @@ def main():
                     if not unchanged or (state == 'success' and merge != expected_merge):
                         state, detail = 'error', 'ref-changed'
                     status(token, repo, head, base, expected_merge, state, detail)
+                    # The heartbeat thread is stopped before the terminal status.
+                    finish_progress(token, repo, head, base, expected_merge, state)
                     if state != "success":
                         report={"schema":1,"repository":repo,"pr":pr["number"],"head":head,"base":base,"merge":expected_merge,
                                 "run_id":run_id,"state":state,"phase":detail,"started_at":int(started),
