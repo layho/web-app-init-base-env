@@ -306,7 +306,24 @@ def quarantine_legacy_report(folder, path, size):
             os.close(fd)
 
 
+@contextmanager
+def outbox_lock():
+    """Serialize short local queue operations, never remote API calls."""
+    fd = os.open(ROOT / "report-outbox.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(fd, "r+") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("Unsafe report outbox lock")
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
 def save_report(report):
+    with outbox_lock():
+        return _save_report(report)
+
+
+def _save_report(report):
     from tempfile import NamedTemporaryFile
     folder = ROOT / "report-outbox"
     folder.mkdir(mode=0o700,exist_ok=True)
@@ -372,25 +389,33 @@ def save_report(report):
 
 def flush_reports(token):
     folder=ROOT/"report-outbox"
-    if not folder.exists():
-        return True
-    info=folder.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
-        raise ValueError("Unsafe report outbox")
+    with outbox_lock():
+        if not folder.exists():
+            return True
+        info=folder.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+            raise ValueError("Unsafe report outbox")
+        pending=sorted(folder.glob("*.json"),key=lambda p:(p.lstat().st_mtime_ns,p.name))
     delivered = True
-    pending=sorted(folder.glob("*.json"),key=lambda p:(p.lstat().st_mtime_ns,p.name))
     for path in pending[:20]:
+        identity = None
         try:
-            fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
-            with os.fdopen(fd,"r",encoding="utf-8") as stream:
-                info=os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>MAX_REPORT_SIZE:
-                    raise ValueError("Unsafe report")
-                report=json.load(stream)
-            if not valid_report(report,path):
-                raise ValueError("Invalid report")
+            with outbox_lock():
+                try:
+                    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+                except FileNotFoundError:
+                    continue
+                with os.fdopen(fd,"rb") as stream:
+                    info=os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>MAX_REPORT_SIZE:
+                        raise ValueError("Unsafe report")
+                    identity=(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)
+                    payload=stream.read(MAX_REPORT_SIZE+1)
+                    report=json.loads(payload)
+                if not valid_report(report,path):
+                    raise ValueError("Invalid report")
+            # No queue lock is held across network operations.
             endpoint=f"/repos/{report['repository']}/issues/{report['pr']}/comments"
-            # Compare the exact serialized report before retrying a lost POST.
             body=REPORT_MARKER+json.dumps(report,sort_keys=True,separators=(",",":"))
             found=False
             for page in range(1,11):
@@ -404,17 +429,27 @@ def flush_reports(token):
                 raise ValueError("Report dedup pagination limit")
             if not found:
                 api(token,endpoint,{"body":body})
-            path.unlink()
+            with outbox_lock():
+                try:
+                    current=path.lstat()
+                except FileNotFoundError:
+                    continue
+                if (current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns)==identity:
+                    path.unlink()
+                else:
+                    delivered=False
         except (OSError,ValueError,KeyError,TypeError):
             delivered = False
             print("MacCI report delivery pending; will retry",flush=True)
-            # Persist a retry timestamp so a permanent failure cannot occupy
-            # the first batch forever and starve later reports.
             try:
-                os.utime(path,None,follow_symlinks=False)
-            except OSError:
+                with outbox_lock():
+                    current=path.lstat()
+                    if identity is None or (current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns)==identity:
+                        os.utime(path,None,follow_symlinks=False)
+            except (OSError,ValueError):
                 pass
-    return delivered and not any(folder.glob("*.json"))
+    with outbox_lock():
+        return delivered and not any(folder.glob("*.json"))
 
 
 PROGRESS_CONTEXT = "macmini/progress-v1"
