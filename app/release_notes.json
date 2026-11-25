@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.2.13",
+    "title": "MacCI 拉取超时自动重试",
+    "summary": "修复候选 Git fetch 超时直接退出、未使用现有有界重试的问题。",
+    "changes": [
+      "超时与非零退出共享三次精确候选拉取重试预算。",
+      "记录异常类型，不输出额外敏感内容。",
+      "新增超时后恢复与耗尽重试回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "模拟候选拉取超时后恢复及连续超时"
+    ],
+    "validation_note": "不替换候选 SHA，不改变测试授权；宿主运行程序需独立升级，未确认实机网络根因。"
+  },
+  {
     "version": "0.2.12",
     "title": "任务历史同步 API 请求优化",
     "summary": "正式分支前进时复用经过验证的历史发布证据，减少重复比较。",

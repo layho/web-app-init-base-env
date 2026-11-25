@@ -86,6 +86,24 @@ class RunnerTests(unittest.TestCase):
                 runner.fetch_merge_ref(Path('/tmp/readonly.git'), REPO, 14, io.StringIO(), {})
             self.assertEqual(mocked.call_count, 3)
 
+    def test_merge_ref_fetch_timeout_retries_exact_ref(self):
+        import io
+        err = subprocess.TimeoutExpired(['git', 'fetch'], 120)
+        log = io.StringIO()
+        with patch.object(runner, 'run', side_effect=[err, None]) as mocked, \
+             patch.object(runner.time, 'sleep') as sleeper:
+            runner.fetch_merge_ref(Path('/tmp/readonly.git'), REPO, 14, log, {})
+            self.assertEqual(mocked.call_count, 2)
+            self.assertEqual(mocked.call_args_list[0].args[0], mocked.call_args_list[1].args[0])
+            self.assertEqual(sleeper.call_args.args, (2,))
+            self.assertIn('TimeoutExpired', log.getvalue())
+        with patch.object(runner, 'run', side_effect=err) as mocked, \
+             patch.object(runner.time, 'sleep') as sleeper:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                runner.fetch_merge_ref(Path('/tmp/readonly.git'), REPO, 14, io.StringIO(), {})
+            self.assertEqual(mocked.call_count, 3)
+            self.assertEqual(sleeper.call_count, 2)
+
     def test_real_git_archive(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)/'repo'; root.mkdir()
