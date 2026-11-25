@@ -36,6 +36,11 @@ def check_password(password: str, encoded: str) -> bool:
 def token_hash(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
+def session_csrf(raw_session: str) -> str:
+    """Derive a stable token from the secret cookie using a purpose-specific label."""
+    return hmac.new(raw_session.encode(), b"webapp/csrf/v1", hashlib.sha256).hexdigest()
+
+
 def require_origin(request: Request):
     origin = request.headers.get("origin")
     configured = os.getenv("APP_PUBLIC_ORIGIN", "").rstrip("/")
@@ -62,7 +67,7 @@ def login(request: Request, response: Response, db: Session, username: str, pass
         _failures.append(now)
         raise HTTPException(401, "Incorrect credentials")
     raw_token = secrets.token_urlsafe(48)
-    raw_csrf = secrets.token_urlsafe(32)
+    raw_csrf = session_csrf(raw_token)
     row = AdminSession(token_hash=token_hash(raw_token), csrf_hash=token_hash(raw_csrf), username=expected_user,
                        expires_at=utcnow() + timedelta(hours=TTL_HOURS))
     db.add(row)
@@ -90,11 +95,7 @@ def session_info(request: Request, db: Session):
     row = session_row(request, db)
     if row is None:
         raise HTTPException(401, "No active session")
-    # CSRF token never stored in plaintext; browser retains it from login.
-    # For refresh, csrf can be rotated and returned after reading HttpOnly cookie.
-    csrf = secrets.token_urlsafe(32)
-    row.csrf_hash = token_hash(csrf)
-    db.commit()
+    csrf = session_csrf(request.cookies[COOKIE_NAME])
     return {"authenticated": True, "username": row.username, "csrf_token": csrf}
 
 def authorize_request(request: Request, db: Session):
@@ -112,7 +113,11 @@ def authorize_session(request: Request, db: Session):
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         require_origin(request)
         csrf = request.headers.get("x-csrf-token", "")
-        if not csrf or not hmac.compare_digest(token_hash(csrf), row.csrf_hash):
+        csrf_digest = token_hash(csrf)
+        current_digest = token_hash(session_csrf(request.cookies[COOKIE_NAME]))
+        # Existing sessions can still use their last pre-upgrade token until expiry.
+        if not (hmac.compare_digest(csrf_digest, current_digest)
+                or hmac.compare_digest(csrf_digest, row.csrf_hash)):
             raise HTTPException(403, "CSRF token invalid")
     return row.username
 

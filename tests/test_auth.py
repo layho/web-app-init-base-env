@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import pytest
@@ -39,10 +40,15 @@ def test_login_and_csrf(client):
     assert client.get("/api/v1/feedback").status_code==200
     assert client.post("/api/v1/feedback",json={"category":"bug","message":"Auth regression feedback"},headers={"Origin":"https://webapp.example"}).status_code==403
     token = client.cookies[COOKIE_NAME]
-    refreshed = client.get("/api/session")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_tab, refreshed = pool.map(client.get, ["/api/session", "/api/session"])
+    assert first_tab.status_code == 200
+    assert first_tab.json()["csrf_token"] == response.json()["csrf_token"]
     assert refreshed.status_code == 200
     assert refreshed.json()["username"] == "admin"
-    csrf = refreshed.json()["csrf_token"]
+    csrf = response.json()["csrf_token"]
+    assert refreshed.json()["csrf_token"] == csrf
+    assert csrf != token
     assert client.post("/api/v1/feedback",json={"category":"bug","message":"Auth regression feedback"},headers={"Origin":"https://webapp.example","X-CSRF-Token":csrf}).status_code==200
     assert client.post("/api/logout",headers={"Origin":"https://webapp.example","X-CSRF-Token":csrf}).status_code==200
     client.cookies.set(COOKIE_NAME, token, path="/api")

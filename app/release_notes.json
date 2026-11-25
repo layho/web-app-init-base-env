@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.2.7",
+    "title": "会话刷新 CSRF 稳定性修复",
+    "summary": "同一有效会话使用稳定派生令牌，避免多标签页刷新使写操作失效。",
+    "changes": [
+      "会话读取不再轮换 CSRF 或写入数据库。",
+      "兼容升级前最后一个有效令牌，保留会话到期、退出及来源校验。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证同一会话多次刷新后写操作仍有效",
+      "验证错误令牌及退出后请求仍拒绝"
+    ],
+    "validation_note": "无需生产数据库迁移；实机登录及刷新待验收。"
+  },
+  {
     "version": "0.2.6",
     "title": "MacCI 辅助状态终态修复",
     "summary": "正式测试回执写入后关闭辅助进度状态，并修复已有同候选残留 Pending。",
