@@ -349,6 +349,38 @@ class Progress:
         self.thread.join(timeout=35)
 
 
+def reconcile_progress(token, repo, head, base, merge, statuses):
+    """Close only advisory progress using the newest trusted exact test receipt.
+    Never write or infer the authoritative test result. Retry on subsequent ticks.
+    """
+    latest = next((s for s in statuses if s.get("context") == CONTEXT), None)
+    progress = next((s for s in statuses if s.get("context") == PROGRESS_CONTEXT), None)
+    if not latest or not progress:
+        return False
+    if any((s.get("creator") or {}).get("login") != "layho" for s in (latest, progress)):
+        return False
+    prefix = f"base={base} merge={merge} "
+    if not str(latest.get("description", "")).startswith(prefix) or not str(progress.get("description", "")).startswith(prefix):
+        return False
+    state = latest.get("state")
+    if state not in {"success", "failure", "error"}:
+        return False
+    if state == "success" and latest.get("description") != prefix + "passed":
+        return False
+    if progress.get("state") != "pending":
+        return False
+    if not completed(statuses, base, merge):
+        return False
+    try:
+        api(token, f"/repos/{repo}/statuses/{head}", {
+            "state": state, "context": PROGRESS_CONTEXT,
+            "description": description(base, merge, "finished")})
+        return True
+    except (OSError, ValueError, TypeError):
+        print("MacCI progress completion pending; retry next tick", flush=True)
+        return False
+
+
 def status(token, repo, head, base, merge, state, detail=None):
     api(token, f'/repos/{repo}/statuses/{head}', {'state': state, 'context': CONTEXT,
         'description': description(base, merge, detail or state)})
@@ -544,6 +576,7 @@ def main():
                     pr = {**pr, 'base': {**pr['base'], 'sha': base}, 'merge_commit_sha': expected_merge}
                     statuses = api(token, f'/repos/{repo}/commits/{head}/statuses?per_page=100')
                     if completed(statuses, base, expected_merge) and not args.force:
+                        reconcile_progress(token, repo, head, base, expected_merge, statuses)
                         continue
                     print(f'Testing {repo} PR #{pr["number"]}: {head} against {base}', flush=True)
                     status(token, repo, head, base, None, 'pending')
@@ -566,6 +599,11 @@ def main():
                     if not unchanged or (state == 'success' and merge != expected_merge):
                         state, detail = 'error', 'ref-changed'
                     status(token, repo, head, base, expected_merge, state, detail)
+                    try:
+                        receipts = api(token, f'/repos/{repo}/commits/{head}/statuses?per_page=100')
+                        reconcile_progress(token, repo, head, base, expected_merge, receipts)
+                    except (OSError, ValueError, TypeError):
+                        print('MacCI progress completion pending; retry next tick', flush=True)
                     if state != "success":
                         report={"schema":1,"repository":repo,"pr":pr["number"],"head":head,"base":base,"merge":expected_merge,
                                 "run_id":run_id,"state":state,"phase":detail,"started_at":int(started),

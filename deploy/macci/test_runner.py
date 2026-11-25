@@ -131,6 +131,32 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(payload["state"],"pending")
             self.assertIn("dependencies",payload["description"])
 
+    def test_reconcile_exact_terminal_receipt(self):
+        final={"context":runner.CONTEXT,"state":"success","creator":{"login":"layho"},
+               "description":runner.description(BASE,MERGE,"passed")}
+        progress={"context":runner.PROGRESS_CONTEXT,"state":"pending","creator":{"login":"layho"},
+                  "description":runner.description(BASE,MERGE,"test")}
+        with patch.object(runner,"api") as api:
+            self.assertTrue(runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[final,progress]))
+            self.assertEqual(api.call_args.args[2]["context"],runner.PROGRESS_CONTEXT)
+            self.assertEqual(api.call_args.args[2]["state"],"success")
+            api.reset_mock()
+            self.assertFalse(runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[{**final,"state":"pending"},final,progress]))
+            self.assertFalse(runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[final,{**progress,"creator":{"login":"other"}}]))
+            self.assertFalse(runner.reconcile_progress("fake",REPO,HEAD,BASE,"d"*40,[final,progress]))
+            self.assertFalse(runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[final,{**progress,"state":"success"}]))
+            api.assert_not_called()
+
+    def test_reconcile_failure_and_transport_retry(self):
+        final={"context":runner.CONTEXT,"state":"failure","creator":{"login":"layho"},
+               "description":runner.description(BASE,MERGE,"pytest-failed")}
+        progress={"context":runner.PROGRESS_CONTEXT,"state":"pending","creator":{"login":"layho"},
+                  "description":runner.description(BASE,MERGE,"test")}
+        with patch.object(runner,"api",side_effect=[OSError("offline"),None]) as api:
+            self.assertFalse(runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[final,progress]))
+            self.assertTrue(runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[final,progress]))
+            self.assertEqual(api.call_args.args[2]["state"],"failure")
+
 class DeploymentJournalTests(unittest.TestCase):
     def test_rollback_failure_receipt(self):
         lines=[("update_started",BASE),("update_candidate",MERGE),("update_test_build",MERGE),
