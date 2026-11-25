@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.2.6",
+    "title": "MacCI 辅助状态终态修复",
+    "summary": "正式测试回执写入后关闭辅助进度状态，并修复已有同候选残留 Pending。",
+    "changes": [
+      "测试结束写入独立辅助终态，不修改正式测试上下文。",
+      "仅根据可信且完全匹配的正式回执修复历史残留，避免重复运行测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证成功、失败和历史残留辅助状态",
+      "验证宿主升级后新 PR 不再残留辅助 Pending"
+    ],
+    "validation_note": "宿主 runner 必须升级后生效；不伪造 MacCI 正式回执。"
+  },
+  {
     "version": "0.2.5",
     "title": "升级执行器文件所有权预检",
     "summary": "在创建下游升级 PR 前核验真实已提交文件路径和模板所有权。",

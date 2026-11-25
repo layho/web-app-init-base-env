@@ -143,5 +143,24 @@ class DeploymentJournalTests(unittest.TestCase):
         self.assertEqual(result[0]["previous"],BASE)
         self.assertEqual(runner.deployment_events(raw.split("rollback_ok")[0]),[])
 
+
+
+class ProgressTerminalTests(unittest.TestCase):
+    def test_terminal_context_is_separate(self):
+        with patch.object(runner,"api") as api:
+            runner.finish_progress("fake",REPO,HEAD,BASE,MERGE,"success")
+            self.assertEqual(api.call_args.args[2],{"state":"success","context":runner.PROGRESS_CONTEXT,"description":runner.description(BASE,MERGE,"finished")})
+    def test_reconcile_only_exact_trusted_receipt(self):
+        receipt={"context":runner.CONTEXT,"state":"success","creator":{"login":"layho"},"description":runner.description(BASE,MERGE,"passed")}
+        progress={"context":runner.PROGRESS_CONTEXT,"state":"pending","creator":{"login":"layho"},"description":runner.description(BASE,MERGE,"test")}
+        with patch.object(runner,"finish_progress") as finish:
+            runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[receipt,progress])
+            finish.assert_called_once_with("fake",REPO,HEAD,BASE,MERGE,"success")
+            finish.reset_mock()
+            runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[{**receipt,"creator":{"login":"other"}},progress])
+            runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[receipt,{**progress,"description":runner.description(BASE,HEAD,"test")}])
+            runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[{**receipt,"state":"pending"},receipt,progress])
+            finish.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()
