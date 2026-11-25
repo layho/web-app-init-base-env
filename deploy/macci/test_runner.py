@@ -469,5 +469,49 @@ class ReceiptAvailabilityTests(unittest.TestCase):
                 self.assertFalse(runner.report_base_deployments("fake"))
             self.assertEqual(posted,[("status",MERGE),("issue",MERGE)])
 
+    def test_outbox_writer_can_run_during_remote_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def report(run_id):
+                return {"schema":1,"repository":REPO,"pr":14,"head":HEAD,
+                        "base":BASE,"merge":MERGE,"run_id":run_id,
+                        "state":"failure","phase":"pytest-failed"}
+            with patch.object(runner,"ROOT",root):
+                first=runner.save_report(report("1"*32))
+                def api(token, endpoint, data=None):
+                    if data is None:
+                        # Separate descriptor, nonblocking: proves the local
+                        # queue lock was released before the remote request.
+                        import fcntl
+                        with (root/"report-outbox.lock").open("r+") as lock:
+                            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        runner.save_report(report("2"*32))
+                        return []
+                    return {}
+                with patch.object(runner,"api",side_effect=api):
+                    self.assertFalse(runner.flush_reports("token"))
+                self.assertFalse(first.exists())
+                self.assertTrue((root/"report-outbox"/("2"*32+".json")).exists())
+
+    def test_delivery_does_not_unlink_replaced_queue_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            report={"schema":1,"repository":REPO,"pr":14,"head":HEAD,
+                    "base":BASE,"merge":MERGE,"run_id":"3"*32,
+                    "state":"failure","phase":"pytest-failed"}
+            with patch.object(runner,"ROOT",root):
+                path=runner.save_report(report)
+                def api(token,endpoint,data=None):
+                    if data is None:
+                        return []
+                    with runner.outbox_lock():
+                        path.rename(path.with_suffix(".old"))
+                        runner._save_report({**report,"pr":15})
+                    return {}
+                with patch.object(runner,"api",side_effect=api):
+                    self.assertFalse(runner.flush_reports("token"))
+                self.assertTrue(path.exists())
+                self.assertIn('"pr":15',path.read_text())
+
 if __name__ == "__main__":
     unittest.main()
