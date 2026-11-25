@@ -78,7 +78,7 @@ test('workbench uses the shared task classifier and excludes stale snapshots', a
     {status: '开发中', test_state: 'pending'},
   ]}
   assert.deepEqual(workbenchMetrics(snapshot), {tasks: 6, active: 3, review: 1, done: 1, blocked: 1})
-  assert.equal(workbenchMetrics({...snapshot, stale: true}), null)
+  assert.deepEqual(workbenchMetrics({...snapshot, stale: true}), workbenchMetrics(snapshot))
   assert.equal(workbenchMetrics(null), null)
 })
 
@@ -88,4 +88,14 @@ test('overview evidence does not infer public or worker health from a PR snapsho
   assert.equal(result.health.macci.state,'unknown')
   assert.equal(result.activity.length,1)
   assert.equal(facts.overviewEvidence(null,null,null).activity.length,0)
+})
+
+
+test('stale snapshot remains visible with warning and translated events',()=>{
+  const evidence=facts.overviewEvidence({stale:true,synced_at:'2026-11-25',refresh_status:{state:'failed',phase:'issues',reason:'GH-REST-401'}},null,[{at:'2026-11-25T00:00:00Z',code:'feedback_failed',sha:'a'.repeat(40)}])
+  assert.equal(evidence.health.github.state,'error')
+  assert.match(evidence.health.github.detail,/GH-REST-401/)
+  assert.match(evidence.activity[0].text,/反馈同步失败/)
+  const html=render({project,snapshotStale:true,snapshotAt:'2026-11-25T00:00:00Z',metrics:{tasks:3}})
+  assert.match(html,/上次成功同步的缓存/)
 })
