@@ -93,9 +93,89 @@ assert_main() {
   test "$(git branch --show-current)" = "${TRACK_BRANCH:-main}" || { log "Required branch: ${TRACK_BRANCH:-main}"; exit 1; }
   test -z "$(git status --porcelain --untracked-files=no)" || { log 'Tracked file modifications'; exit 1; }
 }
+replace_path_entry() {
+  python3 -c 'import os,sys; os.replace(sys.argv[1],sys.argv[2])' "$1" "$2"
+}
 dependencies() {
-  test -x .venv/bin/python || python3 -m venv .venv
-  .venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
+  local python_version fingerprint env_root candidate relative python current_target link
+  python_version="$(python3 --version 2>&1 | awk '{print $2}')" || return 1
+  fingerprint="$(shasum -a 256 requirements.txt | awk '{print $1}')" || return 1
+  fingerprint="${python_version}-${fingerprint}"
+  env_root="$ROOT/.venvs"
+  mkdir -p "$env_root" || return 1
+  if test -x .venv/bin/python &&
+     test "$(cat .venv/.requirements-fingerprint 2>/dev/null || true)" = "$fingerprint" &&
+     .venv/bin/python -c 'import PIL, fastapi, sqlalchemy, uvicorn; from app import main' >/dev/null 2>&1 &&
+     test -x .venv/bin/uvicorn; then
+    return 0
+  fi
+  test ! -e .venv.previous && test ! -L .venv.previous || {
+    log 'Previous Python environment backup exists; inspect before rebuilding'; return 1;
+  }
+  candidate="$env_root/$fingerprint-$$"
+  relative=".venvs/${fingerprint}-$$"
+  test ! -e "$candidate" || { log 'Incomplete Python environment path already exists'; return 1; }
+  python3 -m venv "$candidate" || { rm -rf "$candidate"; return 1; }
+  python="$candidate/bin/python"
+  if ! "$python" -m pip install --disable-pip-version-check -r requirements.txt ||
+     ! "$python" -c 'import PIL, fastapi, sqlalchemy, uvicorn; from app import main' ||
+     ! "$python" -m scripts.apply_migrations --help >/dev/null 2>&1 ||
+     ! test -x "$candidate/bin/uvicorn"; then
+    rm -rf "$candidate"
+    return 1
+  fi
+  printf '%s\n' "$fingerprint" > "$candidate/.requirements-fingerprint" || {
+    rm -rf "$candidate"; return 1;
+  }
+  if test -L .venv; then
+    current_target="$(readlink .venv)" || { rm -rf "$candidate"; return 1; }
+    ln -s "$current_target" .venv.previous || { rm -rf "$candidate"; return 1; }
+  elif test -e .venv; then
+    mv .venv .venv.previous || { rm -rf "$candidate"; return 1; }
+  fi
+  link=".venv.next.$$"
+  ln -s "$relative" "$link" || {
+    if test -L .venv && test -L .venv.previous; then rm -f .venv.previous || return 1
+    elif test ! -e .venv && { test -e .venv.previous || test -L .venv.previous; }; then mv .venv.previous .venv || return 1
+    fi
+    rm -rf "$candidate"
+    return 1
+  }
+  if test -L .venv; then
+    replace_path_entry "$link" .venv || {
+      rm -f "$link"
+      rm -f .venv.previous || return 1
+      rm -rf "$candidate"
+      return 1
+    }
+  elif ! replace_path_entry "$link" .venv; then
+    rm -f "$link"
+    if test -e .venv.previous || test -L .venv.previous; then mv .venv.previous .venv || return 1; fi
+    rm -rf "$candidate"
+    return 1
+  fi
+}
+restore_dependencies() {
+  if test -e .venv.previous || test -L .venv.previous; then
+    if test -L .venv && test -L .venv.previous; then
+      replace_path_entry .venv.previous .venv || return 1
+    else
+      if test -L .venv || test -e .venv; then rm -rf .venv || return 1; fi
+      mv .venv.previous .venv || return 1
+    fi
+    # Rollback must restore the exact prior environment, including legacy
+    # directories without a fingerprint. Re-running dependencies here may try
+    # to recreate the just-built candidate at the same fingerprint path.
+    return 0
+  fi
+  dependencies
+}
+commit_dependencies() {
+  if test -L .venv.previous; then
+    rm -f .venv.previous || return 1
+  elif test -e .venv.previous; then
+    mv .venv.previous ".venvs/legacy-$$" || return 1
+  fi
 }
 check_schema() { .venv/bin/python -m scripts.apply_migrations --check; }
 test_app() {
@@ -232,25 +312,34 @@ PY
 }
 install() {
   assert_main; load_env
-  dependencies
-  check_schema
-  test_app
-  build
-  # Reinstall must not nest dist.next inside an existing dist directory.
-  # Preserve previous assets until the replacement has passed health checks.
   if test -d frontend/dist.previous; then
     log 'Previous asset backup exists; inspect before reinstall'; exit 1
   fi
-  if test -d frontend/dist; then mv frontend/dist frontend/dist.previous; fi
-  mv frontend/dist.next frontend/dist
+  test ! -e .venv.previous && test ! -L .venv.previous || {
+    log 'Previous Python environment backup exists; inspect before reinstall'; exit 1;
+  }
+  if ! dependencies || ! check_schema || ! test_app || ! build; then
+    restore_dependencies || log 'Python environment restore failed after install preflight'
+    exit 1
+  fi
+  # Reinstall must not nest dist.next inside an existing dist directory.
+  # Preserve previous assets until the replacement has passed health checks.
+  if test -d frontend/dist; then mv frontend/dist frontend/dist.previous || { restore_dependencies || true; exit 1; }; fi
+  mv frontend/dist.next frontend/dist || {
+    if test -d frontend/dist.previous; then mv frontend/dist.previous frontend/dist || true; fi
+    restore_dependencies || true
+    exit 1
+  }
   if ! agents || ! health "$(git rev-parse HEAD)"; then
     record_operation install_failed "$(git rev-parse HEAD)"
     log 'Install health failed; restoring previous frontend assets'
     rm -rf frontend/dist
     if test -d frontend/dist.previous; then mv frontend/dist.previous frontend/dist; fi
+    restore_dependencies || log 'Python environment restore failed after install health check'
     launchctl kickstart -k "gui/$(id -u)/$WEB" || true
     exit 1
   fi
+  commit_dependencies || { log 'Could not finalize Python environment backup'; exit 1; }
   rm -rf frontend/dist.previous
   record_operation install_ok "$(git rev-parse HEAD)"
   log "Installed $(git rev-parse HEAD)"
@@ -347,7 +436,7 @@ rollback() {
   fi
   rm -rf frontend/dist.next || restored=0
   git reset --hard "$old" || restored=0
-  .venv/bin/python -m pip install -q -r requirements.txt || restored=0
+  restore_dependencies || restored=0
   if test "${3:-hold}" = "hold"; then record_operation rollback "$bad"; fi
   # A failure before restart may leave the previous service healthy.
   # Do not stop that process unnecessarily. Otherwise wait for launchd.
@@ -435,6 +524,10 @@ update() {
     log "Previous frontend backup exists; manual recovery required"
     exit 1
   fi
+  if test -e .venv.previous || test -L .venv.previous; then
+    log "Previous Python environment backup exists; manual recovery required"
+    exit 1
+  fi
   record_operation update_candidate "$new"
   git merge --ff-only "$new"
   # Never auto-migrate or pretend DB rollback is transactional.
@@ -473,18 +566,20 @@ update() {
   if ! health "$new"; then
     rollback "$old" "$new"; exit 1
   fi
+  commit_dependencies || { rollback "$old" "$new"; exit 1; }
   rm -rf frontend/dist.previous .webapp-failed-sha
   record_operation update_ok "$new"
   log "DEPLOY_OK $new (verify public HTTPS separately)"
 }
 prepare() {
   assert_main; load_env
-  dependencies
-  .venv/bin/python -m scripts.apply_migrations
-  check_schema
-  test_app
-  build
+  if ! dependencies || ! .venv/bin/python -m scripts.apply_migrations ||
+     ! check_schema || ! test_app || ! build; then
+    restore_dependencies || log 'Python environment restore failed during prepare'
+    return 1
+  fi
   mv frontend/dist.next frontend/dist
+  commit_dependencies
 }
 case "$1" in
   prepare) prepare;;
