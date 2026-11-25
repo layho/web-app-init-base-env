@@ -7,7 +7,28 @@ Run tests from the reviewed checkout:
 cd deploy/macci
 python3 -m unittest -v test_runner test_merge_preview test_publish_main
 ```
-For maintenance, use upgrade-runtime.py with --check to verify prerequisites and tests, or --apply after confirming the exact source SHA and test receipt. It uses the existing lock files and rejects concurrent jobs. It backs up the two runtime files, atomically replaces them, and does not install a new LaunchAgent, change credentials or stop any processes. The next existing scheduled invocation reads the new script. If a service is busy, it exits without replacing files; retry once idle. Afterward verify actual MacCI statuses and preview branch advancement, not only process registration. Do not install unreviewed code or execute arbitrary issue text.
+## Trusted runtime installer
+
+`upgrade-runtime.py` in a candidate checkout is source data only. Never execute that copy on the host. `--check` and `--apply` must be invoked through the root-owned fixed installer at `/usr/local/libexec/macmini-pr-tests/runtime-installer.py`; it verifies its own SHA-256 against the separate root-owned read-only pin at `/usr/local/etc/macmini-pr-tests/runtime-installer.sha256` before parsing arguments or reading the candidate checkout. The fixed installer reads candidate blobs from `~/web-app-init-base-env-preview` by exact commit SHA, disables Git replace objects and system/global configuration, compiles modules without executing them, and only applies the two modules after independent digests are provided.
+
+Initial provisioning or changing the installer itself is a deliberate administrator operation after independent review of the exact installer bytes. For a reviewed commit, install the file and its separately recorded digest with root ownership and no write bits:
+
+```sh
+sudo install -d -o root -g wheel -m 0755 /usr/local/libexec/macmini-pr-tests /usr/local/etc/macmini-pr-tests
+sudo install -o root -g wheel -m 0555 deploy/macci/upgrade-runtime.py /usr/local/libexec/macmini-pr-tests/runtime-installer.py
+shasum -a 256 /usr/local/libexec/macmini-pr-tests/runtime-installer.py | awk '{print $1}' > /tmp/runtime-installer.sha256
+sudo install -o root -g wheel -m 0444 /tmp/runtime-installer.sha256 /usr/local/etc/macmini-pr-tests/runtime-installer.sha256
+rm -f /tmp/runtime-installer.sha256
+```
+
+After provisioning, invoke only the fixed path, as the MacCI user (not with `sudo`):
+
+```sh
+python3 /usr/local/libexec/macmini-pr-tests/runtime-installer.py --sha <reviewed-main-SHA> --check
+python3 /usr/local/libexec/macmini-pr-tests/runtime-installer.py --sha <reviewed-main-SHA> --runner-sha256 <independent-runner-digest> --merge-sha256 <independent-merge-digest> --apply
+```
+
+The installer uses the existing lock files, rejects concurrent jobs, backs up the two runtime files, atomically replaces them, and does not install a LaunchAgent, change credentials, or stop processes. The next existing scheduled invocation reads the new script. If a service is busy, it exits without replacing files; retry once idle. Afterward verify actual MacCI statuses and preview branch advancement, not only process registration. Do not install unreviewed code or execute arbitrary issue text.
 
 
 ## Manual test lock handoff (PR #95)
