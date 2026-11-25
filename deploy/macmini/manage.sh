@@ -94,8 +94,32 @@ assert_main() {
   test -z "$(git status --porcelain --untracked-files=no)" || { log 'Tracked file modifications'; exit 1; }
 }
 dependencies() {
-  test -x .venv/bin/python || python3 -m venv .venv
-  .venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
+  local candidate=".venv.next.$$" previous=".venv.previous.$$" had_previous=0
+  local python
+  if test -x .venv/bin/python && .venv/bin/python -c 'import PIL, fastapi, sqlalchemy, uvicorn; from app import main' >/dev/null 2>&1; then
+    return 0
+  fi
+  rm -rf "$candidate" "$previous" || return 1
+  python3 -m venv "$candidate" || { rm -rf "$candidate"; return 1; }
+  python="$candidate/bin/python"
+  if ! "$python" -m pip install --disable-pip-version-check -r requirements.txt ||
+     ! "$python" -c 'import PIL, fastapi, sqlalchemy, uvicorn; from app import main' ||
+     ! "$python" -m scripts.apply_migrations --help >/dev/null 2>&1; then
+    rm -rf "$candidate"
+    return 1
+  fi
+  if test -e .venv; then
+    mv .venv "$previous" || { rm -rf "$candidate"; return 1; }
+    had_previous=1
+  fi
+  if ! mv "$candidate" .venv; then
+    if test "$had_previous" = 1; then
+      mv "$previous" .venv || return 1
+    fi
+    rm -rf "$candidate"
+    return 1
+  fi
+  rm -rf "$previous"
 }
 check_schema() { .venv/bin/python -m scripts.apply_migrations --check; }
 test_app() {
