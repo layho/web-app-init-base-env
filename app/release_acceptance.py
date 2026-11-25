@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from tempfile import NamedTemporaryFile
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -72,6 +73,8 @@ def github_http_error(exc):
         return prefix + "：请求被禁止，需核查对应接口权限、仓库访问或组织策略"
     if exc.code == 401:
         return prefix + "：GitHub 身份认证失败，请核查运行服务凭据"
+    if exc.code in (500, 502, 503, 504):
+        return prefix + "：GitHub 服务暂时异常"
     return prefix + "：GitHub 请求失败"
 
 
@@ -83,13 +86,25 @@ def github(path, data=None):
                       data=json.dumps(data).encode() if data is not None else None,
                       headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                                "Content-Type": "application/json", "User-Agent": "base-release-acceptance"})
-    try:
-        with build_opener(NoRedirect()).open(request, timeout=8) as response:
-            return json.load(response)
-    except HTTPError as exc:
-        raise AcceptanceError(github_http_error(exc)) from None
-    except (URLError, OSError, ValueError):
-        raise AcceptanceError("GH-REST-NETWORK：GitHub 请求失败或回执无效") from None
+    # Only idempotent GET requests may be replayed. A POST might have
+    # succeeded remotely even if the response was lost.
+    delays = (0.5, 1.0) if data is None else ()
+    for attempt in range(len(delays) + 1):
+        try:
+            with build_opener(NoRedirect()).open(request, timeout=8) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            reason = github_http_error(exc)
+            retryable = exc.code in (500, 502, 503, 504)
+            exc.close()
+            if retryable and attempt < len(delays):
+                time.sleep(delays[attempt])
+                continue
+            if retryable and delays:
+                reason += "；已尝试 " + str(attempt + 1) + " 次"
+            raise AcceptanceError(reason) from None
+        except (URLError, OSError, ValueError):
+            raise AcceptanceError("GH-REST-NETWORK：GitHub 请求失败或回执无效") from None
 
 def api(path, data=None):
     return github(f"/repos/{REPO}{path}", data)

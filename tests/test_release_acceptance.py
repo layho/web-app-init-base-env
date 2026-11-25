@@ -194,3 +194,47 @@ def test_github_http_error_distinguishes_rate_limit_and_permission():
     msg = acceptance.github_http_error(error(403, {}, {"message":"secret credential"}))
     assert "接口权限" in msg and "secret" not in msg
     assert "身份认证失败" in acceptance.github_http_error(error(401, {}, {}))
+
+
+@pytest.mark.parametrize("code", [500, 502, 503, 504])
+def test_github_read_recovers_transient_server_error(monkeypatch, code):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    monkeypatch.setattr(acceptance, "github_token", lambda: "test-only")
+    calls, sleeps = [], []
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(request.get_method())
+            if len(calls) < 3:
+                raise HTTPError(request.full_url, code, "test", {}, BytesIO(b"private"))
+            return BytesIO(b'{"ok": true}')
+    monkeypatch.setattr(acceptance, "build_opener", lambda *a: Opener())
+    monkeypatch.setattr(acceptance.time, "sleep", sleeps.append)
+    assert acceptance.github("/repos/owner/repo/pulls") == {"ok": True}
+    assert calls == ["GET", "GET", "GET"]
+    assert sleeps == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("code, data, expected", [
+    (500, None, 3), (500, {"title": "test"}, 1),
+    (401, None, 1), (403, None, 1), (429, None, 1), (404, None, 1),
+])
+def test_github_retry_is_bounded_and_never_replays_writes(monkeypatch, code, data, expected):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    monkeypatch.setattr(acceptance, "github_token", lambda: "test-only")
+    calls, sleeps = [], []
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(request.get_method())
+            raise HTTPError(request.full_url, code, "test", {}, BytesIO(b"private"))
+    monkeypatch.setattr(acceptance, "build_opener", lambda *a: Opener())
+    monkeypatch.setattr(acceptance.time, "sleep", sleeps.append)
+    with pytest.raises(acceptance.AcceptanceError) as exc:
+        acceptance.github("/repos/owner/repo/issues", data)
+    assert str(exc.value).startswith(f"GH-REST-{code}")
+    assert "private" not in str(exc.value)
+    assert len(calls) == expected
+    assert len(sleeps) == expected - 1
+    if expected == 3:
+        assert "已尝试 3 次" in str(exc.value)
