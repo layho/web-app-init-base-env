@@ -223,6 +223,8 @@ REPORT_PHASES = {"setup-failed","fetch-failed","context-failed","dependencies-fa
 MAX_REPORT_SIZE = 12000
 MAX_OUTBOX_REPORTS = 100
 MAX_OUTBOX_BYTES = 1200000
+MAX_QUARANTINE_REPORTS = 20
+MAX_QUARANTINE_BYTES = 1200000
 
 
 def failure_summary(raw, phase):
@@ -254,6 +256,56 @@ def failure_summary(raw, phase):
     return result
 
 
+def valid_report(report, path):
+    return (isinstance(report,dict) and report.get("repository") in REPOS
+            and type(report.get("pr")) is int and report["pr"]>0
+            and isinstance(report.get("run_id"),str)
+            and re.fullmatch(r"[0-9a-f]{32}",report.get("run_id",""))
+            and path.stem==report["run_id"]
+            and all(SHA.fullmatch(str(report.get(k,""))) for k in ("head","base","merge"))
+            and report.get("phase") in REPORT_PHASES)
+
+
+def quarantine_legacy_report(folder, path, size):
+    """Move an unusable same-user legacy receipt out of the active queue."""
+    quarantine=folder/"quarantine"
+    quarantine.mkdir(mode=0o700,exist_ok=True)
+    info=quarantine.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise ValueError("Unsafe report quarantine")
+    if size>MAX_OUTBOX_BYTES:
+        path.unlink()
+        print("Oversized legacy MacCI report discarded; retained test log is local",flush=True)
+        return
+    queued=[]
+    total=0
+    with os.scandir(quarantine) as entries:
+        for entry in entries:
+            item=entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(item.st_mode) or item.st_uid!=os.getuid() or item.st_mode&0o077:
+                raise ValueError("Unsafe quarantined MacCI report")
+            queued.append((item.st_mtime_ns,entry.path,item.st_size))
+            total+=item.st_size
+    queued.sort()
+    while queued and (len(queued)>=MAX_QUARANTINE_REPORTS or total+size>MAX_QUARANTINE_BYTES):
+        _,old_path,old_size=queued.pop(0)
+        os.unlink(old_path)
+        total-=old_size
+    if total+size>MAX_QUARANTINE_BYTES:
+        path.unlink()
+        print("Legacy MacCI report exceeded quarantine capacity; discarded",flush=True)
+        return
+    os.chmod(path,0o600,follow_symlinks=False)
+    target=quarantine/("legacy-"+uuid.uuid4().hex+".json")
+    os.replace(path,target)
+    for directory in (folder,quarantine):
+        fd=os.open(directory,os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def save_report(report):
     from tempfile import NamedTemporaryFile
     folder = ROOT / "report-outbox"
@@ -272,9 +324,23 @@ def save_report(report):
             if not entry.name.endswith(".json"):
                 continue
             item=entry.stat(follow_symlinks=False)
-            if (not stat.S_ISREG(item.st_mode) or item.st_uid!=os.getuid()
-                    or item.st_mode&0o077 or item.st_size>MAX_REPORT_SIZE):
+            if not stat.S_ISREG(item.st_mode) or item.st_uid!=os.getuid():
                 raise ValueError("Unsafe queued MacCI report")
+            valid=False
+            if item.st_size<=MAX_REPORT_SIZE and not item.st_mode&0o077:
+                try:
+                    fd=os.open(entry.path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+                    with os.fdopen(fd,"r",encoding="utf-8") as stream:
+                        opened=os.fstat(stream.fileno())
+                        if (stat.S_ISREG(opened.st_mode) and opened.st_uid==os.getuid()
+                                and not opened.st_mode&0o077 and opened.st_size<=MAX_REPORT_SIZE):
+                            valid_report_data=json.load(stream)
+                            valid=valid_report(valid_report_data,Path(entry.path))
+                except (OSError,ValueError,KeyError,TypeError):
+                    valid=False
+            if not valid:
+                quarantine_legacy_report(folder,Path(entry.path),item.st_size)
+                continue
             reports.append(entry.name)
             total+=item.st_size
     if path.name in reports:
@@ -321,7 +387,7 @@ def flush_reports(token):
                 if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>MAX_REPORT_SIZE:
                     raise ValueError("Unsafe report")
                 report=json.load(stream)
-            if report.get("repository") not in REPOS or type(report.get("pr")) is not int or report["pr"]<=0 or not re.fullmatch(r"[0-9a-f]{32}",report.get("run_id","")) or path.stem!=report["run_id"] or any(not SHA.fullmatch(str(report.get(k,""))) for k in ("head","base","merge")) or report.get("phase") not in REPORT_PHASES:
+            if not valid_report(report,path):
                 raise ValueError("Invalid report")
             endpoint=f"/repos/{report['repository']}/issues/{report['pr']}/comments"
             # Compare the exact serialized report before retrying a lost POST.

@@ -260,33 +260,49 @@ class ReceiptAvailabilityTests(unittest.TestCase):
                     runner.save_report(report)
                 self.assertFalse((Path(tmp)/"report-outbox"/("a"*32+".json")).exists())
 
-    def test_permanent_report_failure_does_not_starve_later_outbox_entries(self):
-        from unittest.mock import Mock
+    def test_legacy_oversized_and_corrupt_reports_are_quarantined(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
-            report=lambda index:{
+            folder=root/"report-outbox"
+            folder.mkdir(mode=0o700)
+            oversized=folder/"oversized.json"
+            oversized.write_bytes(b"x"*(runner.MAX_REPORT_SIZE+1))
+            corrupt=folder/"corrupt.json"
+            corrupt.write_text("not json")
+            oversized.chmod(0o600)
+            corrupt.chmod(0o600)
+            report={
                 "schema":1,"repository":REPO,"pr":14,"head":HEAD,"base":BASE,"merge":MERGE,
-                "run_id":f"{index:032x}","state":"failure","phase":"pytest-failed",
+                "run_id":"b"*32,"state":"failure","phase":"pytest-failed",
                 "started_at":1,"finished_at":2,"failures":[],
             }
             with patch.object(runner,"ROOT",root):
-                paths=[runner.save_report(report(i)) for i in range(41)]
-                failed=paths[0]
-                def api(_token,endpoint,data=None):
-                    if endpoint.endswith("?per_page=100&page=1"):
-                        return []
-                    if data and failed.stem in data["body"]:
-                        raise OSError("permanent report failure")
-                    if data:
-                        return {}
-                    raise AssertionError(endpoint)
-                with patch.object(runner,"api",side_effect=api):
-                    self.assertFalse(runner.flush_reports("token"))
-                    self.assertTrue(failed.exists())
-                    self.assertFalse(runner.flush_reports("token"))
-                    self.assertTrue(failed.exists())
-                    self.assertFalse(runner.flush_reports("token"))
-                self.assertEqual([p.stem for p in (root/"report-outbox").glob("*.json")],[failed.stem])
+                saved=runner.save_report(report)
+                self.assertTrue(saved.exists())
+                self.assertFalse(oversized.exists())
+                self.assertFalse(corrupt.exists())
+                quarantined=list((folder/"quarantine").glob("*.json"))
+                self.assertEqual(len(quarantined),2)
+                self.assertTrue(all(p.stat().st_mode&0o077==0 for p in quarantined))
+
+    def test_legacy_report_quarantine_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            folder=root/"report-outbox"
+            folder.mkdir(mode=0o700)
+            for name in ("first.json","second.json"):
+                path=folder/name
+                path.write_text("corrupt")
+                path.chmod(0o600)
+            report={
+                "schema":1,"repository":REPO,"pr":14,"head":HEAD,"base":BASE,"merge":MERGE,
+                "run_id":"c"*32,"state":"failure","phase":"pytest-failed",
+                "started_at":1,"finished_at":2,"failures":[],
+            }
+            with patch.object(runner,"ROOT",root), \
+                 patch.object(runner,"MAX_QUARANTINE_REPORTS",1):
+                runner.save_report(report)
+            self.assertEqual(len(list((folder/"quarantine").glob("*.json"))),1)
 
     def test_permanent_report_failure_does_not_starve_later_outbox_entries(self):
         from unittest.mock import Mock
@@ -417,41 +433,6 @@ class ReceiptAvailabilityTests(unittest.TestCase):
                  patch.object(runner, "api") as api:
                 self.assertFalse(runner.report_base_deployments("fake"))
                 api.assert_not_called()
-
-    def test_deployment_receipt_failure_does_not_block_later_rows_or_channel(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)
-            journal=root/"web-app-init-base-env-preview"/"logs"/"operations.tsv"
-            journal.parent.mkdir(parents=True)
-            journal.write_text("\n".join([
-                f"2026-11-25T00:00:00Z\tupdate_started\t{BASE}",
-                f"2026-11-25T00:00:01Z\tupdate_candidate\t{HEAD}",
-                f"2026-11-25T00:00:02Z\tupdate_preflight_failed\t{HEAD}",
-                f"2026-11-25T00:00:03Z\tupdate_started\t{BASE}",
-                f"2026-11-25T00:00:04Z\tupdate_candidate\t{MERGE}",
-                f"2026-11-25T00:00:05Z\tupdate_preflight_failed\t{MERGE}",
-            ])+"\n")
-            posted=[]
-            def api(token, endpoint, data=None):
-                if endpoint.endswith("/statuses?per_page=100"):
-                    return []
-                if endpoint.endswith(f"/statuses/{HEAD}"):
-                    raise OSError("first candidate status unavailable")
-                if endpoint.endswith(f"/statuses/{MERGE}"):
-                    posted.append(("status",MERGE))
-                    return {}
-                if "/issues?state=all&" in endpoint:
-                    return []
-                if endpoint.endswith("/issues"):
-                    if data["title"].endswith(HEAD+"]"):
-                        raise OSError("first candidate issue unavailable")
-                    posted.append(("issue",MERGE))
-                    return {}
-                raise AssertionError(endpoint)
-            with patch.object(runner.Path,"home",return_value=root), \
-                 patch.object(runner,"api",side_effect=api):
-                self.assertFalse(runner.report_base_deployments("fake"))
-            self.assertEqual(posted,[("status",MERGE),("issue",MERGE)])
 
     def test_deployment_receipt_failure_does_not_block_later_rows_or_channel(self):
         with tempfile.TemporaryDirectory() as tmp:
