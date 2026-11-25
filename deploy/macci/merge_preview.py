@@ -242,25 +242,31 @@ def replacement_allowed(token, number, base, head, merge):
     return False
 
 
+def gate_block(number, reason):
+    # Fixed reason codes only: never print API payloads, credentials or git output.
+    print(f"PR #{number}: preview gate blocked: {reason}", flush=True)
+    return None
+
+
 def authorization(token, number):
     pr = api(token, f"/pulls/{number}")
     if not eligible(pr):
-        return None
+        return gate_block(number, "pr_ineligible")
     head, merge = pr["head"]["sha"], pr["merge_commit_sha"]
     base = api(token, "/branches/preview")["commit"]["sha"]
     if not valid(base):
-        return None
+        return gate_block(number, "invalid_preview_sha")
     commit = api(token, "/git/commits/" + merge)
     if [p["sha"] for p in commit["parents"]] != [base, head]:
-        return None
+        return gate_block(number, "candidate_parents_mismatch")
     required = review(all_pages(token, f"/issues/{number}/comments"), head)
     if not required:
-        return None
+        return gate_block(number, "owner_review_missing_or_revoked")
     statuses = api(token, f"/commits/{head}/statuses?per_page=100")
     if not tested(statuses, head, base, merge):
-        return None
+        return gate_block(number, "exact_test_receipt_missing_or_invalid")
     if api(token, "/branches/preview")["commit"]["sha"] != base:
-        return None
+        return gate_block(number, "preview_changed")
     return head, base, merge, required
 
 
@@ -290,6 +296,7 @@ def merge_one(token, number, dry_run=False):
         return False
     head, base, merge, required = gate
     if frozen and not replacement_allowed(token, number, base, head, merge):
+        gate_block(number, "acceptance_freeze")
         return False
     with TemporaryDirectory(prefix="macci-preview-") as folder:
         git(folder, "init", "--bare")
