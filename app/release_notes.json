@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.2.14",
+    "title": "修复限流冷却期限重复延长",
+    "summary": "区分本地冷却拦截与真实 GitHub 限流响应，防止重复延长等待。",
+    "changes": [
+      "本地冷却异常不再重新登记为服务端限流。",
+      "损坏的冷却记录不阻塞刷新。",
+      "新增冷却期限及损坏记录回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "模拟同步过程中另一通道触发冷却，确认不重复延长期限"
+    ],
+    "validation_note": "保留真实 GitHub 限流等待及安全门禁。"
+  },
+  {
     "version": "0.2.13",
     "title": "MacCI 拉取超时自动重试",
     "summary": "修复候选 Git fetch 超时直接退出、未使用现有有界重试的问题。",

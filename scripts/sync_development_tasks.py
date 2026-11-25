@@ -156,14 +156,22 @@ def cooldown(reason=None):
         try:
             saved = json.loads(path.read_text())
             until = pr_tracking.instant(saved.get("retry_at"))
+            if not isinstance(saved.get("reason"), str) or not retry_deadline(saved["reason"], now):
+                saved, until = {}, None
         except (OSError, ValueError, TypeError, AttributeError):
             saved, until = {}, None
+        # Re-observing our own local hold is not a new server rate limit.
+        # The worker must not extend a relative Retry-After on every retry.
         candidate = retry_deadline(reason, now)
         if candidate and (until is None or candidate > until):
             until = candidate
             saved = {"retry_at": until.isoformat(), "reason": reason}
             write_json(path, saved)
         return saved if until and until > now else None
+
+
+class LocalCooldown(release_acceptance.AcceptanceError):
+    """A local hold, not a new GitHub response."""
 
 
 def enqueue_refresh():
@@ -290,13 +298,14 @@ def run_refresh(force=False):
                 raise ValueError("Read-only task sync")
             held = cooldown()
             if held:
-                raise release_acceptance.AcceptanceError(held["reason"])
+                raise LocalCooldown(held["reason"])
             state["requests"] += 1
             write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
             try:
                 return release_acceptance.github(path)
             except release_acceptance.AcceptanceError as exc:
-                cooldown(str(exc))
+                if not isinstance(exc, LocalCooldown):
+                    cooldown(str(exc))
                 raise
         try:
             if target is None:
@@ -307,7 +316,7 @@ def run_refresh(force=False):
                 state["token_health_checked_at"] = datetime.now(timezone.utc).isoformat()
                 held = cooldown()
                 if held:
-                    raise release_acceptance.AcceptanceError(held["reason"])
+                    raise LocalCooldown(held["reason"])
                 state["phase"] = "issues"
                 write_status(state)
             issues = sync(force=True, repository=target[0], request=request,
@@ -364,7 +373,7 @@ def run_refresh(force=False):
             state["state"] = "failed"
             # AcceptanceError messages are already sanitized by the REST client.
             state["reason"] = str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else type(exc).__name__
-            held = cooldown(state["reason"])
+            held = cooldown() if isinstance(exc, LocalCooldown) else cooldown(state["reason"])
             if held:
                 state["reason"] = held["reason"] + "；下次重试 " + held["retry_at"]
             if state["phase"] in {"issues", "pulls"} and isinstance(exc, release_acceptance.AcceptanceError):
@@ -400,11 +409,12 @@ def refresh_active():
                 raise ValueError("Read only")
             held = cooldown()
             if held:
-                raise release_acceptance.AcceptanceError(held["reason"])
+                raise LocalCooldown(held["reason"])
             try:
                 return release_acceptance.github(path)
             except release_acceptance.AcceptanceError as exc:
-                cooldown(str(exc))
+                if not isinstance(exc, LocalCooldown):
+                    cooldown(str(exc))
                 raise
         try:
             repo,branch=target
