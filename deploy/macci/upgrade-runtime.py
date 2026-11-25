@@ -41,18 +41,21 @@ def replace_file(path, content):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--source", type=Path, default=SOURCE)
+    parser.add_argument("--enable-recovery", action="store_true")
     parser.add_argument("--sha", required=True, help="exact reviewed source commit")
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--check", action="store_true")
     modes.add_argument("--apply", action="store_true")
     args = parser.parse_args()
+    source=args.source.resolve()
     os.umask(0o077)
     if not re.fullmatch(r"[0-9a-f]{40}", args.sha):
         raise SystemExit("Invalid SHA")
-    actual = subprocess.check_output(["git","-C",str(SOURCE),"rev-parse","HEAD"], text=True).strip()
+    actual = subprocess.check_output(["git","-C",str(source),"rev-parse","HEAD"], text=True).strip()
     if actual != args.sha:
         raise SystemExit("Checkout is not the exact reviewed SHA")
-    changes = subprocess.check_output(["git","-C",str(SOURCE),"status","--porcelain","--","."],text=True).strip()
+    changes = subprocess.check_output(["git","-C",str(source),"status","--porcelain","--","."],text=True).strip()
     if changes:
         raise SystemExit("MacCI source checkout contains changes; refuse upgrade")
     if not owned_private(ROOT, False):
@@ -61,7 +64,7 @@ def main():
         if not owned_private(ROOT / name):
             raise SystemExit("Unsafe or missing existing file: " + name)
     subprocess.run([sys.executable,"-B","-m","unittest","-v","test_runner","test_merge_preview","test_publish_main"],
-                   cwd=SOURCE,check=True)
+                   cwd=source,check=True)
     if args.check:
         print("Host source tests passed; no runtime changes")
         return 0
@@ -79,10 +82,9 @@ def main():
             except BlockingIOError:
                 raise SystemExit("MacCI job active; no files changed; retry when idle")
         previous={name:(ROOT/name).read_bytes() for name in NAMES}
-        desired={name:(SOURCE/name).read_bytes() for name in NAMES}
+        desired={name:(source/name).read_bytes() for name in NAMES}
         if previous == desired:
-            print("Runtime already matches reviewed source; no changes")
-            return 0
+            print("Runtime already matches reviewed source")
         stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup=ROOT/("runtime-backup-"+stamp)
         backup.mkdir(mode=0o700)
@@ -95,6 +97,16 @@ def main():
             for name,content in previous.items():
                 replace_file(ROOT/name,content)
             raise
+        if args.enable_recovery:
+            # Explicit one-time enablement. Never auto-replace the trust anchor.
+            for name,origin in (("runtime-installer.py",source/"upgrade-runtime.py"),("runtime-recovery.py",source/"runtime_recovery.py")):
+                if (ROOT/name).exists():
+                    if not owned_private(ROOT/name) or (ROOT/name).read_bytes()!=origin.read_bytes():
+                        raise SystemExit("Existing recovery trust anchor differs; refuse replacement")
+                else:
+                    replace_file(ROOT/name,origin.read_bytes())
+            replace_file(ROOT/"runtime-recovery.enabled",b"enabled\n")
+        replace_file(ROOT/"runtime-installed-sha",(actual+"\n").encode())
         print("Runtime updated to reviewed SHA",actual)
         print("Backup:",backup)
         print("Existing launchd services will use new scripts on their next invocation.")

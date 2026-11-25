@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import stat
+import sys
 import tarfile
 import time
 import threading
@@ -544,6 +545,15 @@ def main():
         token = stream.read().strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,300}", token):
         raise SystemExit("Invalid credential format")
+    if args.lock_fd is None and not args.force:
+        recovery=ROOT/"runtime-recovery.py"
+        if recovery.is_file() and not recovery.is_symlink():
+            try:
+                info=recovery.stat()
+                if info.st_uid==os.getuid() and not info.st_mode&0o077:
+                    subprocess.run([sys.executable,"-B",str(recovery)],check=False,timeout=360)
+            except (OSError,subprocess.SubprocessError):
+                print("Independent runtime recovery deferred",flush=True)
     docker_command()
     subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
     try:
