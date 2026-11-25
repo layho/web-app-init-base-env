@@ -275,7 +275,11 @@ def run_refresh(force=False):
             fcntl.flock(lock, fcntl.LOCK_EX if force else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
-        force = force or refresh_status().get("state") == "queued"
+        prior_status = refresh_status()
+        # Acquiring the exclusive worker lock proves no other worker owns
+        # the refresh. A leftover running record is therefore recoverable.
+        recovering = prior_status.get("state") in {"failed", "interrupted", "running", "queued"}
+        force = force or prior_status.get("state") == "queued"
         held = cooldown()
         if held:
             write_status({**refresh_status(), "state": "failed", "phase": "rate_limit", "requests": 0,
@@ -284,14 +288,17 @@ def run_refresh(force=False):
         target = pr_tracking.target()
         previous = development_tasks.snapshot()
         tracking = pr_tracking.snapshot() if target else {}
-        if not force and not previous.get("stale") and not tracking.get("stale", True):
+        if not force and not recovering and not previous.get("stale") and not tracking.get("stale", True):
             if all(datetime.now(timezone.utc) - datetime.fromisoformat(x["synced_at"]) < development_tasks.REFRESH_INTERVAL for x in (previous, tracking)):
                 return 0
         start = time.monotonic()
         state = {"state": "running", "phase": "issues", "requests": 0,
-                 "token_health": refresh_status().get("token_health", {}),
-                 "token_health_checked_at": refresh_status().get("token_health_checked_at"),
+                 "token_health": prior_status.get("token_health", {}),
+                 "token_health_checked_at": prior_status.get("token_health_checked_at"),
                  "started_at": datetime.now(timezone.utc).isoformat()}
+        if recovering:
+            state["recovery_from"] = prior_status.get("state")
+            state["previous_failure"] = prior_status.get("reason")
         write_status(state)
         def request(method, path):
             if method != "GET":
