@@ -34,11 +34,11 @@ def test_runner_digest_validation_executes_without_launchctl(tmp_path):
     import sys
 
     source = SCRIPT.read_text()
-    validation = source.split('"$python" - "$root" "$expected_hash" <<\'PY\'\\n', 1)[1].split('\\nPY', 1)[0]
+    validation = source.split('"$python" - "$root" "$expected_hash" <<\'PY\'\n', 1)[1].split('\nPY', 1)[0]
     root = tmp_path / "runtime"
     root.mkdir(mode=0o700)
     runner = root / "runner.py"
-    runner.write_bytes(b"# reviewed runner\\n")
+    runner.write_bytes(b"# reviewed runner\n")
     runner.chmod(0o600)
     token = root / "github-token"
     token.write_text("fixture")
