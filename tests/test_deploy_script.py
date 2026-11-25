@@ -74,6 +74,51 @@ test ! -e .venv.previous
     result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
 
+def test_rollback_restores_legacy_environment_without_rebuilding_candidate(tmp_path):
+    script = SCRIPT.read_text()
+    function = script[script.index("replace_path_entry() {"):script.index("\ncheck_schema() {")]
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    python3 = fake_bin / "python3"
+    python3.write_text("""#!/bin/bash
+if test "$1" = --version; then echo 'Python 3.13.0'; exit 0; fi
+if test "$1" = -c; then exec "$REAL_PYTHON3" "$@"; fi
+test "$1" = -m && test "$2" = venv
+mkdir -p "$3/bin"
+cat > "$3/bin/python" <<'PY'
+#!/bin/bash
+exit 0
+PY
+printf '#!%s/bin/python\\nexit 0\\n' "$3" > "$3/bin/uvicorn"
+chmod +x "$3/bin/python" "$3/bin/uvicorn"
+""")
+    python3.chmod(0o755)
+    (tmp_path / "requirements.txt").write_text("same-requirements\\n")
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/python").write_text("#!/bin/bash\\nexit 1\\n")
+    (tmp_path / ".venv/bin/python").chmod(0o755)
+    (tmp_path / ".venv/legacy-marker").write_text("preserve")
+    root = tmp_path.resolve()
+    program = """@FUNCTION@
+PATH='@FAKE_BIN@':\"$PATH\"
+export REAL_PYTHON3='@REAL_PYTHON3@'
+ROOT='@ROOT@'
+set -e
+dependencies
+test -L .venv
+test -d .venv.previous
+candidate=$(readlink .venv)
+test -d \"$ROOT/$candidate\"
+test -f .venv.previous/legacy-marker
+restore_dependencies
+test ! -L .venv
+test -f .venv/legacy-marker
+test ! -e .venv.previous
+test -d \"$ROOT/$candidate\"
+""".replace("@FUNCTION@", function).replace("@FAKE_BIN@", str(fake_bin)).replace("@REAL_PYTHON3@", sys.executable).replace("@ROOT@", str(root))
+    result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
 def test_schema_gate_is_retryable_and_real_failures_are_held():
     script = SCRIPT.read_text()
     assert 'if ! check_schema; then' in script

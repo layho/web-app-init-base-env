@@ -163,6 +163,10 @@ restore_dependencies() {
       if test -L .venv || test -e .venv; then rm -rf .venv || return 1; fi
       mv .venv.previous .venv || return 1
     fi
+    # Rollback must restore the exact prior environment, including legacy
+    # directories without a fingerprint. Re-running dependencies here may try
+    # to recreate the just-built candidate at the same fingerprint path.
+    return 0
   fi
   dependencies
 }
