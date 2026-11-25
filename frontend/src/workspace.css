@@ -67,9 +67,9 @@
 
 .workspace-content {
   width: 100%;
-  max-width: 1500px;
+  max-width: none;
   margin-inline: auto;
-  padding: 26px;
+  padding: clamp(12px, 1.5vw, 26px);
 }
 
 @media (max-width: 767px) {

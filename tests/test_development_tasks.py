@@ -296,6 +296,8 @@ def test_token_health_uses_read_queries_and_sanitized_results(monkeypatch):
             return {"login": "owner", "token": "secret"}
         if path == "/rate_limit":
             return {"resources": {"core": {"remaining": 123, "limit": 5000}}}
+        if "/issues?" in path or "/pulls?" in path:
+            return []
         return {"permissions": {"pull": True, "push": False}}
     def graphql(path, data):
         assert path == "/graphql"

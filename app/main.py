@@ -179,7 +179,7 @@ def release_notes(response: Response):
         "running_sha": running_sha,
         "releases": releases,
         "deployments": deployments,
-        "acceptance": {**acceptance, **readiness, "ready": readiness["ready"] and acceptance.get("state") == "not_requested"},
+        "acceptance": {**acceptance, **readiness, "ready": readiness["ready"] and acceptance.get("state") == "not_requested" and "is_published" in acceptance},
     }
 
 
@@ -225,7 +225,7 @@ def accept_release(req: ReleaseAcceptanceIn, request: Request, response: Respons
     block_reason = deployment_block_reason(req.sha)
     if block_reason:
         raise HTTPException(409, block_reason)
-    deployed = bool(deployments and deployments[0]["sha"] == req.sha)
+    deployed = bool(deployments and deployments[0]["sha"] == req.sha and deployments[0]["code"] in {"install_ok", "update_ok"})
     try:
         return release_acceptance.submit(req.sha, req.version, deployed)
     except (release_acceptance.AcceptanceError, KeyError, TypeError, OSError) as exc:

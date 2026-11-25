@@ -167,6 +167,12 @@ def token_health(repository, request):
     check("repository", lambda: request("GET", "/repos/" + repository),
           lambda o: {"permissions": {k: v for k, v in o.get("permissions", {}).items()
                                      if k in {"admin", "maintain", "push", "triage", "pull"} and type(v) is bool}})
+    def list_fields(obj):
+        if not isinstance(obj, list):
+            raise ValueError("Invalid list response")
+        return {}
+    check("issues", lambda: request("GET", "/repos/" + repository + "/issues?state=all&per_page=1"), list_fields)
+    check("pulls", lambda: request("GET", "/repos/" + repository + "/pulls?state=open&per_page=1"), list_fields)
     owner, name = repository.split("/")
     # GraphQL POST carries a fixed read query, never a mutation.
     query = 'query($owner:String!,$name:String!){viewer{login} repository(owner:$owner,name:$name){viewerPermission}}'
@@ -197,6 +203,7 @@ def run_refresh(force=False):
         start = time.monotonic()
         state = {"state": "running", "phase": "issues", "requests": 0,
                  "token_health": refresh_status().get("token_health", {}),
+                 "token_health_checked_at": refresh_status().get("token_health_checked_at"),
                  "started_at": datetime.now(timezone.utc).isoformat()}
         write_status(state)
         def request(method, path):
@@ -211,6 +218,7 @@ def run_refresh(force=False):
             if force:
                 state["phase"] = "token_health"
                 state["token_health"] = token_health(target[0], request)
+                state["token_health_checked_at"] = datetime.now(timezone.utc).isoformat()
                 state["phase"] = "issues"
                 write_status(state)
             issues = sync(force=True, repository=target[0], request=request,
@@ -277,6 +285,8 @@ def run_refresh(force=False):
             state["state"] = "failed"
             # AcceptanceError messages are already sanitized by the REST client.
             state["reason"] = str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else type(exc).__name__
+            if state["phase"] in {"issues", "pulls"} and isinstance(exc, release_acceptance.AcceptanceError):
+                state["token_health"] = {**state["token_health"], state["phase"]: {"state": "failed", "reason": state["reason"]}}
         write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
         return int(state["state"] != "success")
 

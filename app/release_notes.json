@@ -1,5 +1,60 @@
 [
   {
+    "version": "0.2.2",
+    "title": "精确测试与辅助状态解耦",
+    "summary": "协调器独立验证辅助进度 Pending，保持正式测试、审查、候选父提交与冻结门禁。",
+    "changes": [
+      "仅允许可信且匹配当前候选的辅助 Pending，其他失败或未完成检查继续阻塞。",
+      "手动入口允许唤醒协调器检查 unstable 候选；增加脱敏门禁原因码。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证协调器实机安装及精确候选自动合并",
+      "验证其他失败检查仍阻塞"
+    ],
+    "validation_note": "宿主独立协调器需要另行升级，仓库发布不代表宿主脚本已替换。"
+  },
+  {
+    "version": "0.2.1",
+    "title": "正式发布证据与补验收状态修复",
+    "summary": "独立展示正式分支 SHA，区分已发布与已验收。",
+    "changes": [
+      "无本地验收记录也显示真实 main SHA，不伪造验收。",
+      "已发布版本支持当前版本补验收；不允许使用未发布候选拒绝流程，问题可通过开发任务反馈。",
+      "工作台保留并明确标记过期任务缓存，展示同步失败原因、中文动态及手动刷新入口。",
+      "反馈 Worker 优先复用统一 GitHub 凭据，兼容旧凭据。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对运行、preview、main SHA",
+      "核对已发布未验收提示及补验收按钮",
+      "核对过期缓存、同步失败诊断、手动刷新和反馈同步"
+    ],
+    "validation_note": "候选待 MacCI 和实机验证；历史版本补录暂未实现。"
+  },
+  {
+    "version": "0.2.0",
+    "title": "基座 UI V2.0",
+    "summary": "统一五大导航模块，接入真实工作台、使用指南、开发任务、更新记录及运行诊断。",
+    "changes": [
+      "新版工作台展示真实任务同步、部署及近期事件，未知数据不伪造。",
+      "使用指南整合项目资料及操作入口，开发任务保留需求提交和交付链路。",
+      "更新记录增加运行与发布证据，运行诊断支持分类、筛选与详情。",
+      "归档 UI V2.0 原始设计资料；保留原发布验收门禁。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "真实登录并验证五个模块及需求提交、版本验收入口",
+      "检查 1920/1440/1024/768/390 像素宽度布局与操作",
+      "核对运行 SHA、任务、部署和诊断数据；未提供的数据明确显示未知"
+    ],
+    "validation_note": "独立 UI 候选；暂停的 #168 回执修复不包含在本版本。新集成 SHA 尚待 MacCI 和真实浏览器验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/152"
+  },
+  {
     "version": "0.1.40",
     "title": "部署失败恢复及独立宿主回执",
     "summary": "修复失败候选交付链路，优先部署日志独立采集。",
