@@ -14,9 +14,11 @@ from . import admin_settings, auth, development_tasks, feedback_progress, feedba
 from .db import get_db
 from . import feedback_attachments
 from .models import UserFeedback
+from .request_limits import RequestBodyLimits
 
 RELEASE_NOTES = Path(__file__).with_name("release_notes.json")
 app = FastAPI(title="Web App Foundation", version=json.loads(RELEASE_NOTES.read_text(encoding="utf-8"))[0]["version"], docs_url="/docs" if os.getenv("APP_ENABLE_DOCS") == "true" else None, openapi_url="/openapi.json" if os.getenv("APP_ENABLE_DOCS") == "true" else None)
+app.add_middleware(RequestBodyLimits)
 
 
 def authorize(request: Request, db: Session = Depends(get_db)):
