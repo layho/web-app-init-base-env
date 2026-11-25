@@ -388,3 +388,33 @@ def test_rate_limit_deadline_uses_reset_and_not_permission_errors():
     stamp = now + timedelta(minutes=10)
     assert sync_development_tasks.retry_deadline("GH-REST-403：GitHub API 主额度耗尽；恢复时间 " + stamp.isoformat(), now) == stamp + timedelta(seconds=5)
     assert sync_development_tasks.retry_deadline("GH-REST-403：请求被禁止", now) is None
+
+
+def test_publication_history_reuses_only_proven_forward_ancestry():
+    old, new, ancestor, unknown = ("a"*40, "b"*40, "c"*40, "d"*40)
+    tracking = {"published_main_sha": old, "published_commits": {ancestor: True, unknown: False}}
+    prs = [{"merge_state": "merged", "merge_sha": x} for x in (ancestor, unknown, new)]
+    calls = []
+    def request(method, path):
+        assert method == "GET"
+        calls.append(path)
+        a = path.split("/")[-1].split("...")[0]
+        return {"status": "ahead", "merge_base_commit": {"sha": a}}
+    result = sync_development_tasks.publication_history(request, "owner/repo", new, tracking, prs)
+    assert result == {ancestor: True, unknown: True, new: True}
+    assert len(calls) == 2
+    assert calls[0].endswith(old + "..." + new)
+    assert calls[1].endswith(unknown + "..." + new)
+
+
+def test_publication_history_rechecks_after_rewritten_main():
+    old, new, ancestor = ("a"*40, "b"*40, "c"*40)
+    tracking = {"published_main_sha": old, "published_commits": {ancestor: True}}
+    calls = []
+    def request(method, path):
+        calls.append(path)
+        return {"status": "diverged", "merge_base_commit": {"sha": "e"*40}}
+    result = sync_development_tasks.publication_history(request, "owner/repo", new, tracking,
+        [{"merge_state": "merged", "merge_sha": ancestor}])
+    assert result == {ancestor: False}
+    assert len(calls) == 2

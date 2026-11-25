@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.2.12",
+    "title": "任务历史同步 API 请求优化",
+    "summary": "正式分支前进时复用经过验证的历史发布证据，减少重复比较。",
+    "changes": [
+      "一次祖先比较确认 main 前进后复用历史正向发布证据。",
+      "分支改写时重新验证全部候选，负向结果不复用。",
+      "冷却期拦截的请求不计入真实 REST 请求数。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证 main 正常前进及分叉时的历史状态和请求数量"
+    ],
+    "validation_note": "仅优化发布历史比较，不改变人工验收、合并授权或强制刷新语义。"
+  },
+  {
     "version": "0.2.11",
     "title": "GitHub 任务同步限流自动恢复",
     "summary": "任务同步两个后台通道共享持久化冷却期限，避免强制刷新绕过限流。",
