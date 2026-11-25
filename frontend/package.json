@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "npm test && tsc -b && vite build",
-    "test": "node --test src/v2/workbench/workbench.test.mjs src/v2/usage-guide/usage-guide.test.mjs tests/diagnostics-page.test.mjs tests/release-page.test.mjs"
+    "test": "node --test src/v2/workbench/workbench.test.mjs src/v2/usage-guide/usage-guide.test.mjs tests/diagnostics-page.test.mjs tests/release-page.test.mjs src/module-sdk/registry.test.mjs src/module-sdk/host/open.test.mjs src/module-sdk/host/ModuleOutlet.test.mjs"
   },
   "dependencies": {
     "antd": "^5.22.0",
