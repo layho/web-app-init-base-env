@@ -418,3 +418,32 @@ def test_publication_history_rechecks_after_rewritten_main():
         [{"merge_state": "merged", "merge_sha": ancestor}])
     assert result == {ancestor: False}
     assert len(calls) == 2
+
+
+def test_local_cooldown_does_not_extend_retry_deadline(tmp_path, monkeypatch):
+    from app import pr_tracking, release_acceptance
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    monkeypatch.setattr(pr_tracking, "target", lambda: ("owner/repo", "main"))
+    monkeypatch.setattr(pr_tracking, "snapshot", lambda: {})
+    reason = "GH-REST-429：GitHub 请求限流；建议等待 120 秒"
+    def sync(**kwargs):
+        sync_development_tasks.cooldown(reason)
+        kwargs["request"]("GET", "/user")
+    monkeypatch.setattr(sync_development_tasks, "sync", sync)
+    monkeypatch.setattr(release_acceptance, "github", lambda *a, **k: pytest.fail("must not request during hold"))
+    original = sync_development_tasks.cooldown
+    calls = []
+    def track(reason=None):
+        if reason is not None:
+            calls.append(reason)
+        return original(reason)
+    monkeypatch.setattr(sync_development_tasks, "cooldown", track)
+    assert sync_development_tasks.run_refresh() == 1
+    assert calls == [reason]
+    assert "下次重试" in sync_development_tasks.refresh_status()["reason"]
+
+
+def test_malformed_cooldown_record_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    (tmp_path / "task-sync-cooldown.json").write_text(json.dumps({"retry_at": "2099-01-01T00:00:00+00:00"}))
+    assert sync_development_tasks.cooldown() is None
