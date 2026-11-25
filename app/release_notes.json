@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.2.10",
+    "title": "MacCI 可信宿主安装器隔离",
+    "summary": "将候选代码作为不可执行数据读取，禁止在宿主执行候选测试。",
+    "changes": [
+      "固定可信安装器路径及独立摘要校验。",
+      "候选模块仅读取精确 Git blob 并编译语法，安装需要独立模块摘要。",
+      "隔离 Python 导入环境与 Git 环境变量。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证候选代码不在宿主执行",
+      "验证可信安装器及模块摘要校验"
+    ],
+    "validation_note": "需一次管理员可信安装器配置；本版不自动安装宿主、不取消独立授权。"
+  },
+  {
     "version": "0.2.9",
     "title": "Python 依赖环境恢复及部署回滚",
     "summary": "隔离构建新版 Python 虚拟环境，保留旧环境直至健康检查通过。",
