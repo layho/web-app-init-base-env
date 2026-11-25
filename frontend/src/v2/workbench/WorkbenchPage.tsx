@@ -113,7 +113,7 @@ export function WorkbenchPage({
             <section className="v2-board-card" aria-label="最近7天任务趋势">
               <h2>最近7天任务趋势</h2>
               <div className="v2-board-legend"><span>新增任务</span><span>完成任务</span></div>
-              {chart ? <svg viewBox="0 0 320 120" role="img" aria-label="任务趋势">{chart}</svg> : <p className="v2-board-empty">未记录</p>}
+              {chart ? <svg className="v2-board-trend" viewBox="0 0 320 120" role="img" aria-label="任务趋势">{chart}</svg> : <p className="v2-board-empty">未记录</p>}
             </section>
           </div>
           <div className="v2-board-bottom">
