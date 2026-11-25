@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.2.4",
+    "title": "应用升级预检与代码隔离基础能力",
+    "summary": "交付只读文件所有权预检及临时目录隔离回归工具。",
+    "changes": [
+      "检测业务文件重叠、路径穿越、符号链接及所有权策略异常。",
+      "临时目录验证业务文件保留和模拟失败后的字节级恢复。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "执行所有权预检及临时目录隔离回归"
+    ],
+    "validation_note": "仅基础工具与测试，尚未接入真实 app-init 升级执行器；不代表生产回滚或业务文件保护已经启用。"
+  },
+  {
     "version": "0.2.3",
     "title": "前端模块 SDK 基础能力",
     "summary": "独立交付模块注册、菜单投影与 React 隔离宿主，暂不启用正式菜单。",
