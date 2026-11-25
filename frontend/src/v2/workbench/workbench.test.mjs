@@ -61,3 +61,23 @@ test('加载中不渲染指标正文', () => {
   assert.ok(html.includes('正在读取工作台'))
   assert.equal(html.includes('开发交付进度'), false)
 })
+
+
+test('embedded workbench has no duplicate navigation or header', () => {
+  const html = render({project, embedded: true})
+  assert.ok(html.includes('data-shell="embedded"'))
+  assert.equal(html.includes('<nav'), false)
+  assert.equal(html.includes('v2-board-top'), false)
+})
+
+test('workbench uses the shared task classifier and excludes stale snapshots', async () => {
+  const {workbenchMetrics} = await server.ssrLoadModule('/src/DevelopmentTasksPage.tsx')
+  const snapshot = {synced_at: '2026-11-25T00:00:00Z', stale: false, tasks: [
+    {status: '已完成'}, {status: '开发中'}, {status: '未记录开发状态'},
+    {status: '受阻'}, {status: '已关闭'}, {status: '待验收', merge_state: 'merged', deployment_state: 'running'},
+    {status: '开发中', test_state: 'pending'},
+  ]}
+  assert.deepEqual(workbenchMetrics(snapshot), {tasks: 6, active: 3, review: 1, done: 1, blocked: 1})
+  assert.equal(workbenchMetrics({...snapshot, stale: true}), null)
+  assert.equal(workbenchMetrics(null), null)
+})

@@ -36,6 +36,32 @@ type PRRecord = { head_branch?: string | null; base_branch?: string | null; numb
 type PRTracking = { active_synced_at?: string; history_synced_at?: string|null; running_sha?: string | null; synced_at: string | null; stale: boolean; prs: PRRecord[]; repository?: string; branch?: string; can_release_draft?: boolean; manual_actions_available?: boolean }
 export type TaskSnapshot = { refresh_status?: {state: string; phase?: string; requests?: number; elapsed_seconds?: number; reason?: string; token_health?: Record<string, {state:string; reason?:string; login?:string; permission?:string; remaining?:number; limit?:number; permissions?:Record<string,boolean>; elapsed_seconds?:number}>}; synced_at: string | null; stale: boolean; tasks: DevelopmentTask[]; pr_tracking?: PRTracking }
 
+export function taskCategory(t: DevelopmentTask) {
+    const stage=t.delivery_status ?? ''
+    if (t.status === '已关闭' || (t.source === 'pr' && t.merge_state === 'closed')) return 'closed'
+    if (t.status === '已完成' || (t.source==='pr' && stage === '用户验收通过 · 已正式发布')) return 'done'
+    if (t.test_failures?.length || t.status === '受阻' || /冲突|失败|不通过/.test(stage)) return 'blocked'
+    if (/待验收确认|待正式发布/.test(stage) || (t.status==='待验收' && t.merge_state==='merged' && t.deployment_state==='running')) return 'review'
+    if (stage === '关联代码已正式发布 · 需求待结项') return 'review'
+    if (t.merge_state === 'merged') return 'review'
+    if (t.test_state === 'pending' || t.prs?.some(p=>p.test?.state==='pending' && p.merge_state!=='closed' && p.merge_state!=='merged')) return 'testing'
+    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.status === '开发中') return 'active'
+    return 'todo'
+}
+
+export function workbenchMetrics(snapshot: TaskSnapshot | null) {
+  if (!snapshot || snapshot.stale || !snapshot.synced_at) return null
+  const counts = {tasks: 0, active: 0, review: 0, done: 0, blocked: 0}
+  for (const task of snapshot.tasks) {
+    const stage = taskCategory(task)
+    if (stage === 'closed') continue
+    counts.tasks++
+    if (stage === 'testing' || stage === 'active' || stage === 'todo') counts.active++
+    else if (stage === 'review' || stage === 'done' || stage === 'blocked') counts[stage]++
+  }
+  return counts
+}
+
 const statusColors: Record<string, string> = {
   开发中: 'processing',
   未记录开发状态: 'default',
@@ -248,18 +274,7 @@ export function DevelopmentTasksPage({ data, loading, onRefresh, onReleaseDraft,
   const [urgency,setUrgency]=useState('all')
   const [healthOpen,setHealthOpen]=useState(false)
   const [expanded,setExpanded]=useState<Record<string,number>>({})
-  const category = (t: DevelopmentTask) => {
-    const stage=t.delivery_status ?? ''
-    if (t.status === '已关闭' || (t.source === 'pr' && t.merge_state === 'closed')) return 'closed'
-    if (t.status === '已完成' || (t.source==='pr' && stage === '用户验收通过 · 已正式发布')) return 'done'
-    if (t.test_failures?.length || t.status === '受阻' || /冲突|失败|不通过/.test(stage)) return 'blocked'
-    if (/待验收确认|待正式发布/.test(stage) || (t.status==='待验收' && t.merge_state==='merged' && t.deployment_state==='running')) return 'review'
-    if (stage === '关联代码已正式发布 · 需求待结项') return 'review'
-    if (t.merge_state === 'merged') return 'review'
-    if (t.test_state === 'pending' || t.prs?.some(p=>p.test?.state==='pending' && p.merge_state!=='closed' && p.merge_state!=='merged')) return 'testing'
-    if (t.merge_state === 'open' || t.merge_state === 'draft' || t.status === '开发中') return 'active'
-    return 'todo'
-  }
+  const category = taskCategory
   const priority:Record<string,number>={blocked:0,review:1,testing:2,active:3,todo:4,done:5,closed:6}
   const lanes=[{key:'blocked',label:'受阻 / 失败'},{key:'todo',label:'待开发'},{key:'active',label:'开发中'},{key:'testing',label:'测试中'},{key:'review',label:'待验收 / 发布'},{key:'done',label:'已完成'},{key:'closed',label:'已关闭'}]
   const urgencyOf=(t:DevelopmentTask)=>/\bP[0-3]\b/i.exec(t.title)?.[0].toUpperCase() ?? '未标记'

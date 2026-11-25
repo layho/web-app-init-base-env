@@ -7,7 +7,7 @@ import zhCN from 'antd/locale/zh_CN'
 import 'antd/dist/reset.css'
 import { ReleasePage, SystemLogPage } from './OperationsPage'
 import type { ReleaseHistory, SystemLogs } from './OperationsPage'
-import { DevelopmentTasksPage } from './DevelopmentTasksPage'
+import { DevelopmentTasksPage, workbenchMetrics } from './DevelopmentTasksPage'
 import type { TaskSnapshot } from './DevelopmentTasksPage'
 import { ProjectInfoPage } from './ProjectInfoPage'
 import type { ProjectInfo } from './ProjectInfoPage'
@@ -392,6 +392,28 @@ function App() {
     return () => { active = false; window.clearInterval(timer) }
   }, [signedIn, page])
 
+  useEffect(() => {
+    if (!signedIn || page !== 'workspace') return
+    let active = true
+    let pending = false
+    async function refreshOverview() {
+      if (pending) return
+      pending = true
+      try {
+        const [tasks, project] = await Promise.allSettled([
+          api<TaskSnapshot>('/api/v1/development-tasks'),
+          api<ProjectInfo>('/api/v1/project-info'),
+        ])
+        if (!active) return
+        setDevelopmentTasks(tasks.status === 'fulfilled' ? tasks.value : null)
+        setProjectInfo(project.status === 'fulfilled' ? project.value : null)
+      } finally { pending = false }
+    }
+    void refreshOverview()
+    const timer = window.setInterval(() => void refreshOverview(), 30000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [signedIn, page])
+
   async function loadOperations(key: 'releases' | 'logs' | 'tasks' | 'project', refresh = false) {
     setLoadingOperations(key)
     setNotice(null)
@@ -505,7 +527,7 @@ function App() {
       </Modal>
       {page === 'workspace' ? (
         <Space direction="vertical" size="middle" style={{width:'100%'}}>
-          <WorkbenchPage embedded project={projectInfo} running={versionUnavailable ? null : runningVersion} versions={{running: versionUnavailable ? null : runningVersion?.version}} />
+          <WorkbenchPage embedded metrics={workbenchMetrics(developmentTasks)} project={projectInfo} running={versionUnavailable ? null : runningVersion} versions={{running: versionUnavailable ? null : runningVersion?.version}} />
           <Space wrap><Button type="primary" onClick={() => navigate('tasks')}>开发任务</Button><Button onClick={() => {navigate('feedback');setFeedbackOpen(true)}}>提交需求</Button><Button onClick={() => navigate('releases')}>更新记录</Button><Button onClick={() => navigate('logs')}>运行诊断</Button></Space>
         </Space>
       ) : page === 'project' ? (
