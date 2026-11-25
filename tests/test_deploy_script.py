@@ -1,12 +1,123 @@
 """Deployment control-flow regression without starting macOS services."""
 from pathlib import Path
 import subprocess
+import sys
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "macmini" / "manage.sh"
 
 def test_macmini_shell_syntax():
     result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+def test_dependencies_rebuilds_broken_venv_without_losing_previous(tmp_path):
+    script = SCRIPT.read_text()
+    function = script[script.index("replace_path_entry() {"):script.index("\ncheck_schema() {")]
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    python3 = fake_bin / "python3"
+    python3.write_text("""#!/bin/bash
+set -e
+if test "$1" = --version; then echo 'Python 3.13.0'; exit 0; fi
+if test "$1" = -c; then
+  if [[ "$2" = *os.replace* && "${FAIL_SWITCH:-0}" = 1 ]]; then exit 23; fi
+  exec "$REAL_PYTHON3" "$@"
+fi
+test "$1" = -m && test "$2" = venv
+mkdir -p "$3/bin"
+cat > "$3/bin/python" <<'PY'
+#!/bin/bash
+if [[ "${1:-}" = -m && "${2:-}" = pip && "${3:-}" = install && "${FAIL_INSTALL:-0}" = 1 ]]; then exit 19; fi
+exit 0
+PY
+printf '#!%s/bin/python\\nexit 0\\n' "$3" > "$3/bin/uvicorn"
+chmod +x "$3/bin/uvicorn"
+chmod +x "$3/bin/python"
+""")
+    python3.chmod(0o755)
+    (tmp_path / "requirements.txt").write_text("first-version\n")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "scripts").mkdir()
+    root = tmp_path.resolve()
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    old_python = tmp_path / ".venv/bin/python"
+    old_python.write_text("#!/bin/bash\nexit 1\n")
+    old_python.chmod(0o755)
+    (tmp_path / ".venv/old-marker").write_text("keep")
+    program = """@FUNCTION@
+PATH='@FAKE_BIN@':"$PATH"
+export REAL_PYTHON3='@REAL_PYTHON3@'
+ROOT='@ROOT@'
+set -e
+if FAIL_INSTALL=1 dependencies; then exit 31; fi
+test -f .venv/old-marker
+if FAIL_SWITCH=1 dependencies; then exit 32; fi
+test -f .venv/old-marker
+test ! -e .venv.previous
+dependencies
+test -L .venv
+first=$(readlink .venv)
+test -x .venv/bin/python
+test -x .venv/bin/uvicorn
+test "$(head -n 1 .venv/bin/uvicorn)" = "#!$ROOT/$first/bin/python"
+test -f .venv.previous/old-marker
+commit_dependencies
+printf 'second-version\\n' > requirements.txt
+dependencies
+second=$(readlink .venv)
+test "$first" != "$second"
+test "$(readlink .venv.previous)" = "$first"
+printf 'first-version\\n' > requirements.txt
+restore_dependencies
+test "$(readlink .venv)" = "$first"
+test ! -e .venv.previous
+""".replace("@FUNCTION@", function).replace("@FAKE_BIN@", str(fake_bin)).replace("@REAL_PYTHON3@", sys.executable).replace("@ROOT@", str(root))
+    result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+def test_rollback_restores_legacy_environment_without_rebuilding_candidate(tmp_path):
+    script = SCRIPT.read_text()
+    function = script[script.index("replace_path_entry() {"):script.index("\ncheck_schema() {")]
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    python3 = fake_bin / "python3"
+    python3.write_text("""#!/bin/bash
+if test "$1" = --version; then echo 'Python 3.13.0'; exit 0; fi
+if test "$1" = -c; then exec "$REAL_PYTHON3" "$@"; fi
+test "$1" = -m && test "$2" = venv
+mkdir -p "$3/bin"
+cat > "$3/bin/python" <<'PY'
+#!/bin/bash
+exit 0
+PY
+printf '#!%s/bin/python\\nexit 0\\n' "$3" > "$3/bin/uvicorn"
+chmod +x "$3/bin/python" "$3/bin/uvicorn"
+""")
+    python3.chmod(0o755)
+    (tmp_path / "requirements.txt").write_text("same-requirements\\n")
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/python").write_text("#!/bin/bash\\nexit 1\\n")
+    (tmp_path / ".venv/bin/python").chmod(0o755)
+    (tmp_path / ".venv/legacy-marker").write_text("preserve")
+    root = tmp_path.resolve()
+    program = """@FUNCTION@
+PATH='@FAKE_BIN@':\"$PATH\"
+export REAL_PYTHON3='@REAL_PYTHON3@'
+ROOT='@ROOT@'
+set -e
+dependencies
+test -L .venv
+test -d .venv.previous
+candidate=$(readlink .venv)
+test -d \"$ROOT/$candidate\"
+test -f .venv.previous/legacy-marker
+restore_dependencies
+test ! -L .venv
+test -f .venv/legacy-marker
+test ! -e .venv.previous
+test -d \"$ROOT/$candidate\"
+""".replace("@FUNCTION@", function).replace("@FAKE_BIN@", str(fake_bin)).replace("@REAL_PYTHON3@", sys.executable).replace("@ROOT@", str(root))
+    result = subprocess.run(["bash", "-c", program], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 def test_schema_gate_is_retryable_and_real_failures_are_held():
     script = SCRIPT.read_text()
@@ -23,7 +134,7 @@ def test_schema_gate_is_retryable_and_real_failures_are_held():
 def test_reinstall_preserves_previous_assets_until_healthy():
     script = SCRIPT.read_text()
     install_body = script.split("install() {", 1)[1].split("\nfeedback() {", 1)[0]
-    assert "if test -d frontend/dist; then mv frontend/dist frontend/dist.previous; fi" in install_body
+    assert "if test -d frontend/dist; then mv frontend/dist frontend/dist.previous ||" in install_body
     assert "mv frontend/dist.next frontend/dist" in install_body
     assert "if ! agents || ! health" in install_body
     assert "if test -d frontend/dist.previous; then mv frontend/dist.previous frontend/dist; fi" in install_body
@@ -74,7 +185,14 @@ printf previous > frontend/dist/index.html
 # Run the real updater and rollback with fake app gates and process supervision.
 source ../functions.sh
 load_env() { :; }
-dependencies() { :; }
+dependencies() {
+    if ! test -e switched-environment; then
+      ln -s "$(readlink .venv)" .venv.previous
+      ln -s .venvs/candidate .venv.next
+      python3 -c 'import os,sys; os.replace(sys.argv[1],sys.argv[2])' .venv.next .venv
+      touch switched-environment
+    fi
+}
 check_schema() { :; }
 test_app() { :; }
 build() {
@@ -94,9 +212,11 @@ health() {
     touch health-checked
     return 1
 }
-mkdir -p .venv/bin
-printf '#!/bin/bash\nexit 0\n' > .venv/bin/python
-chmod +x .venv/bin/python
+mkdir -p .venvs/old/bin .venvs/candidate/bin
+printf '#!/bin/bash\nexit 0\n' > .venvs/old/bin/python
+printf '#!/bin/bash\nexit 0\n' > .venvs/candidate/bin/python
+chmod +x .venvs/old/bin/python .venvs/candidate/bin/python
+ln -s .venvs/old .venv
 ROOT=$PWD
 LOCK=$ROOT/.webapp-deploy.lock
 WEB=local-test
@@ -111,6 +231,8 @@ grep -q "$(printf '\trollback_ok\t%s' "$old")" logs/operations.tsv
 if grep -q $'\tupdate_ok\t' logs/operations.tsv; then exit 2; fi
 test "$(git rev-parse HEAD)" = "$old"
 test "$(cat frontend/dist/index.html)" = previous
+test "$(readlink .venv)" = .venvs/old
+test ! -e .venv.previous
 test "$(cat .webapp-failed-sha)" = "$new"
 test "$(cat restarts)" = "$(printf '%s\n%s' "$new" "$old")"
 test ! -d frontend/dist.previous

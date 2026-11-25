@@ -1,5 +1,22 @@
 [
   {
+    "version": "0.2.9",
+    "title": "Python 依赖环境恢复及部署回滚",
+    "summary": "隔离构建新版 Python 虚拟环境，保留旧环境直至健康检查通过。",
+    "changes": [
+      "按 Python 版本和依赖清单指纹构建候选环境，避免直接污染旧环境。",
+      "原子切换环境链接，部署失败恢复旧环境及前端资产。",
+      "覆盖安装失败、切换失败和旧环境恢复回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对候选环境切换及旧环境保留",
+      "验证真实 Mac mini 安装和失败回滚"
+    ],
+    "validation_note": "仅合入既有 #151 修复，真实 macOS 环境及生产部署待验证；不改变数据库迁移规则。"
+  },
+  {
     "version": "0.2.8",
     "title": "API 请求体与慢上传保护",
     "summary": "在 JSON 解析前限制实际请求体字节数及截图并发，限制慢速请求读取时长。",
