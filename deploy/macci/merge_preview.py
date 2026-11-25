@@ -251,7 +251,7 @@ def gate_block(number, reason):
 def authorization(token, number):
     pr = api(token, f"/pulls/{number}")
     if not eligible(pr):
-        return gate_block(number, "pr_ineligible")
+        return gate_block(number, "github_merge_state_unstable" if pr.get("mergeable") is True and pr.get("mergeable_state") == "unstable" and not pr.get("draft") else "pr_ineligible")
     head, merge = pr["head"]["sha"], pr["merge_commit_sha"]
     base = api(token, "/branches/preview")["commit"]["sha"]
     if not valid(base):

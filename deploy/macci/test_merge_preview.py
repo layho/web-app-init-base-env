@@ -211,3 +211,11 @@ class MergeTests(unittest.TestCase):
             with patch.object(m, 'api', side_effect=[pr(), {'commit': {'sha': B}}, {'parents': [{'sha': B}, {'sha': H}]}, statuses]), patch.object(m, 'all_pages', return_value=reviews), redirect_stdout(output):
                 self.assertIsNone(m.authorization('fake', 7))
             self.assertIn(reason, output.getvalue())
+
+    def test_unstable_merge_state_remains_blocked_with_specific_reason(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+        output = StringIO()
+        with patch.object(m, "api", return_value={**pr(), "mergeable_state": "unstable"}), redirect_stdout(output):
+            self.assertIsNone(m.authorization("fake", 7))
+        self.assertIn("github_merge_state_unstable", output.getvalue())
