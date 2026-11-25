@@ -64,8 +64,9 @@
 }
 @media (max-width: 767px) {
   .v2-guide-top, .v2-guide-main { padding-inline: 16px; }
-  .v2-guide-top { flex-wrap: wrap; }
-  .v2-guide-version { margin-left: 0; }
+  .v2-guide-top { flex-wrap: wrap; align-items: flex-start; }
+  .v2-guide-version { flex-wrap: wrap; max-width: 100%; margin-left: 0; }
+  .v2-guide-version span, .v2-guide-version strong, .v2-guide-modules h3, .v2-guide-loop strong { overflow-wrap: anywhere; white-space: normal; }
   .v2-guide-steps, .v2-guide-modules, .v2-guide-summary { grid-template-columns: 1fr; }
   .v2-guide-step-title strong { white-space: normal; }
 }
