@@ -46,7 +46,7 @@ def read_candidate_modules(source, sha):
     for name in NAMES:
         path = "deploy/macci/" + name
         entry = subprocess.check_output(
-            ["git", "-C", str(source), "ls-tree", sha, "--", path], timeout=30
+            ["git", "-C", str(source), "ls-tree", "--full-tree", sha, "--", path], timeout=30
         ).decode("ascii").rstrip("\n")
         if not re.fullmatch(r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(path), entry):
             raise ValueError("Candidate module is not a regular Git blob: " + name)
