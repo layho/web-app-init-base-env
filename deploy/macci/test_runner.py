@@ -202,11 +202,11 @@ class ReceiptAvailabilityTests(unittest.TestCase):
                  patch.object(runner, "token_file", return_value=token), \
                  patch.object(runner, "lock", return_value=nullcontext()), \
                  patch.object(runner, "report_base_deployments", side_effect=OSError("offline")), \
-                 patch.object(runner, "flush_reports") as flush, \
+                 patch.object(runner, "flush_reports", return_value=True) as flush, \
                  patch.object(runner, "docker_command") as docker, \
                  patch.object(runner, "test_candidate") as test, \
                  patch("sys.argv", ["runner.py", "--receipts-only"]):
-                self.assertEqual(runner.main(), 0)
+                self.assertEqual(runner.main(), 1)
                 flush.assert_called_once_with("a"*40)
                 docker.assert_not_called()
                 test.assert_not_called()
@@ -220,8 +220,8 @@ class ReceiptAvailabilityTests(unittest.TestCase):
             token.chmod(0o600)
             with patch.object(runner, "ROOT", root), \
                  patch.object(runner, "token_file", return_value=token), \
-                 patch.object(runner, "report_base_deployments") as deploy, \
-                 patch.object(runner, "flush_reports") as flush, \
+                 patch.object(runner, "report_base_deployments", return_value=True) as deploy, \
+                 patch.object(runner, "flush_reports", return_value=True) as flush, \
                  patch.object(runner, "docker_command") as docker, \
                  patch("sys.argv", ["runner.py", "--receipts-only"]):
                 with runner.lock():
@@ -256,6 +256,22 @@ class ReceiptAvailabilityTests(unittest.TestCase):
                 deploy.assert_not_called()
                 flush.assert_not_called()
             self.assertEqual(target.read_text(), "unchanged")
+
+
+    def test_delivery_status_distinguishes_failure_and_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(runner, "ROOT", Path(tmp)), \
+                 patch.object(runner, "report_base_deployments", return_value=True), \
+                 patch.object(runner, "flush_reports", side_effect=[False, True]):
+                self.assertFalse(runner.deliver_pending_reports("fake"))
+                self.assertTrue(runner.deliver_pending_reports("fake"))
+
+    def test_missing_deployment_journal_is_not_delivery_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(runner.Path, "home", return_value=Path(tmp)), \
+                 patch.object(runner, "api") as api:
+                self.assertFalse(runner.report_base_deployments("fake"))
+                api.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

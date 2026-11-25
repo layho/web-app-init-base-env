@@ -275,10 +275,11 @@ def save_report(report):
 def flush_reports(token):
     folder=ROOT/"report-outbox"
     if not folder.exists():
-        return
+        return True
     info=folder.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
         raise ValueError("Unsafe report outbox")
+    delivered = True
     for path in sorted(folder.glob("*.json"))[:20]:
         try:
             fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
@@ -306,7 +307,9 @@ def flush_reports(token):
                 api(token,endpoint,{"body":body})
             path.unlink()
         except (OSError,ValueError,KeyError,TypeError):
+            delivered = False
             print("MacCI report delivery pending; will retry",flush=True)
+    return delivered and not any(folder.glob("*.json"))
 
 
 PROGRESS_CONTEXT = "macmini/progress-v1"
@@ -479,7 +482,7 @@ def report_base_deployments(token):
         with os.fdopen(fd,"rb") as stream:
             info=os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:
-                return
+                raise ValueError("Unsafe deployment journal")
             stream.seek(max(0,info.st_size-1048576))
             raw=stream.read(1048576).decode("utf-8",errors="replace")
         for row in deployment_events(raw)[-12:]:
@@ -507,8 +510,10 @@ def report_base_deployments(token):
                 if not found:
                     body="[BASE_DEPLOY_FAILURE] "+json.dumps({"schema":1,"candidate_sha":sha,**row},sort_keys=True,separators=(",",":"))
                     api(token,f"/repos/{repo}/issues",{"title":title,"body":body})
+        return True
     except (OSError,ValueError,KeyError,TypeError):
-        print("Deployment journal delivery pending; will retry",flush=True)
+        print("Deployment journal delivery unavailable; will retry",flush=True)
+        return False
 
 
 @contextmanager
@@ -525,18 +530,23 @@ def receipt_lock():
 
 
 def deliver_pending_reports(token):
+    """Return true only when both channels report no outstanding delivery failure."""
     try:
         with receipt_lock():
-            # A failure in one delivery channel must not block the other.
+            delivered = True
             for deliver in (report_base_deployments, flush_reports):
                 try:
-                    deliver(token)
+                    if deliver(token) is not True:
+                        delivered = False
                 except (OSError, ValueError, KeyError, TypeError):
+                    delivered = False
                     print('Receipt delivery deferred; retry next tick', flush=True)
+            return delivered
     except BlockingIOError:
         print('Another receipt sender is active; retry next tick', flush=True)
     except (OSError, ValueError):
         print('Receipt delivery lock unavailable; retry next tick', flush=True)
+    return False
 
 
 def main():
@@ -576,9 +586,9 @@ def main():
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,300}", token):
         raise SystemExit("Invalid credential format")
     # Receipt-only invocations never acquire the test worker lock.
-    deliver_pending_reports(token)
+    delivered = deliver_pending_reports(token)
     if args.receipts_only:
-        return 0
+        return 0 if delivered else 1
     try:
         with (lock() if args.lock_fd is None else inherited_lock(args.lock_fd)):
             try:
