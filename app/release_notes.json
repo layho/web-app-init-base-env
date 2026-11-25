@@ -1,5 +1,21 @@
 [
   {
+    "version": "0.2.3",
+    "title": "前端模块 SDK 基础能力",
+    "summary": "独立交付模块注册、菜单投影与 React 隔离宿主，暂不启用正式菜单。",
+    "changes": [
+      "模块注册校验及权限声明过滤；按需加载与模块级错误边界。",
+      "保留 UI 四组及 SDK 三组构建前置回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对既有五模块功能不受影响",
+      "后续接线时验证模块切换、Hooks 与异常恢复"
+    ],
+    "validation_note": "SDK 基础设施版本，未接入生产导航；权限声明不是后端鉴权。"
+  },
+  {
     "version": "0.2.2",
     "title": "精确测试与辅助状态解耦",
     "summary": "协调器独立验证辅助进度 Pending，保持正式测试、审查、候选父提交与冻结门禁。",
