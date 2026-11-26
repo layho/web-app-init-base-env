@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.3.0",
+    "title": "HostOps 远程运维中心（开发候选）",
+    "summary": "实现宿主诊断、受控远程运维与可审计执行闭环。",
+    "changes": [
+      "宿主心跳、运行摘要与只读诊断。",
+      "签名任务、持久化执行回执、取消及审计。",
+      "六大 HostOps 页面接入真实 API。",
+      "本地可信 Agent 安装、登录自启及失败回滚。",
+      "只读 MCP 协议候选与独立调用审计。",
+      "本地 MacCI 故障恢复及持久化冷却保护。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核验 Agent 身份、在线状态、任务授权、执行记录及实际宿主运行"
+    ],
+    "validation_note": "开发候选；远程写操作、远程升级及实际 ChatGPT 接入尚未完成，须通过完整回归与 MacCI 实机验收。"
+  },
+  {
     "version": "0.2.15",
     "title": "任务同步恢复与全局 UI 更新",
     "summary": "失败状态不再被新鲜缓存掩盖；利用独占锁识别遗留运行状态并恢复。 统一公共界面样式与版本串行交付规范。",

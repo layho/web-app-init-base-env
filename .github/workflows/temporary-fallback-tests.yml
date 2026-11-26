@@ -1,8 +1,8 @@
-name: V0.2.15 release candidate regression
+name: V0.3.0 isolated fallback tests
 on:
   pull_request:
     branches: [preview]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 permissions:
   contents: read
 concurrency:
@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   regression:
-    if: github.event.pull_request.draft == false && github.event.pull_request.number == 185
+    if: github.event.pull_request.number == 189
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -20,12 +20,16 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: HostOps offline regressions
+        run: python3 -m unittest discover -s deploy/hostops -p 'test_*.py' -v
       - name: Backend regression
         run: |
           python3 -m venv /tmp/fallback-ci
           /tmp/fallback-ci/bin/python -m pip --isolated install --only-binary=:all: -r requirements.txt
-          /tmp/fallback-ci/bin/python -m pytest -q
+          /tmp/fallback-ci/bin/python -m pytest -q tests/test_hostops_gateway.py tests/test_hostops_tasks.py tests/test_app_init.py
           /tmp/fallback-ci/bin/python -m compileall -q app
+      - name: Full backend regression
+        run: /tmp/fallback-ci/bin/python -m pytest -q
       - name: Frontend regression and build
         run: |
           npm --prefix frontend ci --ignore-scripts --no-audit --no-fund
