@@ -223,6 +223,11 @@ def test_candidate(repo, pr, log, progress=lambda phase: None):
 REPORT_MARKER = "[MACCI_REPORT] "
 REPORT_PHASES = {"setup-failed","fetch-failed","context-failed","dependencies-failed",
                  "pytest-failed","compile-failed","frontend-failed","test-failed","ref-changed","passed"}
+MAX_REPORT_SIZE = 12000
+MAX_OUTBOX_REPORTS = 100
+MAX_OUTBOX_BYTES = 1200000
+MAX_QUARANTINE_REPORTS = 20
+MAX_QUARANTINE_BYTES = 1200000
 
 
 def failure_summary(raw, phase):
@@ -254,7 +259,74 @@ def failure_summary(raw, phase):
     return result
 
 
+def valid_report(report, path):
+    return (isinstance(report,dict) and report.get("repository") in REPOS
+            and type(report.get("pr")) is int and report["pr"]>0
+            and isinstance(report.get("run_id"),str)
+            and re.fullmatch(r"[0-9a-f]{32}",report.get("run_id",""))
+            and path.stem==report["run_id"]
+            and all(SHA.fullmatch(str(report.get(k,""))) for k in ("head","base","merge"))
+            and report.get("phase") in REPORT_PHASES)
+
+
+def quarantine_legacy_report(folder, path, size):
+    """Move an unusable same-user legacy receipt out of the active queue."""
+    quarantine=folder/"quarantine"
+    quarantine.mkdir(mode=0o700,exist_ok=True)
+    info=quarantine.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+        raise ValueError("Unsafe report quarantine")
+    if size>MAX_OUTBOX_BYTES:
+        path.unlink()
+        print("Oversized legacy MacCI report discarded; retained test log is local",flush=True)
+        return
+    queued=[]
+    total=0
+    with os.scandir(quarantine) as entries:
+        for entry in entries:
+            item=entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(item.st_mode) or item.st_uid!=os.getuid() or item.st_mode&0o077:
+                raise ValueError("Unsafe quarantined MacCI report")
+            queued.append((item.st_mtime_ns,entry.path,item.st_size))
+            total+=item.st_size
+    queued.sort()
+    while queued and (len(queued)>=MAX_QUARANTINE_REPORTS or total+size>MAX_QUARANTINE_BYTES):
+        _,old_path,old_size=queued.pop(0)
+        os.unlink(old_path)
+        total-=old_size
+    if total+size>MAX_QUARANTINE_BYTES:
+        path.unlink()
+        print("Legacy MacCI report exceeded quarantine capacity; discarded",flush=True)
+        return
+    os.chmod(path,0o600,follow_symlinks=False)
+    target=quarantine/("legacy-"+uuid.uuid4().hex+".json")
+    os.replace(path,target)
+    for directory in (folder,quarantine):
+        fd=os.open(directory,os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+@contextmanager
+def outbox_lock():
+    """Serialize short local queue operations, never remote API calls."""
+    fd = os.open(ROOT / "report-outbox.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(fd, "r+") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("Unsafe report outbox lock")
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
 def save_report(report):
+    with outbox_lock():
+        return _save_report(report)
+
+
+def _save_report(report):
     from tempfile import NamedTemporaryFile
     folder = ROOT / "report-outbox"
     folder.mkdir(mode=0o700,exist_ok=True)
@@ -262,14 +334,57 @@ def save_report(report):
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
         raise ValueError("Unsafe report outbox")
     path=folder/(report["run_id"]+".json")
-    with NamedTemporaryFile(mode="w",dir=folder,delete=False,encoding="utf-8") as stream:
+    payload=json.dumps(report,ensure_ascii=True,separators=(",",":")).encode("utf-8")
+    if len(payload)>MAX_REPORT_SIZE:
+        raise ValueError("MacCI report exceeds size limit")
+    reports=[]
+    total=0
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            item=entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(item.st_mode) or item.st_uid!=os.getuid():
+                raise ValueError("Unsafe queued MacCI report")
+            valid=False
+            if item.st_size<=MAX_REPORT_SIZE and not item.st_mode&0o077:
+                try:
+                    fd=os.open(entry.path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+                    with os.fdopen(fd,"r",encoding="utf-8") as stream:
+                        opened=os.fstat(stream.fileno())
+                        if (stat.S_ISREG(opened.st_mode) and opened.st_uid==os.getuid()
+                                and not opened.st_mode&0o077 and opened.st_size<=MAX_REPORT_SIZE):
+                            valid_report_data=json.load(stream)
+                            valid=valid_report(valid_report_data,Path(entry.path))
+                except (OSError,ValueError,KeyError,TypeError):
+                    valid=False
+            if not valid:
+                quarantine_legacy_report(folder,Path(entry.path),item.st_size)
+                continue
+            reports.append(entry.name)
+            total+=item.st_size
+    if path.name in reports:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,"rb") as existing:
+            if existing.read(MAX_REPORT_SIZE+1)==payload:
+                return path
+        raise ValueError("Conflicting MacCI report id")
+    if len(reports)>=MAX_OUTBOX_REPORTS or total+len(payload)>MAX_OUTBOX_BYTES:
+        raise ValueError("MacCI report outbox capacity reached")
+    with NamedTemporaryFile(mode="wb",dir=folder,delete=False) as stream:
         temp=Path(stream.name)
         try:
-            json.dump(report,stream,ensure_ascii=True,separators=(",",":"))
+            os.fchmod(stream.fileno(),0o600)
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
             stream.close()
             os.replace(temp,path)
+            dfd=os.open(folder,os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         finally:
             temp.unlink(missing_ok=True)
     return path
@@ -277,23 +392,33 @@ def save_report(report):
 
 def flush_reports(token):
     folder=ROOT/"report-outbox"
-    if not folder.exists():
-        return
-    info=folder.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
-        raise ValueError("Unsafe report outbox")
-    for path in sorted(folder.glob("*.json"))[:20]:
+    with outbox_lock():
+        if not folder.exists():
+            return True
+        info=folder.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+            raise ValueError("Unsafe report outbox")
+        pending=sorted(folder.glob("*.json"),key=lambda p:(p.lstat().st_mtime_ns,p.name))
+    delivered = True
+    for path in pending[:20]:
+        identity = None
         try:
-            fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
-            with os.fdopen(fd,"r",encoding="utf-8") as stream:
-                info=os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>12000:
-                    raise ValueError("Unsafe report")
-                report=json.load(stream)
-            if report.get("repository") not in REPOS or type(report.get("pr")) is not int or report["pr"]<=0 or not re.fullmatch(r"[0-9a-f]{32}",report.get("run_id","")) or path.stem!=report["run_id"] or any(not SHA.fullmatch(str(report.get(k,""))) for k in ("head","base","merge")) or report.get("phase") not in REPORT_PHASES:
-                raise ValueError("Invalid report")
+            with outbox_lock():
+                try:
+                    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+                except FileNotFoundError:
+                    continue
+                with os.fdopen(fd,"rb") as stream:
+                    info=os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>MAX_REPORT_SIZE:
+                        raise ValueError("Unsafe report")
+                    identity=(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)
+                    payload=stream.read(MAX_REPORT_SIZE+1)
+                    report=json.loads(payload)
+                if not valid_report(report,path):
+                    raise ValueError("Invalid report")
+            # No queue lock is held across network operations.
             endpoint=f"/repos/{report['repository']}/issues/{report['pr']}/comments"
-            # Compare the exact serialized report before retrying a lost POST.
             body=REPORT_MARKER+json.dumps(report,sort_keys=True,separators=(",",":"))
             found=False
             for page in range(1,11):
@@ -307,9 +432,27 @@ def flush_reports(token):
                 raise ValueError("Report dedup pagination limit")
             if not found:
                 api(token,endpoint,{"body":body})
-            path.unlink()
+            with outbox_lock():
+                try:
+                    current=path.lstat()
+                except FileNotFoundError:
+                    continue
+                if (current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns)==identity:
+                    path.unlink()
+                else:
+                    delivered=False
         except (OSError,ValueError,KeyError,TypeError):
+            delivered = False
             print("MacCI report delivery pending; will retry",flush=True)
+            try:
+                with outbox_lock():
+                    current=path.lstat()
+                    if identity is None or (current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns)==identity:
+                        os.utime(path,None,follow_symlinks=False)
+            except (OSError,ValueError):
+                pass
+    with outbox_lock():
+        return delivered and not any(folder.glob("*.json"))
 
 
 PROGRESS_CONTEXT = "macmini/progress-v1"
@@ -355,13 +498,15 @@ class Progress:
 def finish_progress(token, repo, head, base, merge, state):
     """Close advisory context only after the authoritative receipt is written."""
     if state not in {"success", "failure", "error"}:
-        return
+        return False
     try:
         api(token, f"/repos/{repo}/statuses/{head}", {
             "state": state, "context": PROGRESS_CONTEXT,
             "description": description(base, merge, "finished")})
+        return True
     except (OSError, ValueError, TypeError):
         print("MacCI advisory terminal delivery pending; retry next tick", flush=True)
+        return False
 
 
 def reconcile_progress(token, repo, head, base, merge, statuses):
@@ -369,17 +514,18 @@ def reconcile_progress(token, repo, head, base, merge, statuses):
     receipt = next((s for s in statuses if s.get("context") == CONTEXT), None)
     advisory = next((s for s in statuses if s.get("context") == PROGRESS_CONTEXT), None)
     if not receipt or not advisory:
-        return
+        return False
     if any((s.get("creator") or {}).get("login") != "layho" for s in (receipt, advisory)):
-        return
+        return False
     state = receipt.get("state")
     valid_details = {"passed"} if state == "success" else REPORT_PHASES - {"passed", "ref-changed"}
     if state not in {"success", "failure", "error"} or not any(
             receipt.get("description") == description(base, merge, detail) for detail in valid_details):
-        return
+        return False
     if (advisory.get("state") == "pending" and any(
             advisory.get("description") == description(base, merge, phase) for phase in PROGRESS_PHASES)):
-        finish_progress(token, repo, head, base, merge, state)
+        return finish_progress(token, repo, head, base, merge, state)
+    return False
 
 
 def status(token, repo, head, base, merge, state, detail=None):
@@ -480,46 +626,95 @@ def report_base_deployments(token):
         with os.fdopen(fd,"rb") as stream:
             info=os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:
-                return
+                raise ValueError("Unsafe deployment journal")
             stream.seek(max(0,info.st_size-1048576))
             raw=stream.read(1048576).decode("utf-8",errors="replace")
-        for row in deployment_events(raw)[-12:]:
-            sha=row["candidate"]
-            # Status is scoped to the immutable candidate. No merge authority.
-            state="success" if row["code"]=="update_ok" else "failure"
-            detail=(row["detail"] or row["code"])+" rollback="+row["rollback"]+" at="+row["finished"]
+    except (OSError,ValueError,KeyError,TypeError):
+        print("Deployment journal delivery unavailable; will retry",flush=True)
+        return False
+    delivered=True
+    for row in deployment_events(raw)[-12:]:
+        sha=row["candidate"]
+        # Status is scoped to the immutable candidate. No merge authority.
+        state="success" if row["code"]=="update_ok" else "failure"
+        rollback_target=row["previous"] if row["rollback"]=="ok" else "unknown"
+        detail=(row["detail"] or row["code"])+" rollback="+rollback_target+" at="+row["finished"]
+        try:
             statuses=api(token,f"/repos/{repo}/commits/{sha}/statuses?per_page=100")
             existing=next((s for s in statuses if s.get("context")==DEPLOY_CONTEXT and
                            (s.get("creator") or {}).get("login")=="layho"),None)
             if not existing or (existing.get("description")!=detail and
                 str(existing.get("description","")).rsplit(" at=",1)[-1]<=row["finished"]):
                 api(token,f"/repos/{repo}/statuses/{sha}",{"state":state,"context":DEPLOY_CONTEXT,"description":detail})
+        except (OSError,ValueError,KeyError,TypeError):
+            delivered=False
+            print("Deployment status delivery pending; will retry",flush=True)
+        if state!="failure":
+            continue
+        try:
             # Stable event identity: a lost acknowledgement cannot create another issue.
-            if state=="failure":
-                title=f"[BASE-DEPLOY-FAILURE {sha}]"
-                found=None
-                for page in range(1,11):
-                    issues=api(token,f"/repos/{repo}/issues?state=all&per_page=100&page={page}")
-                    found=next((i for i in issues if i.get("title")==title and "pull_request" not in i and (i.get("user") or {}).get("login")=="layho"),None)
-                    if found or len(issues)<100:
-                        break
-                else:
-                    raise ValueError("Deployment failure issue pagination exhausted")
-                if not found:
-                    body="[BASE_DEPLOY_FAILURE] "+json.dumps({"schema":1,"candidate_sha":sha,**row},sort_keys=True,separators=(",",":"))
-                    api(token,f"/repos/{repo}/issues",{"title":title,"body":body})
-    except (OSError,ValueError,KeyError,TypeError):
-        print("Deployment journal delivery pending; will retry",flush=True)
+            title=f"[BASE-DEPLOY-FAILURE {sha}]"
+            found=None
+            for page in range(1,11):
+                issues=api(token,f"/repos/{repo}/issues?state=all&per_page=100&page={page}")
+                found=next((i for i in issues if i.get("title")==title and "pull_request" not in i and (i.get("user") or {}).get("login")=="layho"),None)
+                if found or len(issues)<100:
+                    break
+            else:
+                raise ValueError("Deployment failure issue pagination exhausted")
+            if not found:
+                body="[BASE-DEPLOY_FAILURE] "+json.dumps({"schema":1,"candidate_sha":sha,**row},sort_keys=True,separators=(",",":"))
+                api(token,f"/repos/{repo}/issues",{"title":title,"body":body})
+        except (OSError,ValueError,KeyError,TypeError):
+            delivered=False
+            print("Deployment failure issue delivery pending; will retry",flush=True)
+    return delivered
+
+
+@contextmanager
+def receipt_lock():
+    # Serialize senders, not tests. Never follow symlinks or accept shared locks.
+    fd = os.open(ROOT / "receipt-delivery.lock",
+                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(fd, "r+") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("Unsafe receipt delivery lock")
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def deliver_pending_reports(token):
+    """Return true only when both channels report no outstanding delivery failure."""
+    try:
+        with receipt_lock():
+            delivered = True
+            for deliver in (report_base_deployments, flush_reports):
+                try:
+                    if deliver(token) is not True:
+                        delivered = False
+                except (OSError, ValueError, KeyError, TypeError):
+                    delivered = False
+                    print('Receipt delivery deferred; retry next tick', flush=True)
+            return delivered
+    except BlockingIOError:
+        print('Another receipt sender is active; retry next tick', flush=True)
+    except (OSError, ValueError):
+        print('Receipt delivery lock unavailable; retry next tick', flush=True)
+    return False
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--configure', action='store_true')
+    parser.add_argument('--receipts-only', action='store_true', help='Attempt pending receipt delivery without Docker or candidate tests')
     parser.add_argument('--repo', choices=REPOS)
     parser.add_argument('--pr', type=int)
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--lock-fd', type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.receipts_only and (args.configure or args.repo or args.pr is not None or args.force or args.lock_fd is not None):
+        parser.error('--receipts-only cannot be combined with test or configuration options')
     os.umask(0o077)
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.configure:
@@ -545,12 +740,18 @@ def main():
         token = stream.read().strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,300}", token):
         raise SystemExit("Invalid credential format")
-    docker_command()
-    subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
+    # Receipt-only invocations never acquire the test worker lock.
+    delivered = deliver_pending_reports(token)
+    if args.receipts_only:
+        return 0 if delivered else 1
     try:
         with (lock() if args.lock_fd is None else inherited_lock(args.lock_fd)):
-            report_base_deployments(token)
-            flush_reports(token)
+            try:
+                docker_command()
+                subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], check=True, timeout=30)
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                print('Docker unavailable; tests deferred, receipt delivery attempted', flush=True)
+                return 1
             for repo in ([args.repo] if args.repo else REPOS):
                 if args.pr:
                     prs = [api(token, f'/repos/{repo}/pulls/{args.pr}')]
@@ -608,7 +809,7 @@ def main():
                                 "finished_at":int(time.time()),"failures":diagnostic if detail!="ref-changed" else []}
                         try:
                             save_report(report)
-                            flush_reports(token)
+                            deliver_pending_reports(token)
                         except (OSError,ValueError,TypeError):
                             print("MacCI report unavailable; local test log retained",flush=True)
                     print(f'{state}: {logfile}', flush=True)
