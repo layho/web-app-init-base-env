@@ -65,3 +65,39 @@ def test_task_api(store, monkeypatch):
     assert client.post(url,json=payload).status_code == 200
     assert client.post(url,json={**payload,"reason":"other"}).status_code == 409
     assert len(client.get(url).json()["tasks"]) == 1
+
+
+def test_claim_atomic_and_expiry(store):
+    row,_ = store.enqueue("admin","macmini-01","host.health","key-123","diagnostics",120,now=100)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: store.claim("macmini-01",b"k"*32,now=101), range(8)))
+    claims = [x for x in results if x is not None]
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim["job"]["task_id"] == row["task_id"]
+    assert claim["job"]["actor"] == "admin"
+    assert store.list("macmini-01",now=102)[0]["state"] == "CLAIMED"
+    assert store.list("macmini-01",now=161)[0]["state"] == "UNKNOWN"
+    assert store.claim("macmini-01",b"k"*32,now=162) is None
+
+
+def test_claim_api_auth_and_opt_in(store, monkeypatch):
+    monkeypatch.setenv("HOSTOPS_ENABLED","true")
+    monkeypatch.setenv("HOSTOPS_HOST_ID","macmini-01")
+    monkeypatch.setenv("HOSTOPS_AGENT_TOKEN","a"*40)
+    monkeypatch.setenv("HOSTOPS_STATE_DIR",str(store.path.parent))
+    monkeypatch.delenv("HOSTOPS_DISPATCH_ENABLED",raising=False)
+    client = TestClient(app)
+    url = "/api/hostops/v1/agent/claim"
+    payload = {"host_id":"macmini-01"}
+    headers = {"Authorization":"Bearer "+"a"*40}
+    assert client.post(url,json=payload).status_code == 401
+    assert client.post(url,json=payload,headers=headers).status_code == 503
+    monkeypatch.setenv("HOSTOPS_DISPATCH_ENABLED","true")
+    monkeypatch.setenv("HOSTOPS_JOB_SIGNING_KEY","b"*64)
+    assert client.post(url,json={"host_id":"other"},headers=headers).status_code == 403
+    store.enqueue("admin","macmini-01","host.health","key-123","diagnostics",120)
+    response = client.post(url,json=payload,headers=headers)
+    assert response.status_code == 200
+    assert response.json()["claim"]["job"]["policy_version"] == "readonly-v1"
+    assert client.post(url,json=payload,headers=headers).json()["claim"] is None

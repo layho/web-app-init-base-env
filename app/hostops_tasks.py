@@ -3,6 +3,9 @@
 No execution authority. Only read-only diagnostic task requests are accepted.
 """
 import hashlib
+import hmac
+import secrets
+from datetime import datetime, timezone
 import json
 import os
 import sqlite3
@@ -45,9 +48,15 @@ class TaskStore:
                 reason TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
                 state TEXT NOT NULL, UNIQUE(actor,host_id,idem))""")
 
+            db.execute("""CREATE TABLE IF NOT EXISTS leases (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),
+                token_hash TEXT NOT NULL, expires_at INTEGER NOT NULL,
+                envelope TEXT NOT NULL)""")
+
     def connect(self):
         db = sqlite3.connect(self.path, timeout=3)
         db.row_factory = sqlite3.Row
+        db.execute('PRAGMA foreign_keys=ON')
         return db
 
     @staticmethod
@@ -58,6 +67,9 @@ class TaskStore:
     @staticmethod
     def expire(db, now):
         db.execute("UPDATE tasks SET state='TIMED_OUT' WHERE state='QUEUED' AND expires_at<=?", (now,))
+
+        db.execute("""UPDATE tasks SET state='UNKNOWN' WHERE state='CLAIMED' AND task_id IN
+            (SELECT task_id FROM leases WHERE expires_at<=?)""", (now,))
 
     def enqueue(self, actor, host, operation, key, reason, timeout, now=None):
         now = int(time.time()) if now is None else now
@@ -91,3 +103,33 @@ class TaskStore:
             self.expire(db, now)
             return [self.public(row) for row in db.execute(
                 "SELECT * FROM tasks WHERE host_id=? ORDER BY created_at DESC, task_id DESC LIMIT 100", (host,))]
+
+
+    def claim(self, host, signing_key, now=None):
+        """Claim once, atomically. Lost or expired leases never re-execute automatically."""
+        now = int(time.time()) if now is None else now
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self.expire(db, now)
+            if db.execute("SELECT 1 FROM tasks WHERE host_id=? AND state='CLAIMED'", (host,)).fetchone():
+                return None
+            row = db.execute("""SELECT * FROM tasks WHERE host_id=? AND state='QUEUED'
+                                AND expires_at>? ORDER BY created_at,task_id LIMIT 1""", (host,now)).fetchone()
+            if row is None:
+                return None
+            expires = min(row["expires_at"], now+60)
+            token = secrets.token_urlsafe(32)
+            def stamp(value):
+                return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            envelope = {"schema":2, "task_id":row["task_id"], "host_id":host,
+                        "actor":row["actor"], "operation":row["operation"], "parameters":{},
+                        "parameter_sha256":hashlib.sha256(b"{}").hexdigest(),
+                        "issued_at":stamp(now), "expires_at":stamp(expires),
+                        "nonce":secrets.token_hex(16), "policy_version":"readonly-v1",
+                        "lease_sha256":hashlib.sha256(token.encode("ascii")).hexdigest()}
+            encoded = json.dumps(envelope, sort_keys=True, separators=(",",":"), ensure_ascii=True)
+            signature = hmac.new(signing_key, b"hostops/job/v2\0"+encoded.encode("ascii"), hashlib.sha256).hexdigest()
+            db.execute("INSERT INTO leases VALUES (?,?,?,?)",
+                       (row["task_id"], envelope["lease_sha256"], expires, encoded))
+            db.execute("UPDATE tasks SET state='CLAIMED' WHERE task_id=?", (row["task_id"],))
+            return {"job":envelope,"signature":signature,"lease_token":token}

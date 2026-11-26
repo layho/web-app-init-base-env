@@ -139,3 +139,27 @@ def list_tasks(request: Request, response: Response, db: Session = Depends(get_d
         return {"tasks": task_store().list(host), "dispatch_enabled": False}
     except sqlite3.Error:
         raise HTTPException(503, "HostOps task storage unavailable") from None
+
+
+class ClaimRequest(StrictModel):
+    host_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$")
+
+
+@router.post("/agent/claim")
+def claim_task(payload: ClaimRequest, request: Request, response: Response):
+    host, secret = settings()
+    if not hmac.compare_digest(request.headers.get("authorization","").encode(),
+                               ("Bearer "+secret).encode()):
+        raise HTTPException(401, "Agent authentication required")
+    if payload.host_id != host:
+        raise HTTPException(403, "Host identity mismatch")
+    key = os.getenv("HOSTOPS_JOB_SIGNING_KEY","")
+    if os.getenv("HOSTOPS_DISPATCH_ENABLED") != "true" or not re.fullmatch(r"[0-9a-f]{64}",key):
+        raise HTTPException(503, "HostOps dispatch not configured")
+    if hmac.compare_digest(key, secret):
+        raise HTTPException(503, "Separate signing credential required")
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"claim":task_store().claim(host, bytes.fromhex(key))}
+    except sqlite3.Error:
+        raise HTTPException(503, "HostOps task storage unavailable") from None
