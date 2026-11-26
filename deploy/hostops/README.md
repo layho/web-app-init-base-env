@@ -7,3 +7,6 @@ Health reports home-volume capacity; CPU and memory utilization remain explicitl
 Design reference: PR #188. This implementation is independent of its UI changes to preserve the already tested UI candidate.
 
 The `agent.snapshot` operation emits a combined local heartbeat payload with health, service inventory and supported capabilities. It explicitly reports local-only transport; it does not register with a gateway or send network requests. Disk errors yield null, not fabricated capacity. Malformed service status entries are ignored.
+
+## Outbound heartbeat client (candidate)
+`agent.py --once` sends a read-only heartbeat to the configured HTTPS gateway; continuous mode uses 15-second normal cadence and bounded failure backoff. Configure HOSTOPS_HOST_ID, HOSTOPS_GATEWAY_ORIGIN, HOSTOPS_AGENT_TOKEN_FILE locally; the token file must be a regular non-symlink owned by the executing user with mode 0600. No token is accepted on the command line. TLS verification is retained and redirects rejected. No installer, job execution, or real host connectivity is verified by these offline tests. Earlier local-only descriptions refer to diagnostics.py.
