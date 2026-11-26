@@ -29,6 +29,7 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
   const [detail,setDetail]=useState<TaskDetail|null>(null)
   const [detailError,setDetailError]=useState('')
   const [detailLoading,setDetailLoading]=useState(false)
+  const [detailRevision,setDetailRevision]=useState(0)
   const attempt=useRef<{fingerprint:string;key:string}|null>(null)
   const polling=useRef<AbortController|null>(null)
   async function refresh(){
@@ -37,6 +38,11 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
     try{const data=await apiRef.current.list(c.signal);if(!c.signal.aborted){setTasks(data.tasks);setEnabled(data.dispatch_enabled);setError('')}}
     catch{if(!c.signal.aborted){setTasks([]);setEnabled(false);setError('任务记录暂不可用，请检查 HostOps 存储配置或登录状态。')}}
     finally{if(polling.current===c){polling.current=null;if(!c.signal.aborted)setLoading(false)}}
+  }
+  function refreshAfterMutation(){
+    polling.current?.abort()
+    polling.current=null
+    void refresh()
   }
   useEffect(()=>{void refresh();const timer=window.setInterval(()=>void refresh(),5000);return()=>{window.clearInterval(timer);polling.current?.abort();polling.current=null}},[host])
   useEffect(()=>{
@@ -51,7 +57,7 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
     }
     void read();const timer=window.setInterval(()=>void read(),5000)
     return()=>{active=false;window.clearInterval(timer);pending?.abort()}
-  },[selected,host])
+  },[selected,host,detailRevision])
   async function submit(){
     if(submitting.current||!host||!online||!enabled||!reason.trim())return
     submitting.current=true;setBusy(true);setSubmitError('')
@@ -59,18 +65,25 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
     try{
       if(attempt.current?.fingerprint!==fingerprint)attempt.current={fingerprint,key:crypto.randomUUID()}
       const response=await apiRef.current.create({host_id:host,operation,parameters:{},timeout_seconds:120,idempotency_key:attempt.current.key,reason:reason.trim()})
-      attempt.current=null;setReason('');setSelected(response.task.task_id);void refresh()
+      attempt.current=null;setReason('');setSelected(response.task.task_id);refreshAfterMutation()
     }catch{setSubmitError('任务提交未确认。原参数重试会复用同一任务键，防止重复执行。')}
     finally{submitting.current=false;setBusy(false)}
   }
   async function cancel(id:string){
     if(cancelling.current)return
     cancelling.current=true;setCancelBusy(id);setCancelError('')
-    try{const data=await apiRef.current.cancel(id);setTasks(old=>old.map(t=>t.task_id===id?data.task:t));void refresh()}
-    catch{setCancelError('取消未确认：任务可能已领取或完成，系统不会声称已停止宿主执行。');void refresh()}
-    finally{cancelling.current=false;setCancelBusy(null)}
+    try{
+      const data=await apiRef.current.cancel(id)
+      setTasks(old=>old.map(t=>t.task_id===id?data.task:t))
+      setDetail(old=>old?.task_id===id?null:old)
+      setDetailRevision(revision=>revision+1)
+    }
+    catch{setCancelError('取消未确认：任务可能已领取或完成，系统不会声称已停止宿主执行。')}
+    finally{cancelling.current=false;setCancelBusy(null);refreshAfterMutation()}
   }
   const selectedRow=tasks.find(t=>t.task_id===selected)
+  const currentDetail=detail?.task_id===selected?detail:null
+  const displayedTask=currentDetail??selectedRow
   return <Flex vertical gap="middle">
     {error&&<Alert type="warning" showIcon message={error}/>}
     {mode==='terminal'&&<Card title="受控远程终端" extra={<Tag>L1 · 只读</Tag>}>
@@ -98,16 +111,16 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
     </Card>
     <Drawer title="任务执行详情" open={selected!==null} onClose={()=>setSelected(null)} width="min(680px,100vw)">
       {detailError&&<Alert type="error" message={detailError}/>}
-      {(detail??selectedRow)&&<Descriptions column={1} size="small" bordered items={[
+      {displayedTask&&<Descriptions column={1} size="small" bordered items={[
         {key:'id',label:'任务 ID',children:<Typography.Text copyable>{selected}</Typography.Text>},
-        {key:'state',label:'状态',children:<TaskState value={(detail??selectedRow)!.state}/>},
-        {key:'actor',label:'操作人',children:(detail??selectedRow)!.actor},
-        {key:'reason',label:'执行原因',children:(detail??selectedRow)!.reason},
-        {key:'created',label:'创建时间',children:date((detail??selectedRow)!.created_at)},
+        {key:'state',label:'状态',children:<TaskState value={displayedTask.state}/>},
+        {key:'actor',label:'操作人',children:displayedTask.actor},
+        {key:'reason',label:'执行原因',children:displayedTask.reason},
+        {key:'created',label:'创建时间',children:date(displayedTask.created_at)},
       ]}/>}
-      <Card size="small" title="任务状态审计" style={{marginTop:12}}>{detail?.events?.length?<Timeline items={detail.events.map(e=>({children:<Space direction="vertical" size={0}><TaskState value={e.state}/><Typography.Text type="secondary">{date(e.at)} · {e.actor}</Typography.Text></Space>}))}/>:<Typography.Text type="secondary">暂无状态事件记录</Typography.Text>}</Card>
-      <Card size="small" title="Agent 执行回执" loading={detailLoading&&!detail} style={{marginTop:12}}>
-        {detail?.receipt?<Space direction="vertical" style={{width:'100%'}}><Typography.Text type="secondary">接收时间：{date(detail.receipt.received_at)}</Typography.Text><pre className="hostops-terminal">{JSON.stringify(detail.receipt.result??{outcome:detail.receipt.outcome},null,2)}</pre></Space>:<Typography.Text type="secondary">尚无 Agent 执行回执，不代表执行成功。</Typography.Text>}
+      <Card size="small" title="任务状态审计" style={{marginTop:12}}>{currentDetail?.events?.length?<Timeline items={currentDetail.events.map(e=>({children:<Space direction="vertical" size={0}><TaskState value={e.state}/><Typography.Text type="secondary">{date(e.at)} · {e.actor}</Typography.Text></Space>}))}/>:<Typography.Text type="secondary">暂无状态事件记录</Typography.Text>}</Card>
+      <Card size="small" title="Agent 执行回执" loading={detailLoading&&!currentDetail} style={{marginTop:12}}>
+        {currentDetail?.receipt?<Space direction="vertical" style={{width:'100%'}}><Typography.Text type="secondary">接收时间：{date(currentDetail.receipt.received_at)}</Typography.Text><pre className="hostops-terminal">{JSON.stringify(currentDetail.receipt.result??{outcome:currentDetail.receipt.outcome},null,2)}</pre></Space>:<Typography.Text type="secondary">尚无 Agent 执行回执，不代表执行成功。</Typography.Text>}
       </Card>
     </Drawer>
   </Flex>
