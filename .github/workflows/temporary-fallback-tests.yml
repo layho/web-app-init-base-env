@@ -1,0 +1,36 @@
+name: Temporary isolated fallback tests
+on:
+  pull_request:
+    branches: [preview]
+permissions:
+  contents: read
+jobs:
+  hostops:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: HostOps offline regressions
+        run: python3 -m unittest discover -s deploy/hostops -p 'test_*.py' -v
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: sqlite:////tmp/hostops-fallback-ci.sqlite3
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Python isolated tests
+        run: |
+          python3 -m venv /tmp/fallback-ci
+          /tmp/fallback-ci/bin/python -m pip --isolated install --only-binary=:all: -r requirements.txt
+          /tmp/fallback-ci/bin/python -m pytest -q
+          /tmp/fallback-ci/bin/python -m compileall -q app
+      - name: Frontend regression and build
+        run: |
+          npm --prefix frontend ci --ignore-scripts --no-audit --no-fund
+          npm --prefix frontend run build
