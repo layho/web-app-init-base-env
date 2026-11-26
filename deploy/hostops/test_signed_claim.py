@@ -37,3 +37,21 @@ class SignedClaimTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 run_claim(claim,"macmini-01",b"k"*32,path)
             execute.assert_called_once()
+
+
+    def test_receipt_survives_restart_and_network_failure(self):
+        from agent import flush_receipts
+        from urllib.error import URLError
+        claim=self.claim()
+        with tempfile.TemporaryDirectory() as root, patch("agent.execute",return_value={"operation":"host.health"}) as execute:
+            path=Path(root)/"ledger.sqlite3"
+            receipt=run_claim(claim,"macmini-01",b"k"*32,path)
+            with patch("agent.post_json",side_effect=URLError("offline")):
+                with self.assertRaises(URLError):
+                    flush_receipts("macmini-01","https://base.example","a"*40,path)
+            with patch("agent.post_json",return_value={"accepted":True}) as post:
+                flush_receipts("macmini-01","https://base.example","a"*40,path)
+                post.assert_called_once_with("https://base.example","a"*40,"report",receipt)
+                flush_receipts("macmini-01","https://base.example","a"*40,path)
+                post.assert_called_once()
+            execute.assert_called_once()

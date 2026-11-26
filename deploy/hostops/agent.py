@@ -1,4 +1,4 @@
-"""Outbound heartbeat client. No remote execution or inbound listener."""
+"""Outbound heartbeat and signed read-only diagnostic agent; no inbound listener."""
 import argparse
 import json
 import os
@@ -12,7 +12,7 @@ from contextlib import closing
 from protocol import verify_claim, envelope_digest
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 from diagnostics import execute
 
@@ -113,11 +113,18 @@ def read_job_config():
     return bytes.fromhex(key),path
 
 
+def initialize_ledger(db):
+    db.execute("CREATE TABLE IF NOT EXISTS executions(task_id TEXT PRIMARY KEY,nonce TEXT UNIQUE,digest TEXT NOT NULL)")
+    db.execute("""CREATE TABLE IF NOT EXISTS outbox(
+        task_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, receipt TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'PENDING')""")
+
+
 def run_claim(claim,host,key,path):
     job=verify_claim(claim,host,key,datetime.now(timezone.utc))
     digest=envelope_digest(job)
     with closing(sqlite3.connect(path,timeout=3)) as db,db:
-        db.execute("CREATE TABLE IF NOT EXISTS executions(task_id TEXT PRIMARY KEY,nonce TEXT UNIQUE,digest TEXT NOT NULL)")
+        initialize_ledger(db)
         db.execute("BEGIN IMMEDIATE")
         try:
             db.execute("INSERT INTO executions VALUES (?,?,?)",(job["task_id"],job["nonce"],digest))
@@ -129,24 +136,44 @@ def run_claim(claim,host,key,path):
     except (OSError,ValueError):
         result=None
         outcome="FAILED"
-    return {"host_id":host,"task_id":job["task_id"],"lease_token":claim["lease_token"],
-            "outcome":outcome,"result":result}
+    receipt={"host_id":host,"task_id":job["task_id"],"lease_token":claim["lease_token"],
+             "outcome":outcome,"result":result}
+    encoded=json.dumps(receipt,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
+    if len(encoded)>16384:
+        raise ValueError("receipt exceeds bound")
+    with closing(sqlite3.connect(path,timeout=3)) as db,db:
+        db.execute("INSERT INTO outbox(task_id,host_id,receipt) VALUES (?,?,?)",
+                   (job["task_id"],host,encoded))
+    return receipt
 
 
-def dispatch_once(host,origin,token,key,path):
-    claim=post_json(origin,token,"claim",{"host_id":host}).get("claim")
-    if claim is None:
-        return
-    receipt=run_claim(claim,host,key,path)
-    # Retry only the identical receipt, never re-execute the job.
-    for attempt in range(2):
+def flush_receipts(host,origin,token,path):
+    # Never re-run completed diagnostics merely because receipt delivery failed.
+    with closing(sqlite3.connect(path,timeout=3)) as db,db:
+        initialize_ledger(db)
+        pending=db.execute("SELECT task_id,receipt FROM outbox WHERE host_id=? AND state='PENDING' ORDER BY rowid LIMIT 20",(host,)).fetchall()
+    for task_id,encoded in pending:
+        receipt=json.loads(encoded)
         try:
             if post_json(origin,token,"report",receipt).get("accepted") is not True:
                 raise ValueError("receipt not acknowledged")
-            return
-        except (OSError,URLError):
-            if attempt:
+            state="ACKNOWLEDGED"
+        except HTTPError as exc:
+            # A stale/conflicting lease is not successful execution evidence.
+            if exc.code!=409:
                 raise
+            state="REJECTED"
+        with closing(sqlite3.connect(path,timeout=3)) as db,db:
+            db.execute("UPDATE outbox SET state=?,receipt='' WHERE task_id=? AND state='PENDING'",(state,task_id))
+
+
+def dispatch_once(host,origin,token,key,path):
+    flush_receipts(host,origin,token,path)
+    claim=post_json(origin,token,"claim",{"host_id":host}).get("claim")
+    if claim is None:
+        return
+    run_claim(claim,host,key,path)
+    flush_receipts(host,origin,token,path)
 
 
 def main():

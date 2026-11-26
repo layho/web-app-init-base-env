@@ -63,3 +63,16 @@ class InstallTests(unittest.TestCase):
                 activate(path,{"Label":LABEL,"ProgramArguments":["new"]},runner)
             self.assertEqual(path.read_bytes(),old)
             self.assertTrue(loaded)
+
+
+    def test_installation_lock_excludes_concurrent_operator(self):
+        from install import installation_lock
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)/"state"
+            with installation_lock(root):
+                with self.assertRaises(RuntimeError):
+                    with installation_lock(root):
+                        self.fail("concurrent install allowed")
+            with installation_lock(root):
+                pass
+            self.assertTrue((root/"install.lock").is_file())

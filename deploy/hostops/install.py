@@ -3,6 +3,8 @@
 No downloads, sudo, remote policy changes or other service manipulation.
 """
 import argparse
+import fcntl
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -25,6 +27,23 @@ def private_directory(path):
     info=path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o700:
         raise ValueError("unsafe private directory")
+
+
+@contextmanager
+def installation_lock(root):
+    private_directory(root)
+    fd=os.open(root/"install.lock",os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:
+            raise ValueError("unsafe installation lock")
+        try:
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("another installation is active") from None
+        yield
+    finally:
+        os.close(fd)
 
 
 def read_private(path,limit=512):
@@ -173,29 +192,30 @@ def main():
         parser.error("run as the dedicated non-root macOS login user")
     root=Path.home()/".hostops"
     try:
-        release=stage(root,args.source,args.digest)
-        spec=launch_spec(root,release,args.host,args.origin,Path(sys.executable),args.dispatch)
-        if not args.activate:
-            print("Verified release staged; service not changed")
+        with installation_lock(root):
+            release=stage(root,args.source,args.digest)
+            spec=launch_spec(root,release,args.host,args.origin,Path(sys.executable),args.dispatch)
+            if not args.activate:
+                print("Verified release staged; service not changed")
+                return 0
+            launch_dir=Path.home()/"Library/LaunchAgents"
+            launch_dir.mkdir(exist_ok=True)
+            info=launch_dir.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:
+                raise ValueError("unsafe LaunchAgents directory")
+            # Check the exact staged code against the gateway before changing the service.
+            # Never dispatch a task during installation probes.
+            env={**spec["EnvironmentVariables"],"HOSTOPS_AGENT_DISPATCH":"false",
+                 "PATH":"/usr/bin:/bin","HOME":str(Path.home())}
+            def probe(_):
+                return subprocess.run([*spec["ProgramArguments"],"--once"],env=env,
+                                      stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL,timeout=35,check=False).returncode==0
+            if not probe(spec):
+                raise RuntimeError("staged release heartbeat probe failed; service unchanged")
+            activate(launch_dir/(LABEL+".plist"),spec,probe=probe)
+            print("HostOps LaunchAgent registered; independent runtime heartbeat verification required")
             return 0
-        launch_dir=Path.home()/"Library/LaunchAgents"
-        launch_dir.mkdir(exist_ok=True)
-        info=launch_dir.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:
-            raise ValueError("unsafe LaunchAgents directory")
-        # Check the exact staged code against the gateway before changing the service.
-        # Never dispatch a task during installation probes.
-        env={**spec["EnvironmentVariables"],"HOSTOPS_AGENT_DISPATCH":"false",
-             "PATH":"/usr/bin:/bin","HOME":str(Path.home())}
-        def probe(_):
-            return subprocess.run([*spec["ProgramArguments"],"--once"],env=env,
-                                  stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL,timeout=35,check=False).returncode==0
-        if not probe(spec):
-            raise RuntimeError("staged release heartbeat probe failed; service unchanged")
-        activate(launch_dir/(LABEL+".plist"),spec,probe=probe)
-        print("HostOps LaunchAgent registered; independent runtime heartbeat verification required")
-        return 0
     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError):
         print("HostOps installation not confirmed; check local configuration and service state",file=sys.stderr)
         return 1
