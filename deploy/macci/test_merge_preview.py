@@ -176,7 +176,7 @@ class MergeTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
         status={"context":"macmini/deployment-v1","state":"failure","creator":{"login":m.OWNER},
-                "description":"host_test_failed rollback=ok at=2026-11-24T22:55:18Z"}
+                "description":f"host_test_failed rollback={D} at=2026-11-24T22:55:18Z"}
         review={"id":1,"author_association":"OWNER","user":{"login":m.OWNER},
                 "body":"[BASE_DEPLOY_REPAIR_REVIEW] "+json.dumps({"schema":1,"head":H,"failed_sha":B,"rollback_sha":D,"decision":"approved"})}
         with tempfile.TemporaryDirectory() as folder:
@@ -190,6 +190,10 @@ class MergeTests(unittest.TestCase):
                 self.assertTrue(m.deployment_replacement_allowed("fake",7,B,H,C,D))
                 held.write_text(C)
                 self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
+                held.write_text(B+"\\n")
+                wrong_target={**status,"description":f"host_test_failed rollback={B} at=2026-11-24T22:55:18Z"}
+                with patch.object(m,"api",return_value=[wrong_target]):
+                    self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
             with patch.object(m,"api",return_value=[{**status,"state":"success"}]):
                 self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
 
@@ -208,7 +212,7 @@ class MergeTests(unittest.TestCase):
         from contextlib import redirect_stdout
         for reviews, statuses, reason in [([], [], 'owner_review_missing_or_revoked'), ([comment()], [], 'exact_test_receipt_missing_or_invalid')]:
             output = StringIO()
-            with patch.object(m, 'api', side_effect=[pr(), {'commit': {'sha': B}}, {'parents': [{'sha': B}, {'sha': H}]}, statuses]), patch.object(m, 'all_pages', return_value=reviews), redirect_stdout(output):
+            with patch.object(m, 'api', side_effect=[pr(), {'commit': {'sha': B}}, {'parents': [{'sha': B}, {'sha': H}]}, statuses]), patch.object(m, 'all_pages', return_value=reviews), patch.object(m, 'automatic_paths', return_value=frozenset()), redirect_stdout(output):
                 self.assertIsNone(m.authorization('fake', 7))
             self.assertIn(reason, output.getvalue())
 
@@ -228,3 +232,58 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(m.authorization("fake",7),(H,B,C,B))
         with patch.object(m,"all_pages",return_value=[comment()]),patch.object(m,"api",side_effect=prefix+[{"total_count":1,"check_runs":[{"status":"completed","conclusion":"failure"}]}]):
             self.assertIsNone(m.authorization("fake",7))
+
+
+
+class AutomaticPolicyTests(unittest.TestCase):
+    def test_exact_path_and_regular_blob_only(self):
+        path = "docs/guide.md"
+        row = ":100644 100644 " + B + " " + H + " M\t" + path
+        with patch.object(m, "git", return_value=row):
+            self.assertTrue(m.automatic_diff_allowed("fake", B, C, {path}))
+            self.assertFalse(m.automatic_diff_allowed("fake", B, C, {"docs/other.md"}))
+        for invalid in (row.replace("100644 100644", "100644 120000"),
+                        row.replace(" M\t", " D\t"),
+                        row + "\n" + row.replace(path, "deploy/macci/runner.py")):
+            with patch.object(m, "git", return_value=invalid):
+                self.assertFalse(m.automatic_diff_allowed("fake", B, C, {path}))
+
+    def test_sensitive_paths_are_never_automatic(self):
+        for path in ("deploy/macci/merge_preview.py", "app/auth.py", "tests/test_auth.py",
+                     "docs/../runner.md", "frontend/package.json"):
+            self.assertFalse(m.safe_auto_path(path))
+
+    def test_owner_denial_blocks_policy(self):
+        with patch.object(m, "all_pages", return_value=[comment("revoked")]), patch.object(m, "automatic_paths") as policy, patch.object(m, "api", side_effect=[pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}]):
+            self.assertIsNone(m.authorization("fake", 7))
+            policy.assert_not_called()
+
+    def test_policy_requires_exact_macci(self):
+        prefix = [pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}]
+        with patch.object(m, "all_pages", return_value=[]), patch.object(m, "automatic_paths", return_value={"docs/guide.md"}), patch.object(m, "api", side_effect=prefix+[[]]):
+            self.assertIsNone(m.authorization("fake", 7))
+        with patch.object(m, "all_pages", return_value=[]), patch.object(m, "automatic_paths", return_value={"docs/guide.md"}), patch.object(m, "api", side_effect=prefix+[[success()], {"commit": {"sha": B}}]):
+            self.assertEqual(m.authorization("fake", 7), (H, B, C, "automatic-path-policy"))
+
+    def test_real_git_diff_format(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        import subprocess
+        with TemporaryDirectory() as folder:
+            def run(*args):
+                return subprocess.check_output(["git", "-C", folder, *args], text=True).strip()
+            run("init", "-q")
+            run("config", "user.name", "MacCI test")
+            run("config", "user.email", "macci@example.invalid")
+            path = Path(folder) / "docs/guide.md"
+            path.parent.mkdir()
+            path.write_text("before\n")
+            run("add", ".")
+            run("commit", "-qm", "base")
+            base_sha = run("rev-parse", "HEAD")
+            path.write_text("after\n")
+            run("add", ".")
+            run("commit", "-qm", "candidate")
+            candidate = run("rev-parse", "HEAD")
+            self.assertTrue(m.automatic_diff_allowed(folder, base_sha, candidate, {"docs/guide.md"}))
+            self.assertFalse(m.automatic_diff_allowed(folder, base_sha, candidate, {"docs/other.md"}))
