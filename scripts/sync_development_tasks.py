@@ -106,7 +106,8 @@ def refresh_status():
         if data.get("state") in {"queued", "running"}:
             stamp = datetime.fromisoformat(data["updated_at"])
             if datetime.now(timezone.utc) - stamp > timedelta(minutes=15):
-                return {**data, "state": "interrupted"}
+                return {**data, "state": "interrupted",
+                        "force_requested": data.get("force_requested") is True or data.get("state") == "queued"}
         return data
     except (OSError, ValueError, KeyError, TypeError):
         return {"state": "unknown"}
@@ -189,9 +190,9 @@ def enqueue_refresh():
             held = cooldown()
             if held:
                 write_status({**refresh_status(), "state": "failed", "phase": "rate_limit", "requests": 0,
-                              "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
+                              "force_requested": True, "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
                 return refresh_status()
-            write_status({"state": "queued", "requests": 0})
+            write_status({"state": "queued", "requests": 0, "force_requested": True})
             try:
                 with (folder / "task-sync-worker.log").open("ab") as log:
                     subprocess.Popen([sys.executable, "-m", "scripts.sync_development_tasks", "--force"],
@@ -199,7 +200,7 @@ def enqueue_refresh():
                                      stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                      start_new_session=True)
             except OSError:
-                write_status({"state": "failed", "reason": "WorkerStartFailed"})
+                write_status({"state": "failed", "reason": "WorkerStartFailed", "force_requested": True})
             return refresh_status()
 
 
@@ -275,23 +276,30 @@ def run_refresh(force=False):
             fcntl.flock(lock, fcntl.LOCK_EX if force else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
-        force = force or refresh_status().get("state") == "queued"
+        prior_status = refresh_status()
+        # Acquiring the exclusive worker lock proves no other worker owns
+        # the refresh. A leftover running record is therefore recoverable.
+        recovering = prior_status.get("state") in {"failed", "interrupted", "running", "queued"}
+        force = force or prior_status.get("state") == "queued" or prior_status.get("force_requested") is True
         held = cooldown()
         if held:
-            write_status({**refresh_status(), "state": "failed", "phase": "rate_limit", "requests": 0,
-                          "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
+            write_status({**prior_status, "state": "failed", "phase": "rate_limit", "requests": 0,
+                          "force_requested": force, "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
             return 1
         target = pr_tracking.target()
         previous = development_tasks.snapshot()
         tracking = pr_tracking.snapshot() if target else {}
-        if not force and not previous.get("stale") and not tracking.get("stale", True):
+        if not force and not recovering and not previous.get("stale") and not tracking.get("stale", True):
             if all(datetime.now(timezone.utc) - datetime.fromisoformat(x["synced_at"]) < development_tasks.REFRESH_INTERVAL for x in (previous, tracking)):
                 return 0
         start = time.monotonic()
         state = {"state": "running", "phase": "issues", "requests": 0,
-                 "token_health": refresh_status().get("token_health", {}),
-                 "token_health_checked_at": refresh_status().get("token_health_checked_at"),
-                 "started_at": datetime.now(timezone.utc).isoformat()}
+                 "token_health": prior_status.get("token_health", {}),
+                 "token_health_checked_at": prior_status.get("token_health_checked_at"),
+                 "started_at": datetime.now(timezone.utc).isoformat(), "force_requested": force}
+        if recovering:
+            state["recovery_from"] = prior_status.get("state")
+            state["previous_failure"] = prior_status.get("reason")
         write_status(state)
         def request(method, path):
             if method != "GET":
@@ -369,6 +377,7 @@ def run_refresh(force=False):
             write_json(pr_tracking.CACHE, pr_data)
             write_json(folder / "task-sync-combined.json", {"issues": issues, "tracking": pr_data})
             state["state"] = "success"
+            state["force_requested"] = False
         except (release_acceptance.AcceptanceError, OSError, ValueError, TypeError, KeyError) as exc:
             state["state"] = "failed"
             # AcceptanceError messages are already sanitized by the REST client.

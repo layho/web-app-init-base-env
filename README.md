@@ -58,3 +58,7 @@ bash deploy/base-preview.sh --verify
 ```
 
 合并 main 前必须核对候选提交 SHA、完整自动化测试及真实 Mac/HTTPS 验收结果。preview 不推送至下游项目。基座仓库公开，站内反馈会同步到公开 Issues，请勿提交秘密或内部敏感数据。若部署中断，保留数据库及本机配置，先核对日志及端口再重试；禁止为迁就端口冲突而自动更改已配置端口。
+
+## 开发与发布规范
+
+遵守 [版本驱动开发规范](docs/VERSION_DEVELOPMENT.md) 与 [当前版本计划](docs/RELEASE_PLAN.md)。
