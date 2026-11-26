@@ -127,7 +127,7 @@ def automatic_paths():
 def safe_auto_path(path):
     # Deliberately narrow first rollout: documentation and presentation-only
     # styles. No scripts, dependencies, tests, authentication, or host runtime.
-    return bool(re.fullmatch(r"(?:docs/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\\.md|frontend/src/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\\.css)", path))
+    return bool(re.fullmatch(r"(?:docs/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.md|frontend/src/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.css)", path))
 
 
 def automatic_diff_allowed(folder, base, merge, allowed):
@@ -140,7 +140,7 @@ def automatic_diff_allowed(folder, base, merge, allowed):
     if not raw:
         return False
     for line in raw.splitlines():
-        match = re.fullmatch(r":100644 100644 [0-9a-f]{40} [0-9a-f]{40} M\\t([^\\t]+)", line)
+        match = re.fullmatch(r":100644 100644 [0-9a-f]{40} [0-9a-f]{40} M\t([^\t]+)", line)
         if not match or match.group(1) not in allowed or not safe_auto_path(match.group(1)):
             return False
     return True
