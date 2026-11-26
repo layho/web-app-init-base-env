@@ -1,4 +1,5 @@
 import unittest
+from collections import namedtuple
 from unittest.mock import patch
 import diagnostics as d
 
@@ -11,7 +12,7 @@ class DiagnosticTests(unittest.TestCase):
                 d.execute(operation, params)
 
     def test_health_truthful_missing_metrics(self):
-        with patch.object(d.shutil, "disk_usage", return_value=(100, 30, 70)):
+        with patch.object(d.shutil, "disk_usage", return_value=namedtuple('DiskUsage', 'total used free')(100, 30, 70)):
             result = d.execute("host.health", {})["result"]
         self.assertEqual(result["disk"]["free_bytes"], 70)
         self.assertIsNone(result["cpu_percent"])
