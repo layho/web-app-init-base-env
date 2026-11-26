@@ -232,3 +232,28 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(m.authorization("fake",7),(H,B,C,B))
         with patch.object(m,"all_pages",return_value=[comment()]),patch.object(m,"api",side_effect=prefix+[{"total_count":1,"check_runs":[{"status":"completed","conclusion":"failure"}]}]):
             self.assertIsNone(m.authorization("fake",7))
+
+
+class DelegatedReviewTests(unittest.TestCase):
+    def test_independent_exact_head_only(self):
+        row = {"id": 1, "user": {"login": "review-agent"}, "state": "APPROVED",
+               "commit_id": H, "author_association": "COLLABORATOR"}
+        self.assertTrue(m.delegated_review([row], "review-agent", m.OWNER, H))
+        self.assertFalse(m.delegated_review([row], "review-agent", "review-agent", H))
+        self.assertFalse(m.delegated_review([row], "review-agent", m.OWNER, D))
+        self.assertFalse(m.delegated_review([{**row, "author_association": "NONE"}], "review-agent", m.OWNER, H))
+        for state in ("DISMISSED", "CHANGES_REQUESTED"):
+            self.assertFalse(m.delegated_review([row, {**row, "id": 2, "state": state}], "review-agent", m.OWNER, H))
+
+    def test_owner_denial_blocks_delegation(self):
+        with patch.object(m, "all_pages", return_value=[comment("revoked")]), patch.object(m, "trusted_reviewer") as reviewer, patch.object(m, "api", side_effect=[pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}]):
+            self.assertIsNone(m.authorization("fake", 7))
+            reviewer.assert_not_called()
+
+    def test_delegation_still_requires_exact_macci(self):
+        with patch.object(m, "all_pages", side_effect=[[], [{"id": 1, "user": {"login": "review-agent"}, "state": "APPROVED", "commit_id": H, "author_association": "COLLABORATOR"}]]), patch.object(m, "trusted_reviewer", return_value="review-agent"), patch.object(m, "api", side_effect=[pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}, []]):
+            self.assertIsNone(m.authorization("fake", 7))
+
+    def test_delegated_authorization(self):
+        with patch.object(m, "all_pages", side_effect=[[], [{"id": 1, "user": {"login": "review-agent"}, "state": "APPROVED", "commit_id": H, "author_association": "COLLABORATOR"}]]), patch.object(m, "trusted_reviewer", return_value="review-agent"), patch.object(m, "api", side_effect=[pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}, [success()], {"commit": {"sha": B}}]):
+            self.assertEqual(m.authorization("fake", 7), (H, B, C, B))

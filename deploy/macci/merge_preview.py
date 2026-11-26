@@ -1,7 +1,7 @@
 """Trusted base-only preview merge coordinator; separate from Docker tests.
 
 No main publishing, arbitrary repository/branch arguments, or forced push.
-The GitHub owner records exact-head code review before tests finish.
+The owner or a separately configured trusted reviewer authorizes the exact head.
 """
 import argparse
 import base64
@@ -76,6 +76,57 @@ def review(comments, head):
             return None
         return data["requires_ancestor"]
     return None
+
+
+def owner_decision_present(comments, head):
+    """A recorded exact-head owner decision takes precedence over delegation."""
+    for item in comments:
+        if item.get("author_association") != "OWNER" or (item.get("user") or {}).get("login") != OWNER:
+            continue
+        body = item.get("body") or ""
+        if not body.startswith(MARKER):
+            continue
+        try:
+            data = json.loads(body[len(MARKER):])
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("head") == head:
+            return True
+    return False
+
+
+def trusted_reviewer():
+    """Host-only opt-in; never read delegation from candidate files or comments."""
+    path = ROOT / "trusted-reviewer"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "r", encoding="ascii") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_size > 128):
+            raise ValueError("Unsafe trusted reviewer configuration")
+        login = stream.read().strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,38}(?:\\[bot\\])?", login) or login == OWNER:
+        raise ValueError("Invalid independent reviewer identity")
+    return login
+
+
+def delegated_review(reviews, reviewer, author, head):
+    """Use GitHub review identity and commit, not self-reported agent labels."""
+    if not reviewer or reviewer.lower() == author.lower() or reviewer.lower() == OWNER:
+        return False
+    for item in sorted(reviews, key=lambda row: row["id"], reverse=True):
+        if (item.get("user") or {}).get("login", "").lower() != reviewer.lower():
+            continue
+        state = item.get("state")
+        if state in {"COMMENTED", "PENDING"}:
+            continue
+        # A later denial/dismissal or a review of another commit cannot approve.
+        return (state == "APPROVED" and item.get("commit_id") == head
+                and item.get("author_association") in {"OWNER", "MEMBER", "COLLABORATOR"})
+    return False
 
 
 def tested(statuses, head, base, merge):
@@ -280,9 +331,19 @@ def authorization(token, number):
     commit = api(token, "/git/commits/" + merge)
     if [p["sha"] for p in commit["parents"]] != [base, head]:
         return gate_block(number, "candidate_parents_mismatch")
-    required = review(all_pages(token, f"/issues/{number}/comments"), head)
+    comments = all_pages(token, f"/issues/{number}/comments")
+    required = review(comments, head)
     if not required:
-        return gate_block(number, "owner_review_missing_or_revoked")
+        # An explicit owner denial must never fall through to delegated review.
+        if owner_decision_present(comments, head):
+            return gate_block(number, "owner_review_missing_or_revoked")
+        reviewer = trusted_reviewer()
+        if not reviewer:
+            return gate_block(number, "owner_review_missing_or_revoked")
+        reviews = all_pages(token, f"/pulls/{number}/reviews")
+        if not delegated_review(reviews, reviewer, pr["user"]["login"], head):
+            return gate_block(number, "trusted_exact_head_review_missing")
+        required = base
     statuses = api(token, f"/commits/{head}/statuses?per_page=100")
     if not tested(statuses, head, base, merge):
         return gate_block(number, "exact_test_receipt_missing_or_invalid")
