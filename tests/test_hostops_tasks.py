@@ -101,3 +101,18 @@ def test_claim_api_auth_and_opt_in(store, monkeypatch):
     assert response.status_code == 200
     assert response.json()["claim"]["job"]["policy_version"] == "readonly-v1"
     assert client.post(url,json=payload,headers=headers).json()["claim"] is None
+
+
+def test_receipt_idempotency_and_lease(store):
+    row,_=store.enqueue("admin","macmini-01","host.health","key","diag",120,now=100)
+    claim=store.claim("macmini-01",b"k"*32,now=101)
+    task=row["task_id"]
+    token=claim["lease_token"]
+    result={"operation":"host.health"}
+    with pytest.raises(TaskConflict):
+        store.report("macmini-01",task,"x"*43,"SUCCESS",result,now=102)
+    assert store.report("macmini-01",task,token,"SUCCESS",result,now=102)
+    assert not store.report("macmini-01",task,token,"SUCCESS",result,now=200)
+    with pytest.raises(TaskConflict):
+        store.report("macmini-01",task,token,"FAILED",None,now=103)
+    assert store.detail("macmini-01",task)["state"]=="SUCCESS"

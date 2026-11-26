@@ -127,7 +127,7 @@ def create_task(payload: TaskRequest, request: Request, response: Response, db: 
     except sqlite3.Error:
         raise HTTPException(503, "HostOps task storage unavailable") from None
     response.status_code = 202 if created else 200
-    return {"task": task, "created": created, "dispatch_enabled": False}
+    return {"task": task, "created": created, "dispatch_enabled": os.getenv("HOSTOPS_DISPATCH_ENABLED") == "true" and bool(re.fullmatch(r"[0-9a-f]{64}", os.getenv("HOSTOPS_JOB_SIGNING_KEY","")))}
 
 
 @router.get("/tasks")
@@ -136,7 +136,7 @@ def list_tasks(request: Request, response: Response, db: Session = Depends(get_d
     host, _ = settings()
     response.headers["Cache-Control"] = "no-store"
     try:
-        return {"tasks": task_store().list(host), "dispatch_enabled": False}
+        return {"tasks": task_store().list(host), "dispatch_enabled": os.getenv("HOSTOPS_DISPATCH_ENABLED") == "true" and bool(re.fullmatch(r"[0-9a-f]{64}", os.getenv("HOSTOPS_JOB_SIGNING_KEY","")))}
     except sqlite3.Error:
         raise HTTPException(503, "HostOps task storage unavailable") from None
 
@@ -163,3 +163,79 @@ def claim_task(payload: ClaimRequest, request: Request, response: Response):
         return {"claim":task_store().claim(host, bytes.fromhex(key))}
     except sqlite3.Error:
         raise HTTPException(503, "HostOps task storage unavailable") from None
+
+
+class HealthResult(StrictModel):
+    system: Literal["Darwin","Linux"]
+    architecture: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,32}$")
+    disk: Disk | None
+    cpu_percent: None = None
+    memory_percent: None = None
+
+
+class SnapshotResult(StrictModel):
+    health: HealthResult
+    services: list[Service] = Field(max_length=5)
+    capabilities: list[Literal["host.health","service.inventory","agent.snapshot"]] = Field(max_length=3)
+    transport: Literal["local_only"]
+
+
+class DiagnosticResult(StrictModel):
+    schema: Literal[1]
+    operation: Literal["host.health","service.inventory","agent.snapshot"]
+    observed_at: str = Field(pattern=r"^[0-9T:+.Z-]{20,40}$")
+    result: HealthResult | list[Service] | SnapshotResult
+
+
+class ReportRequest(ClaimRequest):
+    task_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    lease_token: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
+    outcome: Literal["SUCCESS","FAILED"]
+    result: DiagnosticResult | None = None
+
+
+@router.post("/agent/report")
+def report_task(payload: ReportRequest, request: Request, response: Response):
+    host,secret=settings()
+    if not hmac.compare_digest(request.headers.get("authorization","").encode(),("Bearer "+secret).encode()):
+        raise HTTPException(401,"Agent authentication required")
+    if payload.host_id != host:
+        raise HTTPException(403,"Host identity mismatch")
+    if (payload.outcome == "SUCCESS") != (payload.result is not None):
+        raise HTTPException(422,"Invalid receipt")
+    result=payload.result
+    if result:
+        expected={"host.health":HealthResult,"service.inventory":list,"agent.snapshot":SnapshotResult}
+        if not isinstance(result.result,expected[result.operation]):
+            raise HTTPException(422,"Invalid diagnostic result")
+        services=result.result if isinstance(result.result,list) else result.result.services if isinstance(result.result,SnapshotResult) else []
+        ids=[s.service_id for s in services]
+        if len(ids)!=len(set(ids)) or not set(ids)<=SERVICES:
+            raise HTTPException(422,"Invalid service result")
+        health=result.result if isinstance(result.result,HealthResult) else result.result.health if isinstance(result.result,SnapshotResult) else None
+        if health and health.disk and max(health.disk.used_bytes,health.disk.free_bytes)>health.disk.total_bytes:
+            raise HTTPException(422,"Invalid disk result")
+    response.headers["Cache-Control"]="no-store"
+    try:
+        created=task_store().report(host,payload.task_id,payload.lease_token,payload.outcome,result.model_dump() if result else None)
+        return {"accepted":True,"created":created}
+    except TaskConflict:
+        raise HTTPException(409,"Invalid or expired lease") from None
+    except ValueError:
+        raise HTTPException(422,"Invalid receipt") from None
+    except sqlite3.Error:
+        raise HTTPException(503,"HostOps task storage unavailable") from None
+
+
+@router.get("/tasks/{task_id}")
+def task_detail(task_id: str, request: Request, response: Response, db: Session=Depends(get_db)):
+    auth.authorize_session(request,db)
+    host,_=settings()
+    response.headers["Cache-Control"]="no-store"
+    try:
+        task=task_store().detail(host,task_id)
+    except sqlite3.Error:
+        raise HTTPException(503,"HostOps task storage unavailable") from None
+    if task is None:
+        raise HTTPException(404,"Task not found")
+    return task

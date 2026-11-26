@@ -53,6 +53,10 @@ class TaskStore:
                 token_hash TEXT NOT NULL, expires_at INTEGER NOT NULL,
                 envelope TEXT NOT NULL)""")
 
+            db.execute("""CREATE TABLE IF NOT EXISTS receipts (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),
+                body TEXT NOT NULL, received_at INTEGER NOT NULL)""")
+
     def connect(self):
         db = sqlite3.connect(self.path, timeout=3)
         db.row_factory = sqlite3.Row
@@ -133,3 +137,40 @@ class TaskStore:
                        (row["task_id"], envelope["lease_sha256"], expires, encoded))
             db.execute("UPDATE tasks SET state='CLAIMED' WHERE task_id=?", (row["task_id"],))
             return {"job":envelope,"signature":signature,"lease_token":token}
+
+
+    def report(self, host, task_id, token, outcome, result, now=None):
+        now = int(time.time()) if now is None else now
+        body = json.dumps({"outcome":outcome,"result":result},sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
+        if len(body)>16384:
+            raise ValueError("receipt exceeds bound")
+        digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT t.*,l.token_hash,l.expires_at AS lease_expires
+                                FROM tasks t JOIN leases l USING(task_id)
+                                WHERE t.task_id=? AND t.host_id=?""",(task_id,host)).fetchone()
+            if row is None or not hmac.compare_digest(digest,row["token_hash"]):
+                raise TaskConflict("invalid lease")
+            previous = db.execute("SELECT body FROM receipts WHERE task_id=?",(task_id,)).fetchone()
+            if previous:
+                if previous["body"] != body:
+                    raise TaskConflict("receipt conflict")
+                return False
+            if row["state"] != "CLAIMED" or now >= row["lease_expires"]:
+                raise TaskConflict("expired lease")
+            if outcome == "SUCCESS" and (type(result) is not dict or result.get("operation") != row["operation"]):
+                raise ValueError("operation mismatch")
+            db.execute("INSERT INTO receipts VALUES (?,?,?)",(task_id,body,now))
+            db.execute("UPDATE tasks SET state=? WHERE task_id=?",(outcome,task_id))
+            return True
+
+    def detail(self, host, task_id):
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self.expire(db,int(time.time()))
+            row=db.execute("SELECT * FROM tasks WHERE host_id=? AND task_id=?",(host,task_id)).fetchone()
+            if not row:
+                return None
+            receipt=db.execute("SELECT body,received_at FROM receipts WHERE task_id=?",(task_id,)).fetchone()
+            return {**self.public(row),"receipt":{**json.loads(receipt["body"]),"received_at":receipt["received_at"]} if receipt else None}

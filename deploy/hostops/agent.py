@@ -5,6 +5,11 @@ import os
 import re
 import stat
 import time
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from contextlib import closing
+from protocol import verify_claim, envelope_digest
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import URLError
@@ -64,13 +69,96 @@ def send_heartbeat(host, origin, token, opener=None):
         raise ValueError("heartbeat not acknowledged")
 
 
+def post_json(origin, token, route, payload):
+    if route not in ("claim","report"):
+        raise ValueError("unsupported route")
+    body=json.dumps(payload,ensure_ascii=True,allow_nan=False).encode("ascii")
+    if len(body)>32768:
+        raise ValueError("request too large")
+    request=Request(origin+"/api/hostops/v1/agent/"+route,data=body,method="POST",
+                    headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"})
+    with build_opener(NoRedirect()).open(request,timeout=10) as response:
+        raw=response.read(32769)
+    if len(raw)>32768:
+        raise ValueError("response too large")
+    result=json.loads(raw)
+    if type(result) is not dict:
+        raise ValueError("invalid response")
+    return result
+
+
+def read_job_config():
+    root=Path(os.environ["HOSTOPS_AGENT_STATE_DIR"])
+    if not root.is_absolute():
+        raise ValueError("absolute state directory required")
+    info=root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o700:
+        raise ValueError("unsafe state directory")
+    fd=os.open(os.environ["HOSTOPS_JOB_KEY_FILE"],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,"r",encoding="ascii") as stream:
+        info=os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600 or info.st_size>128:
+            raise ValueError("unsafe signing key")
+        key=stream.read(129).strip()
+    if not re.fullmatch(r"[0-9a-f]{64}",key):
+        raise ValueError("invalid signing key")
+    path=root/"execution.sqlite3"
+    fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:
+            raise ValueError("unsafe execution ledger")
+    finally:
+        os.close(fd)
+    return bytes.fromhex(key),path
+
+
+def run_claim(claim,host,key,path):
+    job=verify_claim(claim,host,key,datetime.now(timezone.utc))
+    digest=envelope_digest(job)
+    with closing(sqlite3.connect(path,timeout=3)) as db,db:
+        db.execute("CREATE TABLE IF NOT EXISTS executions(task_id TEXT PRIMARY KEY,nonce TEXT UNIQUE,digest TEXT NOT NULL)")
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute("INSERT INTO executions VALUES (?,?,?)",(job["task_id"],job["nonce"],digest))
+        except sqlite3.IntegrityError:
+            raise ValueError("replayed task") from None
+    try:
+        result=execute(job["operation"],{})
+        outcome="SUCCESS"
+    except (OSError,ValueError):
+        result=None
+        outcome="FAILED"
+    return {"host_id":host,"task_id":job["task_id"],"lease_token":claim["lease_token"],
+            "outcome":outcome,"result":result}
+
+
+def dispatch_once(host,origin,token,key,path):
+    claim=post_json(origin,token,"claim",{"host_id":host}).get("claim")
+    if claim is None:
+        return
+    receipt=run_claim(claim,host,key,path)
+    # Retry only the identical receipt, never re-execute the job.
+    for attempt in range(2):
+        try:
+            if post_json(origin,token,"report",receipt).get("accepted") is not True:
+                raise ValueError("receipt not acknowledged")
+            return
+        except (OSError,URLError):
+            if attempt:
+                raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     try:
         host, origin, token = config()
-    except (OSError, ValueError):
+        job_config = read_job_config() if os.getenv('HOSTOPS_AGENT_DISPATCH') == 'true' else None
+        if job_config and job_config[0].hex() == token:
+            raise ValueError('separate signing key required')
+    except (OSError, ValueError, KeyError):
         print("HostOps agent configuration unavailable", flush=True)
         return 2
     delay = 15
@@ -78,10 +166,12 @@ def main():
         try:
             send_heartbeat(host, origin, token)
             print("HostOps heartbeat accepted", flush=True)
+            if job_config:
+                dispatch_once(host,origin,token,*job_config)
             delay = 15
             if args.once:
                 return 0
-        except (OSError, URLError, ValueError):
+        except (OSError, URLError, ValueError, sqlite3.Error):
             print("HostOps heartbeat unavailable; retry deferred", flush=True)
             delay = min(delay * 2, 60)
             if args.once:
