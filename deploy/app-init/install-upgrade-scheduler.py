@@ -20,7 +20,7 @@ import upgrade_scheduler as scheduler
 import upgrade_pr as upgrade
 
 HERE = Path(__file__).resolve().parent
-FILES = ("upgrade_scheduler.py", "upgrade_pr.py", "upgrade_plan.py", "upgrade_auto_merge.py", "upgrade_runtime_auto.py")
+FILES = ("upgrade_scheduler.py", "upgrade_pr.py", "upgrade_plan.py", "upgrade_auto_merge.py", "upgrade_runtime_auto.py", "ownership_preflight.py")
 PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
@@ -118,6 +118,9 @@ def main():
                     info = candidate.lstat()
                     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
                         raise SystemExit("Unsafe runtime file: " + name)
+            for name in FILES:
+                if (runtime/name).is_file():
+                    originals[name] = (runtime/name).read_bytes()
             desired = {name: (HERE/name).read_bytes() for name in FILES}
             if all((runtime/name).is_file() and (runtime/name).read_bytes() == content for name,content in desired.items()):
                 print("Existing scheduler matches; no files or jobs replaced")

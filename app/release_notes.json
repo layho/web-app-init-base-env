@@ -1,5 +1,252 @@
 [
   {
+    "version": "0.2.14",
+    "title": "修复限流冷却期限重复延长",
+    "summary": "区分本地冷却拦截与真实 GitHub 限流响应，防止重复延长等待。",
+    "changes": [
+      "本地冷却异常不再重新登记为服务端限流。",
+      "损坏的冷却记录不阻塞刷新。",
+      "新增冷却期限及损坏记录回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "模拟同步过程中另一通道触发冷却，确认不重复延长期限"
+    ],
+    "validation_note": "保留真实 GitHub 限流等待及安全门禁。"
+  },
+  {
+    "version": "0.2.13",
+    "title": "MacCI 拉取超时自动重试",
+    "summary": "修复候选 Git fetch 超时直接退出、未使用现有有界重试的问题。",
+    "changes": [
+      "超时与非零退出共享三次精确候选拉取重试预算。",
+      "记录异常类型，不输出额外敏感内容。",
+      "新增超时后恢复与耗尽重试回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "模拟候选拉取超时后恢复及连续超时"
+    ],
+    "validation_note": "不替换候选 SHA，不改变测试授权；宿主运行程序需独立升级，未确认实机网络根因。"
+  },
+  {
+    "version": "0.2.12",
+    "title": "任务历史同步 API 请求优化",
+    "summary": "正式分支前进时复用经过验证的历史发布证据，减少重复比较。",
+    "changes": [
+      "一次祖先比较确认 main 前进后复用历史正向发布证据。",
+      "分支改写时重新验证全部候选，负向结果不复用。",
+      "冷却期拦截的请求不计入真实 REST 请求数。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证 main 正常前进及分叉时的历史状态和请求数量"
+    ],
+    "validation_note": "仅优化发布历史比较，不改变人工验收、合并授权或强制刷新语义。"
+  },
+  {
+    "version": "0.2.11",
+    "title": "GitHub 任务同步限流自动恢复",
+    "summary": "任务同步两个后台通道共享持久化冷却期限，避免强制刷新绕过限流。",
+    "changes": [
+      "识别主额度恢复时间和次级 Retry-After；限流期间保留缓存且阻止手动/定时任务重复请求。",
+      "健康探测遇限流立即终止；显示下一次重试时间。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "模拟 403/429 限流并检查手动刷新、后台刷新和缓存保留"
+    ],
+    "validation_note": "冷却仅覆盖任务同步两个通道，不覆盖其他 GitHub 客户端；旧缓存及强制刷新完整历史语义保留。"
+  },
+  {
+    "version": "0.2.10",
+    "title": "MacCI 可信宿主安装器隔离",
+    "summary": "将候选代码作为不可执行数据读取，禁止在宿主执行候选测试。",
+    "changes": [
+      "固定可信安装器路径及独立摘要校验。",
+      "候选模块仅读取精确 Git blob 并编译语法，安装需要独立模块摘要。",
+      "隔离 Python 导入环境与 Git 环境变量。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证候选代码不在宿主执行",
+      "验证可信安装器及模块摘要校验"
+    ],
+    "validation_note": "需一次管理员可信安装器配置；本版不自动安装宿主、不取消独立授权。"
+  },
+  {
+    "version": "0.2.9",
+    "title": "Python 依赖环境恢复及部署回滚",
+    "summary": "隔离构建新版 Python 虚拟环境，保留旧环境直至健康检查通过。",
+    "changes": [
+      "按 Python 版本和依赖清单指纹构建候选环境，避免直接污染旧环境。",
+      "原子切换环境链接，部署失败恢复旧环境及前端资产。",
+      "覆盖安装失败、切换失败和旧环境恢复回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对候选环境切换及旧环境保留",
+      "验证真实 Mac mini 安装和失败回滚"
+    ],
+    "validation_note": "仅合入既有 #151 修复，真实 macOS 环境及生产部署待验证；不改变数据库迁移规则。"
+  },
+  {
+    "version": "0.2.8",
+    "title": "API 请求体与慢上传保护",
+    "summary": "在 JSON 解析前限制实际请求体字节数及截图并发，限制慢速请求读取时长。",
+    "changes": [
+      "普通 JSON 64 KiB，截图按附件总量计算上限，支持分块计数。",
+      "每 worker 两个截图请求，读取总时限 30 秒，超时释放槽位。",
+      "初始化同步复制中间件及回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证超限 413、慢上传 408、正常截图提交"
+    ],
+    "validation_note": "限制按 worker 生效；未引入全局限流，不替代网关保护。"
+  },
+  {
+    "version": "0.2.7",
+    "title": "会话刷新 CSRF 稳定性修复",
+    "summary": "同一有效会话使用稳定派生令牌，避免多标签页刷新使写操作失效。",
+    "changes": [
+      "会话读取不再轮换 CSRF 或写入数据库。",
+      "兼容升级前最后一个有效令牌，保留会话到期、退出及来源校验。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证同一会话多次刷新后写操作仍有效",
+      "验证错误令牌及退出后请求仍拒绝"
+    ],
+    "validation_note": "无需生产数据库迁移；实机登录及刷新待验收。"
+  },
+  {
+    "version": "0.2.6",
+    "title": "MacCI 辅助状态终态修复",
+    "summary": "正式测试回执写入后关闭辅助进度状态，并修复已有同候选残留 Pending。",
+    "changes": [
+      "测试结束写入独立辅助终态，不修改正式测试上下文。",
+      "仅根据可信且完全匹配的正式回执修复历史残留，避免重复运行测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证成功、失败和历史残留辅助状态",
+      "验证宿主升级后新 PR 不再残留辅助 Pending"
+    ],
+    "validation_note": "宿主 runner 必须升级后生效；不伪造 MacCI 正式回执。"
+  },
+  {
+    "version": "0.2.5",
+    "title": "升级执行器文件所有权预检",
+    "summary": "在创建下游升级 PR 前核验真实已提交文件路径和模板所有权。",
+    "changes": [
+      "接入只读所有权预检，拒绝大小写路径别名和文件目录碰撞。",
+      "宿主安装器包含预检模块并完整备份已有运行文件。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证业务路径冲突阻止升级 PR 创建",
+      "验证宿主升级后实际预检生效"
+    ],
+    "validation_note": "仍需宿主安装升级；不改变正式升级自动合并授权，不修改生产数据库。"
+  },
+  {
+    "version": "0.2.4",
+    "title": "应用升级预检与代码隔离基础能力",
+    "summary": "交付只读文件所有权预检及临时目录隔离回归工具。",
+    "changes": [
+      "检测业务文件重叠、路径穿越、符号链接及所有权策略异常。",
+      "临时目录验证业务文件保留和模拟失败后的字节级恢复。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "执行所有权预检及临时目录隔离回归"
+    ],
+    "validation_note": "仅基础工具与测试，尚未接入真实 app-init 升级执行器；不代表生产回滚或业务文件保护已经启用。"
+  },
+  {
+    "version": "0.2.3",
+    "title": "前端模块 SDK 基础能力",
+    "summary": "独立交付模块注册、菜单投影与 React 隔离宿主，暂不启用正式菜单。",
+    "changes": [
+      "模块注册校验及权限声明过滤；按需加载与模块级错误边界。",
+      "保留 UI 四组及 SDK 三组构建前置回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对既有五模块功能不受影响",
+      "后续接线时验证模块切换、Hooks 与异常恢复"
+    ],
+    "validation_note": "SDK 基础设施版本，未接入生产导航；权限声明不是后端鉴权。"
+  },
+  {
+    "version": "0.2.2",
+    "title": "精确测试与辅助状态解耦",
+    "summary": "协调器独立验证辅助进度 Pending，保持正式测试、审查、候选父提交与冻结门禁。",
+    "changes": [
+      "仅允许可信且匹配当前候选的辅助 Pending，其他失败或未完成检查继续阻塞。",
+      "手动入口允许唤醒协调器检查 unstable 候选；增加脱敏门禁原因码。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证协调器实机安装及精确候选自动合并",
+      "验证其他失败检查仍阻塞"
+    ],
+    "validation_note": "宿主独立协调器需要另行升级，仓库发布不代表宿主脚本已替换。"
+  },
+  {
+    "version": "0.2.1",
+    "title": "正式发布证据与补验收状态修复",
+    "summary": "独立展示正式分支 SHA，区分已发布与已验收。",
+    "changes": [
+      "无本地验收记录也显示真实 main SHA，不伪造验收。",
+      "已发布版本支持当前版本补验收；不允许使用未发布候选拒绝流程，问题可通过开发任务反馈。",
+      "工作台保留并明确标记过期任务缓存，展示同步失败原因、中文动态及手动刷新入口。",
+      "反馈 Worker 优先复用统一 GitHub 凭据，兼容旧凭据。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对运行、preview、main SHA",
+      "核对已发布未验收提示及补验收按钮",
+      "核对过期缓存、同步失败诊断、手动刷新和反馈同步"
+    ],
+    "validation_note": "候选待 MacCI 和实机验证；历史版本补录暂未实现。"
+  },
+  {
+    "version": "0.2.0",
+    "title": "基座 UI V2.0",
+    "summary": "统一五大导航模块，接入真实工作台、使用指南、开发任务、更新记录及运行诊断。",
+    "changes": [
+      "新版工作台展示真实任务同步、部署及近期事件，未知数据不伪造。",
+      "使用指南整合项目资料及操作入口，开发任务保留需求提交和交付链路。",
+      "更新记录增加运行与发布证据，运行诊断支持分类、筛选与详情。",
+      "归档 UI V2.0 原始设计资料；保留原发布验收门禁。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "真实登录并验证五个模块及需求提交、版本验收入口",
+      "检查 1920/1440/1024/768/390 像素宽度布局与操作",
+      "核对运行 SHA、任务、部署和诊断数据；未提供的数据明确显示未知"
+    ],
+    "validation_note": "独立 UI 候选；暂停的 #168 回执修复不包含在本版本。新集成 SHA 尚待 MacCI 和真实浏览器验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/152"
+  },
+  {
     "version": "0.1.40",
     "title": "部署失败恢复及独立宿主回执",
     "summary": "修复失败候选交付链路，优先部署日志独立采集。",

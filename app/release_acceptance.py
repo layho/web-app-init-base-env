@@ -45,6 +45,36 @@ def enabled():
             and bool(github_token()))
 
 
+def github_http_error(exc):
+    """Classify using bounded response metadata; never expose raw GitHub text."""
+    headers = exc.headers or {}
+    prefix = f"GH-REST-{exc.code}"
+    if exc.code in (403, 429):
+        if headers.get("X-RateLimit-Remaining") == "0":
+            reset = headers.get("X-RateLimit-Reset", "")
+            suffix = ""
+            if isinstance(reset, str) and re.fullmatch(r"[0-9]{1,10}", reset):
+                try:
+                    suffix = "；恢复时间 " + datetime.fromtimestamp(int(reset), timezone.utc).isoformat()
+                except (ValueError, OSError, OverflowError):
+                    pass
+            return prefix + "：GitHub API 主额度耗尽" + suffix
+        retry = headers.get("Retry-After", "")
+        try:
+            body = json.loads(exc.read(8192))
+            message = body.get("message", "") if isinstance(body, dict) else ""
+        except (ValueError, OSError, TypeError):
+            message = ""
+        secondary = isinstance(message, str) and ("secondary rate limit" in message.lower() or "abuse detection" in message.lower())
+        if exc.code == 429 or secondary or retry:
+            suffix = "；建议等待 " + retry + " 秒" if isinstance(retry, str) and re.fullmatch(r"[0-9]{1,6}", retry) else ""
+            return prefix + "：GitHub 请求限流" + suffix
+        return prefix + "：请求被禁止，需核查对应接口权限、仓库访问或组织策略"
+    if exc.code == 401:
+        return prefix + "：GitHub 身份认证失败，请核查运行服务凭据"
+    return prefix + "：GitHub 请求失败"
+
+
 def github(path, data=None):
     token = github_token()
     if not token:
@@ -57,11 +87,7 @@ def github(path, data=None):
         with build_opener(NoRedirect()).open(request, timeout=8) as response:
             return json.load(response)
     except HTTPError as exc:
-        if exc.code in (401, 403):
-            raise AcceptanceError(
-                f"GH-REST-{exc.code}：当前 GitHub Token 被拒绝；"
-                "请核查运行服务的凭据、仓库授权和对应 API 权限") from None
-        raise AcceptanceError(f"GH-REST-{exc.code}：GitHub 请求失败") from None
+        raise AcceptanceError(github_http_error(exc)) from None
     except (URLError, OSError, ValueError):
         raise AcceptanceError("GH-REST-NETWORK：GitHub 请求失败或回执无效") from None
 
@@ -138,18 +164,20 @@ def state(sha):
         return {"enabled": False, "state": "unavailable"}
     try:
         receipt = load_receipt(sha)
+        main = ref("main")
+        publication = {"main_sha": main, "is_published": contains(sha, main)}
         if not receipt:
-            return {"enabled": True, "state": "not_requested"}
+            return {"enabled": True, "state": "not_requested", **publication}
         issue = receipt.get("issue")
         if receipt.get("decision") == "rejected":
             return {"enabled": True, "state": "rejected", "issue": issue,
-                    "reason": receipt.get("reason"), "attachments": receipt.get("attachments", [])}
-        if contains(sha, ref("main")):
-            return {"enabled": True, "state": "published", "issue": issue}
+                    "reason": receipt.get("reason"), "attachments": receipt.get("attachments", []), **publication}
+        if publication["is_published"]:
+            return {"enabled": True, "state": "published", "issue": issue, **publication}
         if type(issue) is int and issue > 0:
             current = api(f"/issues/{issue}")
-            return {"enabled": True, "state": "blocked" if current.get("state") == "closed" else "queued", "issue": issue}
-        return {"enabled": True, "state": "blocked"}
+            return {"enabled": True, "state": "blocked" if current.get("state") == "closed" else "queued", "issue": issue, **publication}
+        return {"enabled": True, "state": "blocked", **publication}
     except (AcceptanceError, KeyError, TypeError, OSError):
         return {"enabled": True, "state": "unknown"}
 
@@ -204,8 +232,8 @@ def submit(sha, version, deployed):
             raise AcceptanceError("preview 已有新候选，请检查更新并重新验收")
         main = ref("main")
         if contains(sha, main):
-            save_receipt(sha, {"issue": None})
-            return {"enabled": True, "state": "published", "issue": None}
+            save_receipt(sha, {"issue": None, "decision": "accepted", "at": datetime.now(timezone.utc).isoformat()})
+            return {"enabled": True, "state": "published", "issue": None, "main_sha": main, "is_published": True}
         if not contains(main, sha):
             raise AcceptanceError("main 与候选存在分歧，禁止直接发布")
         evidence = test_evidence(sha)

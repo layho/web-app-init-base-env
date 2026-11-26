@@ -172,8 +172,10 @@ def latest_status(head):
 
 def request_merge(number, head, base):
     pr, merge = current_pr(number, head, base)
-    if pr.get("draft") or pr.get("mergeable_state") != "clean":
-        raise ManualActionError("PR 尚未解除草稿或 GitHub 合并条件未满足")
+    if pr.get("draft"):
+        raise ManualActionError("PR 尚未解除草稿，请先完成审查并解除 Draft")
+    if pr.get("mergeable_state") not in {"clean", "unstable"}:
+        raise ManualActionError("GitHub 合并状态为 " + ("unstable（存在未完成或未通过的状态检查）" if pr.get("mergeable_state") == "unstable" else "非 clean") + "；安全合并门禁尚未满足，请核对状态检查")
     status = latest_status(head)
     if (not isinstance(status, dict) or status.get("state") != "success"
             or status.get("description") != f"base={base} merge={merge} passed"):

@@ -86,6 +86,24 @@ class RunnerTests(unittest.TestCase):
                 runner.fetch_merge_ref(Path('/tmp/readonly.git'), REPO, 14, io.StringIO(), {})
             self.assertEqual(mocked.call_count, 3)
 
+    def test_merge_ref_fetch_timeout_retries_exact_ref(self):
+        import io
+        err = subprocess.TimeoutExpired(['git', 'fetch'], 120)
+        log = io.StringIO()
+        with patch.object(runner, 'run', side_effect=[err, None]) as mocked, \
+             patch.object(runner.time, 'sleep') as sleeper:
+            runner.fetch_merge_ref(Path('/tmp/readonly.git'), REPO, 14, log, {})
+            self.assertEqual(mocked.call_count, 2)
+            self.assertEqual(mocked.call_args_list[0].args[0], mocked.call_args_list[1].args[0])
+            self.assertEqual(sleeper.call_args.args, (2,))
+            self.assertIn('TimeoutExpired', log.getvalue())
+        with patch.object(runner, 'run', side_effect=err) as mocked, \
+             patch.object(runner.time, 'sleep') as sleeper:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                runner.fetch_merge_ref(Path('/tmp/readonly.git'), REPO, 14, io.StringIO(), {})
+            self.assertEqual(mocked.call_count, 3)
+            self.assertEqual(sleeper.call_count, 2)
+
     def test_real_git_archive(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)/'repo'; root.mkdir()
@@ -142,6 +160,25 @@ class DeploymentJournalTests(unittest.TestCase):
         self.assertEqual(result[0]["rollback"],"ok")
         self.assertEqual(result[0]["previous"],BASE)
         self.assertEqual(runner.deployment_events(raw.split("rollback_ok")[0]),[])
+
+
+
+class ProgressTerminalTests(unittest.TestCase):
+    def test_terminal_context_is_separate(self):
+        with patch.object(runner,"api") as api:
+            runner.finish_progress("fake",REPO,HEAD,BASE,MERGE,"success")
+            self.assertEqual(api.call_args.args[2],{"state":"success","context":runner.PROGRESS_CONTEXT,"description":runner.description(BASE,MERGE,"finished")})
+    def test_reconcile_only_exact_trusted_receipt(self):
+        receipt={"context":runner.CONTEXT,"state":"success","creator":{"login":"layho"},"description":runner.description(BASE,MERGE,"passed")}
+        progress={"context":runner.PROGRESS_CONTEXT,"state":"pending","creator":{"login":"layho"},"description":runner.description(BASE,MERGE,"test")}
+        with patch.object(runner,"finish_progress") as finish:
+            runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[receipt,progress])
+            finish.assert_called_once_with("fake",REPO,HEAD,BASE,MERGE,"success")
+            finish.reset_mock()
+            runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[{**receipt,"creator":{"login":"other"}},progress])
+            runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[receipt,{**progress,"description":runner.description(BASE,HEAD,"test")}])
+            runner.reconcile_progress("fake",REPO,HEAD,BASE,MERGE,[{**receipt,"state":"pending"},receipt,progress])
+            finish.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
