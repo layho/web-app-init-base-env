@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 
 from . import auth
 from .db import get_db
+from .hostops_tasks import TaskStore, TaskConflict, TaskCapacity
+import sqlite3
 
 router = APIRouter(prefix="/api/hostops/v1")
 _lock = threading.Lock()
@@ -85,3 +87,55 @@ def hosts(request: Request, response: Response, db: Session = Depends(get_db)):
         age = max(0, int(_clock() - received))
         return {"hosts": [{"host_id": host, "state": "online" if age <= 90 else "stale",
                            "age_seconds": age, "snapshot": data}]}
+
+
+class TaskRequest(StrictModel):
+    host_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$")
+    operation: Literal["host.health", "service.inventory", "agent.snapshot"]
+    parameters: dict = Field(default_factory=dict, max_length=0)
+    timeout_seconds: int = Field(default=120, ge=15, le=300)
+    idempotency_key: str = Field(pattern=r"^[A-Za-z0-9_-]{16,96}$")
+    reason: str = Field(min_length=1, max_length=240)
+
+
+def task_store():
+    directory = os.getenv("HOSTOPS_STATE_DIR", "")
+    if not directory:
+        raise HTTPException(503, "HostOps task storage not configured")
+    try:
+        return TaskStore(directory)
+    except (OSError, ValueError, sqlite3.Error):
+        raise HTTPException(503, "HostOps task storage unavailable") from None
+
+
+@router.post("/tasks")
+def create_task(payload: TaskRequest, request: Request, response: Response, db: Session = Depends(get_db)):
+    actor = auth.authorize_session(request, db)
+    host, _ = settings()
+    if payload.host_id != host:
+        raise HTTPException(403, "Host identity mismatch")
+    if not payload.reason.strip() or any(ord(c) < 32 for c in payload.reason):
+        raise HTTPException(422, "Invalid reason")
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        task, created = task_store().enqueue(actor, host, payload.operation, payload.idempotency_key,
+                                             payload.reason, payload.timeout_seconds)
+    except TaskConflict:
+        raise HTTPException(409, "Idempotency key conflict") from None
+    except TaskCapacity:
+        raise HTTPException(429, "HostOps task queue capacity reached") from None
+    except sqlite3.Error:
+        raise HTTPException(503, "HostOps task storage unavailable") from None
+    response.status_code = 202 if created else 200
+    return {"task": task, "created": created, "dispatch_enabled": False}
+
+
+@router.get("/tasks")
+def list_tasks(request: Request, response: Response, db: Session = Depends(get_db)):
+    auth.authorize_session(request, db)
+    host, _ = settings()
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"tasks": task_store().list(host), "dispatch_enabled": False}
+    except sqlite3.Error:
+        raise HTTPException(503, "HostOps task storage unavailable") from None

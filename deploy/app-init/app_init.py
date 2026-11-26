@@ -93,7 +93,7 @@ def copy_foundation(source, target, repository, title, domain, port, label):
         ".gitignore", "requirements.txt", "app/__init__.py", "app/auth.py", "app/db.py",
         "app/development_tasks.py", "app/foundation_version.py", "app/upgrade_status.py", "app/feedback_progress.py",
         "app/admin_settings.py", "app/feedback_delivery.py", "app/manual_pr_actions.py",
-        "app/pr_conflict_controls.py", "app/pr_draft_controls.py", "app/hostops.py",
+        "app/pr_conflict_controls.py", "app/pr_draft_controls.py", "app/hostops.py", "app/hostops_tasks.py",
         "app/pr_tracking.py", "app/request_limits.py", "app/feedback_attachments.py", "app/release_acceptance.py", "app/main.py", "app/models.py", "app/operations.py",
         "migrations/002_admin_sessions.sql", "migrations/003_feedback.sql",
         "scripts/apply_migrations.py", "scripts/hash_admin_password.py", "scripts/sync_feedback.py",
@@ -101,7 +101,7 @@ def copy_foundation(source, target, repository, title, domain, port, label):
         "deploy/macmini/acceptance.sh", "deploy/macmini/release.py", "tests/test_auth.py",
         "tests/test_deploy_script.py", "tests/test_development_tasks.py", "tests/test_feedback.py",
         "tests/test_feedback_issue_body.py", "tests/test_foundation_version.py", "tests/test_upgrade_status.py", "tests/test_feedback_progress.py", "tests/test_release_acceptance.py",
-        "tests/test_uvicorn_shutdown.py", "tests/test_request_limits.py", "tests/test_hostops_gateway.py",
+        "tests/test_uvicorn_shutdown.py", "tests/test_request_limits.py", "tests/test_hostops_gateway.py", "tests/test_hostops_tasks.py",
     ]
     paths += [path.relative_to(source).as_posix() for path in sorted((source / "frontend/src").rglob("*")) if path.is_file()]
     paths += [f"frontend/{path}" for path in ("index.html", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts")]
