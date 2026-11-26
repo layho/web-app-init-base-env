@@ -586,7 +586,11 @@ function App() {
             await loadOperations('releases')
           }} />
       ) : page === 'hostops' ? (
-        <HostOpsPage load={signal => api('/api/hostops/v1/hosts', {signal})} />
+        <HostOpsPage load={signal => api('/api/hostops/v1/hosts', {signal})} taskApi={{
+          list: signal => api('/api/hostops/v1/tasks',{signal}),
+          create: input => api('/api/hostops/v1/tasks',{method:'POST',body:JSON.stringify(input)},session.csrf_token),
+          detail: (id,signal) => api('/api/hostops/v1/tasks/'+encodeURIComponent(id),{signal}),
+        }} />
       ) : page === 'logs' ? (
         <SystemLogPage data={systemLogs} loading={loadingOperations === 'logs'} onRefresh={() => void loadOperations('logs')} />
       ) : (

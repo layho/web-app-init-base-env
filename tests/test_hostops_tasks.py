@@ -116,3 +116,33 @@ def test_receipt_idempotency_and_lease(store):
     with pytest.raises(TaskConflict):
         store.report("macmini-01",task,token,"FAILED",None,now=103)
     assert store.detail("macmini-01",task)["state"]=="SUCCESS"
+
+
+def test_diagnostic_api_full_cycle(store, monkeypatch):
+    monkeypatch.setenv("HOSTOPS_ENABLED","true")
+    monkeypatch.setenv("HOSTOPS_HOST_ID","macmini-01")
+    monkeypatch.setenv("HOSTOPS_AGENT_TOKEN","a"*40)
+    monkeypatch.setenv("HOSTOPS_DISPATCH_ENABLED","true")
+    monkeypatch.setenv("HOSTOPS_JOB_SIGNING_KEY","b"*64)
+    monkeypatch.setenv("HOSTOPS_STATE_DIR",str(store.path.parent))
+    monkeypatch.setattr(auth,"authorize_session",lambda *args:"admin")
+    client=TestClient(app)
+    prefix="/api/hostops/v1"
+    headers={"Authorization":"Bearer "+"a"*40}
+    created=client.post(prefix+"/tasks",json={"host_id":"macmini-01","operation":"host.health",
+        "idempotency_key":"full-cycle-key-001","reason":"diagnostic"})
+    assert created.status_code==202 and created.json()["dispatch_enabled"]
+    task=created.json()["task"]["task_id"]
+    claim=client.post(prefix+"/agent/claim",headers=headers,json={"host_id":"macmini-01"}).json()["claim"]
+    assert claim["job"]["task_id"]==task
+    receipt={"host_id":"macmini-01","task_id":task,"lease_token":claim["lease_token"],
+        "outcome":"SUCCESS","result":{"schema":1,"operation":"host.health","observed_at":"2026-11-26T12:00:00+00:00",
+        "result":{"system":"Darwin","architecture":"arm64","disk":None}}}
+    assert client.post(prefix+"/agent/report",json=receipt).status_code==401
+    assert client.post(prefix+"/agent/report",headers=headers,json={**receipt,"lease_token":"x"*43}).status_code==409
+    assert client.post(prefix+"/agent/report",headers=headers,json=receipt).json()=={"accepted":True,"created":True}
+    assert client.post(prefix+"/agent/report",headers=headers,json=receipt).json()=={"accepted":True,"created":False}
+    detail=client.get(prefix+"/tasks/"+task).json()
+    assert detail["state"]=="SUCCESS" and detail["receipt"]["result"]["result"]["system"]=="Darwin"
+    assert "lease_token" not in detail
+    assert client.get(prefix+"/tasks").json()["tasks"][0]["state"]=="SUCCESS"

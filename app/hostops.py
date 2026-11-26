@@ -1,4 +1,4 @@
-"""Opt-in, authenticated single-host heartbeat gateway; no task execution."""
+"""Opt-in single-host heartbeat and read-only diagnostic task gateway."""
 import hmac
 import os
 import re
@@ -46,6 +46,13 @@ class Heartbeat(StrictModel):
     disk: Disk | None
     services: list[Service] = Field(max_length=5)
     capabilities: list[str] = Field(max_length=3)
+
+
+def dispatch_ready():
+    key = os.getenv("HOSTOPS_JOB_SIGNING_KEY","")
+    secret = os.getenv("HOSTOPS_AGENT_TOKEN","")
+    return (os.getenv("HOSTOPS_DISPATCH_ENABLED") == "true" and bool(re.fullmatch(r"[0-9a-f]{64}",key))
+            and not hmac.compare_digest(key,secret))
 
 
 def settings():
@@ -127,7 +134,7 @@ def create_task(payload: TaskRequest, request: Request, response: Response, db: 
     except sqlite3.Error:
         raise HTTPException(503, "HostOps task storage unavailable") from None
     response.status_code = 202 if created else 200
-    return {"task": task, "created": created, "dispatch_enabled": os.getenv("HOSTOPS_DISPATCH_ENABLED") == "true" and bool(re.fullmatch(r"[0-9a-f]{64}", os.getenv("HOSTOPS_JOB_SIGNING_KEY","")))}
+    return {"task": task, "created": created, "dispatch_enabled": dispatch_ready()}
 
 
 @router.get("/tasks")
@@ -136,7 +143,7 @@ def list_tasks(request: Request, response: Response, db: Session = Depends(get_d
     host, _ = settings()
     response.headers["Cache-Control"] = "no-store"
     try:
-        return {"tasks": task_store().list(host), "dispatch_enabled": os.getenv("HOSTOPS_DISPATCH_ENABLED") == "true" and bool(re.fullmatch(r"[0-9a-f]{64}", os.getenv("HOSTOPS_JOB_SIGNING_KEY","")))}
+        return {"tasks": task_store().list(host), "dispatch_enabled": dispatch_ready()}
     except sqlite3.Error:
         raise HTTPException(503, "HostOps task storage unavailable") from None
 
