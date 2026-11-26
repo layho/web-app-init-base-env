@@ -60,6 +60,41 @@ def test_cross_origin_denied(client):
     assert response.status_code==403
 
 
+def test_login_rate_limit_is_per_client_with_global_cap(client, monkeypatch):
+    from types import SimpleNamespace
+    from app import auth
+
+    clock = [0]
+    monkeypatch.setattr(auth, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(auth, "_login_attempts", {})
+    monkeypatch.setattr(auth, "LOGIN_CLIENT_LIMIT", 1)
+    monkeypatch.setattr(auth, "LOGIN_GLOBAL_LIMIT", 2)
+    monkeypatch.setattr(auth, "check_password", lambda password, _: password == "correct")
+
+    def attempt(address, password="wrong", forwarded="198.51.100.100"):
+        with TestClient(app, base_url="https://webapp.example", client=(address, 12345)) as peer:
+            return peer.post("/api/login", json={"username": "admin", "password": password},
+                             headers={"X-Forwarded-For": forwarded}).status_code
+
+    assert attempt("192.0.2.1") == 401
+    assert attempt("192.0.2.1", "correct", "198.51.100.101") == 429
+    assert attempt("192.0.2.2", "correct") == 200
+    assert attempt("192.0.2.2") == 401
+    assert attempt("192.0.2.3", "correct") == 429
+    clock[0] = auth.LOGIN_WINDOW_SECONDS
+    assert attempt("192.0.2.1", "correct") == 200
+
+
+def test_security_headers_use_https_and_html_boundaries(client):
+    response = client.get("/api/version")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["strict-transport-security"] == "max-age=31536000"
+    assert "content-security-policy" not in response.headers
+    with TestClient(app, base_url="http://webapp.example") as local:
+        assert "strict-transport-security" not in local.get("/api/version").headers
+
+
 def test_login_prunes_only_one_batch_of_expired_sessions(client, monkeypatch):
     from datetime import timedelta
     from sqlalchemy import select

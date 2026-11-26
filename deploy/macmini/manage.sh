@@ -272,7 +272,7 @@ serve() {
   if test "${APP_INIT_SYSTEM_SERVICE:-}" = "1"; then
     printf '%s\n' "$$" > logs/web.pid
   fi
-  exec .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port "$PORT" --workers 1 --timeout-graceful-shutdown 5
+  exec .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port "$PORT" --workers 1 --timeout-graceful-shutdown 5 --forwarded-allow-ips 127.0.0.1
 }
 agents() {
   export APP_AGENT_ROOT="$ROOT" APP_AGENT_DIR="$AGENT_DIR" APP_AGENT_PREFIX="$LABEL_PREFIX"
