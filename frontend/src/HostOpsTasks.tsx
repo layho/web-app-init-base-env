@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Card, Descriptions, Drawer, Flex, Input, Select, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Descriptions, Drawer, Flex, Input, Select, Space, Table, Tag, Typography, Popconfirm, Timeline } from 'antd'
 
 export type HostTask = { task_id:string; actor:string; host_id:string; operation:string; reason:string; created_at:number; expires_at:number; state:string }
-export type TaskDetail = HostTask & {receipt:null|{outcome:string;result:unknown;received_at:number}}
+export type TaskEvent = {seq:number;actor:string;state:string;at:number}
+export type TaskDetail = HostTask & {events?:TaskEvent[];receipt:null|{outcome:string;result:unknown;received_at:number}}
 export type TaskList = {tasks:HostTask[];dispatch_enabled:boolean}
 export type TaskInput = {host_id:string;operation:string;parameters:Record<string,never>;timeout_seconds:number;idempotency_key:string;reason:string}
-export type TaskApi = {list:(signal:AbortSignal)=>Promise<TaskList>;create:(input:TaskInput)=>Promise<{task:HostTask;created:boolean}>;detail:(id:string,signal:AbortSignal)=>Promise<TaskDetail>}
+export type TaskApi = {list:(signal:AbortSignal)=>Promise<TaskList>;create:(input:TaskInput)=>Promise<{task:HostTask;created:boolean}>;detail:(id:string,signal:AbortSignal)=>Promise<TaskDetail>;cancel:(id:string)=>Promise<{task:HostTask}>}
 const operations = [{value:'host.health',label:'宿主健康诊断'},{value:'service.inventory',label:'服务清单诊断'},{value:'agent.snapshot',label:'完整宿主快照'}]
 const labels:Record<string,[string,string]> = {QUEUED:['等待领取','blue'],CLAIMED:['已领取 · 等待回执','processing'],SUCCESS:['执行成功','success'],FAILED:['执行失败','error'],TIMED_OUT:['等待超时','warning'],UNKNOWN:['结果未知','warning'],CANCELLED:['已取消','default']}
 function TaskState({value}:{value:string}) {const s=labels[value]??['状态未知','default'];return <Tag color={s[1]}>{s[0]}</Tag>}
@@ -18,6 +19,9 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
   const [submitError,setSubmitError]=useState('')
   const [loading,setLoading]=useState(true)
   const [busy,setBusy]=useState(false)
+  const [cancelError,setCancelError]=useState('')
+  const [cancelBusy,setCancelBusy]=useState<string|null>(null)
+  const cancelling=useRef(false)
   const submitting=useRef(false)
   const [operation,setOperation]=useState('host.health')
   const [reason,setReason]=useState('')
@@ -59,6 +63,13 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
     }catch{setSubmitError('任务提交未确认。原参数重试会复用同一任务键，防止重复执行。')}
     finally{submitting.current=false;setBusy(false)}
   }
+  async function cancel(id:string){
+    if(cancelling.current)return
+    cancelling.current=true;setCancelBusy(id);setCancelError('')
+    try{const data=await apiRef.current.cancel(id);setTasks(old=>old.map(t=>t.task_id===id?data.task:t));void refresh()}
+    catch{setCancelError('取消未确认：任务可能已领取或完成，系统不会声称已停止宿主执行。');void refresh()}
+    finally{cancelling.current=false;setCancelBusy(null)}
+  }
   const selectedRow=tasks.find(t=>t.task_id===selected)
   return <Flex vertical gap="middle">
     {error&&<Alert type="warning" showIcon message={error}/>}
@@ -76,12 +87,13 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
       </Flex>
     </Card>}
     <Card title="执行记录" extra={<Button loading={loading} onClick={()=>void refresh()}>刷新记录</Button>}>
+      {cancelError&&<Alert type="warning" message={cancelError} style={{marginBottom:12}}/>}
       <Table<HostTask> size="small" rowKey="task_id" dataSource={tasks} loading={loading} scroll={{x:760}} pagination={{pageSize:10}} columns={[
         {title:'任务',dataIndex:'operation',render:(v:string)=>operations.find(x=>x.value===v)?.label??v},
         {title:'操作人',dataIndex:'actor'},
         {title:'创建时间',dataIndex:'created_at',render:date},
         {title:'状态',dataIndex:'state',render:(v:string)=><TaskState value={v}/>},
-        {title:'操作',render:(_,row)=><Button type="link" onClick={()=>setSelected(row.task_id)}>查看详情</Button>},
+        {title:'操作',render:(_,row)=><Space><Button type="link" onClick={()=>setSelected(row.task_id)}>查看详情</Button>{row.state==='QUEUED'&&<Popconfirm title="取消尚未领取的任务？" onConfirm={()=>void cancel(row.task_id)}><Button size="small" danger loading={cancelBusy===row.task_id}>取消</Button></Popconfirm>}</Space>},
       ]}/>
     </Card>
     <Drawer title="任务执行详情" open={selected!==null} onClose={()=>setSelected(null)} width="min(680px,100vw)">
@@ -93,6 +105,7 @@ export function HostOpsTasks({api,host,online,mode}:{api:TaskApi;host?:string;on
         {key:'reason',label:'执行原因',children:(detail??selectedRow)!.reason},
         {key:'created',label:'创建时间',children:date((detail??selectedRow)!.created_at)},
       ]}/>}
+      <Card size="small" title="任务状态审计" style={{marginTop:12}}>{detail?.events?.length?<Timeline items={detail.events.map(e=>({children:<Space direction="vertical" size={0}><TaskState value={e.state}/><Typography.Text type="secondary">{date(e.at)} · {e.actor}</Typography.Text></Space>}))}/>:<Typography.Text type="secondary">暂无状态事件记录</Typography.Text>}</Card>
       <Card size="small" title="Agent 执行回执" loading={detailLoading&&!detail} style={{marginTop:12}}>
         {detail?.receipt?<Space direction="vertical" style={{width:'100%'}}><Typography.Text type="secondary">接收时间：{date(detail.receipt.received_at)}</Typography.Text><pre className="hostops-terminal">{JSON.stringify(detail.receipt.result??{outcome:detail.receipt.outcome},null,2)}</pre></Space>:<Typography.Text type="secondary">尚无 Agent 执行回执，不代表执行成功。</Typography.Text>}
       </Card>

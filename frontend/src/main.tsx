@@ -590,6 +590,7 @@ function App() {
           list: signal => api('/api/hostops/v1/tasks',{signal}),
           create: input => api('/api/hostops/v1/tasks',{method:'POST',body:JSON.stringify(input)},session.csrf_token),
           detail: (id,signal) => api('/api/hostops/v1/tasks/'+encodeURIComponent(id),{signal}),
+          cancel: id => api('/api/hostops/v1/tasks/'+encodeURIComponent(id)+'/cancel',{method:'POST'},session.csrf_token),
         }} />
       ) : page === 'logs' ? (
         <SystemLogPage data={systemLogs} loading={loadingOperations === 'logs'} onRefresh={() => void loadOperations('logs')} />

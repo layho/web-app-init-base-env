@@ -57,6 +57,13 @@ class TaskStore:
                 task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),
                 body TEXT NOT NULL, received_at INTEGER NOT NULL)""")
 
+            db.execute("""CREATE TABLE IF NOT EXISTS task_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                actor TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL)""")
+            db.execute("CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id,seq)")
+            db.execute("CREATE INDEX IF NOT EXISTS tasks_host_state ON tasks(host_id,state,created_at)")
+
     def connect(self):
         db = sqlite3.connect(self.path, timeout=3)
         db.row_factory = sqlite3.Row
@@ -69,11 +76,19 @@ class TaskStore:
                                    "reason", "created_at", "expires_at", "state")}
 
     @staticmethod
-    def expire(db, now):
-        db.execute("UPDATE tasks SET state='TIMED_OUT' WHERE state='QUEUED' AND expires_at<=?", (now,))
+    def event(db, task_id, actor, state, now):
+        db.execute("INSERT INTO task_events(task_id,actor,state,at) VALUES (?,?,?,?)",
+                   (task_id,actor,state,now))
 
-        db.execute("""UPDATE tasks SET state='UNKNOWN' WHERE state='CLAIMED' AND task_id IN
-            (SELECT task_id FROM leases WHERE expires_at<=?)""", (now,))
+    @staticmethod
+    def expire(db, now):
+        for state, query in (
+            ("TIMED_OUT","SELECT task_id FROM tasks WHERE state='QUEUED' AND expires_at<=?"),
+            ("UNKNOWN","SELECT tasks.task_id FROM tasks JOIN leases USING(task_id) WHERE tasks.state='CLAIMED' AND leases.expires_at<=?"),
+        ):
+            for row in db.execute(query,(now,)).fetchall():
+                db.execute("UPDATE tasks SET state=? WHERE task_id=?",(state,row["task_id"]))
+                TaskStore.event(db,row["task_id"],"system",state,now)
 
     def enqueue(self, actor, host, operation, key, reason, timeout, now=None):
         now = int(time.time()) if now is None else now
@@ -98,6 +113,7 @@ class TaskStore:
             task_id = uuid.uuid4().hex
             db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
                        (task_id,actor,host,key,digest,operation,reason,now,now+timeout,"QUEUED"))
+            self.event(db,task_id,actor,"QUEUED",now)
             return self.public(db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()), True
 
     def list(self, host, now=None):
@@ -136,11 +152,14 @@ class TaskStore:
             db.execute("INSERT INTO leases VALUES (?,?,?,?)",
                        (row["task_id"], envelope["lease_sha256"], expires, encoded))
             db.execute("UPDATE tasks SET state='CLAIMED' WHERE task_id=?", (row["task_id"],))
+            self.event(db,row["task_id"],"agent:"+host,"CLAIMED",now)
             return {"job":envelope,"signature":signature,"lease_token":token}
 
 
     def report(self, host, task_id, token, outcome, result, now=None):
         now = int(time.time()) if now is None else now
+        if outcome not in ("SUCCESS","FAILED") or (outcome=="SUCCESS") != (result is not None):
+            raise ValueError("invalid receipt outcome")
         body = json.dumps({"outcome":outcome,"result":result},sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
         if len(body)>16384:
             raise ValueError("receipt exceeds bound")
@@ -163,6 +182,7 @@ class TaskStore:
                 raise ValueError("operation mismatch")
             db.execute("INSERT INTO receipts VALUES (?,?,?)",(task_id,body,now))
             db.execute("UPDATE tasks SET state=? WHERE task_id=?",(outcome,task_id))
+            self.event(db,task_id,"agent:"+host,outcome,now)
             return True
 
     def detail(self, host, task_id):
@@ -173,4 +193,30 @@ class TaskStore:
             if not row:
                 return None
             receipt=db.execute("SELECT body,received_at FROM receipts WHERE task_id=?",(task_id,)).fetchone()
-            return {**self.public(row),"receipt":{**json.loads(receipt["body"]),"received_at":receipt["received_at"]} if receipt else None}
+            events=[dict(e) for e in db.execute("SELECT seq,actor,state,at FROM task_events WHERE task_id=? ORDER BY seq",(task_id,))]
+            return {**self.public(row),"events":events,"receipt":{**json.loads(receipt["body"]),"received_at":receipt["received_at"]} if receipt else None}
+
+
+    def cancel(self, host, task_id, actor, now=None):
+        now=int(time.time()) if now is None else now
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self.expire(db,now)
+            row=db.execute("SELECT * FROM tasks WHERE host_id=? AND task_id=?",(host,task_id)).fetchone()
+            if row is None:
+                return None
+            if row["state"]=="CANCELLED":
+                return self.public(row)
+            if row["state"]!="QUEUED":
+                raise TaskConflict("only queued tasks can be cancelled")
+            db.execute("UPDATE tasks SET state='CANCELLED' WHERE task_id=?",(task_id,))
+            self.event(db,task_id,actor,"CANCELLED",now)
+            return self.public(db.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone())
+
+    def audit(self, host, after=0):
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self.expire(db,int(time.time()))
+            return [dict(row) for row in db.execute("""SELECT e.seq,e.task_id,e.actor,e.state,e.at,t.operation
+                FROM task_events e JOIN tasks t USING(task_id) WHERE t.host_id=? AND e.seq>?
+                ORDER BY e.seq LIMIT 100""",(host,after))]

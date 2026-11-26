@@ -161,10 +161,8 @@ def claim_task(payload: ClaimRequest, request: Request, response: Response):
     if payload.host_id != host:
         raise HTTPException(403, "Host identity mismatch")
     key = os.getenv("HOSTOPS_JOB_SIGNING_KEY","")
-    if os.getenv("HOSTOPS_DISPATCH_ENABLED") != "true" or not re.fullmatch(r"[0-9a-f]{64}",key):
+    if not dispatch_ready():
         raise HTTPException(503, "HostOps dispatch not configured")
-    if hmac.compare_digest(key, secret):
-        raise HTTPException(503, "Separate signing credential required")
     response.headers["Cache-Control"] = "no-store"
     try:
         return {"claim":task_store().claim(host, bytes.fromhex(key))}
@@ -246,3 +244,33 @@ def task_detail(task_id: str, request: Request, response: Response, db: Session=
     if task is None:
         raise HTTPException(404,"Task not found")
     return task
+
+
+@router.post("/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, request: Request, response: Response, db: Session=Depends(get_db)):
+    actor=auth.authorize_session(request,db)
+    host,_=settings()
+    response.headers["Cache-Control"]="no-store"
+    try:
+        task=task_store().cancel(host,task_id,actor)
+    except TaskConflict:
+        raise HTTPException(409,"Task already claimed or completed; cancellation is not guaranteed") from None
+    except sqlite3.Error:
+        raise HTTPException(503,"HostOps task storage unavailable") from None
+    if task is None:
+        raise HTTPException(404,"Task not found")
+    return {"task":task}
+
+
+@router.get("/audit")
+def audit(request: Request, response: Response, after: int=0, db: Session=Depends(get_db)):
+    auth.authorize_session(request,db)
+    host,_=settings()
+    if after<0 or after>9223372036854775807:
+        raise HTTPException(422,"Invalid cursor")
+    response.headers["Cache-Control"]="no-store"
+    try:
+        events=task_store().audit(host,after)
+    except sqlite3.Error:
+        raise HTTPException(503,"HostOps task storage unavailable") from None
+    return {"events":events,"next_cursor":events[-1]["seq"] if events else after}

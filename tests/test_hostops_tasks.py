@@ -146,3 +146,39 @@ def test_diagnostic_api_full_cycle(store, monkeypatch):
     assert detail["state"]=="SUCCESS" and detail["receipt"]["result"]["result"]["system"]=="Darwin"
     assert "lease_token" not in detail
     assert client.get(prefix+"/tasks").json()["tasks"][0]["state"]=="SUCCESS"
+
+
+def test_cancel_audit_and_claim_race(store):
+    row,_=store.enqueue("admin","macmini-01","host.health","cancel-key","diag",120)
+    task=row["task_id"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claim=pool.submit(store.claim,"macmini-01",b"k"*32)
+        cancel=pool.submit(store.cancel,"macmini-01",task,"admin")
+        claimed=claim.result()
+        try:
+            cancelled=cancel.result()
+        except TaskConflict:
+            cancelled=None
+    assert (claimed is None) != (cancelled is None)
+    detail=store.detail("macmini-01",task)
+    assert [e["state"] for e in detail["events"]]==["QUEUED","CLAIMED" if claimed else "CANCELLED"]
+    events=store.audit("macmini-01")
+    assert len(events)==2 and store.audit("other")==[]
+    assert store.audit("macmini-01",events[0]["seq"])==events[1:]
+
+
+def test_cancel_api_and_audit(store,monkeypatch):
+    monkeypatch.setenv("HOSTOPS_ENABLED","true")
+    monkeypatch.setenv("HOSTOPS_HOST_ID","macmini-01")
+    monkeypatch.setenv("HOSTOPS_AGENT_TOKEN","a"*40)
+    monkeypatch.setenv("HOSTOPS_STATE_DIR",str(store.path.parent))
+    client=TestClient(app)
+    row,_=store.enqueue("admin","macmini-01","host.health","key","diag",120)
+    url="/api/hostops/v1/tasks/"+row["task_id"]+"/cancel"
+    assert client.post(url).status_code==401
+    assert client.get("/api/hostops/v1/audit").status_code==401
+    monkeypatch.setattr(auth,"authorize_session",lambda *args:"admin")
+    assert client.post(url).json()["task"]["state"]=="CANCELLED"
+    assert client.post(url).json()["task"]["state"]=="CANCELLED"
+    assert len(client.get("/api/hostops/v1/audit").json()["events"])==2
+    assert client.get("/api/hostops/v1/audit?after=-1").status_code==422
