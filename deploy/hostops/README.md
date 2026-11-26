@@ -5,3 +5,5 @@ Implements two read-only operations, host.health and service.inventory, with no 
 Health reports home-volume capacity; CPU and memory utilization remain explicitly unavailable. Service inventory reports only allowlisted labels visible in the executing user's launchd domain; not_visible does not prove a service is uninstalled. No raw launchctl output or environment is returned. No networking, remote task execution, MacCI credentials, production DB migration, or service mutation. Gateway, signed jobs, separate service identity, UI data binding and actual ChatGPT tool integration remain future implementation and verification steps.
 
 Design reference: PR #188. This implementation is independent of its UI changes to preserve the already tested UI candidate.
+
+The `agent.snapshot` operation emits a combined local heartbeat payload with health, service inventory and supported capabilities. It explicitly reports local-only transport; it does not register with a gateway or send network requests. Disk errors yield null, not fabricated capacity. Malformed service status entries are ignored.

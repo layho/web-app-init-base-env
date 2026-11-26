@@ -31,6 +31,21 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["/bin/launchctl", "list"])
         self.assertEqual(run.call_args.kwargs["timeout"], 5)
 
+    def test_snapshot_and_unavailable_disk(self):
+        with patch.object(d.shutil, "disk_usage", side_effect=OSError), patch.object(d.platform, "system", return_value="Linux"):
+            result = d.execute("agent.snapshot", {})["result"]
+        self.assertIsNone(result["health"]["disk"])
+        self.assertEqual(result["transport"], "local_only")
+        self.assertIn("agent.snapshot", result["capabilities"])
+        self.assertTrue(all(x["state"] == "unsupported" for x in result["services"]))
+
+    def test_malformed_status_is_ignored(self):
+        result = d.subprocess.CompletedProcess([], 0, "- --1 com.layho.macci\n- " + "9"*5000 + " com.layho.macci-preview-merge\n")
+        with patch.object(d.platform, "system", return_value="Darwin"), patch.object(d.subprocess, "run", return_value=result):
+            rows = {x["service_id"]: x for x in d.services()}
+        self.assertEqual(rows["macci.runner"]["state"], "not_visible")
+        self.assertEqual(rows["macci.preview"]["state"], "not_visible")
+
     def test_failure_and_other_os_not_reported_as_healthy(self):
         with patch.object(d.platform, "system", return_value="Darwin"), patch.object(d.subprocess, "run", side_effect=OSError):
             self.assertTrue(all(x["state"] == "unknown" for x in d.services()))

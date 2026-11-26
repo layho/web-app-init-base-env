@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -18,15 +19,19 @@ SERVICES = {
     "macci.receipts": "com.layho.macci-receipt-delivery",
     "panel.merge": "com.layho.macci-app-main-panel",
 }
-OPERATIONS = frozenset({"host.health", "service.inventory"})
+OPERATIONS = frozenset({"host.health", "service.inventory", "agent.snapshot"})
 
 
 def health():
-    total, used, free = shutil.disk_usage(os.path.expanduser("~"))
+    try:
+        total, used, free = shutil.disk_usage(os.path.expanduser("~"))
+        disk = {"total_bytes": total, "used_bytes": used, "free_bytes": free}
+    except OSError:
+        disk = None
     return {
         "system": platform.system(),
         "architecture": platform.machine(),
-        "disk": {"total_bytes": total, "used_bytes": used, "free_bytes": free},
+        "disk": disk,
         "cpu_percent": None,
         "memory_percent": None,
     }
@@ -53,7 +58,7 @@ def services():
         fields = line.split()
         if len(fields) == 3 and fields[2] in SERVICES.values():
             pid, status, label = fields
-            if (pid == "-" or (pid.isascii() and pid.isdecimal())) and status.lstrip("-").isascii() and status.lstrip("-").isdecimal():
+            if re.fullmatch(r"(?:-|[0-9]{1,10})", pid) and re.fullmatch(r"-?[0-9]{1,10}", status):
                 rows[label] = (pid, int(status))
     output = []
     for key, label in SERVICES.items():
@@ -76,7 +81,13 @@ def execute(operation, parameters):
         raise ValueError("unsupported operation")
     if not isinstance(parameters, dict) or parameters:
         raise ValueError("operation accepts no parameters")
-    payload = health() if operation == "host.health" else services()
+    if operation == "host.health":
+        payload = health()
+    elif operation == "service.inventory":
+        payload = services()
+    else:
+        payload = {"health": health(), "services": services(),
+                   "capabilities": sorted(OPERATIONS), "transport": "local_only"}
     return {"schema": 1, "operation": operation,
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "result": payload}
