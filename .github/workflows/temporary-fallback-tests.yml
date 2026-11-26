@@ -1,0 +1,32 @@
+name: V0.2.15 release candidate regression
+on:
+  pull_request:
+    branches: [preview]
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+concurrency:
+  group: release-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  regression:
+    if: github.event.pull_request.draft == false && github.event.pull_request.number == 185
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: sqlite:////tmp/fallback-ci.sqlite3
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Backend regression
+        run: |
+          python3 -m venv /tmp/fallback-ci
+          /tmp/fallback-ci/bin/python -m pip --isolated install --only-binary=:all: -r requirements.txt
+          /tmp/fallback-ci/bin/python -m pytest -q
+          /tmp/fallback-ci/bin/python -m compileall -q app
+      - name: Frontend regression and build
+        run: |
+          npm --prefix frontend ci --ignore-scripts --no-audit --no-fund
+          npm --prefix frontend run build
