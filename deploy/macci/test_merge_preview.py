@@ -234,26 +234,33 @@ class MergeTests(unittest.TestCase):
             self.assertIsNone(m.authorization("fake",7))
 
 
-class DelegatedReviewTests(unittest.TestCase):
-    def test_independent_exact_head_only(self):
-        row = {"id": 1, "user": {"login": "review-agent"}, "state": "APPROVED",
-               "commit_id": H, "author_association": "COLLABORATOR"}
-        self.assertTrue(m.delegated_review([row], "review-agent", m.OWNER, H))
-        self.assertFalse(m.delegated_review([row], "review-agent", "review-agent", H))
-        self.assertFalse(m.delegated_review([row], "review-agent", m.OWNER, D))
-        self.assertFalse(m.delegated_review([{**row, "author_association": "NONE"}], "review-agent", m.OWNER, H))
-        for state in ("DISMISSED", "CHANGES_REQUESTED"):
-            self.assertFalse(m.delegated_review([row, {**row, "id": 2, "state": state}], "review-agent", m.OWNER, H))
 
-    def test_owner_denial_blocks_delegation(self):
-        with patch.object(m, "all_pages", return_value=[comment("revoked")]), patch.object(m, "trusted_reviewer") as reviewer, patch.object(m, "api", side_effect=[pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}]):
+class AutomaticPolicyTests(unittest.TestCase):
+    def test_exact_path_and_regular_blob_only(self):
+        path = "docs/guide.md"
+        row = ":100644 100644 " + B + " " + H + " M\\t" + path
+        with patch.object(m, "git", return_value=row):
+            self.assertTrue(m.automatic_diff_allowed("fake", B, C, {path}))
+            self.assertFalse(m.automatic_diff_allowed("fake", B, C, {"docs/other.md"}))
+        for invalid in (row.replace("100644 100644", "100644 120000"),
+                        row.replace(" M\\t", " D\\t"),
+                        row + "\\n" + row.replace(path, "deploy/macci/runner.py")):
+            with patch.object(m, "git", return_value=invalid):
+                self.assertFalse(m.automatic_diff_allowed("fake", B, C, {path}))
+
+    def test_sensitive_paths_are_never_automatic(self):
+        for path in ("deploy/macci/merge_preview.py", "app/auth.py", "tests/test_auth.py",
+                     "docs/../runner.md", "frontend/package.json"):
+            self.assertFalse(m.safe_auto_path(path))
+
+    def test_owner_denial_blocks_policy(self):
+        with patch.object(m, "all_pages", return_value=[comment("revoked")]), patch.object(m, "automatic_paths") as policy, patch.object(m, "api", side_effect=[pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}]):
             self.assertIsNone(m.authorization("fake", 7))
-            reviewer.assert_not_called()
+            policy.assert_not_called()
 
-    def test_delegation_still_requires_exact_macci(self):
-        with patch.object(m, "all_pages", side_effect=[[], [{"id": 1, "user": {"login": "review-agent"}, "state": "APPROVED", "commit_id": H, "author_association": "COLLABORATOR"}]]), patch.object(m, "trusted_reviewer", return_value="review-agent"), patch.object(m, "api", side_effect=[pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}, []]):
+    def test_policy_requires_exact_macci(self):
+        prefix = [pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}]
+        with patch.object(m, "all_pages", return_value=[]), patch.object(m, "automatic_paths", return_value={"docs/guide.md"}), patch.object(m, "api", side_effect=prefix+[[]]):
             self.assertIsNone(m.authorization("fake", 7))
-
-    def test_delegated_authorization(self):
-        with patch.object(m, "all_pages", side_effect=[[], [{"id": 1, "user": {"login": "review-agent"}, "state": "APPROVED", "commit_id": H, "author_association": "COLLABORATOR"}]]), patch.object(m, "trusted_reviewer", return_value="review-agent"), patch.object(m, "api", side_effect=[pr(), {"commit": {"sha": B}}, {"parents": [{"sha": B}, {"sha": H}]}, [success()], {"commit": {"sha": B}}]):
-            self.assertEqual(m.authorization("fake", 7), (H, B, C, B))
+        with patch.object(m, "all_pages", return_value=[]), patch.object(m, "automatic_paths", return_value={"docs/guide.md"}), patch.object(m, "api", side_effect=prefix+[[success()], {"commit": {"sha": B}}]):
+            self.assertEqual(m.authorization("fake", 7), (H, B, C, "automatic-path-policy"))

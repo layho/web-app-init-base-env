@@ -1,7 +1,7 @@
 """Trusted base-only preview merge coordinator; separate from Docker tests.
 
 No main publishing, arbitrary repository/branch arguments, or forced push.
-The owner or a separately configured trusted reviewer authorizes the exact head.
+Owner review or an explicit host administrator path policy authorizes preview.
 """
 import argparse
 import base64
@@ -95,38 +95,55 @@ def owner_decision_present(comments, head):
     return False
 
 
-def trusted_reviewer():
-    """Host-only opt-in; never read delegation from candidate files or comments."""
-    path = ROOT / "trusted-reviewer"
+AUTO_POLICY = Path("/usr/local/etc/macmini-pr-tests/preview-auto-paths.json")
+
+
+def automatic_paths():
+    """Explicit operator opt-in, outside the candidate and its writable home."""
+    for directory in (Path("/usr/local"), AUTO_POLICY.parent.parent, AUTO_POLICY.parent):
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            return frozenset()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("Unsafe automatic policy directory")
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(AUTO_POLICY, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return None
-    with os.fdopen(fd, "r", encoding="ascii") as stream:
+        return frozenset()
+    with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_size > 128):
-            raise ValueError("Unsafe trusted reviewer configuration")
-        login = stream.read().strip().lower()
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,38}(?:\\[bot\\])?", login) or login == OWNER:
-        raise ValueError("Invalid independent reviewer identity")
-    return login
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o222 or info.st_size > 8192:
+            raise ValueError("Unsafe automatic policy")
+        data = json.loads(stream.read(8193))
+    if not isinstance(data, dict) or set(data) != {"schema", "paths"} or type(data["schema"]) is not int or data["schema"] != 1:
+        raise ValueError("Invalid automatic policy")
+    paths = data["paths"]
+    if not isinstance(paths, list) or len(paths) > 100 or any(not isinstance(p, str) or not safe_auto_path(p) for p in paths):
+        raise ValueError("Invalid automatic path list")
+    return frozenset(paths)
 
 
-def delegated_review(reviews, reviewer, author, head):
-    """Use GitHub review identity and commit, not self-reported agent labels."""
-    if not reviewer or reviewer.lower() == author.lower() or reviewer.lower() == OWNER:
+def safe_auto_path(path):
+    # Deliberately narrow first rollout: documentation and presentation-only
+    # styles. No scripts, dependencies, tests, authentication, or host runtime.
+    return bool(re.fullmatch(r"(?:docs/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\\.md|frontend/src/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\\.css)", path))
+
+
+def automatic_diff_allowed(folder, base, merge, allowed):
+    if not allowed:
         return False
-    for item in sorted(reviews, key=lambda row: row["id"], reverse=True):
-        if (item.get("user") or {}).get("login", "").lower() != reviewer.lower():
-            continue
-        state = item.get("state")
-        if state in {"COMMENTED", "PENDING"}:
-            continue
-        # A later denial/dismissal or a review of another commit cannot approve.
-        return (state == "APPROVED" and item.get("commit_id") == head
-                and item.get("author_association") in {"OWNER", "MEMBER", "COLLABORATOR"})
-    return False
+    # Exact tested merge tree against its first parent, including renames,
+    # symlinks, mode changes and deletions. Only ordinary modified blobs.
+    raw = git(folder, "diff-tree", "--no-commit-id", "--raw", "-r", "--no-renames",
+              "--no-abbrev", base, merge)
+    if not raw:
+        return False
+    for line in raw.splitlines():
+        match = re.fullmatch(r":100644 100644 [0-9a-f]{40} [0-9a-f]{40} M\\t([^\\t]+)", line)
+        if not match or match.group(1) not in allowed or not safe_auto_path(match.group(1)):
+            return False
+    return True
 
 
 def tested(statuses, head, base, merge):
@@ -337,13 +354,9 @@ def authorization(token, number):
         # An explicit owner denial must never fall through to delegated review.
         if owner_decision_present(comments, head):
             return gate_block(number, "owner_review_missing_or_revoked")
-        reviewer = trusted_reviewer()
-        if not reviewer:
+        if not automatic_paths():
             return gate_block(number, "owner_review_missing_or_revoked")
-        reviews = all_pages(token, f"/pulls/{number}/reviews")
-        if not delegated_review(reviews, reviewer, pr["user"]["login"], head):
-            return gate_block(number, "trusted_exact_head_review_missing")
-        required = base
+        required = "automatic-path-policy"
     statuses = api(token, f"/commits/{head}/statuses?per_page=100")
     if not tested(statuses, head, base, merge):
         return gate_block(number, "exact_test_receipt_missing_or_invalid")
@@ -380,7 +393,11 @@ def verify_candidate(folder, base, head, candidate, required):
         raise ValueError("Fetched merge candidate differs from tested parents")
     if git(folder, "rev-parse", "refs/macci/base") != base:
         raise ValueError("Preview moved")
-    git(folder, "merge-base", "--is-ancestor", required, base)
+    if required == "automatic-path-policy":
+        if not automatic_diff_allowed(folder, base, candidate, automatic_paths()):
+            raise ValueError("Candidate outside operator automatic path policy")
+    else:
+        git(folder, "merge-base", "--is-ancestor", required, base)
 
 
 def merge_one(token, number, dry_run=False):
@@ -389,7 +406,7 @@ def merge_one(token, number, dry_run=False):
     if gate is None:
         return False
     head, base, merge, required = gate
-    if frozen and not replacement_allowed(token, number, base, head, merge):
+    if frozen and (required == "automatic-path-policy" or not replacement_allowed(token, number, base, head, merge)):
         gate_block(number, "acceptance_freeze")
         return False
     with TemporaryDirectory(prefix="macci-preview-") as folder:
@@ -405,7 +422,10 @@ def merge_one(token, number, dry_run=False):
         if authorization(token, number) != gate:
             print(f"PR #{number}: gate changed; no push", flush=True)
             return False
-        if preview_frozen(token) and not replacement_allowed(token, number, base, head, merge):
+        if required == "automatic-path-policy" and not automatic_diff_allowed(folder, base, merge, automatic_paths()):
+            gate_block(number, "automatic_path_policy_changed")
+            return False
+        if preview_frozen(token) and (required == "automatic-path-policy" or not replacement_allowed(token, number, base, head, merge)):
             print(f"PR #{number}: preview acceptance freeze; no authorized replacement", flush=True)
             return False
         if dry_run:
