@@ -60,6 +60,37 @@ def test_cross_origin_denied(client):
     assert response.status_code==403
 
 
+def test_login_prunes_only_one_batch_of_expired_sessions(client, monkeypatch):
+    from datetime import timedelta
+    from sqlalchemy import select
+    from app import auth
+    from app.models import AdminSession, utcnow
+
+    now = utcnow()
+    monkeypatch.setattr(auth, "utcnow", lambda: now)
+    monkeypatch.setattr(auth, "SESSION_CLEANUP_BATCH", 2)
+    sessions = app.dependency_overrides[get_db]()
+    db = next(sessions)
+    try:
+        expiry = {"oldest": now - timedelta(days=1),
+                  "boundary": now, "boundary-next": now,
+                  "active": now + timedelta(seconds=1)}
+        db.add_all(AdminSession(token_hash=auth.token_hash(token), csrf_hash="unused",
+                                username="admin", expires_at=expires)
+                   for token, expires in expiry.items())
+        db.commit()
+        response = client.post("/api/login", json={
+            "username": "admin", "password": "A-very-strong-passphrase-123",
+        })
+        assert response.status_code == 200
+        assert set(db.scalars(select(AdminSession.token_hash))) == {
+            auth.token_hash("boundary-next"), auth.token_hash("active"),
+            auth.token_hash(client.cookies[COOKIE_NAME]),
+        }
+    finally:
+        sessions.close()
+
+
 def test_operation_views_require_login_and_hide_raw_log_lines(client, monkeypatch, tmp_path):
     from app import operations
 

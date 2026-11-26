@@ -391,14 +391,30 @@ def run_refresh(force=False):
         return int(state["state"] != "success")
 
 
-def refresh_active():
+def enqueue_active_refresh():
+    folder = development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "pr-active.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"state": "running"}
+        fd = lock.fileno()
+        with (folder / "pr-active-worker.log").open("ab") as log:
+            subprocess.Popen([sys.executable, "-m", "scripts.sync_development_tasks", "--active", str(fd)],
+                             cwd=str(development_tasks.CACHE_PATH.parent.parent), stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=log, start_new_session=True, pass_fds=(fd,))
+    return {"state": "requested"}
+
+
+def refresh_active(lock_fd=None):
     """Fast path independent of the full-history lock; no HTTP request waits."""
     target = pr_tracking.target()
     if not target:
         return 0
     folder = development_tasks.CACHE_PATH.parent
     folder.mkdir(parents=True, exist_ok=True)
-    with (folder/"pr-active.lock").open("a") as lock:
+    with (os.fdopen(lock_fd, "a") if lock_fd is not None else (folder / "pr-active.lock").open("a")) as lock:
         try:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
@@ -463,4 +479,7 @@ def refresh_active():
 
 
 if __name__ == "__main__":
-    raise SystemExit(refresh_active() if "--active" in sys.argv[1:] else run_refresh(force="--force" in sys.argv[1:]))
+    args = sys.argv[1:]
+    if args[:1] == ["--active"]:
+        raise SystemExit(refresh_active(int(args[1]) if len(args) > 1 else None))
+    raise SystemExit(run_refresh(force="--force" in args))

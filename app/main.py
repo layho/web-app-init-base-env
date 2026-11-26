@@ -288,17 +288,11 @@ def request_active_refresh(request: Request, db: Session = Depends(get_db)):
     auth.authorize_session(request, db)
     if not pr_tracking.enabled():
         raise HTTPException(503, "No verified repository")
-    import sys
-    folder=development_tasks.CACHE_PATH.parent
-    folder.mkdir(parents=True,exist_ok=True)
+    from scripts.sync_development_tasks import enqueue_active_refresh
     try:
-        with (folder/"pr-active-worker.log").open("ab") as log:
-            subprocess.Popen([sys.executable,"-m","scripts.sync_development_tasks","--active"],
-                             cwd=str(Path(__file__).resolve().parents[1]),stdin=subprocess.DEVNULL,
-                             stdout=log,stderr=log,start_new_session=True)
+        return enqueue_active_refresh()
     except OSError:
         raise HTTPException(503,"活跃PR同步进程启动失败") from None
-    return {"state":"requested"}
 
 @app.post("/api/v1/development-tasks/refresh", status_code=202)
 def request_task_refresh(request: Request, db: Session = Depends(get_db)):

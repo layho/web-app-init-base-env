@@ -13,6 +13,7 @@ from . import admin_settings
 
 COOKIE_NAME = "webapp_session"
 TTL_HOURS = 12
+SESSION_CLEANUP_BATCH = 100
 _failures = []
 
 def hash_password(password: str) -> str:
@@ -68,8 +69,15 @@ def login(request: Request, response: Response, db: Session, username: str, pass
         raise HTTPException(401, "Incorrect credentials")
     raw_token = secrets.token_urlsafe(48)
     raw_csrf = session_csrf(raw_token)
+    issued_at = utcnow()
+    expired_ids = (select(AdminSession.id)
+                   .where(AdminSession.expires_at <= issued_at)
+                   .order_by(AdminSession.expires_at, AdminSession.id)
+                   .limit(SESSION_CLEANUP_BATCH))
+    db.execute(delete(AdminSession).where(AdminSession.id.in_(expired_ids)),
+               execution_options={"synchronize_session": False})
     row = AdminSession(token_hash=token_hash(raw_token), csrf_hash=token_hash(raw_csrf), username=expected_user,
-                       expires_at=utcnow() + timedelta(hours=TTL_HOURS))
+                       expires_at=issued_at + timedelta(hours=TTL_HOURS))
     db.add(row)
     db.commit()
     response.set_cookie(key=COOKIE_NAME, value=raw_token, secure=os.getenv("APP_COOKIE_SECURE", "true").lower()=="true",
