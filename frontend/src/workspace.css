@@ -1,6 +1,6 @@
 .workspace-shell {
   min-height: 100vh;
-  background: #f6f8fc;
+  background: #f1f5f9;
 }
 
 .workspace-sider {
@@ -26,13 +26,13 @@
   width: 39px;
   height: 39px;
   border-radius: 11px;
-  background: #3979ec;
+  background: #2563eb;
   color: #fff;
   font-weight: 700;
 }
 
 .workspace-name {
-  color: #25334a;
+  color: #172033;
   font-weight: 700;
   white-space: nowrap;
 }
@@ -90,4 +90,32 @@
   .workspace-content {
     padding: 12px;
   }
+}
+
+/* Shared approved HostOps visual language; no business behavior changes. */
+.workspace-shell { --workspace-primary: #2563eb; --workspace-muted: #64748b; }
+.workspace-frame { min-width: 0; flex: 1; }
+.workspace-shell .workspace-sider { top: 64px; height: calc(100vh - 64px); overflow: auto; background: #f8fafc; }
+.workspace-shell .workspace-header { z-index: 10; background: #fff; min-height: 64px; }
+.workspace-header .workspace-brand { min-height: 0; padding: 0; border: 0; }
+.workspace-header .workspace-mark { width: 36px; height: 36px; flex-basis: 36px; }
+.workspace-page-heading { margin: 0 0 14px; }
+.workspace-page-heading .ant-typography { margin: 0; }
+.workspace-content .ant-card { border-color: #e2e8f0; box-shadow: none; border-radius: 10px; }
+.workspace-content .ant-table-wrapper { min-width: 0; }
+@media (max-width: 767px) {
+  .workspace-shell .workspace-sider { position: relative; top: 0; height: auto; min-height: calc(100dvh - 64px); }
+  .workspace-header .workspace-brand { justify-content: flex-start; }
+  .workspace-page-heading { margin-bottom: 10px; }
+}
+
+.workspace-header-actions { min-width: 0; }
+.workspace-shell .workspace-menu .ant-menu-item { margin-block: 4px; }
+.workspace-shell .workspace-menu .ant-menu-item-selected { font-weight: 600; }
+.workspace-content .ant-card-head { border-bottom-color: #e2e8f0; }
+.workspace-content .ant-table-thead > tr > th { font-weight: 600; }
+@media (max-width: 767px) {
+  .workspace-header .workspace-name { font-size: 14px; white-space: normal; }
+  .workspace-header .workspace-brand { flex: 1 1 140px; }
+  .workspace-header-actions { flex: 0 1 auto; }
 }
