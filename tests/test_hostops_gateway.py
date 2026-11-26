@@ -63,3 +63,27 @@ def test_policy_and_module_evidence(client,monkeypatch):
     monkeypatch.setattr(hostops,"_clock",lambda:1091)
     assert client.get(prefix+"/modules").json()["modules"][0]["state"]=="unknown"
     assert not client.get(prefix+"/policy").json()["agent_dispatch_active"]
+
+
+def test_mcp_readonly_audience_and_protocol(client,monkeypatch):
+    import json
+    monkeypatch.setenv("HOSTOPS_MCP_ENABLED","true")
+    monkeypatch.setenv("HOSTOPS_MCP_READ_TOKEN","m"*48)
+    url="/api/hostops/v1/mcp"
+    headers={"Authorization":"Bearer "+"m"*48}
+    def rpc(method,params=None,**kwargs):
+        return client.post(url,json={"jsonrpc":"2.0","id":1,"method":method,"params":params or {}},**kwargs)
+    assert rpc("tools/list").status_code==401
+    assert rpc("tools/list",headers={"Authorization":"Bearer "+"a"*40}).status_code==401
+    assert rpc("tools/list",headers={**headers,"Origin":"https://other.example"}).status_code==403
+    assert rpc("initialize",{"protocolVersion":"2025-06-18"},headers=headers).json()["result"]["protocolVersion"]=="2025-06-18"
+    names={t["name"] for t in rpc("tools/list",headers=headers).json()["result"]["tools"]}
+    assert names=={"hostops_get_health","hostops_list_services","hostops_get_module_versions"}
+    assert rpc("tools/call",{"name":"hostops_submit_task"},headers=headers).json()["error"]["code"]==-32602
+    assert rpc("tools/call",{"name":"hostops_get_health","arguments":{"command":"anything"}},headers=headers).json()["error"]["code"]==-32602
+    data=rpc("tools/call",{"name":"hostops_get_health"},headers=headers).json()["result"]
+    assert json.loads(data["content"][0]["text"])["state"]=="never_seen"
+    assert client.post("/api/hostops/v1/agent/heartbeat",json=payload(),headers=headers).status_code==401
+    assert client.get("/api/hostops/v1/tasks",headers=headers).status_code==401
+    monkeypatch.setenv("HOSTOPS_MCP_READ_TOKEN","a"*40)
+    assert rpc("tools/list",headers=headers).status_code==503

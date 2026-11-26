@@ -308,3 +308,89 @@ def modules(request: Request, response: Response, db: Session=Depends(get_db)):
     return {"modules":[{"module_id":"hostops.agent","observed_digest":observed,
                         "expected_digest":target,"state":state,"fresh":fresh}],
             "remote_upgrade_allowed":False}
+
+
+# Read-only external integration: independent credential and fixed tool schemas.
+# This stateless MCP endpoint deliberately grants no execution authority.
+MCP_TOOLS = [
+    {"name":"hostops_get_health","description":"Read last authenticated host heartbeat; check state before interpreting telemetry.",
+     "inputSchema":{"type":"object","properties":{},"additionalProperties":False},
+     "annotations":{"readOnlyHint":True,"destructiveHint":False,"openWorldHint":False}},
+    {"name":"hostops_list_services","description":"Read allowlisted services from the last heartbeat, not a live command.",
+     "inputSchema":{"type":"object","properties":{},"additionalProperties":False},
+     "annotations":{"readOnlyHint":True,"destructiveHint":False,"openWorldHint":False}},
+    {"name":"hostops_get_module_versions","description":"Compare observed agent digest with configured target; freshness matters.",
+     "inputSchema":{"type":"object","properties":{},"additionalProperties":False},
+     "annotations":{"readOnlyHint":True,"destructiveHint":False,"openWorldHint":False}},
+]
+
+
+def integration_identity(request):
+    host,agent_secret=settings()
+    token=os.getenv("HOSTOPS_MCP_READ_TOKEN","")
+    signing=os.getenv("HOSTOPS_JOB_SIGNING_KEY","")
+    if (os.getenv("HOSTOPS_MCP_ENABLED")!="true" or not re.fullmatch(r"[A-Za-z0-9_-]{43,256}",token)
+            or hmac.compare_digest(token,agent_secret) or hmac.compare_digest(token,signing)):
+        raise HTTPException(503,"HostOps read-only integration not configured")
+    # This bearer-only endpoint is not a browser cookie or agent authentication audience.
+    if not hmac.compare_digest(request.headers.get("authorization","").encode(),("Bearer "+token).encode()):
+        raise HTTPException(401,"Integration authentication required",headers={"WWW-Authenticate":"Bearer"})
+    if request.headers.get("origin"):
+        raise HTTPException(403,"Browser origin not allowed on integration endpoint")
+    return host
+
+
+class RpcRequest(StrictModel):
+    jsonrpc: Literal["2.0"]
+    id: str | int | None = None
+    method: str = Field(max_length=80)
+    params: dict = Field(default_factory=dict)
+
+
+@router.post("/mcp")
+def mcp_rpc(payload: RpcRequest, request: Request, response: Response):
+    import json
+    host=integration_identity(request)
+    response.headers["Cache-Control"]="no-store"
+    response.headers["X-Content-Type-Options"]="nosniff"
+    def error(code,message):
+        return {"jsonrpc":"2.0","id":payload.id,"error":{"code":code,"message":message}}
+    def ok(result):
+        return {"jsonrpc":"2.0","id":payload.id,"result":result}
+    if payload.method=="notifications/initialized" and payload.id is None:
+        return Response(status_code=202,headers={"Cache-Control":"no-store"})
+    if payload.id is None:
+        return error(-32600,"Request id required")
+    if payload.method=="initialize":
+        version=payload.params.get("protocolVersion")
+        if version not in ("2025-03-26","2025-06-18"):
+            version="2025-06-18"
+        return ok({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"hostops-readonly","version":"0.3.0"}})
+    if payload.method=="ping":
+        return ok({})
+    if payload.method=="tools/list":
+        return ok({"tools":MCP_TOOLS})
+    if payload.method!="tools/call":
+        return error(-32601,"Method not supported")
+    name=payload.params.get("name")
+    arguments=payload.params.get("arguments",{})
+    if type(name) is not str or name not in {t["name"] for t in MCP_TOOLS} or type(arguments) is not dict or arguments:
+        return error(-32602,"Unknown tool or invalid arguments")
+    with _lock:
+        latest=_latest if _latest and _latest[0]==host else None
+        age=max(0,int(_clock()-latest[1])) if latest else None
+        snapshot=latest[2] if latest else {}
+    state="never_seen" if age is None else "online" if age<=90 else "stale"
+    result={"host_id":host,"state":state,"age_seconds":age}
+    if name=="hostops_get_health":
+        result["health"]={k:snapshot.get(k) for k in ("system","architecture","disk")} if latest else None
+    elif name=="hostops_list_services":
+        result["services"]=snapshot.get("services",[])
+    else:
+        target=os.getenv("HOSTOPS_EXPECTED_RUNTIME_DIGEST","")
+        target=target if re.fullmatch(r"[0-9a-f]{64}",target) else None
+        observed=snapshot.get("runtime_digest")
+        result.update(observed_digest=observed,expected_digest=target,
+                      comparison="unknown" if state!="online" or not observed or not target else
+                      "matching" if observed==target else "different")
+    return ok({"content":[{"type":"text","text":json.dumps(result,ensure_ascii=True)}]})
