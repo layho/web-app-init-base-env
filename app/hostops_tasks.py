@@ -64,6 +64,14 @@ class TaskStore:
             db.execute("CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id,seq)")
             db.execute("CREATE INDEX IF NOT EXISTS tasks_host_state ON tasks(host_id,state,created_at)")
 
+            db.execute("""CREATE TABLE IF NOT EXISTS host_snapshots (
+                host_id TEXT PRIMARY KEY, received_at INTEGER NOT NULL, body TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS integration_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, host_id TEXT NOT NULL,
+                actor TEXT NOT NULL, operation TEXT NOT NULL, evidence_state TEXT NOT NULL,
+                at INTEGER NOT NULL)""")
+            db.execute("CREATE INDEX IF NOT EXISTS integration_host_seq ON integration_events(host_id,seq)")
+
     def connect(self):
         db = sqlite3.connect(self.path, timeout=3)
         db.row_factory = sqlite3.Row
@@ -220,3 +228,43 @@ class TaskStore:
             return [dict(row) for row in db.execute("""SELECT e.seq,e.task_id,e.actor,e.state,e.at,t.operation
                 FROM task_events e JOIN tasks t USING(task_id) WHERE t.host_id=? AND e.seq>?
                 ORDER BY e.seq LIMIT 100""",(host,after))]
+
+
+    def save_snapshot(self, host, snapshot, now=None):
+        now=int(time.time()) if now is None else now
+        body=json.dumps(snapshot,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
+        if len(body)>16384 or snapshot.get("host_id")!=host:
+            raise ValueError("invalid host snapshot")
+        with closing(self.connect()) as db,db:
+            db.execute("""INSERT INTO host_snapshots VALUES (?,?,?)
+                ON CONFLICT(host_id) DO UPDATE SET received_at=excluded.received_at,body=excluded.body""",
+                (host,now,body))
+
+    def snapshot(self, host, now=None):
+        now=int(time.time()) if now is None else now
+        with closing(self.connect()) as db:
+            row=db.execute("SELECT received_at,body FROM host_snapshots WHERE host_id=?",(host,)).fetchone()
+        if row is None:
+            return None
+        elapsed=now-row["received_at"]
+        # A wall-clock rollback cannot make old evidence appear current.
+        age=elapsed if elapsed>=0 else 91
+        return age,json.loads(row["body"])
+
+    def integration_event(self, host, operation, evidence_state):
+        if operation not in ("hostops_get_health","hostops_list_services","hostops_get_module_versions"):
+            raise ValueError("unsupported integration operation")
+        if evidence_state not in ("never_seen","online","stale"):
+            raise ValueError("invalid evidence state")
+        with closing(self.connect()) as db,db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT COUNT(*) FROM integration_events").fetchone()[0]>=100000:
+                raise TaskCapacity("integration audit capacity reached")
+            cursor=db.execute("INSERT INTO integration_events(host_id,actor,operation,evidence_state,at) VALUES (?,?,?,?,?)",
+                              (host,"mcp:readonly",operation,evidence_state,int(time.time())))
+            return cursor.lastrowid
+
+    def integration_audit(self,host,after=0):
+        with closing(self.connect()) as db:
+            return [dict(row) for row in db.execute("""SELECT seq,actor,operation,evidence_state,at
+                FROM integration_events WHERE host_id=? AND seq>? ORDER BY seq LIMIT 100""",(host,after))]

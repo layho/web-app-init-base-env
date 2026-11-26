@@ -19,6 +19,7 @@ router = APIRouter(prefix="/api/hostops/v1")
 _lock = threading.Lock()
 _latest = None
 _clock = time.monotonic
+_wall_clock = time.time
 OPERATIONS = {"host.health", "service.inventory", "agent.snapshot"}
 SERVICES = {"macci.runner", "macci.preview", "macci.publish", "macci.receipts", "panel.merge"}
 
@@ -79,9 +80,33 @@ def heartbeat(payload: Heartbeat, request: Request, response: Response):
     if payload.disk and max(payload.disk.used_bytes, payload.disk.free_bytes) > payload.disk.total_bytes:
         raise HTTPException(422, "Invalid disk capacity")
     response.headers["Cache-Control"] = "no-store"
+    data=payload.model_dump()
+    if os.getenv("HOSTOPS_STATE_DIR"):
+        try:
+            task_store().save_snapshot(host,data,now=int(_wall_clock()))
+        except (sqlite3.Error,ValueError):
+            raise HTTPException(503,"HostOps snapshot storage unavailable") from None
     with _lock:
-        _latest = (host, _clock(), payload.model_dump())
+        _latest = (host, _clock(), data)
     return {"accepted": True, "schema": 1}
+
+
+def host_evidence(host):
+    # Configured persistent storage is authoritative across worker processes.
+    if os.getenv("HOSTOPS_STATE_DIR"):
+        try:
+            evidence=task_store().snapshot(host,now=int(_wall_clock()))
+        except (sqlite3.Error,ValueError):
+            raise HTTPException(503,"HostOps snapshot storage unavailable") from None
+        if evidence is None:
+            return None,None
+        return evidence
+    with _lock:
+        if _latest is None or _latest[0]!=host:
+            return None,None
+        _,received,data=_latest
+        elapsed=_clock()-received
+        return int(elapsed) if elapsed>=0 else 91,data
 
 
 @router.get("/hosts")
@@ -89,13 +114,9 @@ def hosts(request: Request, response: Response, db: Session = Depends(get_db)):
     auth.authorize_session(request, db)
     response.headers["Cache-Control"] = "no-store"
     host, _ = settings()
-    with _lock:
-        if _latest is None or _latest[0] != host:
-            return {"hosts": [{"host_id": host, "state": "never_seen", "snapshot": None}]}
-        _, received, data = _latest
-        age = max(0, int(_clock() - received))
-        return {"hosts": [{"host_id": host, "state": "online" if age <= 90 else "stale",
-                           "age_seconds": age, "snapshot": data}]}
+    age,data=host_evidence(host)
+    state="never_seen" if age is None else "online" if age<=90 else "stale"
+    return {"hosts":[{"host_id":host,"state":state,"age_seconds":age,"snapshot":data}]}
 
 
 class TaskRequest(StrictModel):
@@ -283,9 +304,8 @@ def policy(request: Request, response: Response, db: Session=Depends(get_db)):
     auth.authorize_session(request,db)
     host,_=settings()
     response.headers["Cache-Control"]="no-store"
-    with _lock:
-        active=bool(_latest and _latest[0]==host and 0<=_clock()-_latest[1]<=90
-                    and _latest[2].get("dispatch_active"))
+    age,snapshot=host_evidence(host)
+    active=bool(age is not None and age<=90 and snapshot and snapshot.get("dispatch_active"))
     return {"host_id":host,"policy_version":"readonly-v1","dispatch_configured":dispatch_ready(),
             "agent_dispatch_active":active,"operations":[{"operation":op,"risk":"L1","allowed":True}
             for op in sorted(OPERATIONS)],"service_mutation_allowed":False,
@@ -299,10 +319,9 @@ def modules(request: Request, response: Response, db: Session=Depends(get_db)):
     response.headers["Cache-Control"]="no-store"
     target=os.getenv("HOSTOPS_EXPECTED_RUNTIME_DIGEST","")
     target=target if re.fullmatch(r"[0-9a-f]{64}",target) else None
-    with _lock:
-        latest=_latest if _latest and _latest[0]==host else None
-        observed=latest[2].get("runtime_digest") if latest else None
-        fresh=bool(latest and 0<=_clock()-latest[1]<=90)
+    age,snapshot=host_evidence(host)
+    observed=snapshot.get("runtime_digest") if snapshot else None
+    fresh=age is not None and age<=90
     state=("unknown" if not fresh or not observed or not target else
            "matching" if observed==target else "different")
     return {"modules":[{"module_id":"hostops.agent","observed_digest":observed,
@@ -376,14 +395,12 @@ def mcp_rpc(payload: RpcRequest, request: Request, response: Response):
     arguments=payload.params.get("arguments",{})
     if type(name) is not str or name not in {t["name"] for t in MCP_TOOLS} or type(arguments) is not dict or arguments:
         return error(-32602,"Unknown tool or invalid arguments")
-    with _lock:
-        latest=_latest if _latest and _latest[0]==host else None
-        age=max(0,int(_clock()-latest[1])) if latest else None
-        snapshot=latest[2] if latest else {}
+    age,snapshot=host_evidence(host)
+    snapshot=snapshot or {}
     state="never_seen" if age is None else "online" if age<=90 else "stale"
     result={"host_id":host,"state":state,"age_seconds":age}
     if name=="hostops_get_health":
-        result["health"]={k:snapshot.get(k) for k in ("system","architecture","disk")} if latest else None
+        result["health"]={k:snapshot.get(k) for k in ("system","architecture","disk")} if snapshot else None
     elif name=="hostops_list_services":
         result["services"]=snapshot.get("services",[])
     else:
@@ -393,4 +410,25 @@ def mcp_rpc(payload: RpcRequest, request: Request, response: Response):
         result.update(observed_digest=observed,expected_digest=target,
                       comparison="unknown" if state!="online" or not observed or not target else
                       "matching" if observed==target else "different")
+    # Fail closed: do not return external telemetry without a durable audit record.
+    try:
+        event_id=task_store().integration_event(host,name,state)
+    except (sqlite3.Error,TaskCapacity):
+        raise HTTPException(503,"HostOps integration audit unavailable") from None
+    result["audit_event_id"]=event_id
     return ok({"content":[{"type":"text","text":json.dumps(result,ensure_ascii=True)}]})
+
+
+@router.get("/integration-audit")
+def integration_audit(request: Request,response: Response,after: int=0,db: Session=Depends(get_db)):
+    auth.authorize_session(request,db)
+    host,_=settings()
+    if after<0 or after>9223372036854775807:
+        raise HTTPException(422,"Invalid cursor")
+    response.headers["Cache-Control"]="no-store"
+    try:
+        events=task_store().integration_audit(host,after)
+    except sqlite3.Error:
+        raise HTTPException(503,"HostOps integration audit unavailable") from None
+    return {"events":events,"next_cursor":events[-1]["seq"] if events else after}
+

@@ -3,3 +3,5 @@ Tools: hostops_get_health, hostops_list_services, hostops_get_module_versions, h
 
 ## Implemented candidate transport
 POST /api/hostops/v1/mcp: stateless JSON-RPC initialize, ping, tools/list and tools/call for the three read-only tools get_health, list_services and get_module_versions. Explicit opt-in and independent bearer audience; no task creation, cancellation, log access or upgrade authorization. Origin-bearing requests rejected. This is a server-side protocol subset, not a verified ChatGPT plugin connection. OAuth discovery, client interoperability and tool-call audit are still required before actual ChatGPT integration acceptance.
+
+Tool results now require configured private HostOps SQLite storage and a successfully committed independent integration audit event. Each result includes its audit_event_id; administrators can query /integration-audit with a sequence cursor. The fixed actor mcp:readonly identifies the shared integration credential, not an individual ChatGPT user. This remains a bearer-only protocol candidate; OAuth and real client interoperability are not verified.
