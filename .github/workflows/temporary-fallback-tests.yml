@@ -32,7 +32,6 @@ jobs:
         if: contains(github.event.pull_request.labels.*.name, 'full-regression')
         run: /tmp/fallback-ci/bin/python -m pytest -q
       - name: Frontend regression and build
-        if: contains(github.event.pull_request.labels.*.name, 'full-regression')
         run: |
           npm --prefix frontend ci --ignore-scripts --no-audit --no-fund
           npm --prefix frontend run build

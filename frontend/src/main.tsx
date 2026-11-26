@@ -14,6 +14,7 @@ import type { ProjectInfo } from './ProjectInfoPage'
 import { UsageGuidePage } from './v2/usage-guide/UsageGuidePage'
 import { WorkbenchPage } from './v2/workbench/WorkbenchPage'
 import { overviewEvidence } from './v2/workbench/facts'
+import { HostOpsPage } from './HostOpsPage'
 import { WorkspaceShell } from './WorkspaceShell'
 import { ScreenshotPicker } from './ScreenshotPicker'
 import { FeedbackDelivery } from './FeedbackDelivery'
@@ -64,6 +65,7 @@ const navigation = [
   { key: 'tasks', label: '开发任务', icon: <UnorderedListOutlined /> },
   { key: 'releases', label: '更新记录', icon: <HistoryOutlined /> },
   { key: 'logs', label: '运行诊断', icon: <ProfileOutlined /> },
+  { key: 'hostops', label: '宿主机管理', icon: <CloudDownloadOutlined /> },
 ] as const
 
 type Page = (typeof navigation)[number]['key'] | 'feedback'
@@ -583,6 +585,8 @@ function App() {
             await api('/api/v1/releases/accept', { method: 'POST', body: JSON.stringify({ sha, version }) }, session.csrf_token)
             await loadOperations('releases')
           }} />
+      ) : page === 'hostops' ? (
+        <HostOpsPage load={signal => api('/api/hostops/v1/hosts', {signal})} />
       ) : page === 'logs' ? (
         <SystemLogPage data={systemLogs} loading={loadingOperations === 'logs'} onRefresh={() => void loadOperations('logs')} />
       ) : (
