@@ -9,7 +9,6 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
-import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,9 +34,32 @@ def provenance():
 
 def generate(tmp_path, record):
     source = tmp_path / "source"
-    subprocess.check_call(["git", "clone", "--local", "--quiet", str(ROOT), str(source)], timeout=60)
-    subprocess.check_call(["git", "-C", str(source), "checkout", "--detach", "--quiet", record["source_sha"]], timeout=60)
+    # MacCI supplies a git archive, not a checkout with historical objects.
+    # Reconstruct the pinned source from inert text blobs; verify each Git blob
+    # identity before executing the historical generator.
+    fixture = PROVENANCE.parent / "source"
+    for name, expected in record["source_blobs"].items():
+        relative = Path(name)
+        assert not relative.is_absolute() and ".." not in relative.parts
+        raw = (fixture / (name + ".txt")).read_bytes()
+        header = f"blob {len(raw)}\0".encode()
+        assert hashlib.sha1(header + raw).hexdigest() == expected, name
+        destination = source / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(raw)
     app_init = load_module(source / "deploy/app-init/app_init.py", "app_init_legacy_baseline")
+
+    def fixture_git(path, *args):
+        assert Path(path) == source
+        if args == ("rev-parse", "HEAD"):
+            return record["source_sha"]
+        if args == ("status", "--porcelain", "--untracked-files=normal"):
+            return ""
+        raise AssertionError(f"Unexpected git operation in offline fixture: {args}")
+
+    # Only checkout identity/cleanliness is simulated; the generator and
+    # generated-file digest assertions remain real.
+    app_init.git = fixture_git
     target = tmp_path / "generated"
     target.mkdir()
     params = record["parameters"]

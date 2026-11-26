@@ -192,3 +192,39 @@ class MergeTests(unittest.TestCase):
                 self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
             with patch.object(m,"api",return_value=[{**status,"state":"success"}]):
                 self.assertFalse(m.deployment_replacement_allowed("fake",7,B,H,C,D))
+
+
+    def test_gate_diagnostics_do_not_expose_remote_payload(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+        output = StringIO()
+        with patch.object(m, 'api', return_value={**pr(), 'mergeable_state': 'secret-remote-value'}), redirect_stdout(output):
+            self.assertIsNone(m.authorization('secret-token', 7))
+        self.assertIn('pr_ineligible', output.getvalue())
+        self.assertNotIn('secret-', output.getvalue())
+
+    def test_gate_diagnostics_missing_review_and_test(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+        for reviews, statuses, reason in [([], [], 'owner_review_missing_or_revoked'), ([comment()], [], 'exact_test_receipt_missing_or_invalid')]:
+            output = StringIO()
+            with patch.object(m, 'api', side_effect=[pr(), {'commit': {'sha': B}}, {'parents': [{'sha': B}, {'sha': H}]}, statuses]), patch.object(m, 'all_pages', return_value=reviews), redirect_stdout(output):
+                self.assertIsNone(m.authorization('fake', 7))
+            self.assertIn(reason, output.getvalue())
+
+
+    def test_advisory_pending_requires_exact_owner_candidate(self):
+        progress={"context":"macmini/progress-v1","state":"pending","creator":{"login":m.OWNER},"description":f"base={B} merge={C} test"}
+        self.assertTrue(m.advisory_only([success(),progress],B,C))
+        self.assertFalse(m.advisory_only([success(),{**progress,"context":"security"}],B,C))
+        self.assertFalse(m.advisory_only([success(),{**progress,"description":"old"}],B,C))
+        self.assertFalse(m.advisory_only([success(),{**progress,"creator":{"login":"other"}}],B,C))
+
+    def test_unstable_exact_advisory_and_checks(self):
+        candidate={**pr(),"mergeable_state":"unstable"}
+        progress={"context":"macmini/progress-v1","state":"pending","creator":{"login":m.OWNER},"description":f"base={B} merge={C} test"}
+        prefix=[candidate,{"commit":{"sha":B}},{"parents":[{"sha":B},{"sha":H}]},[success(),progress]]
+        with patch.object(m,"all_pages",return_value=[comment()]),patch.object(m,"api",side_effect=prefix+[{"total_count":0,"check_runs":[]},{"commit":{"sha":B}}]):
+            self.assertEqual(m.authorization("fake",7),(H,B,C,B))
+        with patch.object(m,"all_pages",return_value=[comment()]),patch.object(m,"api",side_effect=prefix+[{"total_count":1,"check_runs":[{"status":"completed","conclusion":"failure"}]}]):
+            self.assertIsNone(m.authorization("fake",7))

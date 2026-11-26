@@ -9,10 +9,16 @@ from app.models import UserFeedback, utcnow
 REPO = "layho/web-app-init-base-env" if os.getenv("APP_PREVIEW_FEEDBACK") == "1" else "example/web-app"
 API = "https://api.github.com"
 TOKEN = os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "")
+
+def feedback_token():
+    return (os.getenv("APP_GITHUB_TOKEN", "").strip()
+            or os.getenv("APP_GITHUB_PR_TOKEN", "").strip()
+            or os.getenv("APP_GITHUB_FEEDBACK_TOKEN", "").strip()
+            or TOKEN.strip())
 def github(method, path, data=None):
     body=json.dumps(data).encode() if data is not None else None
     req=urllib.request.Request(API+path, data=body, method=method,
-        headers={"Authorization":"Bearer "+TOKEN,"Accept":"application/vnd.github+json",
+        headers={"Authorization":"Bearer "+feedback_token(),"Accept":"application/vnd.github+json",
                  "X-GitHub-Api-Version":"2022-11-28","User-Agent":"web-app-feedback",
                  "Content-Type":"application/json"})
     with urllib.request.urlopen(req,timeout=20) as resp:
@@ -53,7 +59,7 @@ def find_existing_issue(entry, marker):
 
 
 def main():
-    if not TOKEN:
+    if not feedback_token():
         print("GitHub feedback token missing; items remain queued")
         return
     with SessionLocal() as db:
@@ -85,7 +91,7 @@ def main():
 
 def refresh_progress():
     """Pull trusted issue milestones independently from the outbound queue."""
-    if not TOKEN:
+    if not feedback_token():
         return 0
     cache = feedback_progress.load_cache()
     now = utcnow()

@@ -1,0 +1,823 @@
+[
+  {
+    "version": "0.1.40",
+    "title": "部署失败恢复及独立宿主回执",
+    "summary": "修复失败候选交付链路，优先部署日志独立采集。",
+    "changes": [
+      "MacCI 独立读取既有基座部署日志，回写精确候选部署成功或失败、回滚结果；暂仅覆盖基座验收站。",
+      "宿主测试与前端构建失败分开分类；旧版回滚允许缺少构建 SHA 文件。",
+      "修复真实 APP_GITHUB_TOKEN 污染旧凭据测试；宿主测试使用独立环境与 SQLite 内存库，不输出原始断言值；系统日志展示结构化失败用例。",
+      "部署失败独立恢复门禁：宿主失败回执、成功回滚、冻结 SHA、精确修复审查及原 MacCI 门禁同时满足；自动生成部署失败 Issue，保留脱敏测试标识，不伪造用户拒绝。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "实机核对失败候选回执及回滚结果",
+      "验证修复候选部署及前后端 SHA"
+    ],
+    "validation_note": "候选未测试未部署；独立宿主运行时必须升级后才可回传。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/139"
+  },
+  {
+    "version": "0.1.39",
+    "title": "历史任务状态治理与宿主凭据修复",
+    "summary": "区分正式发布代码与需求结项，清理历史任务分类；统一凭据及宿主诊断分阶段交付。",
+    "changes": [
+      "历史独立 PR 按正式 main 祖先证据认定发布，未关闭需求保留待结项。",
+      "显式受阻状态优先于历史 PR，关闭 PR 不再计入开发中。",
+      "统一宿主 GitHub 凭据文件可显式启用，兼容旧文件；提供只读一致性核对及原子无覆盖迁移，保留原配置。",
+      "统一凭据迁移必须以现有一致的宿主凭据为源，并核对基座有效配置；不自动选择旧 Web PR Token。",
+      "HTML 入口禁止缓存，部署检查前端构建 SHA，旧页面提示保存表单后重新加载。",
+      "MacCI 失败报告：绑定精确候选及运行 ID，仅提取限长测试标识或 TypeScript 错误码，私有 outbox 重试回写 GitHub。",
+      "测试详情页读取与最新精确候选匹配的 MacCI 结构化失败报告，拒绝旧候选或未授权评论。",
+      "MacCI 使用独立 advisory 状态报告环境准备、拉取、依赖构建、隔离测试阶段及30秒心跳；前端显示耗时和心跳超时，不改变正式合并门禁。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "同步历史任务并核对已发布 PR、受阻 Issue 和待结项需求。"
+    ],
+    "validation_note": "候选，尚未测试或部署。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/134"
+  },
+  {
+    "version": "0.1.38",
+    "title": "验收修复：任务状态、筛选及更新器诊断",
+    "summary": "针对 V0.1.37 验收未通过的问题修正历史 PR 状态与任务操作体验，并增加 Git 拉取重试和安全故障分类。",
+    "changes": [
+      "最新任务优先，支持状态筛选与任务/PR/负责人搜索。",
+      "关闭未合并的 PR 不再显示待合并或作为当前失败；历史证据仍保留。",
+      "Git 拉取失败分级分类，临时异常有限重试；当前运行版本与更新检查分别展示。",
+      "验收不通过可填写原因并提交修复Issue；反馈与拒绝支持私有截图及鉴权读取。",
+      "开发负责人独立于执行器调度状态展示。",
+      "反馈交付链按精确候选验收证据显示用户验收与正式发布，恢复旧版真实验收历史。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对 #128 负责人及 #129 合并部署证据，#16 已关闭历史记录。",
+      "验证筛选搜索及临时拉取失败后自动恢复。",
+      "MacCI 通过后，按拒绝候选的安全替换流程部署，重新人工验收。"
+    ],
+    "validation_note": "V0.1.37 未通过验收；不得发布旧候选。当前版本尚未测试或部署。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/130"
+  },
+  {
+    "version": "0.1.37",
+    "title": "任务列表后台刷新与同步状态",
+    "summary": "将全量 GitHub 同步移出网页请求，显示后台真实状态并防止重复执行。",
+    "changes": [
+      "手动刷新立即返回缓存，后台同步与定时任务共用跨进程锁。",
+      "任务页轮询本地状态，显示同步阶段、请求数、耗时和失败原因。",
+      "保留旧快照，不把同步失败冒充成功。",
+      "Issue/PR 联合快照、缺失关联主动补查和历史增量读取；保留合法负责人。",
+      "后台使用当前运行凭据执行 REST、GraphQL、仓库权限及额度只读诊断。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证刷新请求不等待 GitHub、重复触发去重及后台状态。",
+      "核对 #128 负责人及最新同步记录。",
+      "核对精确 MacCI、preview 运行 SHA 后人工验收。"
+    ],
+    "validation_note": "候选；尚未取得测试或部署回执。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/128"
+  },
+  {
+    "version": "0.1.36",
+    "title": "统一开发任务与反馈交付证据",
+    "summary": "将意见反馈纳入任务清单，展示开发 Agent、关联 Issue/PR、领取时间和交付 SHA，区分提交回执缺失、PR 同步等待及 HEAD 不匹配。",
+    "changes": [
+      "统一可信 APP_PROGRESS 回执解析与 Agent 声明，保留真实 GitHub 作者。",
+      "测试追踪展示关联开发任务，交付详情展示领取时间及代码 SHA。",
+      "反馈交付诊断区分回执缺失、PR 未同步、版本变更，保持精确 SHA 测试和部署门禁。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "核对 Issue #122 与 PR #125 对应关系、负责人及历史回执时间。",
+      "验证最新 HEAD/base/merge MacCI、前端构建、同步诊断和旧 SHA 拒绝。",
+      "实际部署后核对运行 SHA，再人工验收发布 main。"
+    ],
+    "validation_note": "候选版本；未确认完整 MacCI、合并、部署或验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/122"
+  },
+  {
+    "version": "0.1.35",
+    "title": "基座与衍生应用统一任务追踪及手动 MacCI 操作",
+    "summary": "修复衍生应用虽复用基座同样代码却因基座专属能力门禁隐藏手动立即执行的问题；将手动测试和安全合并指向当前应用受保护的独立 MacCI 服务，并支持明确刷新 GitHub 的 PR 状态，防止刚合并后仍显示待合并。",
+    "changes": [
+      "手动立即执行菜单不再与基座 preview 的 Draft 权限绑定；仅已登记并获宿主协调器白名单授权的应用可以显示入口。",
+      "Panel 手动立即测试由已授权主机 MacCI Runner 针对 layho/macmini-office-app-panel main 的精确 PR 启动，安全合并请求只唤醒应用专用协调器；所有操作仍需精确 HEAD/base/merge 与 MacCI 审核。",
+      "开发任务刷新按钮现在可以安全地重新读取 GitHub 合并状态，无需等待五分钟同步缓存；失败会明示，不将旧快照冒充实时成功。",
+      "基座和 Panel 沿用同一套 DevelopmentTasksPage、manual_pr_actions、pr_tracking；应用实例仅替换仓库、域名和服务参数，不再因基座专属开关丢失公共能力。",
+      "补充只允许授权仓库操作、不允许其他应用越权、合并需最新 MacCI 成功、刷新五分钟缓存的回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "检查当前 PR 的 MacCI HEAD/base/merge 精确 Success 和前后端构建。",
+      "preview v0.1.35 运行 SHA 与发布记录核对后人工验收发布 main。",
+      "确认安装后基座及 Panel 都展示手动立即执行区，且 Panel 操作范围固定为其自身 main，不触发基座 preview。",
+      "对刚合并的 Panel PR 执行刷新列表应从 GitHub 读到 merged，部署状态仅基于实际运行 SHA/操作回执，不能把 merged 当 deployed。",
+      "检查应用专用 Mac mini 合并协调器是否已安装；未安装时安全提示且不可宣称请求成功。"
+    ],
+    "validation_note": "本修复属于基座公共代码，实际 Panel 同步须由官方 main 的安全 base-upgrade PR 完成。应用独立合并协调器的 Mac mini 安装与实际执行需另行核验，不因菜单显示推断已安装。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
+    "version": "0.1.34",
+    "title": "基座调度器受控自动更新：一次启用，后续安全升级",
+    "summary": "为独立运行在 Mac mini 的基座升级调度器新增默认关闭、管理员一次性启用的宿主更新机制。每轮先核验官方 main 和已关闭的 OWNER 验收单，再复用既有安装器的测试、备份、锁和 SHA 门禁；Panel 业务升级仍由独立安全 PR 流程控制。",
+    "changes": [
+      "新增 upgrade_runtime_auto.py，严格核验官方 GitHub main 精确 SHA、OWNER 关闭的 BASE-ACCEPTANCE 闭环证据及私有 opt-in 开关。",
+      "当前已安装的调度器保持默认关闭自动运行时升级，只有首次安全安装时显式传入 --enable-auto-runtime 才允许自动更新。",
+      "自动更新复用原有受保护的 --apply --upgrade 安装器；先跑 MacCI 安全回归，再进行有备份和锁保护的代码更新，不覆盖应用 main、数据库或服务配置。",
+      "已安装 SHA 写入私有控制文件；只有 main 变更且验收单完整时才更新，网络/权限失败则不替换宿主运行时。",
+      "基座调度器实际更新成功与 Panel 基座升级 PR、MacCI、应用自动部署和公网运行 SHA 仍分开验证。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对 v0.1.34 最新 HEAD/base/merge 完成 pytest、编译和前端构建，包含自动更新器及安装器回归。",
+      "基座 preview 运行 v0.1.34 精确 SHA 并验收发布到官方 main。",
+      "在 Mac mini 使用当前官方 main 干净检出以 --check-repo ... --apply --upgrade --enable-auto-runtime 安全执行首次一次性启用；验证私有控制文件及原 LaunchAgent/token/registry 保持不变。",
+      "从真正新的官方 main 验收版本测试后续 tick 触发自动更新：核对安装 SHA、备份记录、未改变 Panel 的 .app-init.json、无错误或越权；没有验收单时禁止更新。",
+      "在 Panel 页核验 base-upgrade PR、精确 MacCI、应用 main、运行 SHA 与部署回执；不能把独立调度器升级算作 Panel 自动升级完成。"
+    ],
+    "validation_note": "宿主 opt-in 仍需第一次由管理员显式启用一次；此 PR 不会悄悄修改 Mac mini 的 LaunchAgent、token 或现有调度器运行时。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
+    "version": "0.1.33",
+    "title": "Office Panel 自动升级：最后两项误冲突修复",
+    "summary": "纠正宿主脚本 Preview/验收动态赋值导致的误审查，并对基座测试源码不变、应用自身测试已通过明确语义核验的场景保留 Panel 的应用专属测试，避免将初始化器规则调整误判为代码冲突。",
+    "changes": [
+      "deploy/macmini/manage.sh 自动合并时，只把顶层 LABEL_PREFIX、PORT、TRACK_BRANCH、EXPECTED_ORIGIN 作为实例身份；带缩进的 Preview/Acceptance 临时赋值不会触发身份重复误判。",
+      "只允许三方合并成功、bash -n 通过、顶层实例身份不变时自动处理脚本；真正内容冲突仍阻塞。",
+      "对 Office Panel 的 tests/test_auth.py，若已验证官方基座旧/新 SHA 的测试源码完全一致，且 Panel 当前测试 Python 语法有效、包含应用专属的必要断言，则保持 Panel 原测试文件，不覆盖其定制内容。",
+      "原有 MacCI 精确测试、OWNER 审查、基座 preview 验收、独立调度器运行时升级和 Panel 公网部署核验继续有效。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 验证新增宿主身份解析及应用自有测试保留的回归。",
+      "先在基座 preview 核对 v0.1.33 和 SHA，验收后才能正式发布 main。",
+      "用 Mac mini 的安全 installer 从正式 main 升级独立的 foundation-upgrades 调度器运行副本，并立即执行一次 tick。",
+      "核对 Panel 版本页的 target_sha、blocked_files 与升级 PR；如仍存在真正冲突不跳过。",
+      "只有生成的 Panel PR 经精确 MacCI 和安全审核合并并验证公网运行 SHA，才算升级闭环完成。"
+    ],
+    "validation_note": "本版处理已核验的两个残余冲突根因；不能把测试通过或源代码发布直接视为 Mac mini 已升级。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
+    "version": "0.1.32",
+    "title": "Office Panel 基座升级：校验旧版漏登记文件并自动恢复",
+    "summary": "修复 Panel 旧版初始化器遗漏五个基座模板文件所导致的假冲突。仅当应用 GitHub main 对应文件与已验证旧基座来源重新渲染后逐字节一致时，规划器才能自动归入基座升级范围；业务定制或未知来源仍受阻。",
+    "changes": [
+      "对五个既有 Panel 文件提供严格的历史基座来源比对：admin_settings、feedback_delivery、manual_pr_actions、pr_conflict_controls、pr_draft_controls。",
+      "只接受官方基座 first-parent 祖先 SHA 下的真实源码，按已登记的应用生成参数还原，和应用主线跟踪文件字节完全相同才自动认领。",
+      "修复旧初始化器遗漏文件导致的 overlapping add 假冲突，其他 app-owned 修改、未知文件、SQL/宿主脚本仍遵守安全冲突与验收门禁。",
+      "与 v0.1.31 的安全 Shell 三方合并、blocked 计划自动重试配合，升级调度器可在规则更新后重新生成 Panel 升级 PR。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 精确 HEAD/base/merge 检查全量 pytest 和前端构建。",
+      "preview 网站验证 v0.1.32 SHA，管理员验收发布到官方 main 后才部署独立 foundation-upgrades scheduler runtime。",
+      "Panel 真实运行调度器报告：registered/create、blocked_files、目标官方 SHA，以及生成的 base-upgrade PR；检查该 PR HEAD/base/merge MacCI 和 OWNER 门禁。",
+      "验证任何被 Panel 修改的文件不被认领或覆盖，真正冲突仍显示需人工审查而非假成功。"
+    ],
+    "validation_note": "仅对五个来源已验证且逐字节一致的旧版遗漏模板文件自动认领，不允许猜测业务自定义；Mac mini 独立调度器升级和公网 Panel 部署必须分别验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
+    "version": "0.1.31",
+    "title": "下游基座升级：自动解决可验证的部署脚本差异与冲突重试",
+    "summary": "升级规划器对 Office Panel 部署脚本引入有约束的自动三方合并，保留应用实例身份；阻塞状态不再永久缓存，调度器在后续周期自动重试。无法安全证明的冲突仍显示具体文件并暂停。",
+    "changes": [
+      "仅对受控的 deploy/macmini/manage.sh，在旧版、新版和应用现有文件均存在的前提下进行三方合并；生成结果须通过 bash -n，且保留 LABEL_PREFIX、PORT、TRACK_BRANCH、EXPECTED_ORIGIN。",
+      "其他宿主脚本、数据库迁移、新增或删除文件不允许自动重写；真实重叠编辑与身份配置改变仍标记 review，避免破坏 Office Panel 服务。",
+      "调度器不再把 blocked 状态作为终态缓存；即使官方 SHA 与 Panel main 没变化，也会在下一轮重新评估已更新的合并规则。",
+      "通过完整规划、MacCI、OWNER 审核后才允许升级 PR 自动合并；原有 Panel 部署更新及公网运行 SHA 验证保持独立。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "精确 MacCI 验证 planner、scheduler、upgrade PR 安全回归及前端构建。",
+      "基座 preview 运行 SHA 与 v0.1.31 元数据一致后人工验收发布 main。",
+      "在 Mac mini 对已安装的独立 foundation-upgrades scheduler 执行官方 main 的安全 --check 和 --apply --upgrade；GitHub 发布不会自动替换独立宿主调度器。",
+      "Panel 版本页检查新的目标 SHA、调度器 create 模式、最新 checked_at、blocked_files 和 base-upgrade PR。",
+      "若仍受其他真正冲突阻塞，应保留冲突文件及原因，不得把普通文件合并成功当成全量升级成功。"
+    ],
+    "validation_note": "本次仅自动解决可证明安全的 manage.sh 三方差异，非无条件覆盖；Panel 显示五项需审核中其余具体文件仍需读取实机调度器 blocked_files 核对后单独评估。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
+    "version": "0.1.30",
+    "title": "基座升级检测与 Office Panel 自动升级验收",
+    "summary": "正式提升基座版本号至 v0.1.30，使使用基座 v0.1.29 的 Office Panel 能检测到官方 main 上的新版本，并通过独立调度器生成、测试和安全审核升级 PR；本版不宣称调度器已经在 Mac mini 实机启用。",
+    "changes": [
+      "将官方基座版本从 v0.1.29 提升为 v0.1.30，并保留唯一可信的官方 main SHA 作为升级目标。",
+      "Office Panel 当前 .app-init.json 所登记的基座版本为 v0.1.29；新版本发布后检查版本检测、升级调度器状态和升级 PR。",
+      "自动升级仅接受真实来源证明及无冲突的升级计划；Draft、精确 MacCI、OWNER 安全审核、应用部署及公网运行 SHA 分阶段验证。",
+      "出现冲突、安装器未更新、没有调度器回执、MacCI 失败或 Panel main 发生改变时保持阻塞，不绕过保护。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对 v0.1.30 PR 最新 HEAD/base/merge 进行 pytest、Python 编译及前端构建。",
+      "在基座 preview 页面核对 v0.1.30 的运行 SHA 和变更说明，管理员验收通过后才发布官方 main。",
+      "核对 Office Panel 版本状态显示已登记 v0.1.29、最新官方 v0.1.30，并验证升级调度器为 create 模式且非 stale。",
+      "检查是否出现基于 v0.1.30 官方 main SHA 的 base-upgrade/<SHA> Draft PR；如计划被阻塞，记录准确原因，不伪称成功。",
+      "只有最新 Panel HEAD/base/merge MacCI success 且安全审查生效才能解除 Draft/合并，随后确认独立部署器和公网运行 SHA。"
+    ],
+    "validation_note": "当前变更只提升正式版本元数据。自动发现、创建升级 PR 与 Panel 部署由 Mac mini 独立调度器/更新器负责；必须根据真实日志和 GitHub PR 回执判断是否已执行。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/86"
+  },
+  {
+    "version": "0.1.29",
+    "title": "统一任务关联与完整交付链路",
+    "summary": "任务作为管理主体，明确关联多个 PR，自动归档无 Issue 的 PR，展示负责人、各阶段实际回执与完整历史，解决项目重建前的基座任务追踪缺口。",
+    "changes": [
+      "一个真实 Issue 可以通过专门的“## 关联 PR”章节关联多个 PR，也可在 PR 描述中明确填写 Fixes/Refs/关联 Issue 编号关联需求；绝不按标题猜测。",
+      "无明确 Issue 关联的 PR 自动保留独立任务记录，已合并 PR 不会因关闭而从历史消失。",
+      "统一任务清单新增负责人、关联 PR 及展开交付链路；详情按每个 PR 展示开发者、MacCI、代码合并、部署时间及状态。",
+      "任务合并前和验收前显示真实阶段；PR 合并或成功测试不等于需求验收通过。",
+      "回归测试覆盖一需求多 PR、自动关联、不关联旧记录、错号隔离及未部署阶段。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 针对精确 HEAD/base/merge 执行所有后端回归测试、编译和前端构建。",
+      "在网页关联含两个 PR 的需求任务，核对两份测试、合并和部署详情与 GitHub 匹配。",
+      "PR 无 Issue 时仍以独立任务出现；已合并的 #77/#79 保留可查看的交付历史。",
+      "验证自动部署候选后可在页面展开任务详情，人工验收后才允许正式发布。"
+    ],
+    "validation_note": "本版以 GitHub 任务描述中的显式引用作为关联来源，不篡改 GitHub Issues/PR 或猜测关联；尚未实现网页内可编辑关联，需下版独立实现后才能称交付全部五项。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
+    "version": "0.1.28",
+    "title": "统一开发任务与测试发布状态",
+    "summary": "解决 PR 已测试或合并却不出现在任务清单的问题。统一合并现有 Issue 与 PR 交付证据，避免业务负责人在多个页面寻找同一任务。",
+    "changes": [
+      "任务清单包含所有已有 Issue 和 PR（含 PR #77），即使 PR 没有独立 Issue，也有对应代码任务记录。",
+      "统一展示任务来源、当前阶段、测试、合并与部署状态，基于原始 GitHub/MacCI/本机部署证据，不编造完成状态。",
+      "通过 issue-N 与 pr-N 类型化身份避免同编号相互覆盖；保留原测试发布详情页面及已有人工立即测试、合并操作。",
+      "未核实的部署仍显示待核验，PR 合并不自动标记为已正式发布或已完成验收。",
+      "新增 PR #77 及冲突、旧基线、同编号回归测试，确保未来新应用也按同一逻辑展示。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对本版提交的精确测试候选完成 pytest、Python 编译、前端构建。",
+      "网页任务清单能看到 PR #77，并显示测试通过、已合并、部署待核验等真实状态。",
+      "同一任务可以从统一任务清单进入 GitHub 来源，在测试发布追踪页核实详细记录。",
+      "测试失败或合并冲突不得显示已完成；功能在 preview 部署后由用户验收并发布 main。"
+    ],
+    "validation_note": "第一阶段解决 PR 记录与 Issue 统一显示问题，不把无法证明关系的 Issue 与 PR 强制关联；后续独立建设任务关联与负责人管理，不阻塞其他项目初始化。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
+    "version": "0.1.27",
+    "title": "开发任务人工即时执行 · 测试与合并双通道",
+    "summary": "补齐自动化后台的人工执行通道。非技术管理员在网页点击“立即测试”可指定 PR 启动 MacCI，点击“请求合并”可唤醒原有安全合并程序；自动调度继续保留。",
+    "changes": [
+      "开发任务的测试追踪新增“立即测试”操作：后台校验本仓库、精确 HEAD/base/合并候选和本机测试服务后，实际启动指定 PR 的隔离测试，不再只等待定时扫描。",
+      "新增“请求合并”操作：要求非 Draft、无冲突、精确最新 MacCI 成功，并检查发布冻结；通过后唤醒原有 MacCI 安全合并程序，原程序继续核验审查授权及安全推送。",
+      "界面明确区分已受理请求和真正测试/合并完成；可刷新查看真实状态，失败直接展示阻塞原因。",
+      "保留原有自动化周期，已存在的立即部署/检查更新入口不重复创建，不能绕过 GitHub 或 MacCI 安全门禁。",
+      "所有新增写接口必须通过后台管理员会话、CSRF、固定仓库、精确 SHA 和权限校验，并增加失败与拒绝路径回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对 PR 精确 HEAD/base/merge 运行后端 pytest 与前端 TypeScript/Vite 构建。",
+      "通过网页验证“立即测试”真的收到新 MacCI pending 回执，并按真实完成结果展示；测试正在运行时不能伪称排队成功。",
+      "通过网页验证请求合并遇到 Draft、旧 SHA、测试失败、冻结或冲突时明确拒绝；安全门禁满足后唤醒协调器并读取实际合并结果。",
+      "验证自动定时调度不受影响，立即部署继续执行现有更新器；验收之前不得合并正式 main。"
+    ],
+    "validation_note": "该版是基座验收站的 PR 测试与安全合并人工通道；合并按钮触发既有安全协调器而非直接合并指定 PR，实际合并情况以 GitHub 回执为准。后续需将对应授权模式扩展到其他应用的各自安全合并协调器。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
+    "version": "0.1.26",
+    "title": "反馈交付中心 · 从意见到部署的可追踪链路",
+    "summary": "重新设计意见反馈后台，将提交、领取、开发、修复 PR、MacCI、合并、部署和用户验收统一在可核验时间线；独立显示执行任务与下一次触发的证据来源。 本版顺序排在 V0.1.25 冲突处理中心之后，须在最新 preview 基线重新验证。",
+    "changes": [
+      "反馈列表精简为当前交付阶段、任务执行情况、下一次触发、GitHub Issue 和链路详情，避免一排无法解释的空时间字段。",
+      "反馈详情改为九阶段证据时间线，关联精确 PR HEAD、MacCI 回执、合并 SHA 和真实本机部署记录，明确分开已提交、测试通过、已合并、已部署与已验收。",
+      "支持 GitHub OWNER 的结构化 APP_EXECUTION 开始/完成/失败/待执行回执，显示真实回写的执行人和计划时间，过期的执行中回执自动转为未知。",
+      "研发评论作者与任务实际执行者严格区分；暂未接通的 ChatGPT Automations 平台状态如实显示未知，绝不伪造实时心跳或任务触发时间。",
+      "加入开发者受信任留言者与验收里程碑时间的安全解析及完整的交付链路单元测试；保持原有安全自动合并和网页验收门禁。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行 MacCI 精确 HEAD/base/merge 测试及前端生产构建；不得把 UI 编译通过当作运行链路验证。",
+      "在基座 preview 的反馈页检查真实任务：待同步、开发中、PR 测试失败、已合并待部署、部署待验收分别对应准确阶段。",
+      "模拟受信任 APP_EXECUTION 回执验证计划与执行分离；没有回执时必须显示未知，不可声称自动任务正在跑。",
+      "基座正式发布后，Panel 通过安全升级 PR/测试/合并/部署继承该功能，并核对两站运行 SHA。",
+      "如将来接入可靠 Automations 日志和运行计划接口，再验证下一次实际触发时间及执行主体可被独立核实。"
+    ],
+    "validation_note": "V0.1.25 初版是基于可读取证据的统一展示，不是已经接入 ChatGPT Automations 原生 API；任务状态时间只在有可信回执时展示，执行回写仍需后续真实 end-to-end 验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
+    "version": "0.1.25",
+    "title": "PR 冲突处理中心 · 可见、可诊断、可手动交办",
+    "summary": "解决旧版 MacCI 仍显示通过但当前 PR 与 preview 冲突且无人知晓的情况：明确阻塞原因，展示当前基线和候选文件，支持管理员建立可去重的 GitHub 修复任务。",
+    "changes": [
+      "开放 Draft PR 同样显示最新 GitHub mergeable_state=dirty，不再因为 Draft 状态隐藏合并冲突。",
+      "当前 preview/main 基线变化后重新读取 PR 详情与最新分支 SHA；旧基线通过不再被展示成当前基线测试成功。",
+      "后台列表显示“冲突阻止重新测试”，提供“处理冲突”入口及候选修改文件清单，说明不等于具体冲突行。",
+      "管理员可按精确 HEAD/base 创建或复用 GitHub 冲突修复 Issue；记录排查约束和回归要求，禁止强行合并或自动覆写源文件。",
+      "添加冲突 Draft 识别、旧测试失效、修复任务去重和 Ref 变化保护回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 在当前 HEAD/base/merge 上完成 pytest 和前端构建。",
+      "在 base.layho.com 核验 #71 冲突显示为“冲突阻止重新测试”，并展示候选修改文件和当前目标 SHA。",
+      "管理员点击处理冲突，核实创建或复用 Issue，并确认未强制合并、未修改原 PR。",
+      "在问题修复后验证 GitHub 冲突消失并重新测试当前 preview 基线；确认 UI 从冲突转为真实测试结果。"
+    ],
+    "validation_note": "第一阶段提供准确阻塞可视化、手动交办和 GitHub 原生编辑入口；不是浏览器内的逐行代码三方合并编辑器。具体冲突 hunk 需要独立可信 Git 合并分析实现。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/71"
+  },
+  {
+    "version": "0.1.24",
+    "title": "通用开发任务与本应用 PR 测试发布追踪",
+    "summary": "将基座的开发任务、MacCI 测试与部署证据追踪下沉为 app-init 所有应用通用能力；每个应用自动读取自己的 GitHub 仓库和正式 main 分支，保留基座 preview 验收专用操作边界。",
+    "changes": [
+      "开发任务列表包含普通 GitHub Issue，不再要求 ## 开发进度 标题才能出现；未记录进展的任务明确显示“未记录开发状态”。",
+      "PR 追踪从当前应用 .app-init.json 解析自身仓库及公网域名，普通应用只跟踪自己 main 分支的 PR，基座验收站仍跟踪 preview。",
+      "MacCI 回执按当前 HEAD/base 读取，列出测试、提交、合并和可验证的本机部署记录，缺失信息不推算；缓存按仓库隔离。",
+      "普通应用只读展示 PR 记录，不显示仅限基座管理员的解除 Draft 按钮；避免误把普通应用发布权限与基座验收权限混用。",
+      "增加普通 Issue、通用仓库解析、跨应用缓存隔离及 PR 状态回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 对最新 HEAD/base/merge 执行 pytest、Python 编译与前端构建。",
+      "在 base.layho.com 验证 preview PR 追踪仍正常、解除 Draft 仅限基座管理员。",
+      "基座正式发布后由升级调度器生成 Panel 升级 PR，确认 Panel 显示自身 GitHub Issue 和 main PR 的测试合并部署追踪。",
+      "对不存在 MacCI/部署证据及不同仓库数据的情况确认不展示虚构状态或跨应用记录；核对公网运行 SHA。"
+    ],
+    "validation_note": "发布基座不意味着所有现有应用立刻展示新功能；应用需经过各自基座升级 PR、MacCI 和部署验证。不会把普通应用的 main 合并权授予基座网页。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
+    "version": "0.1.23",
+    "title": "Panel 升级冲突诊断与自愈反馈",
+    "summary": "升级调度器将冲突文件清单与安全分类保存至只读回执，Panel 的基座版本页可直接显示文件路径，避免只有“需审查文件 3”的不透明阻塞。",
+    "changes": [
+      "调度器对三方升级规划的 review/conflict 决策记录经过路径安全过滤的文件名及原因，不读取或记录业务文件内容与密钥。",
+      "应用只读接口增加 blocked_files 安全清单；页面显示需修复的具体源文件，方便自动开发任务精确处理。",
+      "原有拒绝合并安全限制不变：冲突文件、人工改动、MacCI 未通过时不能生成或自动合并升级 PR。",
+      "补充调度器及只读回执的回归测试，过滤绝对路径、路径穿越及未知操作类型。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 在当前 preview 基线上运行前后端、调度器和安全回执测试。",
+      "通过网页验收正式发布后，使用安全安装器升级 Mac mini 的独立调度器运行时，重新执行 Panel 升级检查。",
+      "在 panel.layho.com 核对实际阻塞文件名及原因，逐个安全解决后再次触发规划和 MacCI。",
+      "核对 Panel .app-init.json 及公网实际运行 SHA，确保升级完成而不覆盖业务自定义代码。"
+    ],
+    "validation_note": "这项变更改善冲突定位，但不能在没有文件差异证据时擅自自动解决代码冲突。基座代码合并不能代替本机独立调度器安装或 Panel 的实际升级。",
+    "reference_url": "https://github.com/layho/macmini-office-app-panel"
+  },
+  {
+    "version": "0.1.22",
+    "title": "解除 Draft 凭据权限与错误提示修复",
+    "summary": "独立配置 PR 写入凭据，明确区分 Issue 审查评论成功与 GitHub GraphQL 解除 Draft 被拒绝。",
+    "changes": [
+      "解除 Draft 的 GraphQL mutation 优先使用 APP_GITHUB_PR_TOKEN，可与仅有 Issues 写入权限的反馈同步 Token 分离。",
+      "未经 GitHub PR 写入权限授权时返回明确错误，不把已写入审查评论误报为已解除 Draft。",
+      "新增专用 Token 选择及 GraphQL 权限拒绝的安全回归测试；旧版精确 SHA、冻结及 MacCI 合并保护不变。",
+      "Panel 自动基座升级恢复：旧升级 PR 目标不是最新正式基座时，确认旧目标为当前 main 的祖先，再通过原始代码来源、允许文件范围及精确 MacCI 测试验证后自动合并；下一轮自动生成新版本升级 PR。",
+      "调度器区分升级已合并、等待验证、多条候选或来源异常；异常失败不绕过测试也不改动 Panel 业务数据。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "取得 MacCI 对精确 HEAD/base/merge 的成功回执。",
+      "在 Mac mini 为基座验收站设置 OWNER 的 Pull requests: Read and write Token（不在网页输入/显示）。",
+      "公网操作解除 Draft，核实 PR Draft→Ready 后最新 preview 的 MacCI 重测及自动合并。",
+      "核对运行 SHA 和网页验收后才正式发布 main。",
+      "使用精确 SHA MacCI 测试 Panel 旧版本升级 PR 合并与后续新 PR 自动创建；验证旧目标不是祖先、多条升级候选和测试失败时不会合并。",
+      "正式版本发布后，通过安全安装器升级 Mac mini 已安装的独立调度器；核对 Panel 最新 main 基座来源、部署回执与公网运行 SHA。"
+    ],
+    "validation_note": "仅代码改动不授予 GitHub Token 权限；安装实例需由授权管理员配置 APP_GITHUB_PR_TOKEN，且 V0.1.21 未正式发布前此 PR 应保持 Draft。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/57"
+  },
+  {
+    "version": "0.1.21",
+    "title": "管理员密码与应用名称设置",
+    "summary": "新增管理员自助修改密码、工作台名称及引用名称；引用名称同步浏览器页面 Title，不修改域名、仓库标识和运行端口。",
+    "changes": [
+      "系统设置新增修改密码：必须输入原密码、新密码及确认，后台重新验证当前密码，使用 PBKDF2 哈希持久化，完成后撤销已有登录会话。",
+      "系统设置可分别修改工作台侧栏名称和应用引用名称；后者同步登录界面标题和浏览器 document.title，页面切换后即时更新。",
+      "配置写入应用自身非 Git 跟踪目录下的私有 0600 文件，部署时不改写 .env 或数据库结构；保存失败保留旧设置。",
+      "所有修改必须由管理员会话、同源 Origin 和 CSRF 认证授权；无凭证、错误旧密码、名称无效、配置文件为符号链接时拒绝。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 执行密码更新、跨会话撤销、名称持久化、CSRF、安全文件权限及前端构建测试。",
+      "公网登录后在系统设置修改两个名称，刷新并切换导航，检查浏览器 Title 和工作台名称一致；原域名与仓库标识不变。",
+      "使用旧密码登录应失败，新密码成功；原有会话失效；重新部署后配置不丢失。",
+      "验收 preview 实际 SHA 后，经网页验收授权正式发布 main。"
+    ],
+    "validation_note": "账户设置只修改当前安装实例，不改 Github 仓库名称或 Cloudflare 域名；不得将 MacCI 通过等同于生产环境已部署。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env"
+  },
+  {
+    "version": "0.1.20",
+    "title": "PR 解除 Draft 操作与自动合并交接",
+    "summary": "基座验收中心的 PR 追踪页面新增管理员确认解除 Draft；通过负责人精确 SHA 审查授权，将后续测试与合并交回 MacCI 和 preview 协调器。",
+    "changes": [
+      "仅对基座 preview 仓库的 OWNER Draft PR 展示“解除 Draft”，操作需登录管理员会话、同源校验、CSRF 令牌和二次确认。",
+      "解除前复核正式 main 与 preview 一致、网页运行 SHA、PR 原始 HEAD SHA、仓库归属、OWNER 身份与可合并状态，不允许验收冻结期操作。",
+      "管理员操作记录绑定精确 HEAD 和当前 preview 祖先的审查授权；解除 Draft 本身不直接合并、不跳过 MacCI，新测试回执及协调器精确合并检查仍为必要条件。",
+      "补充跨仓库、SHA 变化、待验收冻结、状态已变化、无效登录与权限错误的安全回归测试。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 测试 PR #54/#57 的旧版候选与新基线处理，确保解除 Draft 不立即强制合并。",
+      "在 base.layho.com 登录后检查 PR 表格操作按钮、确认弹窗及失败原因；未登录或基座冻结期间必须禁止解除。",
+      "验证解除 Draft 后 MacCI 对当前 HEAD/base/merge 重新测试成功，取得 owner 评论授权后才由 coordinator 自动合并。",
+      "确认 preview 公网运行 SHA，网页验收后通过原有 main 正式发布流程。"
+    ],
+    "validation_note": "解除 Draft 仅解除草稿阻塞，不代表测试、合并、部署完成；依赖现有 Mac mini 测试与自动合并服务。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/54"
+  },
+  {
+    "version": "0.1.19",
+    "title": "Panel 基座升级自动合并闭环",
+    "summary": "对已授权的 Panel 应用打通基座升级 PR 的精确 MacCI 测试、自动安全合并与现有 Mac mini 部署闭环，并提供独立调度器安全升级入口。",
+    "changes": [
+      "仅对 layho/macmini-office-app-panel 启用严格校验的自动升级 PR 合并；其他应用维持现有草稿 PR 与人工审查策略。",
+      "要求 OWNER 发起的 PR、正式基座 main 的准确目标 SHA、Panel 当前 main 的准确基线、三方差异无冲突以及实际修改文件符合生成计划。",
+      "必须检查可信 MacCI 对精确 HEAD/base/merge 的成功回执；提交变化、测试失败、额外业务文件或 GitHub 异常时自动停止。",
+      "增加独立调度器安全更新入口 --apply --upgrade，沿用原凭据/LaunchAgent/注册信息并保留备份；不直接触碰 Panel 业务数据库、域名及生产服务。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 执行新增升级自动合并的正向、失败、冲突、跨仓库和来源 SHA 校验回归测试。",
+      "检查宿主独立调度器的安全升级预检查，核对新模块是否成功安装在运行时，保留原 token 与注册。",
+      "核对 Panel 基座升级 PR 的合并 MacCI 回执、应用 main 合并 SHA、自动部署回执和 panel.layho.com 实际运行 SHA。",
+      "在 base.layho.com 精确候选网页验收后，正式发布基座 main，再启用宿主升级。"
+    ],
+    "validation_note": "GitHub 代码提交/preview 合并不会升级 Mac mini 独立调度器。必须验证运行时版本及真实下游应用公网部署后才能声明闭环已生效。",
+    "reference_url": "https://github.com/layho/macmini-office-app-panel/pull/18"
+  },
+  {
+    "version": "0.1.18",
+    "title": "app-init 默认安装目录与基座升级自动登记",
+    "summary": "将新应用默认安装到 ~/Projects/app-init/owner--repo，初始化或复验时自动登记基座升级调度器，保护已有应用路径和手动注册配置。",
+    "changes": [
+      "新建应用默认位于 ~/Projects/app-init/owner--repo；已安装在旧位置的应用继续沿用旧位置，不做迁移；同时发现两处安装时拒绝继续。",
+      "app-init 在成功安装与现有应用复验后补登记基座升级调度器；原有 observe/create 注册不覆盖。",
+      "兼容已安装的旧版调度器命令接口；未安装调度器时只提示警告，不阻塞应用部署。",
+      "新增默认路径、旧安装兼容、重复路径冲突及调度器登记回归测试；不变更已有 Panel 服务、Cloudflare 或生产数据库。",
+      "基座验收候选冻结：preview 版本高于正式 main 时，本机 preview 合并协调器阻止后续普通 PR 推送；正式发布后自动解冻，并在推送前重复核对。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "确认 MacCI 对精确 PR HEAD/base/merge 完成回归测试及前端构建。",
+      "preview 实际运行 SHA 与候选一致；验证更新记录显示 V0.1.18，并检查默认路径、旧目录保护及调度器登记逻辑。",
+      "用户通过 base.layho.com 页面进行网页验收后，由既有 Mac mini 发布器发布 main；检查正式 SHA。",
+      "验证 Mac mini 已升级 preview 合并协调器运行时；在 main 仍为旧版本时检查冻结日志和 #54 保留 Draft，确认不会继续改写待验收候选。"
+    ],
+    "validation_note": "候选冻结依赖 Mac mini 安装经过审查的新协调器；仅合并 GitHub PR 不代表宿主运行时已升级。公网 SHA、MacCI 与网页验收仍需核对。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/50"
+  },
+  {
+    "version": "0.1.17",
+    "title": "项目信息 · 操作指南与双闭环详细说明",
+    "summary": "将 app-init 初始化、域名回源、验收、故障恢复与仓库重建说明直接嵌入项目信息，区分公共基座和业务应用流程。",
+    "changes": [
+      "「操作指南」覆盖准备、初始化、开发验收、升级、故障恢复和旧仓库重建；强调 Cloudflare 规则独立且新端口与既有 8018 回源冲突时禁止静默覆盖。",
+      "扩展基座开发闭环至12个真实节点：预审查、MacCI、preview、实机部署、网页验收、main 发布、下游升级 PR 和最终公网核验。",
+      "app-init 新应用改用独立应用操作指南与应用开发闭环，不误展示基座 preview/main 发布链路。",
+      "补充项目信息认证返回与空仓库 seed 回归；不修改现有服务、域名映射或数据库。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验收站打开项目信息→操作指南和开发闭环，检查重建/隧道回源/人工验收说明、移动端显示。",
+      "app-init 空仓库隔离初始化验证应用指南与独立开发闭环，确认不会复制基座验收流程。",
+      "确认网页运行 SHA、MacCI 当前候选测试及正式版本发布回执。"
+    ],
+    "validation_note": "代码候选需 MacCI 精确测试、preview 实机部署及网页验收后才能进入 main。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/18"
+  },
+  {
+    "version": "0.1.16",
+    "title": "MacCI 合并引用短暂不可用自动重试",
+    "summary": "消除 GitHub PR 新建时 merge ref 尚未就绪导致的测试卡死。",
+    "changes": [
+      "准确候选 merge ref 的拉取进行最多三次限时重试，不改动实际 HEAD/base。",
+      "同一 HEAD/base/merge 首次 fetch-failed 在下一轮自动重试，三次失败后停止无限重试。",
+      "真正的 pytest、编译或前端失败依旧作为终态，不绕过测试门槛。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "MacCI 完整回归验证合并引用重试和有限次数停止。",
+      "用已有 upgrade-runtime.py 在 Mac mini 安全更新 MacCI 本地脚本，保留原 token 与启动配置。"
+    ],
+    "validation_note": "旧安装的 MacCI 脚本不会随基座 main 自动更新，须验证后安全升级已安装运行时。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/28"
+  },
+  {
+    "version": "0.1.15",
+    "title": "各应用自动升级调度状态展示",
+    "summary": "app-init 生成的应用默认具备基座版本、调度器登记和检查回执页面。",
+    "changes": [
+      "安全读取指定应用的独立调度器登记/状态，显示最近检查、目标 SHA 和 PR。",
+      "调度器已登记但没有运行回执或回执超过15分钟时明确标记过期。",
+      "不读取 Token、其他应用状态或操作部署和数据库。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "执行状态读取安全与过期测试。",
+      "验证新 app-init 生成的应用默认拥有该模块和页签。",
+      "基座 preview 验收后由本机流程发布 main。"
+    ],
+    "validation_note": "候选待 MacCI 回执，不能将代码提交等同于已部署。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.14",
+    "title": "更新执行回执与进度追踪",
+    "summary": "区分已提交、已合并、更新请求、真实执行与本机部署成功，避免静默等待。",
+    "changes": [
+      "更新器记录检查、目标 SHA、依赖、构建、重启与失败原因；无更新及失败 SHA 拦截也有回执。",
+      "登录后自动查询本机更新回执，明确未领取请求、锁占用、运行 SHA 不一致以及回滚失败。",
+      "不自动清理保护锁或跳过失败 SHA，不修改服务或数据库。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "验证点击检查并更新后可观察实际回执；无新版本、拉取失败与运行 SHA 不一致时不误报更新成功。",
+      "在 Mac mini 检查 WatchPaths 触发与五分钟定时服务实际运行。"
+    ],
+    "validation_note": "新代码需部署后生效；当前现场未领取或失败原因需从现有宿主日志核实。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/pull/41"
+  },
+  {
+    "version": "0.1.13",
+    "title": "基座版本查询可靠性",
+    "summary": "修复下游版本页签查询失败及刷新只读取缓存的问题。",
+    "changes": [
+      "GitHub API 失败时回退到 Git main 查询和固定 SHA 版本记录，不使用 preview。",
+      "手动刷新绕过五分钟缓存，10秒防抖，展示查询来源和脱敏失败原因。",
+      "新增 API 失败回退、强制刷新和拒绝 preview 回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "检查基座版本查询和手动刷新。",
+      "确认最新正式版本仍取自 main，失败时保留原缓存并明确提示。"
+    ],
+    "validation_note": "待实际 MacCI 回执及公网验证。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.12",
+    "title": "基座升级调度器 · SSH 与 REST Token 独立认证",
+    "summary": "去除设备码登录及 GitHub CLI 依赖，面向纯 SSH 无人值守环境。",
+    "changes": [
+      "Git 操作继续复用 SSH；PR 列表和草稿创建通过固定 GitHub REST API。",
+      "安装时先验证 SSH 和指定应用 API 读取权限；Token 隐藏输入、独立 0600 文件，不记录到启动参数或日志。",
+      "拒绝非固定 API 路径、重定向、跨仓库 PR 及不完整列表。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行 Token 文件安全、REST 查询范围与去依赖测试。",
+      "在真实 SSH 环境安装，核对每五分钟调度及 Panel 首次规划。"
+    ],
+    "validation_note": "PR 写权限仍需实际创建 PR 验证；不复用或扩大 MacCI 专用凭据。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.11",
+    "title": "基座升级调度器 · Python 安装预检",
+    "summary": "兼容 Mac 默认 Python 较旧的环境，先选择已有 Python 3.10+ 再运行调度器安装。",
+    "changes": [
+      "版本检查移至模块导入前，避免旧解释器触发 bytes | None 类型错误。",
+      "新增安装入口，优先复用 Homebrew 或已有应用虚拟环境中的兼容 Python；不自动安装依赖，不修改现有服务。",
+      "登记命令统一使用调度器实际 Python 解释器。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "检查安装器的 Python 版本预检及 shell 语法测试。",
+      "在默认旧版 Python 的 Mac mini 上验证复用现有解释器安装。"
+    ],
+    "validation_note": "当前正式 v0.1.10 可直接使用已有 Python 3.10+ 执行安装器，无需等待本版本。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.10",
+    "title": "部署可靠性 · Web 关闭超时与回滚恢复",
+    "summary": "同步 Panel 实机验证的部署修复，避免旧进程阻塞更新后重启。",
+    "changes": [
+      "Uvicorn 优雅关闭限制 5 秒；旧进程先 TERM，10 秒后严格复核原 launchd job 及进程身份再执行 SIGKILL。",
+      "本机健康检查绕过代理，校验运行 SHA、前端与权限；回滚区分恢复成功和失败。",
+      "保留 preview 专用端口检查、分支及部署配置；真实 Uvicorn 长请求关闭回归。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行全量 MacCI 测试，包括真实 Uvicorn 长请求和部署控制流回归。",
+      "先安全切换基座旧 updater，再验证公网运行 SHA、回滚记录及自动更新。"
+    ],
+    "validation_note": "Panel 已在独立生产实例实机验证；基座尚待独立部署验收。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.9",
+    "title": "基座升级 · Mac mini 定时调度",
+    "summary": "独立用户 LaunchAgent 每五分钟检查正式基座并为已登记的应用生成草稿 PR。",
+    "changes": [
+      "独立私有注册表、并发锁、逐应用状态与重复冲突去重；仅正式 main 目标。",
+      "同应用已有升级 PR 时不堆叠其他版本；网络错误重试，基线改变重新规划。",
+      "app-init 新应用部署后自动登记到已安装的调度器；旧应用先观察及兼容迁移。",
+      "一次性安装脚本验证正式 SHA 与本机测试，保留原 MacCI 服务，不自动合并部署。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行 tests/test_upgrade_scheduler.py；核对注册、并发、去重、错误重试及跨版本 PR 保护。",
+      "正式发布后在 Mac mini 安装独立调度器，登记 Panel，并以观察模式登记 TI Hunter、雄展爬虫。",
+      "核对实际本机定时日志、独立草稿 PR 及业务应用 main 不被调度器修改。"
+    ],
+    "validation_note": "本版代码不代表宿主已安装；需实机运行回执。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.8",
+    "title": "基座升级 · 正式来源验证和升级 PR",
+    "summary": "基于已正式发布的 main 核验来源，生成独立应用升级草稿 PR。",
+    "changes": [
+      "正式 main 第一父历史来源验证；旧应用必须完整重现初始化提交。",
+      "通过临时 Git 仓库和独立索引生成升级提交，保留业务代码；冲突或主机脚本变更停止自动生成。",
+      "以目标完整 SHA 去重，复用已有 PR，禁止直接修改应用 main。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "运行 tests/test_upgrade_pr.py 的来源、旧应用重现、提交隔离和去重测试。",
+      "核对同一目标 SHA 不重复创建升级 PR；main 基线变更后停止。"
+    ],
+    "validation_note": "本版提供命令行协调器；尚未接入定时调用及存量应用冲突处理。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.7",
+    "title": "基座升级 · 三方差异规划",
+    "summary": "引入只读升级规划器，为后续自动升级 PR 提供可审查差异。",
+    "changes": [
+      "旧、新生成模板和应用 Git 快照三方合并，保留业务文件。",
+      "冲突、删除、迁移和主机脚本变更需审查；保护应用元数据、项目说明和版本记录。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "执行 tests/test_upgrade_plan.py，核对六项回归。",
+      "核对规划报告不写入应用工作区或数据，不输出文件内容。"
+    ],
+    "validation_note": "尚未接入正式来源验证与自动创建升级 PR；存量应用尚未升级。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.6",
+    "title": "基座版本与 MacCI 闭环整合修复",
+    "summary": "将待合并功能在当前 preview 基线上统一验证；修复测试依赖真实分支、宿主运行脚本独立维护以及开发闭环说明。",
+    "changes": [
+      "包含 v0.1.4 测试与发布追踪、v0.1.5 app-init 基座版本登记和查询。",
+      "版本化 MacCI runner、preview 自动合并和 main 自动发布服务；修复 PR base 元数据滞后和重复候选去重。",
+      "按实际分工修改开发闭环图：提交即预审查，Mac mini 每分钟测试、合并、发布；每五分钟部署。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "检查测试与发布追踪、项目信息基座版本和更新记录。",
+      "核对当前运行 SHA 与 preview，以及网页验收请求只发布该 SHA。",
+      "宿主运行脚本需独立升级验证；确认旧基线、新候选、失效回执与自动合并门槛。"
+    ],
+    "validation_note": "此次代码验收与宿主升级分开记录；宿主脚本未实机更新不得标记完成。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/28"
+  },
+  {
+    "version": "0.1.5",
+    "title": "app-init · 基座版本登记",
+    "summary": "新应用自动记录基座来源，并内置基座版本页签。",
+    "changes": [
+      "app-init 保存基座版本与不可变 SHA；应用自身版本独立。",
+      "项目信息内置基座版本页签，以正式 main 为比较来源；旧应用缺少来源时显示待登记。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "初始化测试仓库，核对基座元数据与源代码 SHA。",
+      "打开项目信息 → 基座版本，核对当前版本及最新正式版本。",
+      "确认旧应用不会被自动登记为最新版本，断网时显示未知或缓存。"
+    ],
+    "validation_note": "本次仅实现初始化登记与版本查询，自动升级 PR 执行器仍待接入。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/6"
+  },
+  {
+    "version": "0.1.4",
+    "title": "开发任务 · 测试与发布追踪",
+    "summary": "直接查看真实 MacCI 测试回执、耗时、安全日志摘要、合并与部署证据。",
+    "changes": [
+      "开发任务增加自动化测试与发布追踪页签，显示最近 50 个 PR 范围内的基座 preview PR。",
+      "开始/结束时间、耗时来自 GitHub 状态；通过率来自匹配 head/base 的本机 pytest 日志摘要。",
+      "显示 PR 合并状态和已记录的部署结果；不暴露原始日志、其他仓库及凭据。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "打开开发任务 → 测试与发布追踪，核对 PR #19 和后续 PR 的测试状态与时间。",
+      "打开测试详情，核对计数、测试阶段和提交 SHA；未采集信息显示未记录。",
+      "核对合并记录及当前运行 SHA，并确认同步失败时保留旧数据。"
+    ],
+    "validation_note": "以实际 GitHub 回执和 MacCI 安全摘要为准，不推断缺失数据；通过率不含跳过及预期失败用例。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/20"
+  },
+  {
+    "version": "0.1.3",
+    "title": "项目信息 · 开发闭环图",
+    "summary": "将完整开发、测试、部署及验收发布流程纳入基座项目信息。",
+    "changes": [
+      "新增「开发闭环」页签，展示九步流程、执行者、检查周期及人工验收节点。",
+      "明确测试或部署失败、验收不通过及分支冲突时的处理路径；保留现有架构和任务页签。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "登录基座，打开项目信息 → 开发闭环，确认九个节点及箭头顺序。",
+      "核对每分钟测试、每小时开发审查、每五分钟部署及网页验收节点。",
+      "检查窄屏显示和其他项目信息页签，确认无异常。"
+    ],
+    "validation_note": "图示为工作机制，非实时状态；验收覆盖当前候选全部累积修改。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/18"
+  },
+  {
+    "version": "0.1.2",
+    "title": "网页验收与正式发布",
+    "summary": "在更新记录确认当前运行的完整候选版本，无需回到聊天确认。",
+    "changes": [
+      "当前运行候选版本增加「验收通过」按钮及二次确认。",
+      "绑定候选 SHA、main 基线、MacCI 测试结果，回传独立发布任务。",
+      "区分等待发布、发布受阻和已发布 main；拒绝陈旧候选、未通过测试及未成功部署的候选。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "先体验当前候选包含的反馈详情、开发状态同步和更新记录。",
+      "确认当前运行 SHA，点击「验收通过」并确认正式发布。",
+      "查看发布任务及状态；仅当 main 已实际包含该候选时显示已发布。"
+    ],
+    "validation_note": "当前验收授权覆盖整个正在运行的候选版本（包括前版累积变更）；不自动发布后续未验收代码。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/13"
+  },
+  {
+    "version": "0.1.1",
+    "title": "反馈详情与开发进度回传（候选）",
+    "summary": "按基座验收中心反馈 #1 优化意见反馈和更新记录。",
+    "changes": [
+      "意见反馈支持完整详情，显示同步、认领、开发开始、结束、提交时间及整体状态。",
+      "后台从受信任的 GitHub 评论读取开发状态、回复及关联 PR/SHA；旧记录保留，不能推断的时间显示未记录。",
+      "更新记录使用卡片样式，展示更新说明、验收步骤、版本及实际部署 SHA。"
+    ],
+    "acceptance_required": true,
+    "acceptance_status": "pending",
+    "validation_steps": [
+      "登录验收站，打开已同步的反馈 #1，核对真实领取时间、开发状态、回复及关联 PR。",
+      "刷新反馈状态，确认旧反馈原文可完整显示，未发生重复同步。",
+      "进入更新记录，查看版本详情、验收步骤和完整运行 SHA。"
+    ],
+    "validation_note": "此版本为候选版本，需完成全量测试、前端构建及 Mac 实机验收；尚未正式发布。",
+    "reference_url": "https://github.com/layho/web-app-init-base-env/issues/13"
+  },
+  {
+    "version": "0.1.0",
+    "title": "应用初始化",
+    "changes": [
+      "创建登录、工作台和应用基座。"
+    ],
+    "validation": "验证登录、运行版本、自动更新和反馈同步。"
+  }
+]

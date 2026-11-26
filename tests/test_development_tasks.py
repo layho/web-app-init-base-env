@@ -296,6 +296,8 @@ def test_token_health_uses_read_queries_and_sanitized_results(monkeypatch):
             return {"login": "owner", "token": "secret"}
         if path == "/rate_limit":
             return {"resources": {"core": {"remaining": 123, "limit": 5000}}}
+        if "/issues?" in path or "/pulls?" in path:
+            return []
         return {"permissions": {"pull": True, "push": False}}
     def graphql(path, data):
         assert path == "/graphql"
@@ -363,3 +365,85 @@ def test_blocked_issue_overrides_historical_published_pr():
 
 def test_closed_pr_with_old_conflict_is_not_active():
     assert development_tasks.pr_stage({"merge_state":"closed","conflict":{"blocked":True}})==("已关闭","已关闭")
+
+
+def test_rate_limit_cooldown_shared_and_manual_refresh_respects_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    reason = "GH-REST-429：GitHub 请求限流；建议等待 120 秒"
+    held = sync_development_tasks.cooldown(reason)
+    assert held["reason"] == reason
+    assert sync_development_tasks.cooldown() == held
+    assert sync_development_tasks.cooldown("GH-REST-403：请求被禁止") == held
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", lambda *a, **k: pytest.fail("must not spawn"))
+    status = sync_development_tasks.enqueue_refresh()
+    assert status["state"] == "failed"
+    assert status["phase"] == "rate_limit"
+    assert "下次重试" in status["reason"]
+    assert sync_development_tasks.run_refresh(force=True) == 1
+
+
+def test_rate_limit_deadline_uses_reset_and_not_permission_errors():
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    stamp = now + timedelta(minutes=10)
+    assert sync_development_tasks.retry_deadline("GH-REST-403：GitHub API 主额度耗尽；恢复时间 " + stamp.isoformat(), now) == stamp + timedelta(seconds=5)
+    assert sync_development_tasks.retry_deadline("GH-REST-403：请求被禁止", now) is None
+
+
+def test_publication_history_reuses_only_proven_forward_ancestry():
+    old, new, ancestor, unknown = ("a"*40, "b"*40, "c"*40, "d"*40)
+    tracking = {"published_main_sha": old, "published_commits": {ancestor: True, unknown: False}}
+    prs = [{"merge_state": "merged", "merge_sha": x} for x in (ancestor, unknown, new)]
+    calls = []
+    def request(method, path):
+        assert method == "GET"
+        calls.append(path)
+        a = path.split("/")[-1].split("...")[0]
+        return {"status": "ahead", "merge_base_commit": {"sha": a}}
+    result = sync_development_tasks.publication_history(request, "owner/repo", new, tracking, prs)
+    assert result == {ancestor: True, unknown: True, new: True}
+    assert len(calls) == 2
+    assert calls[0].endswith(old + "..." + new)
+    assert calls[1].endswith(unknown + "..." + new)
+
+
+def test_publication_history_rechecks_after_rewritten_main():
+    old, new, ancestor = ("a"*40, "b"*40, "c"*40)
+    tracking = {"published_main_sha": old, "published_commits": {ancestor: True}}
+    calls = []
+    def request(method, path):
+        calls.append(path)
+        return {"status": "diverged", "merge_base_commit": {"sha": "e"*40}}
+    result = sync_development_tasks.publication_history(request, "owner/repo", new, tracking,
+        [{"merge_state": "merged", "merge_sha": ancestor}])
+    assert result == {ancestor: False}
+    assert len(calls) == 2
+
+
+def test_local_cooldown_does_not_extend_retry_deadline(tmp_path, monkeypatch):
+    from app import pr_tracking, release_acceptance
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    monkeypatch.setattr(pr_tracking, "target", lambda: ("owner/repo", "main"))
+    monkeypatch.setattr(pr_tracking, "snapshot", lambda: {})
+    reason = "GH-REST-429：GitHub 请求限流；建议等待 120 秒"
+    def sync(**kwargs):
+        sync_development_tasks.cooldown(reason)
+        kwargs["request"]("GET", "/user")
+    monkeypatch.setattr(sync_development_tasks, "sync", sync)
+    monkeypatch.setattr(release_acceptance, "github", lambda *a, **k: pytest.fail("must not request during hold"))
+    original = sync_development_tasks.cooldown
+    calls = []
+    def track(reason=None):
+        if reason is not None:
+            calls.append(reason)
+        return original(reason)
+    monkeypatch.setattr(sync_development_tasks, "cooldown", track)
+    assert sync_development_tasks.run_refresh() == 1
+    assert calls == [reason]
+    assert "下次重试" in sync_development_tasks.refresh_status()["reason"]
+
+
+def test_malformed_cooldown_record_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    (tmp_path / "task-sync-cooldown.json").write_text(json.dumps({"retry_at": "2099-01-01T00:00:00+00:00"}))
+    assert sync_development_tasks.cooldown() is None

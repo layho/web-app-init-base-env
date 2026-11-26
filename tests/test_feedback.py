@@ -181,3 +181,12 @@ def test_attachment_rejects_oversized_encoded_input(monkeypatch):
     monkeypatch.setattr(a,"MAX_ENCODED",16)
     with pytest.raises(ValueError,match="单张"):
         a.normalize(["A"*20])
+
+
+def test_feedback_prefers_shared_token(monkeypatch):
+    monkeypatch.setenv("APP_GITHUB_TOKEN","shared-test-token")
+    monkeypatch.setenv("APP_GITHUB_FEEDBACK_TOKEN","legacy-test-token")
+    assert sync_feedback.feedback_token()=="shared-test-token"
+    monkeypatch.delenv("APP_GITHUB_TOKEN")
+    monkeypatch.delenv("APP_GITHUB_PR_TOKEN",raising=False)
+    assert sync_feedback.feedback_token()=="legacy-test-token"
