@@ -14,9 +14,11 @@ from . import admin_settings, auth, development_tasks, feedback_progress, feedba
 from .db import get_db
 from . import feedback_attachments
 from .models import UserFeedback
+from .request_limits import RequestBodyLimits
 
 RELEASE_NOTES = Path(__file__).with_name("release_notes.json")
 app = FastAPI(title="Web App Foundation", version=json.loads(RELEASE_NOTES.read_text(encoding="utf-8"))[0]["version"], docs_url="/docs" if os.getenv("APP_ENABLE_DOCS") == "true" else None, openapi_url="/openapi.json" if os.getenv("APP_ENABLE_DOCS") == "true" else None)
+app.add_middleware(RequestBodyLimits)
 
 
 def authorize(request: Request, db: Session = Depends(get_db)):
@@ -179,7 +181,7 @@ def release_notes(response: Response):
         "running_sha": running_sha,
         "releases": releases,
         "deployments": deployments,
-        "acceptance": {**acceptance, **readiness, "ready": readiness["ready"] and acceptance.get("state") == "not_requested"},
+        "acceptance": {**acceptance, **readiness, "ready": readiness["ready"] and acceptance.get("state") == "not_requested" and "is_published" in acceptance},
     }
 
 
@@ -225,7 +227,7 @@ def accept_release(req: ReleaseAcceptanceIn, request: Request, response: Respons
     block_reason = deployment_block_reason(req.sha)
     if block_reason:
         raise HTTPException(409, block_reason)
-    deployed = bool(deployments and deployments[0]["sha"] == req.sha)
+    deployed = bool(deployments and deployments[0]["sha"] == req.sha and deployments[0]["code"] in {"install_ok", "update_ok"})
     try:
         return release_acceptance.submit(req.sha, req.version, deployed)
     except (release_acceptance.AcceptanceError, KeyError, TypeError, OSError) as exc:

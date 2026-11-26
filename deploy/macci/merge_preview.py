@@ -45,7 +45,7 @@ def api(token, path):
 
 def eligible(pr):
     return (pr.get("state") == "open" and not pr.get("draft")
-            and pr.get("mergeable") is True and pr.get("mergeable_state") == "clean"
+            and pr.get("mergeable") is True and pr.get("mergeable_state") in {"clean", "unstable"}
             and pr.get("author_association") == "OWNER"
             and pr.get("user", {}).get("login") == OWNER
             and pr.get("base", {}).get("ref") == "preview"
@@ -85,6 +85,23 @@ def tested(statuses, head, base, merge):
     return bool(latest and latest.get("creator", {}).get("login") == OWNER
                 and latest.get("state") == "success"
                 and latest.get("description") == f"base={base} merge={merge} passed")
+
+
+def advisory_only(statuses, base, merge):
+    latest = {}
+    for item in statuses:
+        context = item.get("context")
+        if not isinstance(context, str) or not context:
+            return False
+        latest.setdefault(context, item)
+    for context, item in latest.items():
+        if item.get("state") == "success":
+            continue
+        if (context != "macmini/progress-v1" or item.get("state") != "pending"
+                or (item.get("creator") or {}).get("login") != OWNER
+                or not re.fullmatch(r"base=" + base + r" merge=" + merge + r" (setup|fetch|context|dependencies|test|cleanup)", item.get("description") or "")):
+            return False
+    return True
 
 
 def all_pages(token, path):
@@ -246,25 +263,43 @@ def replacement_allowed(token, number, base, head, merge):
     return False
 
 
+def gate_block(number, reason):
+    # Fixed reason codes only: never print API payloads, credentials or git output.
+    print(f"PR #{number}: preview gate blocked: {reason}", flush=True)
+    return None
+
+
 def authorization(token, number):
     pr = api(token, f"/pulls/{number}")
     if not eligible(pr):
-        return None
+        return gate_block(number, "github_merge_state_unstable" if pr.get("mergeable") is True and pr.get("mergeable_state") == "unstable" and not pr.get("draft") else "pr_ineligible")
     head, merge = pr["head"]["sha"], pr["merge_commit_sha"]
     base = api(token, "/branches/preview")["commit"]["sha"]
     if not valid(base):
-        return None
+        return gate_block(number, "invalid_preview_sha")
     commit = api(token, "/git/commits/" + merge)
     if [p["sha"] for p in commit["parents"]] != [base, head]:
-        return None
+        return gate_block(number, "candidate_parents_mismatch")
     required = review(all_pages(token, f"/issues/{number}/comments"), head)
     if not required:
-        return None
+        return gate_block(number, "owner_review_missing_or_revoked")
     statuses = api(token, f"/commits/{head}/statuses?per_page=100")
     if not tested(statuses, head, base, merge):
-        return None
+        return gate_block(number, "exact_test_receipt_missing_or_invalid")
+    if pr.get("mergeable_state") == "unstable":
+        if len(statuses) >= 100 or not advisory_only(statuses, base, merge):
+            return gate_block(number, "github_non_advisory_check_blocked")
+        # Statuses are not the entire check suite. Refuse unknown or failed
+        # check runs rather than treating all unstable states as advisory.
+        checks = api(token, "/commits/" + head + "/check-runs?per_page=100")
+        if (not isinstance(checks.get("check_runs"), list)
+                or checks.get("total_count") != len(checks["check_runs"])
+                or any(x.get("status") != "completed" or x.get("conclusion") != "success" for x in checks["check_runs"])):
+            return gate_block(number, "github_check_run_blocked")
+        if not any(x.get("context") == "macmini/progress-v1" and x.get("state") == "pending" for x in statuses[:1] + [next((x for x in statuses if x.get("context") == "macmini/progress-v1"), {})]):
+            return gate_block(number, "github_unstable_unexplained")
     if api(token, "/branches/preview")["commit"]["sha"] != base:
-        return None
+        return gate_block(number, "preview_changed")
     return head, base, merge, required
 
 
@@ -294,6 +329,7 @@ def merge_one(token, number, dry_run=False):
         return False
     head, base, merge, required = gate
     if frozen and not replacement_allowed(token, number, base, head, merge):
+        gate_block(number, "acceptance_freeze")
         return False
     with TemporaryDirectory(prefix="macci-preview-") as folder:
         git(folder, "init", "--bare")

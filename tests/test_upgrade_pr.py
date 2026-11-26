@@ -228,3 +228,17 @@ def test_preserve_auth_test_requires_app_assertions_not_foundation_acceptance():
             "source", A, B, "layho/macmini-office-app-panel", old, new,
             {path: local})
     assert (a, b) == (old, new)
+
+
+def test_inventory_blocks_case_alias_and_preserves_business_files():
+    def entry(path, mode="100644"):
+        return (mode+" blob "+"a"*40+"\t"+path+"\0").encode()
+    before = {"app/core.py": b"old"}
+    after = {"app/core.py": b"new", "app/new.py": b"new"}
+    decisions = u.planner.plan(before, after, before)
+    with patch.object(u,"git",return_value=entry("app/core.py")+entry("app/business.py")):
+        assert u.verify_upgrade_inventory(".",A,B,before,after,decisions)["ok"]
+    with patch.object(u,"git",return_value=entry("app/core.py")+entry("app/NEW.py")):
+        assert not u.verify_upgrade_inventory(".",A,B,before,after,decisions)["ok"]
+    with patch.object(u,"git",return_value=entry("App/business.py")+entry("app/core.py")):
+        assert not u.verify_upgrade_inventory(".",A,B,before,after,decisions)["ok"]

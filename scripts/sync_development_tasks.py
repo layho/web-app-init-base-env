@@ -125,6 +125,55 @@ def write_status(data):
                 os.unlink(out.name)
 
 
+def retry_deadline(reason, now):
+    """Only classified rate limits trigger a shared cooldown; no raw API body."""
+    if not isinstance(reason, str):
+        return None
+    if "GitHub API 主额度耗尽" in reason:
+        match = re.search(r"恢复时间 ([^；]+)$", reason)
+        if match:
+            try:
+                stamp = datetime.fromisoformat(match[1])
+                if stamp.tzinfo is not None:
+                    return max(now + timedelta(seconds=60), stamp + timedelta(seconds=5))
+            except ValueError:
+                pass
+        return now + timedelta(minutes=5)
+    if "GitHub 请求限流" in reason:
+        match = re.search(r"建议等待 ([0-9]{1,6}) 秒", reason)
+        return now + timedelta(seconds=max(60, int(match[1]) if match else 60))
+    return None
+
+
+def cooldown(reason=None):
+    """Share a durable retry deadline across manual, history and active workers."""
+    folder = development_tasks.CACHE_PATH.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "task-sync-cooldown.json"
+    now = datetime.now(timezone.utc)
+    with (folder / "task-sync-cooldown.lock").open("a") as gate:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        try:
+            saved = json.loads(path.read_text())
+            until = pr_tracking.instant(saved.get("retry_at"))
+            if not isinstance(saved.get("reason"), str) or not retry_deadline(saved["reason"], now):
+                saved, until = {}, None
+        except (OSError, ValueError, TypeError, AttributeError):
+            saved, until = {}, None
+        # Re-observing our own local hold is not a new server rate limit.
+        # The worker must not extend a relative Retry-After on every retry.
+        candidate = retry_deadline(reason, now)
+        if candidate and (until is None or candidate > until):
+            until = candidate
+            saved = {"retry_at": until.isoformat(), "reason": reason}
+            write_json(path, saved)
+        return saved if until and until > now else None
+
+
+class LocalCooldown(release_acceptance.AcceptanceError):
+    """A local hold, not a new GitHub response."""
+
+
 def enqueue_refresh():
     folder = development_tasks.CACHE_PATH.parent
     folder.mkdir(parents=True, exist_ok=True)
@@ -136,6 +185,11 @@ def enqueue_refresh():
             except BlockingIOError:
                 return refresh_status()
             if refresh_status().get("state") == "queued":
+                return refresh_status()
+            held = cooldown()
+            if held:
+                write_status({**refresh_status(), "state": "failed", "phase": "rate_limit", "requests": 0,
+                              "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
                 return refresh_status()
             write_status({"state": "queued", "requests": 0})
             try:
@@ -160,6 +214,10 @@ def token_health(repository, request):
             result[label] = {"state": "ok", **extract(obj)}
         except (release_acceptance.AcceptanceError, OSError, ValueError, KeyError, TypeError) as exc:
             result[label] = {"state": "failed", "reason": str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else type(exc).__name__}
+            if isinstance(exc, release_acceptance.AcceptanceError):
+                # Stop remaining diagnostic probes when quota is exhausted.
+                if retry_deadline(str(exc), datetime.now(timezone.utc)):
+                    raise
         result[label]["elapsed_seconds"] = round(time.monotonic() - started, 2)
     check("identity", lambda: request("GET", "/user"), lambda o: {"login": o["login"]})
     check("rate_limit", lambda: request("GET", "/rate_limit"),
@@ -167,6 +225,12 @@ def token_health(repository, request):
     check("repository", lambda: request("GET", "/repos/" + repository),
           lambda o: {"permissions": {k: v for k, v in o.get("permissions", {}).items()
                                      if k in {"admin", "maintain", "push", "triage", "pull"} and type(v) is bool}})
+    def list_fields(obj):
+        if not isinstance(obj, list):
+            raise ValueError("Invalid list response")
+        return {}
+    check("issues", lambda: request("GET", "/repos/" + repository + "/issues?state=all&per_page=1"), list_fields)
+    check("pulls", lambda: request("GET", "/repos/" + repository + "/pulls?state=open&per_page=1"), list_fields)
     owner, name = repository.split("/")
     # GraphQL POST carries a fixed read query, never a mutation.
     query = 'query($owner:String!,$name:String!){viewer{login} repository(owner:$owner,name:$name){viewerPermission}}'
@@ -176,6 +240,30 @@ def token_health(repository, request):
         return {"permission": o["data"]["repository"]["viewerPermission"]}
     check("graphql", lambda: release_acceptance.github("/graphql", {"query": query, "variables": {"owner": owner, "name": name}}), graphql_fields)
     return result
+
+
+def publication_history(request, repository, main_sha, tracking, prs):
+    """Reuse positive ancestry evidence only across a verified forward move."""
+    from app import release_acceptance
+    previous = tracking.get("published_main_sha")
+    old = tracking.get("published_commits", {})
+    prefix = "/repos/" + repository + "/compare/"
+    def contains(ancestor, descendant):
+        if ancestor == descendant:
+            return True
+        result = request("GET", prefix + ancestor + "..." + descendant)
+        return (result.get("status") in {"ahead", "identical"}
+                and (result.get("merge_base_commit") or {}).get("sha") == ancestor)
+    if not isinstance(old, dict) or not release_acceptance.valid_sha(previous) or not contains(previous, main_sha):
+        old = {}
+    published = {}
+    for pr in prs:
+        candidate = pr.get("merge_sha")
+        if pr.get("merge_state") != "merged" or not release_acceptance.valid_sha(candidate):
+            continue
+        if candidate not in published:
+            published[candidate] = candidate == main_sha or old.get(candidate) is True or contains(candidate, main_sha)
+    return published
 
 
 def run_refresh(force=False):
@@ -188,6 +276,11 @@ def run_refresh(force=False):
         except BlockingIOError:
             return 0
         force = force or refresh_status().get("state") == "queued"
+        held = cooldown()
+        if held:
+            write_status({**refresh_status(), "state": "failed", "phase": "rate_limit", "requests": 0,
+                          "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
+            return 1
         target = pr_tracking.target()
         previous = development_tasks.snapshot()
         tracking = pr_tracking.snapshot() if target else {}
@@ -197,20 +290,33 @@ def run_refresh(force=False):
         start = time.monotonic()
         state = {"state": "running", "phase": "issues", "requests": 0,
                  "token_health": refresh_status().get("token_health", {}),
+                 "token_health_checked_at": refresh_status().get("token_health_checked_at"),
                  "started_at": datetime.now(timezone.utc).isoformat()}
         write_status(state)
         def request(method, path):
             if method != "GET":
                 raise ValueError("Read-only task sync")
+            held = cooldown()
+            if held:
+                raise LocalCooldown(held["reason"])
             state["requests"] += 1
             write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
-            return release_acceptance.github(path)
+            try:
+                return release_acceptance.github(path)
+            except release_acceptance.AcceptanceError as exc:
+                if not isinstance(exc, LocalCooldown):
+                    cooldown(str(exc))
+                raise
         try:
             if target is None:
                 raise ValueError("No verified repository")
             if force:
                 state["phase"] = "token_health"
                 state["token_health"] = token_health(target[0], request)
+                state["token_health_checked_at"] = datetime.now(timezone.utc).isoformat()
+                held = cooldown()
+                if held:
+                    raise LocalCooldown(held["reason"])
                 state["phase"] = "issues"
                 write_status(state)
             issues = sync(force=True, repository=target[0], request=request,
@@ -246,7 +352,7 @@ def run_refresh(force=False):
                         evidence[event["candidate_sha"]] = event
             # Publication is a distinct fact from per-PR user acceptance.
             # Prove historical commits by ancestry of actual official main.
-            # Keep only immutable positive results while the observed main is unchanged.
+            # Reuse positive results only if previous main is proven an ancestor.
             published = {}
             main_sha = None
             if target == (release_acceptance.REPO, "preview"):
@@ -255,17 +361,7 @@ def run_refresh(force=False):
                 main_sha = request("GET", "/repos/" + target[0] + "/branches/main")["commit"]["sha"]
                 if not release_acceptance.valid_sha(main_sha):
                     raise ValueError("Invalid official main")
-                old = tracking.get("published_commits", {}) if tracking.get("published_main_sha") == main_sha else {}
-                for pr in prs:
-                    candidate = pr.get("merge_sha")
-                    if pr.get("merge_state") != "merged" or not release_acceptance.valid_sha(candidate):
-                        continue
-                    if candidate == main_sha or old.get(candidate) is True:
-                        published[candidate] = True
-                    elif candidate not in published:
-                        result = request("GET", "/repos/" + target[0] + "/compare/" + candidate + "..." + main_sha)
-                        published[candidate] = (result.get("status") in {"ahead","identical"} and
-                            (result.get("merge_base_commit") or {}).get("sha") == candidate)
+                published = publication_history(request, target[0], main_sha, tracking, prs)
             pr_data = {"synced_at": stamp, "repository": target[0], "branch": target[1], "prs": prs, "release_evidence": evidence,
                        "published_main_sha":main_sha, "published_commits":published}
             # One atomic publication is authoritative for the unified page.
@@ -277,6 +373,11 @@ def run_refresh(force=False):
             state["state"] = "failed"
             # AcceptanceError messages are already sanitized by the REST client.
             state["reason"] = str(exc) if isinstance(exc, release_acceptance.AcceptanceError) else type(exc).__name__
+            held = cooldown() if isinstance(exc, LocalCooldown) else cooldown(state["reason"])
+            if held:
+                state["reason"] = held["reason"] + "；下次重试 " + held["retry_at"]
+            if state["phase"] in {"issues", "pulls"} and isinstance(exc, release_acceptance.AcceptanceError):
+                state["token_health"] = {**state["token_health"], state["phase"]: {"state": "failed", "reason": state["reason"]}}
         write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
         return int(state["state"] != "success")
 
@@ -299,12 +400,22 @@ def refresh_active():
         except (OSError,ValueError):
             old={}
         stamp=pr_tracking.instant(old.get("synced_at"))
+        if cooldown():
+            return 1
         if stamp and (old.get("repository"),old.get("branch"))==target and (datetime.now(timezone.utc)-stamp).total_seconds()<25:
             return 0
         def request(method,path):
             if method!="GET":
                 raise ValueError("Read only")
-            return release_acceptance.github(path)
+            held = cooldown()
+            if held:
+                raise LocalCooldown(held["reason"])
+            try:
+                return release_acceptance.github(path)
+            except release_acceptance.AcceptanceError as exc:
+                if not isinstance(exc, LocalCooldown):
+                    cooldown(str(exc))
+                raise
         try:
             repo,branch=target
             prefix="/repos/"+repo

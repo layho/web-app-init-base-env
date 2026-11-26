@@ -6,7 +6,7 @@ import { createServer } from 'vite'
 
 const server = await createServer({ server: { middlewareMode: true, hmr: false }, appType: 'custom' })
 after(() => server.close())
-const { ReleasePage } = await server.ssrLoadModule('/src/OperationsPage.tsx')
+const { ReleasePage, releaseEvidence } = await server.ssrLoadModule('/src/OperationsPage.tsx')
 
 function renderGate(state, reason, releaseVersion = '0.1.18') {
   return renderToStaticMarkup(createElement(ReleasePage, {
@@ -39,4 +39,28 @@ test('已发布的旧提交同时显示新候选提示', () => {
   assert.ok(html.includes('验收通过 · 已发布 main'))
   assert.ok(html.includes('当前页面暂不可验收'))
   assert.ok(html.includes('preview 已更新，当前页面仍是旧版'))
+})
+
+
+test('version evidence never infers main or a successful deployment from running SHA',()=>{
+  const a='a'.repeat(40), b='b'.repeat(40)
+  const evidence=releaseEvidence({version:'0.1.40',running_sha:a,releases:[],acceptance:{enabled:true,state:'published',preview_sha:b},deployments:[{code:'update_restart_failed',sha:b,at:'2026-11-25T00:00:00Z'}]})
+  assert.equal(evidence.running,a)
+  assert.equal(evidence.preview,b)
+  assert.equal(evidence.main,'未记录')
+  assert.equal(evidence.deployedSha,'未记录')
+})
+test('deployment evidence uses latest actual successful event',()=>{
+  const a='a'.repeat(40), b='b'.repeat(40)
+  const evidence=releaseEvidence({running_sha:a,deployments:[{code:'update_ok',sha:a,at:'2026-11-24T00:00:00Z'},{code:'install_ok',sha:b,at:'2026-11-25T00:00:00Z'}]})
+  assert.equal(evidence.deployedSha,b)
+})
+
+
+test('published but unaccepted version displays real main and no candidate rejection',()=>{
+  const sha='a'.repeat(40)
+  const html=renderToStaticMarkup(createElement(ReleasePage,{data:{version:'0.2.0',running_sha:sha,releases:[{version:'0.2.0',title:'正式版',acceptance_required:true}],deployments:[],acceptance:{enabled:true,state:'not_requested',ready:true,is_published:true,main_sha:sha,preview_sha:sha}},loading:false}))
+  assert.ok(html.includes('已发布 · 待补验收'))
+  assert.equal(html.includes('验收不通过'),false)
+  assert.equal(releaseEvidence({acceptance:{main_sha:sha}}).main,sha)
 })

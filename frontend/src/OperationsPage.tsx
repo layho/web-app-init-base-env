@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { ScreenshotPicker } from './ScreenshotPicker'
-import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Input, Image, List, Modal, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Descriptions, Drawer, Empty, Flex, Input, Image, List, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 
 type Operation = { at: string; code: string; sha: string; detail?: string }
 type ReleaseNote = { version: string; title: string; changes: string[]; validation?: string; date?: string; summary?: string; acceptance_required?: boolean; acceptance_status?: string; validation_steps?: string[]; validation_note?: string; reference_url?: string }
@@ -9,7 +9,7 @@ export type ReleaseHistory = {
   running_sha: string
   releases: ReleaseNote[]
   deployments: Operation[]
-  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown' | 'rejected'; attachments?: {id:string;url:string}[]; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string }
+  acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown' | 'rejected'; attachments?: {id:string;url:string}[]; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string; main_sha?: string; is_published?: boolean }
 }
 export type SystemLogs = { events: Operation[] }
 
@@ -45,7 +45,7 @@ function OperationTable({ records, loading, onDetails }: { records: Operation[];
     columns={[
       { title: '时间', dataIndex: 'at', width: 180, render: (at: string) => new Date(at).toLocaleString('zh-CN', { hour12: false }) },
       { title: '事件', dataIndex: 'code', render: (code: string) => <Tag color={
-        code.endsWith('_ok') ? 'success' : 'warning'
+        diagnosticSeverity(code) === 'error' ? 'error' : diagnosticSeverity(code) === 'warning' ? 'warning' : diagnosticSeverity(code) === 'success' ? 'success' : 'default'
       }>{labels[code] ?? code}</Tag> },
       { title: '错误详情', render: (_,row) => row.detail ? <Typography.Text code copyable>{row.detail}</Typography.Text> : '—' },
       { title: '关联提交', dataIndex: 'sha', width: 120, render: (sha: string) => <code title={sha}>{sha.slice(0, 10)}</code> },
@@ -70,7 +70,20 @@ function safeReference(value?: string) {
   } catch { return undefined }
 }
 
+export function releaseEvidence(data: ReleaseHistory | null) {
+  const valid = (value?: string) => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value) ? value : '未记录'
+  const running = valid(data?.running_sha)
+  const preview = valid(data?.acceptance?.preview_sha)
+  // A published acceptance proves the accepted running SHA, not an independently refreshed main head.
+  const main = valid(data?.acceptance?.main_sha)
+  const success = (data?.deployments ?? []).filter(row =>
+    ['update_ok','install_ok'].includes(row.code) && valid(row.sha) !== '未记录' && Number.isFinite(Date.parse(row.at))
+  ).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at))[0]
+  return {running,preview,main,deployedAt:success ? new Date(success.at).toLocaleString('zh-CN',{hour12:false}) : '未记录',deployedSha:valid(success?.sha)}
+}
+
 export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: RefreshProps & { data: ReleaseHistory | null; onAccept: (sha: string, version: string) => Promise<void>; onReject:(sha:string,version:string,reason:string,screenshots:string[])=>Promise<void> }) {
+  const [releaseQuery,setReleaseQuery] = useState('')
   const [selectedVersion, setSelectedVersion] = useState<string | null>(null)
   const [deployment, setDeployment] = useState<Operation | null>(null)
   const [accepting, setAccepting] = useState(false)
@@ -82,7 +95,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
   const [screenshots,setScreenshots]=useState<string[]>([])
   const [rejectError,setRejectError]=useState('')
   const acceptance = data?.acceptance
-  const canReject=Boolean(acceptance?.enabled&&acceptance.state==='not_requested'&&data&&/^[0-9a-f]{40}$/.test(data.running_sha)&&data.releases[0]?.acceptance_required)
+  const canReject=Boolean(acceptance?.enabled&&acceptance.state==='not_requested'&&acceptance.ready===true&&acceptance.is_published===false&&data&&/^[0-9a-f]{40}$/.test(data.running_sha)&&data.releases[0]?.acceptance_required)
   const canAccept = Boolean(acceptance?.enabled && acceptance.state === 'not_requested' && acceptance.ready === true && data && /^[0-9a-f]{40}$/.test(data.running_sha) && data.releases[0]?.acceptance_required && data.releases[0]?.version === data.version)
   const gateWarning = acceptance?.enabled && (Boolean(acceptance.reason) || (acceptance.state === 'not_requested' && !canAccept))
   function requestAcceptance() {
@@ -119,8 +132,19 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
   }
   const selected = data?.releases.find(release => release.version === selectedVersion)
   const awaitingAcceptance = Boolean(data?.releases[0]?.acceptance_required && acceptance?.state === 'not_requested' && acceptance.ready)
+  const evidence = releaseEvidence(data)
+  const visibleReleases = (data?.releases ?? []).filter(row=>[row.version,row.title,row.summary,...(row.changes ?? [])].some(value=>String(value ?? '').toLowerCase().includes(releaseQuery.trim().toLowerCase())))
   return <Flex vertical gap="middle">
-    <Card title="当前运行版本" extra={<Space wrap>{awaitingAcceptance && <Tag color="warning">待验收 v{data?.version}</Tag>}{acceptanceAction()}{canReject&&<Button danger onClick={()=>{setRejectError('');setRejectTarget(data?{sha:data.running_sha,version:data.version}:null)}}>验收不通过</Button>}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
+    <div><Typography.Title level={3} style={{margin:'0 0 4px'}}>更新记录</Typography.Title><Typography.Text type="secondary">版本、部署证据与用户验收记录</Typography.Text></div>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(min(220px,100%),1fr))',gap:12}}>
+      {[
+        ['运行版本',data?.version || '未记录',evidence.running],
+        ['Preview 候选','候选 SHA',evidence.preview],
+        ['Main 正式发布','正式 SHA',evidence.main],
+        ['最近成功部署',evidence.deployedAt,evidence.deployedSha],
+      ].map(([label,value,sha])=><Card key={label} size="small"><Typography.Text type="secondary">{label}</Typography.Text><Typography.Title level={4} style={{margin:'8px 0',overflowWrap:'anywhere'}}>{value}</Typography.Title><Typography.Text code style={{overflowWrap:'anywhere'}}>{sha}</Typography.Text></Card>)}
+    </div>
+    <Card title="当前运行版本" extra={<Space wrap>{acceptance?.is_published && acceptance.state==='not_requested' && <Tag color="blue">已发布 · 待补验收</Tag>}{awaitingAcceptance && <Tag color="warning">待验收 v{data?.version}</Tag>}{acceptanceAction()}{canReject&&<Button danger onClick={()=>{setRejectError('');setRejectTarget(data?{sha:data.running_sha,version:data.version}:null)}}>验收不通过</Button>}<Button onClick={onRefresh} loading={loading}>刷新</Button></Space>}>
       {data ? <Flex wrap gap="small" align="center">
         <Tag color="blue">{data.version}</Tag>
         <Typography.Text copyable code style={{ overflowWrap: 'anywhere' }}>{data.running_sha === 'unknown' ? '未上报 Git SHA' : data.running_sha}</Typography.Text>
@@ -129,6 +153,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
     {gateWarning ?
       <Alert type="warning" showIcon message="当前页面暂不可验收" description={acceptance.reason || '正在核对 preview 和本机部署，请刷新后重试。'} /> :
       <Alert type="info" showIcon message="代码已提交不等于线上已验收" description={acceptance?.enabled ? '仅在最新 preview 与运行 SHA 和部署记录一致时允许验收。' : '请核对当前运行版本和 Git SHA，以实际验证结果为准。'} />}
+    {acceptance?.is_published && acceptance.state==='not_requested' && <Alert type="info" showIcon message="正式发布与功能验收独立记录" description="当前版本已经发布；如发现问题，请通过开发任务提交需求或问题反馈，不使用未发布候选的拒绝流程。" />}
     {acceptance?.issue && <Typography.Link href={`https://github.com/layho/web-app-init-base-env/issues/${acceptance.issue}`} target="_blank" rel="noopener noreferrer">{acceptance.state==='rejected'?'查看修复任务':'查看正式发布任务'} #{acceptance.issue}</Typography.Link>}
     {acceptance?.state==='rejected'&&<Alert type="error" showIcon message="当前候选验收不通过" description={<Space direction="vertical"><span>{acceptance.reason}</span><Space wrap>{acceptance.attachments?.map(x=><Image key={x.id} width={100} src={x.url}/>)}</Space></Space>}/>}
     <Modal title="提交验收不通过" open={rejectTarget!==null} onCancel={()=>{if(!rejecting)setRejectTarget(null)}} confirmLoading={rejecting} okText="提交不通过" cancelText="取消"
@@ -146,13 +171,14 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
         {rejectError&&<Alert type="error" message={rejectError}/>}
       </Space>
     </Modal>
-    <Modal title="确认验收并正式发布" open={confirm !== null} onCancel={() => { if (!accepting) setConfirm(null) }} onOk={() => void confirmAcceptance()} okText="验收通过，提交发布" cancelText="取消" confirmLoading={accepting} okButtonProps={{ disabled: !canAccept || loading }} closable={!accepting} maskClosable={!accepting} cancelButtonProps={{ disabled: accepting }}>
-      <Typography.Paragraph>确认已体验以下候选版本，授权将该版本发布至正式 main 分支。系统会再次核验测试结果和分支 SHA。</Typography.Paragraph>
+    <Modal title={acceptance?.is_published ? "补录功能验收" : "确认验收并正式发布"} open={confirm !== null} onCancel={() => { if (!accepting) setConfirm(null) }} onOk={() => void confirmAcceptance()} okText={acceptance?.is_published ? "确认验收通过" : "验收通过，提交发布"} cancelText="取消" confirmLoading={accepting} okButtonProps={{ disabled: !canAccept || loading }} closable={!accepting} maskClosable={!accepting} cancelButtonProps={{ disabled: accepting }}>
+      <Typography.Paragraph>{acceptance?.is_published ? "确认已体验当前正式运行版本，仅补录功能验收，不重复发布。" : "确认已体验以下候选版本，授权将该版本发布至正式 main 分支。系统会再次核验测试结果和分支 SHA。"}</Typography.Paragraph>
       <Typography.Paragraph strong>v{confirm?.version}</Typography.Paragraph>
       <Typography.Paragraph code style={{ overflowWrap: 'anywhere' }}>{confirm?.sha}</Typography.Paragraph>
       {acceptError && <Alert type="error" showIcon message={acceptError} />}
     </Modal>
-    {data?.releases.length ? data.releases.map(release =>
+    <Card size="small"><Space wrap><Typography.Text strong>版本时间线</Typography.Text><Input.Search allowClear value={releaseQuery} onChange={event=>setReleaseQuery(event.target.value)} placeholder="搜索版本、标题、更新内容" style={{maxWidth:'100%',width:280}}/><Typography.Text type="secondary">{visibleReleases.length} / {data?.releases.length ?? 0} 个版本</Typography.Text></Space></Card>
+    {visibleReleases.length ? visibleReleases.map(release =>
       <Card key={release.version}
         title={<Space wrap><Typography.Text strong>v{release.version}</Typography.Text><span>{release.title}</span></Space>}
         extra={<Space wrap><Typography.Text type="secondary">{release.date || '日期未记录'}</Typography.Text>{release.version === data?.version && acceptance?.state === 'published' ? <Tag color="success">已验收</Tag> : acceptanceTag(release)}{release.version === data?.version ? acceptanceAction() : null}<Button type="link" onClick={() => setSelectedVersion(release.version)}>详情</Button></Space>}>
@@ -166,7 +192,7 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
         </div> : <Typography.Paragraph type="secondary" style={{ margin: '12px 0 0' }}>{release.validation_note || release.validation || '暂无验收说明'}</Typography.Paragraph>}
         {safeReference(release.reference_url) && <Typography.Link href={safeReference(release.reference_url)} target="_blank" rel="noopener noreferrer">查看 GitHub 记录</Typography.Link>}
       </Card>
-    ) : <Card><Empty description={loading ? '正在读取更新记录…' : '暂无更新记录'} /></Card>}
+    ) : <Card><Empty description={loading ? '正在读取更新记录…' : releaseQuery ? '未找到匹配版本' : '暂无更新记录'} /></Card>}
     <Card title="本机发布记录">
       <OperationTable records={data?.deployments ?? []} loading={loading} onDetails={setDeployment} />
     </Card>
@@ -199,8 +225,61 @@ export function ReleasePage({ data, loading, onRefresh, onAccept, onReject }: Re
   </Flex>
 }
 
+export function diagnosticCategory(code: string) {
+  if (/^feedback_/.test(code)) return 'GitHub / 反馈'
+  if (/test|build/.test(code)) return '测试与构建'
+  if (/rollback|restart|update_|install_/.test(code)) return '部署与恢复'
+  if (/schema|startup|frontend/.test(code)) return '运行环境'
+  return '其他'
+}
+
+export function diagnosticSeverity(code: string) {
+  if (/failed|failure|error|missing|interrupted|mismatch/.test(code)) return 'error'
+  if (/blocked|held|locked|rollback$|retry|unacknowledged/.test(code)) return 'warning'
+  return /_ok$/.test(code) ? 'success' : 'info'
+}
+
 export function SystemLogPage({ data, loading, onRefresh }: RefreshProps & { data: SystemLogs | null }) {
-  return <Card title="最近 100 条系统事件" extra={<Button onClick={onRefresh} loading={loading}>刷新</Button>}>
-    <OperationTable records={data?.events ?? []} loading={loading} />
-  </Card>
+  const [query,setQuery] = useState('')
+  const [category,setCategory] = useState('all')
+  const [severity,setSeverity] = useState('all')
+  const [selected,setSelected] = useState<Operation | null>(null)
+  const events = data?.events ?? []
+  const filtered = events.filter(row =>
+    (category === 'all' || diagnosticCategory(row.code) === category) &&
+    (severity === 'all' || diagnosticSeverity(row.code) === severity) &&
+    [row.code, labels[row.code], row.sha, row.at, row.detail].some(value => String(value ?? '').toLowerCase().includes(query.trim().toLowerCase()))
+  )
+  const counts = [
+    ['已读取事件', events.length],
+    ['失败事件', events.filter(row => diagnosticSeverity(row.code) === 'error').length],
+    ['警告事件', events.filter(row => diagnosticSeverity(row.code) === 'warning').length],
+    ['成功事件', events.filter(row => diagnosticSeverity(row.code) === 'success').length],
+  ] as const
+  return <Flex vertical gap="middle">
+    <div><Typography.Title level={3} style={{margin:'0 0 4px'}}>运行诊断</Typography.Title><Typography.Text type="secondary">查看真实系统事件、错误原因及关联提交。</Typography.Text></div>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(min(150px,100%),1fr))',gap:12}}>
+      {counts.map(([title,count]) => <Card key={title} size="small"><Typography.Text type="secondary">{title}</Typography.Text><Typography.Title level={3} style={{margin:'8px 0 0'}}>{data ? count : '未记录'}</Typography.Title></Card>)}
+    </div>
+    <Alert showIcon type="info" message="统计范围仅为接口返回的最近系统事件，不代表全量故障、实时服务健康或未解决阻塞数量。" />
+    <Card title="系统事件" extra={<Button onClick={onRefresh} loading={loading}>刷新</Button>}>
+      <Space wrap style={{marginBottom:12}}>
+        <Input.Search allowClear value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索事件、原因、SHA" style={{width:'min(260px,100%)'}} />
+        <Select value={category} onChange={setCategory} style={{minWidth:140}} options={['all','GitHub / 反馈','测试与构建','部署与恢复','运行环境','其他'].map(value=>({value,label:value==='all'?'全部类别':value}))}/>
+        <Select value={severity} onChange={setSeverity} style={{minWidth:120}} options={[{value:'all',label:'全部级别'},{value:'error',label:'失败'},{value:'warning',label:'警告'},{value:'success',label:'成功'},{value:'info',label:'信息'}]}/>
+        <Typography.Text type="secondary">{filtered.length} / {events.length} 条</Typography.Text>
+      </Space>
+      <OperationTable records={filtered} loading={loading} onDetails={setSelected}/>
+    </Card>
+    <Drawer title="系统事件详情" width={580} open={selected!==null} onClose={()=>setSelected(null)}>
+      {selected && <Descriptions bordered size="small" column={1} items={[
+        {key:'at',label:'事件时间',children:selected.at},
+        {key:'category',label:'分类',children:diagnosticCategory(selected.code)},
+        {key:'code',label:'事件代码',children:<Typography.Text code copyable>{selected.code}</Typography.Text>},
+        {key:'label',label:'事件说明',children:labels[selected.code]??'未分类事件'},
+        {key:'sha',label:'关联 SHA',children:<Typography.Text copyable style={{overflowWrap:'anywhere'}}>{selected.sha || '未记录'}</Typography.Text>},
+        {key:'detail',label:'接口返回详情',children:<Typography.Text style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere'}}>{selected.detail || '未记录'}</Typography.Text>},
+      ]}/>}
+    </Drawer>
+  </Flex>
 }
