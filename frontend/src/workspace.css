@@ -104,7 +104,18 @@
 .workspace-content .ant-card { border-color: #e2e8f0; box-shadow: none; border-radius: 10px; }
 .workspace-content .ant-table-wrapper { min-width: 0; }
 @media (max-width: 767px) {
-  .workspace-shell .workspace-sider { top: 0; height: calc(100dvh - 64px); }
+  .workspace-shell .workspace-sider { position: relative; top: 0; height: auto; min-height: calc(100dvh - 64px); }
   .workspace-header .workspace-brand { justify-content: flex-start; }
   .workspace-page-heading { margin-bottom: 10px; }
+}
+
+.workspace-header-actions { min-width: 0; }
+.workspace-shell .workspace-menu .ant-menu-item { margin-block: 4px; }
+.workspace-shell .workspace-menu .ant-menu-item-selected { font-weight: 600; }
+.workspace-content .ant-card-head { border-bottom-color: #e2e8f0; }
+.workspace-content .ant-table-thead > tr > th { font-weight: 600; }
+@media (max-width: 767px) {
+  .workspace-header .workspace-name { font-size: 14px; white-space: normal; }
+  .workspace-header .workspace-brand { flex: 1 1 140px; }
+  .workspace-header-actions { flex: 0 1 auto; }
 }

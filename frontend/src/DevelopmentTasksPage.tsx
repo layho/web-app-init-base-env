@@ -199,7 +199,7 @@ function PRTrackingPage({data, tasks, onReleaseDraft, onRequestRepair}: {data: P
         {key:'count', label:'PR 修改文件数',children:repairPR?.conflict?.candidate_files.length ?? 0},
       ]}/>
       <Typography.Paragraph strong style={{marginTop:12}}>需要检查的文件（不是确认存在冲突的文件）</Typography.Paragraph>
-      <div style={{maxHeight:190,overflowY:'auto',background:'#f6f8fa',padding:12,borderRadius:8}}>
+      <div style={{maxHeight:190,overflowY:'auto',background:'#f1f5f9',padding:12,borderRadius:8}}>
         {(repairPR?.conflict?.candidate_files ?? []).length ?
           repairPR?.conflict?.candidate_files.map((name) =>
             <div key={name}><Typography.Text code>{name}</Typography.Text></div>) :

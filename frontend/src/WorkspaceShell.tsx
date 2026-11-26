@@ -72,7 +72,6 @@ export function WorkspaceShell<Key extends string>({
       <Layout className="workspace-body">
         <Content>
           <main className="workspace-content workspace-content-responsive" aria-label={pageTitle}>
-            <div className="workspace-page-heading"><Typography.Title level={4}>{pageTitle}</Typography.Title></div>
             {children}
           </main>
         </Content>

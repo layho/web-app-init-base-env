@@ -449,7 +449,7 @@ function App() {
 
   if (loading) return <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>正在验证登录状态…</div>
   if (!session) return (
-    <Layout style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#f3f7fa', padding: 20 }}>
+    <Layout style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#f1f5f9', padding: 20 }}>
       <Card style={{ width: '100%', maxWidth: 390 }}>
         <Typography.Title level={3}>{branding.reference_name}</Typography.Title>
         {notice && <Alert type={notice.type} showIcon message={notice.text} style={{ marginBottom: 16 }} />}
