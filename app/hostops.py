@@ -46,6 +46,8 @@ class Heartbeat(StrictModel):
     disk: Disk | None
     services: list[Service] = Field(max_length=5)
     capabilities: list[str] = Field(max_length=3)
+    runtime_digest: str | None = Field(default=None,pattern=r"^[0-9a-f]{64}$")
+    dispatch_active: bool = False
 
 
 def dispatch_ready():
@@ -274,3 +276,35 @@ def audit(request: Request, response: Response, after: int=0, db: Session=Depend
     except sqlite3.Error:
         raise HTTPException(503,"HostOps task storage unavailable") from None
     return {"events":events,"next_cursor":events[-1]["seq"] if events else after}
+
+
+@router.get("/policy")
+def policy(request: Request, response: Response, db: Session=Depends(get_db)):
+    auth.authorize_session(request,db)
+    host,_=settings()
+    response.headers["Cache-Control"]="no-store"
+    with _lock:
+        active=bool(_latest and _latest[0]==host and 0<=_clock()-_latest[1]<=90
+                    and _latest[2].get("dispatch_active"))
+    return {"host_id":host,"policy_version":"readonly-v1","dispatch_configured":dispatch_ready(),
+            "agent_dispatch_active":active,"operations":[{"operation":op,"risk":"L1","allowed":True}
+            for op in sorted(OPERATIONS)],"service_mutation_allowed":False,
+            "remote_upgrade_allowed":False,"arbitrary_shell_allowed":False}
+
+
+@router.get("/modules")
+def modules(request: Request, response: Response, db: Session=Depends(get_db)):
+    auth.authorize_session(request,db)
+    host,_=settings()
+    response.headers["Cache-Control"]="no-store"
+    target=os.getenv("HOSTOPS_EXPECTED_RUNTIME_DIGEST","")
+    target=target if re.fullmatch(r"[0-9a-f]{64}",target) else None
+    with _lock:
+        latest=_latest if _latest and _latest[0]==host else None
+        observed=latest[2].get("runtime_digest") if latest else None
+        fresh=bool(latest and 0<=_clock()-latest[1]<=90)
+    state=("unknown" if not fresh or not observed or not target else
+           "matching" if observed==target else "different")
+    return {"modules":[{"module_id":"hostops.agent","observed_digest":observed,
+                        "expected_digest":target,"state":state,"fresh":fresh}],
+            "remote_upgrade_allowed":False}

@@ -1,5 +1,6 @@
 """Outbound heartbeat and signed read-only diagnostic agent; no inbound listener."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -45,12 +46,25 @@ def config():
     return host, origin.rstrip("/"), token
 
 
+def runtime_digest():
+    root=Path(__file__).resolve().parent
+    manifest={}
+    for name in ("agent.py","diagnostics.py","protocol.py"):
+        data=(root/name).read_bytes()
+        if len(data)>262144:
+            raise ValueError("runtime file exceeds bound")
+        manifest[name]=hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+
+
 def heartbeat_payload(host):
     snap = execute("agent.snapshot", {})["result"]
     health = snap["health"]
     return {"host_id": host, "system": health["system"],
             "architecture": health["architecture"], "disk": health["disk"],
-            "services": snap["services"], "capabilities": snap["capabilities"]}
+            "services": snap["services"], "capabilities": snap["capabilities"],
+            "runtime_digest":runtime_digest(),
+            "dispatch_active":os.getenv("HOSTOPS_AGENT_DISPATCH")=="true"}
 
 
 def send_heartbeat(host, origin, token, opener=None):

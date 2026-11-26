@@ -43,3 +43,23 @@ def test_admin_view_and_staleness(client, monkeypatch):
 def test_disabled_gateway(client, monkeypatch):
     monkeypatch.delenv("HOSTOPS_ENABLED")
     assert client.post("/api/hostops/v1/agent/heartbeat", json=payload()).status_code == 503
+
+
+def test_policy_and_module_evidence(client,monkeypatch):
+    monkeypatch.setattr(auth,"authorize_session",lambda *args:"admin")
+    monkeypatch.setenv("HOSTOPS_EXPECTED_RUNTIME_DIGEST","c"*64)
+    monkeypatch.setenv("HOSTOPS_DISPATCH_ENABLED","true")
+    monkeypatch.setenv("HOSTOPS_JOB_SIGNING_KEY","b"*64)
+    monkeypatch.setattr(hostops,"_clock",lambda:1000)
+    prefix="/api/hostops/v1"
+    assert client.get(prefix+"/modules").json()["modules"][0]["state"]=="unknown"
+    headers={"Authorization":"Bearer "+"a"*40}
+    body={**payload(),"runtime_digest":"c"*64,"dispatch_active":True}
+    assert client.post(prefix+"/agent/heartbeat",json=body,headers=headers).status_code==200
+    assert client.get(prefix+"/modules").json()["modules"][0]["state"]=="matching"
+    policy=client.get(prefix+"/policy").json()
+    assert policy["agent_dispatch_active"] and policy["dispatch_configured"]
+    assert not policy["service_mutation_allowed"] and not policy["remote_upgrade_allowed"]
+    monkeypatch.setattr(hostops,"_clock",lambda:1091)
+    assert client.get(prefix+"/modules").json()["modules"][0]["state"]=="unknown"
+    assert not client.get(prefix+"/policy").json()["agent_dispatch_active"]

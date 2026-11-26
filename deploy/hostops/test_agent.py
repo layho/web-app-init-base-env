@@ -55,3 +55,8 @@ class AgentTests(unittest.TestCase):
 
     def test_no_redirect(self):
         self.assertIsNone(agent.NoRedirect().redirect_request(None, None, 302, "", {}, "https://other.example"))
+
+
+    def test_runtime_digest_shape(self):
+        import re
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{64}",agent.runtime_digest()))

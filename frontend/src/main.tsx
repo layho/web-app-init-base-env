@@ -586,7 +586,7 @@ function App() {
             await loadOperations('releases')
           }} />
       ) : page === 'hostops' ? (
-        <HostOpsPage load={signal => api('/api/hostops/v1/hosts', {signal})} taskApi={{
+        <HostOpsPage load={signal => api('/api/hostops/v1/hosts', {signal})} evidenceApi={{policy:signal=>api('/api/hostops/v1/policy',{signal}),modules:signal=>api('/api/hostops/v1/modules',{signal})}} taskApi={{
           list: signal => api('/api/hostops/v1/tasks',{signal}),
           create: input => api('/api/hostops/v1/tasks',{method:'POST',body:JSON.stringify(input)},session.csrf_token),
           detail: (id,signal) => api('/api/hostops/v1/tasks/'+encodeURIComponent(id),{signal}),

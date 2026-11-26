@@ -4,6 +4,8 @@ import { diskView, hostState, serviceState } from './hostops-view.mjs'
 import './hostops.css'
 import { HostOpsTasks } from './HostOpsTasks'
 import type { TaskApi } from './HostOpsTasks'
+import { HostOpsPolicy, HostOpsModules } from './HostOpsEvidence'
+import type { EvidenceApi } from './HostOpsEvidence'
 
 type Disk = { total_bytes: number; used_bytes: number; free_bytes: number }
 type Service = { service_id: string; state: string; last_exit_code?: number | null }
@@ -15,7 +17,7 @@ const serviceNames: Record<string,string> = {
   'macci.publish':'Main 发布协调器', 'macci.receipts':'回执发送器', 'panel.merge':'Panel 合并协调器',
 }
 
-export function HostOpsPage({load,taskApi}: {load: (signal: AbortSignal) => Promise<HostResponse>; taskApi:TaskApi}) {
+export function HostOpsPage({load,taskApi,evidenceApi}: {load: (signal: AbortSignal) => Promise<HostResponse>; taskApi:TaskApi;evidenceApi:EvidenceApi}) {
   const loader = useRef(load)
   loader.current = load
   const controller = useRef<AbortController | null>(null)
@@ -90,10 +92,10 @@ export function HostOpsPage({load,taskApi}: {load: (signal: AbortSignal) => Prom
         <Card size="small" title="Agent 能力"><Space wrap>{snapshot?.capabilities.length ? snapshot.capabilities.map(c=><Tag key={c}>{c}</Tag>) : '暂无能力上报'}</Space></Card>
       </Flex>},
       {key:'terminal',label:'远程终端',children:tab==='terminal'?<HostOpsTasks api={taskApi} host={host?.host_id} online={host?.state==='online'} mode="terminal"/>:null},
-      {key:'services',label:'服务管理',children:<Card title="服务清单"><Alert type="info" showIcon message="当前仅支持读取服务状态；启动、停止及重启尚未开放" style={{marginBottom:12}}/>{serviceTable}</Card>},
-      {key:'upgrade',label:'模块升级',children:unavailable('模块升级','升级计划、可信制品及回滚流程待接入。')},
+      {key:'services',label:'服务管理',children:<Card title="服务清单"><Alert type="info" showIcon message="当前仅支持读取服务状态；跨用户服务控制需要独立可信 broker，尚未开放" style={{marginBottom:12}}/>{serviceTable}</Card>},
+      {key:'upgrade',label:'模块升级',children:tab==='upgrade'?<HostOpsModules api={evidenceApi}/>:null},
       {key:'records',label:'执行记录',children:tab==='records'?<HostOpsTasks api={taskApi} host={host?.host_id} online={host?.state==='online'} mode="records"/>:null},
-      {key:'security',label:'安全授权',children:<Card title="连接与授权"><DescriptionsSafe state={state.label} host={host?.host_id}/><Alert type="info" showIcon message="Agent 凭据及任务签名密钥独立配置；仅开放 L1 白名单诊断，写操作尚未开放" style={{marginTop:12}}/></Card>},
+      {key:'security',label:'安全授权',children:tab==='security'?<HostOpsPolicy api={evidenceApi}/>:null},
     ]}/>
     <Typography.Text type="secondary">最近读取：{lastRead === null ? '未取得数据' : new Date(lastRead).toLocaleString('zh-CN',{hour12:false})} · 每15秒刷新一次</Typography.Text>
   </Flex>
