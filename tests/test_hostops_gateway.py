@@ -32,11 +32,11 @@ def test_admin_view_and_staleness(client, monkeypatch):
     monkeypatch.setattr(auth, "authorize_session", lambda *args: "admin")
     url = "/api/hostops/v1/hosts"
     assert client.get(url).json()["hosts"][0]["state"] == "never_seen"
-    monkeypatch.setattr(hostops.time, "monotonic", lambda: 1000)
+    monkeypatch.setattr(hostops, "_clock", lambda: 1000)
     assert client.post("/api/hostops/v1/agent/heartbeat", json=payload(),
                        headers={"Authorization": "Bearer " + "a" * 40}).status_code == 200
     assert client.get(url).json()["hosts"][0]["state"] == "online"
-    monkeypatch.setattr(hostops.time, "monotonic", lambda: 1091)
+    monkeypatch.setattr(hostops, "_clock", lambda: 1091)
     assert client.get(url).json()["hosts"][0]["state"] == "stale"
 
 

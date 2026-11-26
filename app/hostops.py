@@ -16,6 +16,7 @@ from .db import get_db
 router = APIRouter(prefix="/api/hostops/v1")
 _lock = threading.Lock()
 _latest = None
+_clock = time.monotonic
 OPERATIONS = {"host.health", "service.inventory", "agent.snapshot"}
 SERVICES = {"macci.runner", "macci.preview", "macci.publish", "macci.receipts", "panel.merge"}
 
@@ -68,7 +69,7 @@ def heartbeat(payload: Heartbeat, request: Request, response: Response):
         raise HTTPException(422, "Invalid disk capacity")
     response.headers["Cache-Control"] = "no-store"
     with _lock:
-        _latest = (host, time.monotonic(), payload.model_dump())
+        _latest = (host, _clock(), payload.model_dump())
     return {"accepted": True, "schema": 1}
 
 
@@ -81,6 +82,6 @@ def hosts(request: Request, response: Response, db: Session = Depends(get_db)):
         if _latest is None or _latest[0] != host:
             return {"hosts": [{"host_id": host, "state": "never_seen", "snapshot": None}]}
         _, received, data = _latest
-        age = max(0, int(time.monotonic() - received))
+        age = max(0, int(_clock() - received))
         return {"hosts": [{"host_id": host, "state": "online" if age <= 90 else "stale",
                            "age_seconds": age, "snapshot": data}]}

@@ -102,7 +102,7 @@ def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path, monkeypatch)
     # Regression: Panel rebuild failed at pytest collection when these modules
     # were absent even though app/main.py imported them.
     for module in ("admin_settings", "feedback_delivery", "manual_pr_actions",
-                   "pr_conflict_controls", "pr_draft_controls"):
+                   "pr_conflict_controls", "pr_draft_controls", "hostops"):
         assert (repo / "app" / f"{module}.py").is_file()
     import ast
     package = ast.parse((repo / "app/main.py").read_text(encoding="utf-8"))
@@ -110,6 +110,7 @@ def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path, monkeypatch)
         if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module is None:
             for entry in node.names:
                 assert (repo / "app" / f"{entry.name}.py").is_file(), entry.name
+    assert (repo / "tests/test_hostops_gateway.py").is_file()
     generated_test = (repo / "tests/test_auth.py").read_text(encoding="utf-8")
     assert 'assert guide["scope"] == "application"' in generated_test
     assert 'assert len(guide["sections"]) == 4' in generated_test
