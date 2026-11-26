@@ -32,7 +32,19 @@ export function WorkspaceShell<Key extends string>({
   const pageTitle = navigation.find(item => item.key === activePage)?.label
 
   return (
-    <Layout className="workspace-shell">
+    <Layout className="workspace-shell" style={{ flexDirection: 'column' }}>
+        <Header className="workspace-header">
+          <div className="workspace-brand" aria-label={appName}>
+            <span className="workspace-mark" aria-hidden="true">{brandMark}</span>
+            <span className="workspace-name">{appName}</span>
+          </div>
+          <Space size="small" wrap className="workspace-header-actions">
+            {headerActions}
+            <Typography.Text className="workspace-user">{username}</Typography.Text>
+            <Button icon={<LogoutOutlined />} onClick={onLogout} disabled={logoutDisabled}>退出登录</Button>
+          </Space>
+        </Header>
+      <Layout className="workspace-frame">
       <Sider
         className="workspace-sider"
         theme="light"
@@ -43,10 +55,6 @@ export function WorkspaceShell<Key extends string>({
         onBreakpoint={setNarrow}
         trigger={null}
       >
-        <div className="workspace-brand" aria-label={appName}>
-          <span className="workspace-mark" aria-hidden="true">{brandMark}</span>
-          {!narrow && <span className="workspace-name">{appName}</span>}
-        </div>
         <nav aria-label="主导航">
           <Menu
             className="workspace-menu"
@@ -62,17 +70,13 @@ export function WorkspaceShell<Key extends string>({
         </nav>
       </Sider>
       <Layout className="workspace-body">
-        <Header className="workspace-header">
-          <Typography.Text strong>{pageTitle}</Typography.Text>
-          <Space size="small" wrap className="workspace-header-actions">
-            {headerActions}
-            <Typography.Text className="workspace-user">{username}</Typography.Text>
-            <Button icon={<LogoutOutlined />} onClick={onLogout} disabled={logoutDisabled}>退出登录</Button>
-          </Space>
-        </Header>
         <Content>
-          <main className="workspace-content workspace-content-responsive" aria-label={pageTitle}>{children}</main>
+          <main className="workspace-content workspace-content-responsive" aria-label={pageTitle}>
+            <div className="workspace-page-heading"><Typography.Title level={4}>{pageTitle}</Typography.Title></div>
+            {children}
+          </main>
         </Content>
+      </Layout>
       </Layout>
     </Layout>
   )

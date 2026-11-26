@@ -679,13 +679,22 @@ createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConfigProvider locale={zhCN} theme={{
       token: {
-        colorPrimary: '#1677ff',
+        colorPrimary: '#2563eb',
+        colorBgLayout: '#f1f5f9',
+        colorBgContainer: '#ffffff',
+        colorText: '#172033',
+        colorTextSecondary: '#64748b',
+        colorBorder: '#e2e8f0',
+        colorSuccess: '#16a34a',
+        colorWarning: '#d97706',
         borderRadius: 9,
         fontFamily: '-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif',
       },
       components: {
-        Layout: { siderBg: '#fff', headerBg: '#fff', bodyBg: '#f3f6fa' },
-        Menu: { itemSelectedBg: '#eaf2ff' },
+        Layout: { siderBg: '#f8fafc', headerBg: '#ffffff', bodyBg: '#f1f5f9' },
+        Menu: { itemBg: '#f8fafc', itemColor: '#475569', itemSelectedBg: '#e5edff', itemSelectedColor: '#2563eb', itemHoverBg: '#edf2f7', itemBorderRadius: 8 },
+        Card: { headerBg: '#ffffff' },
+        Table: { headerBg: '#f8fafc', headerColor: '#475569' },
       },
     }}>
       <App />
