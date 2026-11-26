@@ -71,7 +71,7 @@ export function WorkspaceShell<Key extends string>({
           </Space>
         </Header>
         <Content>
-          <main className="workspace-content" aria-label={pageTitle}>{children}</main>
+          <main className="workspace-content workspace-content-responsive" aria-label={pageTitle}>{children}</main>
         </Content>
       </Layout>
     </Layout>

@@ -163,3 +163,34 @@ def test_active_deployment_overrides_previous_success(github, monkeypatch, tmp_p
                             request, Response(), None)
     assert error.value.status_code == 409
     assert not github[2]
+
+
+def test_published_without_receipt_reports_main_without_claiming_acceptance(github):
+    refs, _, issues, _ = github
+    refs["main"] = RUNNING
+    result = acceptance.state(RUNNING)
+    assert result == {"enabled": True, "state": "not_requested", "main_sha": RUNNING, "is_published": True}
+    assert acceptance.load_receipt(RUNNING) is None
+    assert acceptance.submit(RUNNING, "0.2.0", True)["state"] == "published"
+    assert acceptance.load_receipt(RUNNING)["decision"] == "accepted"
+    assert not issues
+
+
+def test_unpublished_without_receipt_reports_main(github):
+    result = acceptance.state(RUNNING)
+    assert result["main_sha"] == MAIN
+    assert result["is_published"] is False
+    assert result["state"] == "not_requested"
+
+
+def test_github_http_error_distinguishes_rate_limit_and_permission():
+    from io import BytesIO
+    from urllib.error import HTTPError
+    def error(code, headers, body):
+        return HTTPError("https://api.github.com/test", code, "test", headers, BytesIO(json.dumps(body).encode()))
+    assert "主额度耗尽" in acceptance.github_http_error(error(403, {"X-RateLimit-Remaining":"0"}, {}))
+    assert "请求限流" in acceptance.github_http_error(error(403, {"Retry-After":"60"}, {}))
+    assert "请求限流" in acceptance.github_http_error(error(403, {}, {"message":"secondary rate limit secret"}))
+    msg = acceptance.github_http_error(error(403, {}, {"message":"secret credential"}))
+    assert "接口权限" in msg and "secret" not in msg
+    assert "身份认证失败" in acceptance.github_http_error(error(401, {}, {}))

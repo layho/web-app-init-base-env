@@ -18,6 +18,7 @@ import sys
 from tempfile import TemporaryDirectory
 
 import upgrade_plan as planner
+import ownership_preflight
 
 FOUNDATION = "layho/web-app-init-base-env"
 SOURCE_URL = "https://github.com/" + FOUNDATION + ".git"
@@ -405,6 +406,57 @@ def reuse_or_publish(app, repository, app_url, app_sha, target, commit, report):
 
 
 
+def verify_upgrade_inventory(app, app_sha, target_sha, before, after, decisions):
+    """Check exact tracked paths, including business files outside the planner."""
+    entries = git(app, "ls-tree", "-rz", app_sha).split(b"\0")
+    observed = []
+    modes = {}
+    for entry in entries:
+        if not entry:
+            continue
+        fields, raw = entry.split(b"\t", 1)
+        path = raw.decode("utf-8", "strict")
+        mode, kind, oid = fields.decode("ascii").split()
+        observed.append(path)
+        modes[path] = mode
+    template = sorted(set(before) | set(after))
+    changes = [{"path": d.path, "op": "add" if d.local is None else "modify",
+                "symlink": modes.get(d.path, "100644") not in {"100644", "100755"}}
+               for d in decisions if d.action in {"add", "replace", "merge"}]
+    result = ownership_preflight.check({
+        "baseline_sha": app_sha, "candidate_sha": target_sha,
+        "kind": "foundation-upgrade",
+        "policy": {"schema": 1, "origin": "trusted-caller", "foundation": template,
+                   "app": [], "protected": sorted(planner.PROTECTED)},
+        "template_paths": template, "observed_files": observed, "changes": changes,
+    })
+    # Detect file/directory collisions and case-folded parent aliases, not just
+    # full filename collisions. Never stage into an existing business tree alias.
+    occupied = {}
+    for path in sorted(set(observed) | set(template)):
+        parts = path.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            occupied.setdefault(prefix.casefold(), set()).add(prefix)
+    for change in changes:
+        path = change["path"]
+        parts = path.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            if len(occupied.get(prefix.casefold(), ())) > 1:
+                result["errors"].append("case-insensitive path alias: " + prefix)
+            if i < len(parts) and prefix in modes:
+                result["errors"].append("tracked file blocks parent directory: " + prefix)
+        if any(p.startswith(path + "/") for p in observed):
+            result["errors"].append("tracked directory blocks file: " + path)
+    if result["errors"]:
+        result["ok"] = False
+    # Only retain diagnostics, not the complete business-file inventory.
+    return {"ok": result["ok"], "authoritative": False,
+            "errors": result["errors"],
+            "rejected": [d for d in result["decisions"] if d["verdict"] == "reject"]}
+
+
 def coordinate(repository, legacy_base=None, create_pr=False, *, expected_target=None, expected_app=None):
     if not REPO.fullmatch(repository) or repository.lower() == FOUNDATION.lower():
         raise ValueError("Invalid downstream repository")
@@ -450,10 +502,12 @@ def coordinate(repository, legacy_base=None, create_pr=False, *, expected_target
         before, after = preserve_verified_panel_auth_tests(
             source, old_sha, target_sha, repository, before, after, current)
         decisions = planner.plan(before, after, current)
+        inventory = verify_upgrade_inventory(app, app_sha, target_sha, before, after, decisions)
         summary = {"schema": 1, "app_sha": actual, "from": old, "target": target,
                    "legacy_verified_root": legacy_root,
                    "changes": [d.summary() for d in decisions],
-                   "blocked": any(d.action in ("conflict", "review") for d in decisions)}
+                   "ownership_preflight": inventory,
+                   "blocked": not inventory["ok"] or any(d.action in ("conflict", "review") for d in decisions)}
         if summary["blocked"] or not create_pr:
             return {"state": "blocked" if summary["blocked"] else "planned", **summary}
         commit = create_commit(app, app_sha, decisions, meta, target)
