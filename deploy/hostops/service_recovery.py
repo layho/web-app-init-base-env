@@ -9,6 +9,8 @@ import json
 import os
 import platform
 import stat
+import sqlite3
+from contextlib import closing
 import subprocess
 import time
 from contextlib import contextmanager
@@ -55,8 +57,28 @@ def launch(target):
     return result.returncode
 
 
+def reserve_recovery(root,service_id,now):
+    """Persist an attempt before launching. A crash cannot reset its cooldown."""
+    path=root/"attempts.sqlite3"
+    fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:
+            raise ValueError("unsafe recovery ledger")
+    finally:
+        os.close(fd)
+    with closing(sqlite3.connect(path,timeout=3)) as db,db:
+        db.execute("CREATE TABLE IF NOT EXISTS attempts(service_id TEXT PRIMARY KEY, attempted_at INTEGER NOT NULL)")
+        db.execute("BEGIN IMMEDIATE")
+        row=db.execute("SELECT attempted_at FROM attempts WHERE service_id=?",(service_id,)).fetchone()
+        if row and now-row[0]<300:
+            return False
+        db.execute("INSERT INTO attempts VALUES (?,?) ON CONFLICT(service_id) DO UPDATE SET attempted_at=excluded.attempted_at",(service_id,now))
+        return True
+
+
 def recover(service_id, *, execute=False, root=None, inventory=services, runner=launch,
-            system=platform.system, uid=os.getuid, sleeper=time.sleep):
+            system=platform.system, uid=os.getuid, sleeper=time.sleep, clock=time.time):
     if service_id not in RECOVERABLE:
         raise ValueError("service is not approved for recovery")
     if system()!="Darwin" or uid()==0:
@@ -75,6 +97,8 @@ def recover(service_id, *, execute=False, root=None, inventory=services, runner=
         # Recheck immediately before the fixed launchctl action.
         if observe(service_id,inventory)!="last_exit_failed":
             return {**result,"state":"state_changed"}
+        if not reserve_recovery(root,service_id,int(clock())):
+            return {**result,"state":"cooldown"}
         try:
             code=runner(target)
         except (OSError,subprocess.SubprocessError):
@@ -103,11 +127,11 @@ def main():
     args=parser.parse_args()
     try:
         result=recover(args.service,execute=args.execute,root=Path.home()/".hostops-recovery")
-    except (OSError,ValueError):
+    except (OSError,ValueError,sqlite3.Error):
         print(json.dumps({"state":"refused"}))
         return 1
     print(json.dumps(result))
-    return 0 if result["state"] in ("eligible","not_eligible","running_observed","idle_observed","state_changed") else 1
+    return 0 if result["state"] in ("eligible","not_eligible","running_observed","idle_observed","state_changed","cooldown") else 1
 
 
 if __name__=="__main__":

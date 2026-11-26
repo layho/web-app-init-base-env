@@ -29,7 +29,6 @@ jobs:
           /tmp/fallback-ci/bin/python -m pytest -q tests/test_hostops_gateway.py tests/test_hostops_tasks.py tests/test_app_init.py
           /tmp/fallback-ci/bin/python -m compileall -q app
       - name: Full backend regression
-        if: contains(github.event.pull_request.labels.*.name, 'full-regression')
         run: /tmp/fallback-ci/bin/python -m pytest -q
       - name: Frontend regression and build
         run: |

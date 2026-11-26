@@ -45,3 +45,16 @@ class RecoveryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     recover("macci.receipts",execute=True,root=root,**opts)
             self.assertEqual(recover("macci.receipts",execute=True,root=root,**opts)["state"],"outcome_unknown")
+
+
+    def test_persisted_cooldown_and_clock_rollback(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/"state"
+            opts=self.options(["last_exit_failed","last_exit_failed","running"])
+            recover("macci.receipts",execute=True,root=root,clock=lambda:1000,**opts)
+            for now in (1001,999):
+                opts=self.options(["last_exit_failed","last_exit_failed"])
+                self.assertEqual(recover("macci.receipts",execute=True,root=root,clock=lambda:now,**opts)["state"],"cooldown")
+                opts["runner"].assert_not_called()
+            opts=self.options(["last_exit_failed","last_exit_failed","running"])
+            self.assertEqual(recover("macci.receipts",execute=True,root=root,clock=lambda:1300,**opts)["state"],"running_observed")

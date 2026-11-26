@@ -181,7 +181,7 @@ def activate(plist,spec,runner=run_launchctl,probe=None):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source",type=Path,required=True)
+    parser.add_argument("--source",type=Path,help="Reviewed local release directory; omit to select an already staged digest")
     parser.add_argument("--digest",required=True)
     parser.add_argument("--host",required=True)
     parser.add_argument("--origin",required=True)
@@ -193,7 +193,16 @@ def main():
     root=Path.home()/".hostops"
     try:
         with installation_lock(root):
-            release=stage(root,args.source,args.digest)
+            if not re.fullmatch(r"[0-9a-f]{64}",args.digest):
+                raise ValueError("invalid release digest")
+            source=args.source
+            if source is None:
+                versions=root/"versions"
+                private_directory(versions)
+                source=versions/args.digest
+                if not source.is_dir() or source.is_symlink():
+                    raise ValueError("staged release unavailable")
+            release=stage(root,source,args.digest)
             spec=launch_spec(root,release,args.host,args.origin,Path(sys.executable),args.dispatch)
             if not args.activate:
                 print("Verified release staged; service not changed")
