@@ -418,6 +418,10 @@ def version(response: Response):
     }
 
 
+from .hostops import router as hostops_router
+app.include_router(hostops_router)
+
+
 # HTML is never reusable across deployments; hashed assets keep normal caching.
 class FoundationStaticFiles(StaticFiles):
     async def get_response(self, path, scope):

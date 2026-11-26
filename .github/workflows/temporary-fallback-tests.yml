@@ -2,19 +2,22 @@ name: Temporary isolated fallback tests
 on:
   pull_request:
     branches: [preview]
+    paths:
+      - 'app/**'
+      - 'tests/**'
+      - 'deploy/**'
+      - 'frontend/**'
+      - 'scripts/**'
+      - 'migrations/**'
+      - 'requirements.txt'
+      - '.github/workflows/temporary-fallback-tests.yml'
 permissions:
   contents: read
+concurrency:
+  group: fallback-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 jobs:
-  hostops:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: HostOps offline regressions
-        run: python3 -m unittest discover -s deploy/hostops -p 'test_*.py' -v
-  regression:
+  scoped:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -24,13 +27,35 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 2
+      - name: Select regression scope
+        id: scope
+        env:
+          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'full-regression') }}
+        run: |
+          git diff --name-only HEAD^1 HEAD > /tmp/changed-files
+          for scope in backend frontend hostops; do
+            case "$scope" in
+              backend) pattern='^(app/|tests/|deploy/|scripts/|migrations/|requirements.txt$)' ;;
+              frontend) pattern='^frontend/' ;;
+              hostops) pattern='^deploy/hostops/' ;;
+            esac
+            if [ "$FULL" = true ] || grep -Eq "$pattern" /tmp/changed-files; then
+              echo "$scope=true" >> "$GITHUB_OUTPUT"
+            fi
+          done
+      - name: HostOps offline regressions
+        if: steps.scope.outputs.hostops == 'true'
+        run: python3 -m unittest discover -s deploy/hostops -p 'test_*.py' -v
       - name: Python isolated tests
+        if: steps.scope.outputs.backend == 'true'
         run: |
           python3 -m venv /tmp/fallback-ci
           /tmp/fallback-ci/bin/python -m pip --isolated install --only-binary=:all: -r requirements.txt
           /tmp/fallback-ci/bin/python -m pytest -q
           /tmp/fallback-ci/bin/python -m compileall -q app
       - name: Frontend regression and build
+        if: steps.scope.outputs.frontend == 'true'
         run: |
           npm --prefix frontend ci --ignore-scripts --no-audit --no-fund
           npm --prefix frontend run build
