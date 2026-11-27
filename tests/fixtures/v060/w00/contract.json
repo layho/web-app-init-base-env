@@ -1,0 +1,895 @@
+{
+  "schema_version": 1,
+  "status": "draft",
+  "baseline_sha": "db19bff19307fa763fd50e94b4cedfda7181a141",
+  "baseline_tree": "c126d37771fa66a832497e6b2814d782fafc1dff",
+  "package": "W00",
+  "issue": 204,
+  "normative": false,
+  "note": "草案。ChatGPT 评审前不得当作已冻结契约，也不得挂到生产路由。",
+  "delivery": "at_least_once_plus_idempotent_reconcile",
+  "exactly_once_across_github_and_db": false,
+  "entities": {
+    "task": {
+      "description": "业务任务。阶段推进是当前 Run 成功后的投影，不用单一 status 覆盖执行、候选和部署。",
+      "phases": [
+        "feedback_sync",
+        "claim",
+        "develop",
+        "review",
+        "test",
+        "integrate",
+        "preview_merge",
+        "deploy",
+        "accept",
+        "publish",
+        "close"
+      ],
+      "execution_states": [
+        "READY",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "RETRY_WAIT",
+        "BLOCKED",
+        "UNKNOWN",
+        "SUPERSEDED",
+        "CANCELLED"
+      ],
+      "terminal_phases": [
+        "close"
+      ],
+      "terminal_execution": [
+        "SUCCEEDED",
+        "FAILED",
+        "SUPERSEDED",
+        "CANCELLED"
+      ],
+      "transitions": [
+        {
+          "from": "feedback_sync",
+          "to": "claim"
+        },
+        {
+          "from": "claim",
+          "to": "develop"
+        },
+        {
+          "from": "develop",
+          "to": "review"
+        },
+        {
+          "from": "review",
+          "to": "test"
+        },
+        {
+          "from": "test",
+          "to": "integrate"
+        },
+        {
+          "from": "integrate",
+          "to": "preview_merge"
+        },
+        {
+          "from": "preview_merge",
+          "to": "deploy"
+        },
+        {
+          "from": "deploy",
+          "to": "accept"
+        },
+        {
+          "from": "accept",
+          "to": "publish"
+        },
+        {
+          "from": "publish",
+          "to": "close"
+        },
+        {
+          "from": "accept",
+          "to": "develop",
+          "guard": "repair_authorized"
+        }
+      ]
+    },
+    "run": {
+      "description": "某一阶段的一次执行轮次。旧 run 只读，不能覆盖当前轮次。",
+      "states": [
+        "PENDING",
+        "LEASED",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "RETRY_WAIT",
+        "BLOCKED",
+        "UNKNOWN",
+        "SUPERSEDED",
+        "CANCELLED"
+      ],
+      "terminal": [
+        "SUCCEEDED",
+        "FAILED",
+        "SUPERSEDED",
+        "CANCELLED"
+      ],
+      "transitions": [
+        {
+          "from": "PENDING",
+          "to": "LEASED"
+        },
+        {
+          "from": "LEASED",
+          "to": "RUNNING"
+        },
+        {
+          "from": "LEASED",
+          "to": "PENDING",
+          "guard": "release_before_start"
+        },
+        {
+          "from": "RUNNING",
+          "to": "SUCCEEDED"
+        },
+        {
+          "from": "RUNNING",
+          "to": "FAILED"
+        },
+        {
+          "from": "RUNNING",
+          "to": "RETRY_WAIT"
+        },
+        {
+          "from": "RUNNING",
+          "to": "BLOCKED"
+        },
+        {
+          "from": "RUNNING",
+          "to": "UNKNOWN",
+          "guard": "lease_expired_without_terminal_receipt"
+        },
+        {
+          "from": "RUNNING",
+          "to": "CANCELLED"
+        },
+        {
+          "from": "RUNNING",
+          "to": "SUPERSEDED"
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "RUNNING"
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "FAILED"
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "CANCELLED"
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "BLOCKED"
+        },
+        {
+          "from": "BLOCKED",
+          "to": "PENDING",
+          "guard": "reauthorized"
+        },
+        {
+          "from": "BLOCKED",
+          "to": "CANCELLED"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "RETRY_WAIT",
+          "guard": "fence_proof_no_unknown_side_effect"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "FAILED",
+          "guard": "fence_proof_side_effect_failed"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "CANCELLED",
+          "guard": "operator_after_fence_review"
+        },
+        {
+          "from": "LEASED",
+          "to": "CANCELLED"
+        },
+        {
+          "from": "LEASED",
+          "to": "SUPERSEDED"
+        },
+        {
+          "from": "PENDING",
+          "to": "CANCELLED"
+        },
+        {
+          "from": "PENDING",
+          "to": "SUPERSEDED"
+        }
+      ]
+    },
+    "candidate": {
+      "description": "精确候选。身份是 head、base、merge、tree，缺一不可。",
+      "states": [
+        "REGISTERED",
+        "SUPERSEDED",
+        "INVALID",
+        "INTEGRATED"
+      ],
+      "terminal": [
+        "SUPERSEDED",
+        "INVALID",
+        "INTEGRATED"
+      ],
+      "required_identity": [
+        "head",
+        "base",
+        "merge",
+        "tree"
+      ],
+      "transitions": [
+        {
+          "from": "REGISTERED",
+          "to": "SUPERSEDED"
+        },
+        {
+          "from": "REGISTERED",
+          "to": "INVALID"
+        },
+        {
+          "from": "REGISTERED",
+          "to": "INTEGRATED",
+          "guard": "exact_remote_observation"
+        }
+      ]
+    },
+    "release": {
+      "description": "版本计划。开发可并行，集成串行。未来版本可以停留在 PLANNED，不能进入 INTEGRATING。",
+      "states": [
+        "PLANNED",
+        "ACTIVE",
+        "INTEGRATING",
+        "ACCEPTANCE",
+        "PUBLISHING",
+        "PUBLISHED",
+        "ARCHIVED"
+      ],
+      "terminal": [
+        "ARCHIVED"
+      ],
+      "transitions": [
+        {
+          "from": "PLANNED",
+          "to": "ACTIVE"
+        },
+        {
+          "from": "ACTIVE",
+          "to": "INTEGRATING"
+        },
+        {
+          "from": "INTEGRATING",
+          "to": "ACCEPTANCE"
+        },
+        {
+          "from": "ACCEPTANCE",
+          "to": "PUBLISHING",
+          "guard": "user_acceptance_recorded"
+        },
+        {
+          "from": "PUBLISHING",
+          "to": "PUBLISHED",
+          "guard": "main_publish_receipt"
+        },
+        {
+          "from": "PUBLISHED",
+          "to": "ARCHIVED"
+        },
+        {
+          "from": "ACCEPTANCE",
+          "to": "INTEGRATING",
+          "guard": "repair_replacement"
+        },
+        {
+          "from": "PUBLISHING",
+          "to": "ACCEPTANCE",
+          "guard": "publish_failed_closed"
+        }
+      ]
+    },
+    "deployment": {
+      "description": "部署事务。Git HEAD 相等不是成功。生产数据库不在此事务里自动迁移或回滚。",
+      "states": [
+        "PLAN",
+        "STAGE",
+        "VERIFY",
+        "SWITCH",
+        "HEALTH",
+        "COMMIT",
+        "RECONCILE",
+        "ROLLBACK",
+        "VERIFY_OLD",
+        "ROLLED_BACK",
+        "SAFE_FROZEN"
+      ],
+      "terminal": [
+        "COMMIT",
+        "ROLLED_BACK",
+        "SAFE_FROZEN"
+      ],
+      "transitions": [
+        {
+          "from": "PLAN",
+          "to": "STAGE"
+        },
+        {
+          "from": "PLAN",
+          "to": "COMMIT",
+          "guard": "no_change_and_healthy_and_no_pending_journal"
+        },
+        {
+          "from": "STAGE",
+          "to": "VERIFY"
+        },
+        {
+          "from": "VERIFY",
+          "to": "SWITCH"
+        },
+        {
+          "from": "SWITCH",
+          "to": "HEALTH"
+        },
+        {
+          "from": "HEALTH",
+          "to": "COMMIT"
+        },
+        {
+          "from": "STAGE",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "VERIFY",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "SWITCH",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "HEALTH",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "ROLLBACK"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "SAFE_FROZEN",
+          "guard": "outcome_unknown"
+        },
+        {
+          "from": "ROLLBACK",
+          "to": "VERIFY_OLD"
+        },
+        {
+          "from": "VERIFY_OLD",
+          "to": "ROLLED_BACK"
+        },
+        {
+          "from": "VERIFY_OLD",
+          "to": "SAFE_FROZEN",
+          "guard": "old_health_unproven"
+        }
+      ]
+    },
+    "resource": {
+      "description": "宿主资源。卸载和重建默认先 dry-run，破坏性删除需要单独授权。",
+      "states": [
+        "PLANNED",
+        "RESERVED",
+        "APPLYING",
+        "APPLIED",
+        "UNKNOWN",
+        "RECONCILE",
+        "RELEASING",
+        "RELEASED",
+        "ROLLED_BACK",
+        "SAFE_FROZEN"
+      ],
+      "terminal": [
+        "RELEASED",
+        "ROLLED_BACK",
+        "SAFE_FROZEN"
+      ],
+      "transitions": [
+        {
+          "from": "PLANNED",
+          "to": "RESERVED"
+        },
+        {
+          "from": "RESERVED",
+          "to": "APPLYING"
+        },
+        {
+          "from": "RESERVED",
+          "to": "RELEASED",
+          "guard": "reservation_released"
+        },
+        {
+          "from": "APPLYING",
+          "to": "APPLIED"
+        },
+        {
+          "from": "APPLYING",
+          "to": "UNKNOWN"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "APPLIED",
+          "guard": "observed_applied"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "ROLLED_BACK",
+          "guard": "observed_absent"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "SAFE_FROZEN",
+          "guard": "outcome_unknown"
+        },
+        {
+          "from": "APPLIED",
+          "to": "RELEASING",
+          "guard": "explicit_authorization"
+        },
+        {
+          "from": "RELEASING",
+          "to": "RELEASED"
+        },
+        {
+          "from": "RELEASING",
+          "to": "SAFE_FROZEN",
+          "guard": "release_unproven"
+        }
+      ]
+    },
+    "event": {
+      "description": "不可变事实。先本地落盘，再投递。投递至少一次。事件内容不授予权限。",
+      "states": [
+        "DURABLE_LOCAL",
+        "OUTBOX",
+        "DELIVERED",
+        "DELIVERY_UNKNOWN",
+        "QUARANTINED"
+      ],
+      "terminal": [
+        "DELIVERED",
+        "QUARANTINED"
+      ],
+      "required_fields": [
+        "event_id",
+        "schema_version",
+        "event_type",
+        "producer_id",
+        "producer_seq",
+        "occurred_at",
+        "idempotency_key"
+      ],
+      "transitions": [
+        {
+          "from": "DURABLE_LOCAL",
+          "to": "OUTBOX"
+        },
+        {
+          "from": "OUTBOX",
+          "to": "DELIVERED"
+        },
+        {
+          "from": "OUTBOX",
+          "to": "DELIVERY_UNKNOWN"
+        },
+        {
+          "from": "OUTBOX",
+          "to": "QUARANTINED"
+        },
+        {
+          "from": "DELIVERY_UNKNOWN",
+          "to": "OUTBOX",
+          "guard": "retry_same_event_id"
+        },
+        {
+          "from": "DELIVERY_UNKNOWN",
+          "to": "QUARANTINED"
+        }
+      ]
+    }
+  },
+  "error_codes": [
+    {
+      "code": "CONFLICT_REVISION",
+      "http": 409,
+      "meaning": "expected_revision 与当前修订不一致"
+    },
+    {
+      "code": "LEASE_FENCE_REJECTED",
+      "http": 409,
+      "meaning": "租约令牌过期、不匹配或已被新租约作废"
+    },
+    {
+      "code": "IDEMPOTENCY_REPLAY",
+      "http": 200,
+      "meaning": "同一幂等键和同一载荷返回原 request_id 与状态"
+    },
+    {
+      "code": "IDEMPOTENCY_PAYLOAD_MISMATCH",
+      "http": 409,
+      "meaning": "同一幂等键对应了不同载荷"
+    },
+    {
+      "code": "CANDIDATE_STALE",
+      "http": 409,
+      "meaning": "head、base、merge 或 tree 已变化"
+    },
+    {
+      "code": "EVIDENCE_MISSING",
+      "http": 409,
+      "meaning": "缺少该转换要求的证据"
+    },
+    {
+      "code": "POLICY_DENIED",
+      "http": 403,
+      "meaning": "策略拒绝，事件正文不能自授权"
+    },
+    {
+      "code": "NOT_AUTHORIZED",
+      "http": 403,
+      "meaning": "调用身份无权执行该操作"
+    },
+    {
+      "code": "UNKNOWN_EXECUTOR",
+      "http": 409,
+      "meaning": "没有可验证的执行器，不得显示为执行中"
+    },
+    {
+      "code": "SIDE_EFFECT_UNKNOWN",
+      "http": 409,
+      "meaning": "无法证明外部副作用已发生或未发生，保持冻结"
+    },
+    {
+      "code": "SCHEMA_UNSUPPORTED",
+      "http": 422,
+      "meaning": "schema_version 不是接收方支持的版本"
+    },
+    {
+      "code": "RATE_LIMITED",
+      "http": 429,
+      "meaning": "超过调用方限额"
+    },
+    {
+      "code": "DEPENDENCY_UNSATISFIED",
+      "http": 409,
+      "meaning": "前置依赖未完成"
+    },
+    {
+      "code": "RESERVATION_CONFLICT",
+      "http": 409,
+      "meaning": "路径预约重叠"
+    },
+    {
+      "code": "FREEZE_ACTIVE",
+      "http": 409,
+      "meaning": "验收冻结拒绝该候选"
+    },
+    {
+      "code": "PRODUCTION_DB_FORBIDDEN",
+      "http": 403,
+      "meaning": "生产数据库自动迁移或回滚被拒绝"
+    },
+    {
+      "code": "PLATFORM_UNSUPPORTED",
+      "http": 422,
+      "meaning": "平台适配器拒绝该操作系统，且不执行后续命令"
+    }
+  ],
+  "write_required": [
+    "actor",
+    "scope",
+    "expected_revision",
+    "idempotency_key"
+  ],
+  "examples": [
+    {
+      "name": "task_claim",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:claim",
+      "side_effect": true,
+      "implemented": false,
+      "request": {
+        "schema_version": 1,
+        "actor": {
+          "kind": "agent",
+          "id": "grok",
+          "proof_ref": "test-proof://agent/grok/1"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 3,
+        "idempotency_key": "idem-w00-claim-example",
+        "phase": "develop",
+        "candidate": {
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "merge": "cccccccccccccccccccccccccccccccccccccccc",
+          "tree": "dddddddddddddddddddddddddddddddddddddddd"
+        }
+      },
+      "response": {
+        "schema_version": 1,
+        "request_id": "req_example_claim",
+        "run_id": "run_example_1",
+        "state": "LEASED",
+        "revision": 4,
+        "replayed": false
+      }
+    },
+    {
+      "name": "task_claim_replay",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:claim",
+      "side_effect": true,
+      "implemented": false,
+      "request": {
+        "schema_version": 1,
+        "actor": {
+          "kind": "agent",
+          "id": "grok",
+          "proof_ref": "test-proof://agent/grok/1"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 3,
+        "idempotency_key": "idem-w00-claim-example",
+        "phase": "develop",
+        "candidate": {
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "merge": "cccccccccccccccccccccccccccccccccccccccc",
+          "tree": "dddddddddddddddddddddddddddddddddddddddd"
+        }
+      },
+      "response": {
+        "schema_version": 1,
+        "request_id": "req_example_claim",
+        "run_id": "run_example_1",
+        "state": "LEASED",
+        "revision": 4,
+        "replayed": true,
+        "code": "IDEMPOTENCY_REPLAY"
+      }
+    },
+    {
+      "name": "task_claim_payload_mismatch",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:claim",
+      "side_effect": true,
+      "implemented": false,
+      "request": {
+        "schema_version": 1,
+        "actor": {
+          "kind": "agent",
+          "id": "grok",
+          "proof_ref": "test-proof://agent/grok/1"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 9,
+        "idempotency_key": "idem-w00-claim-example",
+        "phase": "develop",
+        "candidate": {
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "merge": "cccccccccccccccccccccccccccccccccccccccc",
+          "tree": "dddddddddddddddddddddddddddddddddddddddd"
+        }
+      },
+      "response": {
+        "schema_version": 1,
+        "code": "IDEMPOTENCY_PAYLOAD_MISMATCH",
+        "request_id": "req_example_claim"
+      }
+    },
+    {
+      "name": "run_finish_stale_lease",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_example_1:complete",
+      "side_effect": true,
+      "implemented": false,
+      "request": {
+        "schema_version": 1,
+        "actor": {
+          "kind": "agent",
+          "id": "grok",
+          "proof_ref": "test-proof://agent/grok/1"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "run_id": "run_example_1"
+        },
+        "expected_revision": 4,
+        "idempotency_key": "idem-w00-stale-lease",
+        "lease_token": "expired-or-replaced-token",
+        "result": "SUCCEEDED"
+      },
+      "response": {
+        "schema_version": 1,
+        "code": "LEASE_FENCE_REJECTED",
+        "state": "UNKNOWN"
+      }
+    },
+    {
+      "name": "event_append",
+      "method": "POST",
+      "path": "/api/v1/control/events",
+      "side_effect": true,
+      "implemented": false,
+      "request": {
+        "schema_version": 1,
+        "actor": {
+          "kind": "macci",
+          "id": "macci-test",
+          "proof_ref": "test-proof://macci/1"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env"
+        },
+        "expected_revision": 0,
+        "idempotency_key": "idem-w00-event-1",
+        "event_id": "evt_example_1",
+        "event_type": "ci.test.finished",
+        "producer_id": "macci-test",
+        "producer_seq": 7,
+        "occurred_at": "2026-11-27T10:00:00Z",
+        "candidate": {
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "merge": "cccccccccccccccccccccccccccccccccccccccc",
+          "tree": "dddddddddddddddddddddddddddddddddddddddd"
+        },
+        "evidence_ref": "status://macmini/isolated-tests-v1/example"
+      },
+      "response": {
+        "schema_version": 1,
+        "request_id": "req_example_event",
+        "state": "DURABLE_LOCAL",
+        "applied": false
+      }
+    },
+    {
+      "name": "event_out_of_order",
+      "method": "POST",
+      "path": "/api/v1/control/events",
+      "side_effect": true,
+      "implemented": false,
+      "request": {
+        "schema_version": 1,
+        "actor": {
+          "kind": "macci",
+          "id": "macci-test",
+          "proof_ref": "test-proof://macci/1"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env"
+        },
+        "expected_revision": 0,
+        "idempotency_key": "idem-w00-event-gap",
+        "event_id": "evt_example_9",
+        "event_type": "ci.test.finished",
+        "producer_id": "macci-test",
+        "producer_seq": 9,
+        "occurred_at": "2026-11-27T10:05:00Z",
+        "gap_after_seq": 7
+      },
+      "response": {
+        "schema_version": 1,
+        "request_id": "req_example_gap",
+        "state": "DURABLE_LOCAL",
+        "applied": false,
+        "watermark_seq": 7
+      }
+    },
+    {
+      "name": "event_query",
+      "method": "GET",
+      "path": "/api/v1/control/events?producer_id=macci-test&after_seq=7",
+      "side_effect": false,
+      "implemented": false,
+      "request": null,
+      "response": {
+        "schema_version": 1,
+        "side_effect": false,
+        "items": [],
+        "gap": true
+      }
+    },
+    {
+      "name": "policy_evaluate_deny",
+      "method": "POST",
+      "path": "/api/v1/control/policy:evaluate",
+      "side_effect": false,
+      "implemented": false,
+      "request": {
+        "schema_version": 1,
+        "actor": {
+          "kind": "candidate",
+          "id": "pr-example",
+          "proof_ref": null
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "action": "release.publish"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-policy-deny",
+        "subject_event_id": "evt_example_1"
+      },
+      "response": {
+        "schema_version": 1,
+        "code": "POLICY_DENIED",
+        "allow": false,
+        "side_effect": false
+      }
+    },
+    {
+      "name": "deployment_plan",
+      "method": "POST",
+      "path": "/api/v1/control/deployments:plan",
+      "side_effect": true,
+      "implemented": false,
+      "request": {
+        "schema_version": 1,
+        "actor": {
+          "kind": "host",
+          "id": "host-test",
+          "proof_ref": "test-proof://host/1"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "app_id": "base"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-deploy-plan",
+        "candidate": {
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "merge": "cccccccccccccccccccccccccccccccccccccccc",
+          "tree": "dddddddddddddddddddddddddddddddddddddddd"
+        },
+        "previous_healthy_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "artifact_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "response": {
+        "schema_version": 1,
+        "request_id": "req_example_plan",
+        "deployment_id": "dep_example_1",
+        "state": "PLAN"
+      }
+    }
+  ]
+}
