@@ -57,6 +57,37 @@ class PreviewJournal:
                 db.rollback()
                 raise
 
+    def initialize_version(self,version):
+        """Provision an explicitly configured first version, never switch it.
+
+        The operator must use a separately reviewed transition for later versions.
+        Initialization cannot abandon an unresolved push or an existing version.
+        """
+        if not isinstance(version,str) or not re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+",version) or len(version)>40:
+            raise ValueError("invalid active version")
+        with self.tx() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS integration_jobs(
+                id TEXT PRIMARY KEY, version TEXT NOT NULL, head TEXT NOT NULL,
+                dependencies TEXT NOT NULL, files TEXT NOT NULL, priority INTEGER NOT NULL,
+                state TEXT NOT NULL, base TEXT, lease TEXT, expires INTEGER,
+                created INTEGER NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS integration_events(
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, job TEXT NOT NULL,
+                event TEXT NOT NULL, at INTEGER NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS integration_version(
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), version TEXT NOT NULL)""")
+            row=db.execute("SELECT version FROM integration_version WHERE singleton=1").fetchone()
+            if row is not None:
+                if row["version"]!=version:
+                    raise ReservationBlocked("active version differs; reviewed transition required")
+                return False
+            if db.execute("SELECT 1 FROM preview_attempts WHERE state='PENDING'").fetchone():
+                raise ReservationBlocked("previous push unresolved")
+            if db.execute("SELECT 1 FROM integration_jobs").fetchone():
+                raise ReservationBlocked("unowned prior jobs")
+            db.execute("INSERT INTO integration_version VALUES(1,?)",(version,))
+            return True
+
     def stage(self,number,head,base,changed_files):
         """Atomically register and prepare the already verified candidate.
 

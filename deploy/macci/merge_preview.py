@@ -531,6 +531,10 @@ def main():
                 return 0
             journal = None
             managed_queue = os.getenv("MACCI_MANAGED_QUEUE") == "1"
+            active_version = os.getenv("MACCI_ACTIVE_VERSION","")
+            active_pr = os.getenv("MACCI_ACTIVE_PR","")
+            if managed_queue and not re.fullmatch(r"[1-9][0-9]{0,9}",active_pr):
+                raise ValueError("managed mode requires explicit active candidate PR")
             if (managed_queue or os.getenv("MACCI_INTEGRATION_JOURNAL") == "1") and not args.dry_run:
                 from preview_journal import PreviewJournal
                 journal = PreviewJournal(ROOT / ("integration-queue.sqlite3" if managed_queue else "preview-integration.sqlite3"))
@@ -539,6 +543,7 @@ def main():
                     print("Preview coordinator blocked: unresolved integration journal", flush=True)
                     return 1
             if managed_queue and journal is not None:
+                journal.initialize_version(active_version)
                 prepared=journal.prepared()
                 if prepared is not None:
                     # Only a closed PR can be automatically cancelled here.
@@ -552,6 +557,8 @@ def main():
             for pr in prs:
                 number = pr.get("number")
                 if type(number) is not int or number <= 0 or pr.get("draft") is not False:
+                    continue
+                if managed_queue and number!=int(active_pr):
                     continue
                 try:
                     if merge_one(token, number, args.dry_run, journal=journal, managed_queue=managed_queue):

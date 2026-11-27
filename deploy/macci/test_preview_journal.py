@@ -97,3 +97,29 @@ class PreparedCancellationTests(unittest.TestCase):
                 db.execute("DELETE FROM preview_attempts")
             self.assertTrue(journal.cancel_prepared("pr-196",H,B))
             self.assertIsNone(journal.prepared())
+
+
+class ManagedInitializationTests(unittest.TestCase):
+    def test_initialize_once_and_never_switch_implicitly(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as root:
+            path=Path(root)/"ledger.sqlite3"
+            journal=PreviewJournal(path)
+            self.assertTrue(journal.initialize_version("0.5.0"))
+            self.assertFalse(journal.initialize_version("0.5.0"))
+            with self.assertRaises(ValueError):
+                journal.initialize_version("0.6.0")
+            with self.assertRaises(ValueError):
+                journal.initialize_version("latest")
+            journal.stage(196,H,B,["app/core.py"])
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("SELECT version FROM integration_version").fetchone()[0],"0.5.0")
+                self.assertEqual(db.execute("SELECT state FROM integration_jobs").fetchone()[0],"PREPARED")
+
+    def test_initialize_cannot_abandon_unresolved_push(self):
+        with tempfile.TemporaryDirectory() as root:
+            journal=PreviewJournal(Path(root)/"ledger.sqlite3")
+            journal.prepare(196,H,B,C)
+            with self.assertRaises(ValueError):
+                journal.initialize_version("0.5.0")
+            self.assertTrue(journal.pending())
