@@ -1,11 +1,39 @@
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from urllib.error import URLError
 
 import pytest
 
 from app import development_tasks
 from scripts import sync_development_tasks
+
+
+def test_active_refresh_starts_one_worker_and_releases_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(development_tasks, "CACHE_PATH", tmp_path / "tasks.json")
+    inherited = []
+
+    def launch(args, *, pass_fds, **kwargs):
+        assert args[-2:] == ["--active", str(pass_fds[0])]
+        inherited.append(os.dup(pass_fds[0]))
+
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", launch)
+    assert sync_development_tasks.enqueue_active_refresh() == {"state": "requested"}
+    try:
+        assert sync_development_tasks.enqueue_active_refresh() == {"state": "running"}
+        assert len(inherited) == 1
+    finally:
+        os.close(inherited.pop())
+
+    def fail(*args, **kwargs):
+        raise OSError("worker unavailable")
+
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", fail)
+    with pytest.raises(OSError, match="worker unavailable"):
+        sync_development_tasks.enqueue_active_refresh()
+    monkeypatch.setattr(sync_development_tasks.subprocess, "Popen", launch)
+    assert sync_development_tasks.enqueue_active_refresh() == {"state": "requested"}
+    os.close(inherited.pop())
 
 ISSUE = {
     "number": 42,

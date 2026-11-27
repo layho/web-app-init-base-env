@@ -8,10 +8,19 @@ LABEL_PREFIX="com.example.webapp"
 PORT=18080
 TRACK_BRANCH=main
 EXPECTED_ORIGIN="https://app.example.com"
+check_private_env() {
+  local file="$1" mode
+  test ! -L "$file" && test -f "$file" && test -O "$file" || return 1
+  if [[ "$OSTYPE" == darwin* ]]; then
+    mode="$(stat -f '%Lp' "$file")" || return 1
+  else
+    mode="$(stat -c '%a' "$file")" || return 1
+  fi
+  test "$mode" = 600 || test "$mode" = 400
+}
 # Dedicated foundation preview configuration is local, never committed.
-if test -f "$ROOT/.base-preview.env"; then
-  test ! -L "$ROOT/.base-preview.env" && test -O "$ROOT/.base-preview.env" || exit 2
-  test "$(stat -f '%Lp' "$ROOT/.base-preview.env")" = 600 || exit 2
+if test -e "$ROOT/.base-preview.env" || test -L "$ROOT/.base-preview.env"; then
+  check_private_env "$ROOT/.base-preview.env" || { echo 'Unsafe private .base-preview.env' >&2; exit 2; }
   source "$ROOT/.base-preview.env"
   [[ "${BASE_PREVIEW_PORT:-}" =~ ^[0-9]{5}$ ]] &&
     test "$BASE_PREVIEW_PORT" -ge 18000 && test "$BASE_PREVIEW_PORT" -lt 29000 || exit 2
@@ -50,7 +59,7 @@ record_operation() {
 }
 log() { echo "$(date '+%F %T') [web-app] $*"; }
 load_env() {
-  test -f .env || { log 'Missing private .env'; exit 1; }
+  check_private_env "$ROOT/.env" || { log 'Missing or unsafe private .env'; exit 1; }
   set -a; source .env; set +a
   # Only the foundation host opts into the shared privileged credential.
   # Downstream application web services retain their repository-scoped tokens.
@@ -272,7 +281,7 @@ serve() {
   if test "${APP_INIT_SYSTEM_SERVICE:-}" = "1"; then
     printf '%s\n' "$$" > logs/web.pid
   fi
-  exec .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port "$PORT" --workers 1 --timeout-graceful-shutdown 5
+  exec .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port "$PORT" --workers 1 --timeout-graceful-shutdown 5 --forwarded-allow-ips 127.0.0.1
 }
 agents() {
   export APP_AGENT_ROOT="$ROOT" APP_AGENT_DIR="$AGENT_DIR" APP_AGENT_PREFIX="$LABEL_PREFIX"

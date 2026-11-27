@@ -21,6 +21,19 @@ app = FastAPI(title="Web App Foundation", version=json.loads(RELEASE_NOTES.read_
 app.add_middleware(RequestBodyLimits)
 
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'self'; object-src 'none'")
+    if request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return response
+
+
 def authorize(request: Request, db: Session = Depends(get_db)):
     return auth.authorize_request(request, db)
 
@@ -288,17 +301,11 @@ def request_active_refresh(request: Request, db: Session = Depends(get_db)):
     auth.authorize_session(request, db)
     if not pr_tracking.enabled():
         raise HTTPException(503, "No verified repository")
-    import sys
-    folder=development_tasks.CACHE_PATH.parent
-    folder.mkdir(parents=True,exist_ok=True)
+    from scripts.sync_development_tasks import enqueue_active_refresh
     try:
-        with (folder/"pr-active-worker.log").open("ab") as log:
-            subprocess.Popen([sys.executable,"-m","scripts.sync_development_tasks","--active"],
-                             cwd=str(Path(__file__).resolve().parents[1]),stdin=subprocess.DEVNULL,
-                             stdout=log,stderr=log,start_new_session=True)
+        return enqueue_active_refresh()
     except OSError:
         raise HTTPException(503,"活跃PR同步进程启动失败") from None
-    return {"state":"requested"}
 
 @app.post("/api/v1/development-tasks/refresh", status_code=202)
 def request_task_refresh(request: Request, db: Session = Depends(get_db)):
