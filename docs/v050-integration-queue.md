@@ -48,3 +48,6 @@ Optional cross-process evidence transport reuses the authenticated HostOps heart
 
 
 Managed-mode bootstrap: a trusted local launch configuration must set MACCI_MANAGED_QUEUE=1, MACCI_ACTIVE_VERSION=0.5.0 and MACCI_ACTIVE_PR=196 (example only). The coordinator creates its private ledger schema and initial active version automatically under the host lock. Only the explicitly configured PR is considered for push, still subject to every original gate. Changing the configured version does not switch an existing ledger, even after jobs integrate; a separately reviewed transition tied to formal publication/acceptance is required. No PR title, label, comment or web request can initialize or switch a version. Dry run does not create a ledger. Existing host launch configuration remains unchanged until explicit trusted activation.
+
+
+The system diagnostics panel links directly to the existing authenticated development task manual controls and includes a read-only receipt refresh. Pending outcomes are explicitly not retried from diagnostic history. Manual actions recheck displayed freshness, conflict, exact SHA and merge prerequisites at dispatch as well as button rendering; the existing server and host gates remain authoritative.
