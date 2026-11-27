@@ -1,0 +1,802 @@
+{
+  "schema_version": 1,
+  "baseline_sha": "db19bff19307fa763fd50e94b4cedfda7181a141",
+  "baseline_tree": "c126d37771fa66a832497e6b2814d782fafc1dff",
+  "source_comments": [
+    7214477264,
+    7214542835,
+    7214573542,
+    7214599555,
+    7214629195,
+    7214656091,
+    7214756309
+  ],
+  "counts": {
+    "items": 74,
+    "p0": 60,
+    "p1": 14
+  },
+  "items": [
+    {
+      "id": "F01",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "scripts/sync_feedback.py；app/feedback_progress.py；app/hostops_tasks.py",
+      "note": "同步 worker 只推拉。APP_EXECUTION 只解析评论。HostOps 任务是只读诊断，不是 AI 执行器。本轮没有本机调度器消费证据。"
+    },
+    {
+      "id": "F02",
+      "priority": "P0",
+      "package": "W05",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "scripts/sync_feedback.py main()",
+      "note": "已有按反馈 ID 查找，避免重复建 Issue。单条失败 return 1，后续条目被挡住。缺 token 时函数返回 None。没有行级认领。"
+    },
+    {
+      "id": "F03",
+      "priority": "P1",
+      "package": "W05",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "scripts/sync_feedback.py refresh_progress()",
+      "note": "只取最近 100 条已关联反馈，每轮最多 15 条，缓存裁到这 100 条。单 Issue 评论有分页，但有 50 页上限。"
+    },
+    {
+      "id": "F04",
+      "priority": "P0",
+      "package": "W01",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/feedback_progress.py",
+      "note": "OWNER/MEMBER/COLLABORATOR 同一信任集合。agent 枚举没有 ChatGPT。APP_EXECUTION 没有 run_id 和合法迁移检查。非法 APP_PROGRESS 被跳过。"
+    },
+    {
+      "id": "F05",
+      "priority": "P0",
+      "package": "W01",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/feedback_progress.py progress_from_comments()",
+      "note": "后写的 overall_status 覆盖先前状态，阶段时间保留首次值。没有按 run_id 或候选分离。"
+    },
+    {
+      "id": "F06",
+      "priority": "P0",
+      "package": "W05",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/feedback_delivery.py timeline()",
+      "note": "related 能收集多个关联 PR，但主里程碑仍由单一 developer_pr 和 delivered_sha 决定。失败列表没有排除已关闭的被替代 PR。"
+    },
+    {
+      "id": "F07",
+      "priority": "P0",
+      "package": "W05",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/feedback_delivery.py timeline()",
+      "note": "accepted 在当前验收决策缺失时可以退回旧 overall_status=accepted。较早缺口会被标成 unrecorded。旧 blocked 会盖过阶段相位。"
+    },
+    {
+      "id": "F08",
+      "priority": "P0",
+      "package": "W05",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/merge_preview.py replacement_allowed()；app/main.py",
+      "note": "网页有解除 Draft、测试和合并检查入口。替换仍要求 Owner 的 BASE_REPAIR_REVIEW 或部署修复标记。没有持久化的普通预授权策略。"
+    },
+    {
+      "id": "F09",
+      "priority": "P0",
+      "package": "W05",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/pr_tracking.py active_snapshot()；scripts/sync_development_tasks.py",
+      "note": "活跃快照按文件时间覆盖同号 PR。#202 终态回退由评论 7214348117 登记。本轮没有读取本机 pr-active.json，现场缓存未证实。"
+    },
+    {
+      "id": "F10",
+      "priority": "P0",
+      "package": "W05",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/publish_main.py acknowledge()",
+      "note": "该函数关闭的是 BASE-ACCEPTANCE Issue，并写 BASE_PUBLISHED。没有在这里收尾关联业务反馈。"
+    },
+    {
+      "id": "F11",
+      "priority": "P1",
+      "package": "W11",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "评论 7214477264",
+      "note": "审查明确当前只有历史样本和源码审查。本轮没有新的同一 run_id 全链实机证据。"
+    },
+    {
+      "id": "U01",
+      "priority": "P0",
+      "package": "W08",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "评论 7214542835；deploy/app-init/upgrade_scheduler.py",
+      "note": "审查记录 Panel #13 滞留且 MacCI frontend-failed。本轮没有重读 Panel PR 或本机调度器注册表。源码不能单独证明该 PR 仍滞留。"
+    },
+    {
+      "id": "U02",
+      "priority": "P0",
+      "package": "W06",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/runner.py failure_summary()",
+      "note": "只提取 pytest FAILED 行和特定 TS 错误。其他阶段返回空列表。Panel #13 failures=[] 来自审查评论，本轮未重取。"
+    },
+    {
+      "id": "U03",
+      "priority": "P0",
+      "package": "W08",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py enroll_foundation_scheduler()",
+      "note": "只有预装调度器文件通过属主和权限检查时才 register --mode create。缺失或异常时打印提示并返回 False。"
+    },
+    {
+      "id": "U04",
+      "priority": "P1",
+      "package": "W08",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/foundation_version.py",
+      "note": "审查确认已有 REST 到 git/raw 的回退，同时指出进程内锁包裹网络且缓存不持久。本轮未另测旧 Panel 显示。"
+    },
+    {
+      "id": "U05",
+      "priority": "P0",
+      "package": "W08",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py copy_foundation()",
+      "note": "固定后端清单加全部 frontend/src 复制和字符串替换。tests/test_auth.py 还有精确文本改写。这是所有权风险，不是已证实的业务覆盖事故。"
+    },
+    {
+      "id": "U06",
+      "priority": "P0",
+      "package": "W08",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/module_sdk.py；app_modules/registry.py",
+      "note": "文件头写明同进程可信 SDK，不是沙箱。MODULES 为空元组。角色名不同不等于已实测 PostgreSQL ACL。"
+    },
+    {
+      "id": "U07",
+      "priority": "P0",
+      "package": "W08",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/upgrade_plan.py；评论 7214542835",
+      "note": "审查指出 #13 mergeable=true 但构建失败，不能把无文本冲突当成兼容。普通预授权自动合并尚未成为基座门禁。"
+    },
+    {
+      "id": "U08",
+      "priority": "P0",
+      "package": "W08",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/hostops/diagnostics.py；deploy/macmini/manage.sh",
+      "note": "仓库版本和已安装 scheduler、MacCI、HostOps、launchd 运行版本是分开的。本轮没有读取本机安装回执或运行 SHA。"
+    },
+    {
+      "id": "U09",
+      "priority": "P1",
+      "package": "W11",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "评论 7214542835",
+      "note": "没有本次跨版本、同版本新 SHA、失败替换和回滚的实机记录。历史合并不能代替。"
+    },
+    {
+      "id": "S01",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/merge_preview.py；docs/v050-integration-queue.md",
+      "note": "MACCI_MANAGED_QUEUE 和 MACCI_ACTIVE_PR 是可选固定入口。文档写明生产协调器接入仍要可信宿主激活。未激活时不能说队列已被强制使用。"
+    },
+    {
+      "id": "S02",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/integration_queue.py；deploy/macci/preview_journal.py",
+      "note": "activate 检查旧 job 是否 INTEGRATED 或 CANCELLED，不等于部署、验收和 Main 发布。版本状态机还没有机器实现。"
+    },
+    {
+      "id": "S03",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/integration_queue.py register()",
+      "note": "登记要求已有 head，并在规格变化时拒绝。没有开发前的 task/run/worktree 可信绑定。预约冲突直接失败，不能排队等待。"
+    },
+    {
+      "id": "S04",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/integration_queue.py；deploy/macci/preview_journal.py",
+      "note": "同 PR 新 head 不能改已有 spec。取消依赖会使下游无法满足。没有带证据的 revision 替换流程。"
+    },
+    {
+      "id": "S05",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/integration_queue.py claim()；deploy/macci/preview_journal.py",
+      "note": "claim 按优先级选取，但 stage 可以把已有 QUEUED job 直接准备。固定 MACCI_ACTIVE_PR 可以和队列优先级不一致。"
+    },
+    {
+      "id": "S06",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/integration_queue.py claim()、reconcile_unknown()",
+      "note": "过期 CLAIMED 在下次 claim 时转 UNKNOWN，并阻塞该版本队列。恢复依赖可信 verify_stopped。没有生产自动 fencing 接入证据。"
+    },
+    {
+      "id": "S07",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/preview_journal.py；docs/v050-integration-queue.md",
+      "note": "远端 SHA 与候选不一致时保持 PENDING。明确未合并且关闭的 PR 可以释放预约。丢失响应不能盲重试。受控恢复流程仍缺。"
+    },
+    {
+      "id": "S08",
+      "priority": "P0",
+      "package": "W04",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/main.py；app/hostops_tasks.py",
+      "note": "集成准备重试和 push 恢复已有局部实现。没有通用的分阶段 run_id 重跑 API。HostOps 不能被当成 AI 执行器。"
+    },
+    {
+      "id": "S09",
+      "priority": "P1",
+      "package": "W10",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/integration_diagnostics.py",
+      "note": "只读诊断存在，状态集合有限，文档写明不返回租约和路径。缺少依赖、优先级、责任人、下一步和分页所需的完整看板。"
+    },
+    {
+      "id": "S10",
+      "priority": "P1",
+      "package": "W11",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "tests/test_integration_queue.py；评论 7214573542",
+      "note": "队列单测覆盖局部规则。多 Agent、推送丢失和版本切换的实机故障注入没有在本轮执行。"
+    },
+    {
+      "id": "D01",
+      "priority": "P0",
+      "package": "W06",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/runner.py failure_summary()",
+      "note": "结构化提取只覆盖 pytest 与指定 TS 格式。编译、依赖、容器、超时和启动失败没有同等摘要。"
+    },
+    {
+      "id": "D02",
+      "priority": "P0",
+      "package": "W01",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/runner.py",
+      "note": "存在本地 report-outbox、隔离区和锁。审查指出远端 status 与 finish 可能先于 save_report。本轮未重放进程中断。"
+    },
+    {
+      "id": "D03",
+      "priority": "P0",
+      "package": "W06",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/operations.py recent_operations()",
+      "note": "operations.tsv 只保留解析后的最近 100 条，不是逐次部署的持久 outbox。下游应用没有同一条路径。"
+    },
+    {
+      "id": "D04",
+      "priority": "P0",
+      "package": "W06",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/hostops/diagnostics.py OPERATIONS",
+      "note": "只接受 host.health、service.inventory、agent.snapshot。非 Darwin 服务标 unsupported。dispatch 扩大不在本包，且本轮未读本机开关。"
+    },
+    {
+      "id": "D05",
+      "priority": "P1",
+      "package": "W06",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/hostops/diagnostics.py services()",
+      "note": "五个固定 launchd 标签，只读当前 launchctl list 域。CPU 和内存固定为 None。"
+    },
+    {
+      "id": "D06",
+      "priority": "P0",
+      "package": "W01",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/operations.py EVENT_CODES",
+      "note": "事件是时间、代码、SHA 和有限 detail。没有统一 run_id、producer_seq 或来源索引。"
+    },
+    {
+      "id": "D07",
+      "priority": "P0",
+      "package": "W01",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/runner.py",
+      "note": "outbox 有批次、容量、隔离和去重限制。失败主要打印。没有统一的积压和最老事件健康投影。"
+    },
+    {
+      "id": "D08",
+      "priority": "P0",
+      "package": "W06",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "评论 7214599555",
+      "note": "测试错误进 GitHub 评论，部分部署失败会建 Issue。没有证实执行器自动领取并修复。"
+    },
+    {
+      "id": "D09",
+      "priority": "P1",
+      "package": "W06",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/main.py /api/v1/system-logs",
+      "note": "诊断页读取 operations、integration 和 preview attempts。没有按 run_id 的跨服务检索。前端是否完整渲染本轮未用浏览器复核。"
+    },
+    {
+      "id": "D10",
+      "priority": "P0",
+      "package": "W11",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "评论 7214599555",
+      "note": "没有 Panel #13 原始日志，也没有隔离故障注入记录。不能宣称 Agent 已能不复制日志完成修复。"
+    },
+    {
+      "id": "A01",
+      "priority": "P0",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macmini/manage.sh load_env；scripts/sync_feedback.py feedback_token()",
+      "note": "反馈 token 会回退到 APP_GITHUB_TOKEN 或 APP_GITHUB_PR_TOKEN。审查指出 MacCI 与合并读取共享路径。本轮不读取凭据值，也未核实 token 权限。"
+    },
+    {
+      "id": "A02",
+      "priority": "P0",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/merge_preview.py tested()",
+      "note": "成功门禁要求 macmini/isolated-tests-v1 的 state、description 和 creator.login==OWNER。共享 Owner 身份不能区分 MacCI、Agent 和人。"
+    },
+    {
+      "id": "A03",
+      "priority": "P0",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/release_acceptance.py；deploy/macci/publish_main.py",
+      "note": "网页验收写 Owner Issue 和本地 receipt。发布器核对接纳 Issue 与同 UID 私有文件。独立验收签发还不存在。"
+    },
+    {
+      "id": "A04",
+      "priority": "P0",
+      "package": "W03",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py install_job()",
+      "note": "审查确认服务以安装者 UID 和 HOME 运行。目录权限不能隔离同一 UID。本轮没有切换任何生产服务。"
+    },
+    {
+      "id": "A05",
+      "priority": "P0",
+      "package": "W03",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py；app/module_sdk.py",
+      "note": "独立 cluster 和 Unix socket 已存在。trust 认证和同 UID 不能证明应用间 ACL。禁止在本任务改生产库。"
+    },
+    {
+      "id": "A06",
+      "priority": "P0",
+      "package": "W03",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macmini/manage.sh test_app()",
+      "note": "宿主 pytest 使用 env -i，但仍保留 HOME，并在宿主执行。审查指出 build 继承 load_env 且未禁生命周期脚本。泄露未被本轮实测。"
+    },
+    {
+      "id": "A07",
+      "priority": "P0",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/auth.py authorize_request()",
+      "note": "单个 APP_API_TOKEN 比对成功即返回 service，可走通用 authorize 依赖。会话写操作另有 Origin 和 CSRF。没有分操作矩阵。"
+    },
+    {
+      "id": "A08",
+      "priority": "P1",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/auth.py",
+      "note": "已有 PBKDF2、HttpOnly Cookie 和 CSRF。登录限流在进程内 Lock。审查要求不要把已实现项写成缺失。跨 worker 共享限流仍缺。"
+    },
+    {
+      "id": "A09",
+      "priority": "P1",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/request_limits.py；app/main.py",
+      "note": "请求体限制和上传并发已有测试。CSP、HSTS 和代理信任按审查仍不完整。本轮未做利用性验证，也不把未验证的缺口写成已经可以攻击。"
+    },
+    {
+      "id": "A10",
+      "priority": "P0",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "评论 7214504062；deploy/macci/merge_preview.py",
+      "note": "普通预授权无人值守还不是现行门禁。高风险替换仍要 Owner 标记。策略不能由候选自改这一条尚未落成独立策略服务。"
+    },
+    {
+      "id": "A11",
+      "priority": "P0",
+      "package": "W02",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "本轮只读 GitHub API",
+      "note": "GET branch protection（main 与 preview）返回 403。GET /rulesets 返回空数组。组织级 ruleset 和 bypass 未读到。不能写成已无保护，也不能写成已有保护。"
+    },
+    {
+      "id": "A12",
+      "priority": "P0",
+      "package": "W11",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "评论 7214629195",
+      "note": "隔离环境的伪造验收、跨应用和重放矩阵没有在本轮执行。"
+    },
+    {
+      "id": "I01",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/bootstrap.sh",
+      "note": "入口要求 Darwin、非 root 和 TTY。帮助文本只描述 Mac。没有固定发布摘要校验，也没有把参数转发给后续安装。"
+    },
+    {
+      "id": "I02",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py；deploy/app-init/bootstrap.sh",
+      "note": "依赖检查和网络预检是现有局部能力。审查要求的磁盘、端口、后台凭据和域名预检没有成为统一无副作用阶段。"
+    },
+    {
+      "id": "I03",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py application_directory()",
+      "note": "默认目录是 ~/Projects/app-init/owner--repo。没有完整的宿主资源登记。本轮未制造目录冲突。"
+    },
+    {
+      "id": "I04",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py find_port()",
+      "note": "bind 成功后套接字关闭，没有持续预约。operations.EVENT_CODES 没有 port_conflict。"
+    },
+    {
+      "id": "I05",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py",
+      "note": "初始化没有统一的阶段 journal 和 run_id。现有集成 journal 只覆盖 preview push，不覆盖初始化资源。"
+    },
+    {
+      "id": "I06",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py map_domain()",
+      "note": "函数存在 GET 后更新 ingress 和 DNS 的路径。审查所述条件更新和局部失败恢复没有在本轮用真实 Cloudflare 验证。"
+    },
+    {
+      "id": "I07",
+      "priority": "P0",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py；scripts/sync_feedback.py",
+      "note": "重跑仍可能提示新 token。反馈 token 有多环境变量回退。本轮不读取或打印任何秘密。"
+    },
+    {
+      "id": "I08",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py install_job()",
+      "note": "已有 plist 不一致会拒绝，一致且 active 会返回。没有统一资源清单把数据库 cluster 完整性算进恢复。"
+    },
+    {
+      "id": "I09",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py",
+      "note": "命令参数没有专用重建或卸载计划。破坏性删除不能在没有单独授权时执行。"
+    },
+    {
+      "id": "I10",
+      "priority": "P0",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/app_init.py seed()、enroll_foundation_scheduler()",
+      "note": "首次推送前的检查被审查标为静态检查。调度器缺失只创建不了 Draft 以外的自动推进。反馈 POST 与本地 receipt 不是同一个事务。"
+    },
+    {
+      "id": "I11",
+      "priority": "P1",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/app-init/bootstrap.sh；Issue #197",
+      "note": "当前入口拒绝非 Darwin。W00 只写平台适配契约，不实现 systemd，也不把 Linux 结果称作 MacCI。"
+    },
+    {
+      "id": "I12",
+      "priority": "P1",
+      "package": "W11",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "评论 7214656091",
+      "note": "没有空仓库、端口冲突、重复安装或 Linux 的实机记录。"
+    },
+    {
+      "id": "R01",
+      "priority": "P0",
+      "package": "W07",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macmini/manage.sh update()",
+      "note": "锁是 mkdir .webapp-deploy.lock，EXIT trap 里 rmdir。update_locked 只表示目录存在。没有进程 fencing。"
+    },
+    {
+      "id": "R02",
+      "priority": "P0",
+      "package": "W07",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macmini/manage.sh update()",
+      "note": "HEAD 等于跟踪分支时先记录 update_no_change 并退出，发生在残留备份和健康检查之前。"
+    },
+    {
+      "id": "R03",
+      "priority": "P0",
+      "package": "W07",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macmini/manage.sh",
+      "note": "fast-forward、venv、dist、重启和 commit_dependencies 分步发生。没有持久阶段和上一健康资源清单。"
+    },
+    {
+      "id": "R04",
+      "priority": "P0",
+      "package": "W07",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macmini/manage.sh rollback 路径",
+      "note": "残留 frontend/dist.previous 或 .venv.previous 会使后续 update 在合并前退出。回滚失败没有独立协调器。"
+    },
+    {
+      "id": "R05",
+      "priority": "P1",
+      "package": "W07",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macmini/manage.sh fetch_with_retry",
+      "note": "fetch 有分类和有限退避。依赖或构建失败会 hold SHA。临时故障和确定性缺陷还没有分开的自动复测策略。"
+    },
+    {
+      "id": "R06",
+      "priority": "P0",
+      "package": "W07",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macmini/manage.sh；app/operations.py",
+      "note": "本机健康和运行 SHA 事件已有。公网回源持续观察不是 update_ok 的同一证据。"
+    },
+    {
+      "id": "R07",
+      "priority": "P0",
+      "package": "W07",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "scripts/apply_migrations.py",
+      "note": "--check 按文件名比对 schema_migrations，不校验 SQL 摘要，也不自动执行。文件头写明 updater 不得自动迁移。"
+    },
+    {
+      "id": "R08",
+      "priority": "P0",
+      "package": "W05",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "deploy/macci/merge_preview.py replacement_allowed()",
+      "note": "拒绝 Issue 和 Owner 修复标记是现有窄例外。普通预授权修复不能自动替换。不得伪造用户验收。"
+    },
+    {
+      "id": "R09",
+      "priority": "P0",
+      "package": "W07",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "评论 7214756309",
+      "note": "HostOps 7/7 是基础实机确认，审查明确不能扩大成冷启动通过。本轮没有重启全链证据。"
+    },
+    {
+      "id": "R10",
+      "priority": "P1",
+      "package": "W11",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "tests/test_deploy_script.py；评论 7214756309",
+      "note": "部署脚本单测存在。各事务阶段 SIGKILL、磁盘满和回执中断没有在隔离环境执行。禁止生产故障注入。"
+    }
+  ],
+  "supplements": [
+    {
+      "id": "SUP-P0-1",
+      "priority": "P0",
+      "package": "W05",
+      "category": "covered",
+      "category_label": "已覆盖",
+      "evidence": "deploy/macci/merge_preview.py published_preview_equivalent()；提交 e5623cf 与 c9202ad",
+      "note": "#200 的冻结判断已进入 #196，并在基线中。相等 tree 本身不解冻。#200 补丁相对当前文件已过时，禁止 cherry-pick。本轮没有读取 MacCI 进程是否已加载该 SHA。"
+    },
+    {
+      "id": "SUP-P0-2",
+      "priority": "P0",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "app/pr_tracking.py；deploy/macci/merge_preview.py；app/manual_pr_actions.py",
+      "note": "门禁和跟踪读取的是 /commits/{sha}/statuses，不是 combined /status。tested() 仍以共享 OWNER login 作为创建者。跟踪里的 evidence() 不检查终端状态创建者。诊断原因仍缺。"
+    },
+    {
+      "id": "SUP-P0-3",
+      "priority": "P0",
+      "package": "W10",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "评论 7211876147；frontend/src/DevelopmentTasksPage.tsx",
+      "note": "阶段责任人、催促、立即执行和真实回执没有统一模型。现有手动按钮不能被写成已接通执行器。"
+    },
+    {
+      "id": "SUP-DATA",
+      "priority": "P0",
+      "package": "W10",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "评论 7212519006",
+      "note": "默认列表仍可能混入历史和被替代项。要求归档而不是删除。本轮不关闭 #186、#161、#191。"
+    },
+    {
+      "id": "SUP-SYNC",
+      "priority": "P0",
+      "package": "W05",
+      "category": "unproven",
+      "category_label": "未证实",
+      "evidence": "app/pr_tracking.py active_snapshot()；评论 7214348117",
+      "note": "源码存在活跃文件覆盖同号 PR 的路径。本机缓存在 #202 之后是否回退，本轮没有读到缓存文件。"
+    },
+    {
+      "id": "SUP-F08",
+      "priority": "P0",
+      "package": "W02",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "评论 7214504062",
+      "note": "普通同仓 PR 无人值守是目标，不是当前门禁。与 F08、A10 同一缺口，不单独实现第二套授权。"
+    },
+    {
+      "id": "SUP-197",
+      "priority": "P1",
+      "package": "W09",
+      "category": "remaining",
+      "category_label": "独有待做",
+      "evidence": "Issue #197；docs/v060/05-compatibility-migration.md",
+      "note": "Linux 适配只在 W00 写成契约。bootstrap 仍拒绝非 Darwin。不提前实现。"
+    }
+  ],
+  "special_reviews": [
+    {
+      "id": "196",
+      "kind": "pull",
+      "state": "merged",
+      "category": "covered",
+      "head": "c9202ad3f2d9cf108da7846fcbe205c3c8e4a983",
+      "merge_commit": "4cd400ddc47039c0c08e331e7901e880d03acbf2",
+      "note": "已是基线祖先。包含从 #200 吸收的冻结修正。不重复实现 V0.5.0 队列。"
+    },
+    {
+      "id": "200",
+      "kind": "pull",
+      "state": "closed_unmerged",
+      "category": "outdated",
+      "head": "78aa70a271a10d4b5047236e019ae5837256d83e",
+      "note": "关闭未合并。意图已由 e5623cf 进入基线。当前 merge_preview.py 比该补丁更长，禁止整补丁 cherry-pick。"
+    },
+    {
+      "id": "186",
+      "kind": "pull",
+      "state": "open_draft",
+      "category": "remaining",
+      "head": "e63f31254aa222b26804cd413592d8a29f4c37c4",
+      "note": "相对基线仅多出 tests/fixtures/legacy-generated-baseline 与 tests/test_ownership_preflight_legacy_baseline.py。没有生产代码。对当前生成器是否仍有效未证实。不关闭。"
+    },
+    {
+      "id": "161",
+      "kind": "pull",
+      "state": "open_draft",
+      "category": "outdated",
+      "head": "78a7ca772a8b84de0aeec9fb0108e2e3d60be2c1",
+      "note": "frontend/src/guide 不在基线。v2 使用指南已挂在项目页上方。旧补丁不要原样合入。逐段文案是否完全等价未逐行证明。不关闭。"
+    },
+    {
+      "id": "191",
+      "kind": "pull",
+      "state": "open_draft",
+      "category": "covered",
+      "head": "a35886fa4aadcb6eb0cc8147a46c5ac3a304381c",
+      "note": "未合入提交 a35886f 的 HostOpsTasks.tsx blob 与 HEAD 同为 b963e41c390f3ea19de036ad5a46e26254b3a34e。PR 载体过时。不关闭。"
+    },
+    {
+      "id": "155",
+      "kind": "pull",
+      "state": "closed_unmerged",
+      "category": "outdated",
+      "note": "评论 7212519006 点名关闭。PR 已于 2026-11-27 关闭且未合并。协作文档在基线 docs/AGENT_COLLABORATION.md。不再处理。"
+    }
+  ]
+}
