@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -151,7 +152,7 @@ class IsolatedBuildTests(unittest.TestCase):
             self.assertFalse(receipt["w02_bundled"])
             self.assertFalse(receipt["production_verification_enabled"])
             self.assertNotIn(TOKEN, json.dumps(receipt))
-            self.assertEqual(sorted(path.name for path in parent.iterdir()), [".w03-claims"])
+            self.assertEqual(sorted(path.name for path in parent.iterdir()), [".w03-artifacts", ".w03-claims"])
 
     def test_credential_allowlist_and_caller_values_are_rejected(self):
         with tempfile.TemporaryDirectory(prefix="w03-build-") as folder:
@@ -410,7 +411,7 @@ class IsolatedBuildTests(unittest.TestCase):
             self.assertEqual(loser["detail_code"], "CONCURRENCY_CONFLICT")
             self.assertEqual(loser["http"], 409)
             self.assertEqual(winner_box[0]["state"], "SUCCEEDED")
-            self.assertEqual(sorted(path.name for path in parent.iterdir()), [".w03-claims"])
+            self.assertEqual(sorted(path.name for path in parent.iterdir()), [".w03-artifacts", ".w03-claims"])
 
             barrier = threading.Barrier(2)
             boxes = {"app_alpha": [], "app_beta": []}
@@ -590,6 +591,24 @@ class IsolatedBuildTests(unittest.TestCase):
         self.assertFalse(report["w02_alignment"]["bundled"])
         self.assertEqual(report["w02_alignment"]["approved_isolated_baseline_head"], isolated_build.W02_BASELINE_HEAD)
         self.assertIn("app/control_identity", " ".join(report["w02_alignment"]["pending"]))
+        self.assertEqual(report["w02_alignment"]["public_auth_interface"], "app/control_authz")
+        self.assertNotEqual(report["w02_alignment"]["public_auth_interface"], "app.auth.authorize_request")
+        self.assertEqual(report["macci_evidence"], "pending")
+        self.assertEqual(report["macci_runtime"], "BLOCKED")
+        self.assertEqual(report["a04_a05_real_machine_status"], "pending")
+        self.assertFalse(report["production_verification_enabled"])
+        self.assertFalse(report["host_downgrade"])
+        self.assertFalse(report["trusted_execution_identity"])
+        self.assertEqual(report["runtime_target"], "macos")
+        exception = report["ownership_exceptions"]
+        self.assertEqual(len(exception), 1)
+        self.assertEqual(exception[0]["path"], "docs/v060/02-architecture-contract.md")
+        self.assertIn("六行", exception[0]["wording"])
+        self.assertIn("七行", exception[0]["wording"])
+        self.assertTrue(exception[0]["coordinated"])
+        self.assertFalse(exception[0]["shared_edits_expanded"])
+        self.assertFalse(exception[0]["contract_json_edited"])
+        self.assertEqual(exception[0]["contract_json"], "tests/fixtures/v060/w00/contract.json")
         for item, phrases in {
             "A04": ("launchd", "same uid"),
             "A05": ("trust", "production"),
@@ -661,8 +680,11 @@ class IsolatedBuildTests(unittest.TestCase):
         self.assertIn("subprocess", module_imports)
         self.assertIn("sqlite3", module_imports)
         self.assertNotIn("shell=True", source)
+        self.assertNotIn("capture_output=True", source)
         self.assertNotIn("def authorize_request", source)
         self.assertNotIn("def authorize(", source)
+        self.assertIn("app/control_authz", source)
+        self.assertNotIn("W02_PUBLIC_AUTH = \"app.auth.authorize_request\"", source)
 
     def test_session_lookup_does_not_execute_or_write_the_store(self):
         with tempfile.TemporaryDirectory(prefix="w03-build-") as folder:
@@ -889,6 +911,11 @@ isolated_build.leave_unfinished_claim(parent, request)
             )
             binding = receipt["execution_binding"]
             self.assertEqual(binding["executor"], "Grok")
+            self.assertEqual(binding["self_reported_executor"], "Grok")
+            self.assertFalse(binding["trusted_execution_identity"])
+            self.assertIsNone(binding["execution_identity"])
+            self.assertFalse(binding["self_reported_executor_is_identity"])
+            self.assertFalse(receipt["trusted_execution_identity"])
             self.assertEqual(binding["exit_code"], None)
             self.assertEqual(
                 [binding["candidate_tuple"][name] for name in ("head", "base", "merge", "tree")],
@@ -898,14 +925,15 @@ isolated_build.leave_unfinished_claim(parent, request)
             self.assertEqual(binding["input_digest"], receipt["artifact_digest"])
             evidence = json.dumps(receipt["probe_evidence"], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
             preimage = "\n".join((
-                "w03-binding-v1",
+                "w03-binding-v2",
                 receipt["artifact_digest"],
                 receipt["output_digest"],
                 HEAD,
                 BASE,
                 MERGE,
                 TREE,
-                "Grok",
+                "self-reported:Grok",
+                "trusted_execution_identity:false",
                 "-",
                 evidence,
             ))
@@ -919,7 +947,12 @@ isolated_build.leave_unfinished_claim(parent, request)
                 probe_evidence=receipt["probe_evidence"],
             )
             self.assertNotEqual(other["digest"], binding["digest"])
-            self.assertIn("authorize_request", " ".join(isolated_build.W02_ALIGNMENT_PENDING))
+            self.assertEqual(isolated_build.W02_PUBLIC_AUTH, "app/control_authz")
+            self.assertNotEqual(isolated_build.W02_PUBLIC_AUTH, "app.auth.authorize_request")
+            pending = " ".join(isolated_build.W02_ALIGNMENT_PENDING)
+            self.assertIn("app/control_authz", pending)
+            self.assertIn("app.auth.authorize_request is not that entry", pending)
+            self.assertIn("tests-only", pending)
             self.assertIn("Same-UID", receipt["same_uid_threat_boundary"])
             self.assertFalse(receipt["host_acl_effective"])
             self.assertFalse(receipt["production_verification_enabled"])
@@ -1013,6 +1046,222 @@ isolated_build.leave_unfinished_claim(parent, request)
         self.assertNotIn(TOKEN, completed.stdout)
         self.assertNotIn(TOKEN, completed.stderr)
         self.assertTrue(Path("/etc/passwd").is_file())
+
+    def test_retained_artifacts_can_be_verified_after_the_workspace_is_gone(self):
+        with tempfile.TemporaryDirectory(prefix="w03-build-") as folder:
+            parent = Path(folder)
+            receipt = isolated_build.construct(
+                isolated_build.IsolationSession(),
+                build_request(key="idem-w03-retain", run_id="run-w03-retain"),
+                parent=parent,
+            )
+            self.assertEqual(receipt["state"], "SUCCEEDED")
+            self.assertTrue(receipt["artifact_retain"]["verified"])
+            self.assertEqual(receipt["artifact_retain"]["digest"], receipt["output_digest"])
+            self.assertFalse(any(path.name.startswith("build-") for path in parent.iterdir()))
+            checked = isolated_build.verify_retained_artifacts(parent, "run-w03-retain", receipt["output_digest"])
+            self.assertTrue(checked["verified"])
+            retained = parent / checked["relative_root"] / "output" / "build-sha.txt"
+            self.assertEqual(retained.read_bytes(), b"ok\n")
+            retained.write_bytes(b"tampered\n")
+            tampered = isolated_build.verify_retained_artifacts(parent, "run-w03-retain", receipt["output_digest"])
+            self.assertFalse(tampered["verified"])
+            self.assertNotEqual(tampered["digest"], receipt["output_digest"])
+
+    def test_macci_boundary_is_mapped_and_this_host_stays_blocked(self):
+        argv = isolated_build.macci_container_argv("macci-job", "macci-job:test")
+        runner = Path(__file__).with_name("runner.py").read_text(encoding="utf-8")
+        for flag in (
+            "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--pids-limit", "256", "--memory", "3g", "--cpus", "2",
+        ):
+            self.assertIn(flag, argv)
+            self.assertIn(flag, runner)
+        assessment = isolated_build.assess_macci_runtime()
+        self.assertEqual(assessment["status"], "BLOCKED")
+        self.assertEqual(assessment["runtime_target"], "macos")
+        self.assertFalse(assessment["host_downgrade"])
+        self.assertEqual(assessment["macci_evidence"], "pending")
+        self.assertIn("macos_host", assessment["missing_capabilities"])
+        self.assertIn("container_output_cap", assessment["missing_capabilities"])
+        self.assertIn("container_disk_quota", assessment["missing_capabilities"])
+        self.assertIn("container_timeout_tree_reap", assessment["missing_capabilities"])
+        self.assertIn("a04_real_mac_host_isolation", assessment["missing_capabilities"])
+        self.assertIn("a05_real_database_role_isolation", assessment["missing_capabilities"])
+        self.assertIn("macOS", assessment["reason"])
+        self.assertNotEqual(sys.platform, "darwin")
+        self.assertIsNone(isolated_build.shutil.which("docker"))
+
+    def test_grok_label_does_not_authorize_and_limits_fail_closed(self):
+        with tempfile.TemporaryDirectory(prefix="w03-build-") as folder:
+            parent = Path(folder)
+            labeled = isolated_build.construct(
+                isolated_build.IsolationSession(),
+                build_request(kind="Grok", key="idem-w03-grok-label", run_id="run-w03-grok-label"),
+                parent=parent,
+            )
+            self.assertEqual(labeled["detail_code"], "IDENTITY_REJECTED")
+            self.assertEqual(labeled["commands_executed"], 0)
+            self.assertFalse(labeled["trusted_execution_identity"])
+            sentinel = parent / "limit-sentinel"
+            sentinel.write_bytes(b"keep")
+            original = isolated_build.execute_isolated
+
+            def forced(ws_fd, workspace, script, **kwargs):
+                kwargs["force_limit_failure"] = True
+                return original(ws_fd, workspace, script, **kwargs)
+
+            isolated_build.execute_isolated = forced
+            try:
+                blocked = isolated_build.construct(
+                    isolated_build.IsolationSession(),
+                    build_request(
+                        script="rm -f " + sentinel.as_posix() + "\n",
+                        key="idem-w03-limit-fail",
+                        run_id="run-w03-limit-fail",
+                    ),
+                    parent=parent,
+                )
+            finally:
+                isolated_build.execute_isolated = original
+            self.assertEqual(blocked["detail_code"], "ISOLATION_BLOCKED")
+            self.assertEqual(blocked["commands_executed"], 0)
+            self.assertEqual(sentinel.read_bytes(), b"keep")
+
+    def test_process_cpu_disk_and_output_limits_stop_the_candidate(self):
+        with tempfile.TemporaryDirectory(prefix="w03-build-") as folder:
+            parent = Path(folder)
+            sentinel = parent / "resource-sentinel"
+            sentinel.write_bytes(b"keep")
+            fork = isolated_build.construct(
+                isolated_build.IsolationSession(),
+                build_request(
+                    script="i=0; while :; do i=$((i+1)); sh -c true & done\n",
+                    key="idem-w03-nproc",
+                    run_id="run-w03-nproc",
+                ),
+                parent=parent,
+            )
+            self.assertIn(fork["detail_code"], {"SCRIPT_FAILED", "RESOURCE_LIMIT"})
+            self.assertNotEqual(fork["state"], "SUCCEEDED")
+            self.assertTrue(fork["process_tree_terminated"])
+            self.assertEqual(sentinel.read_bytes(), b"keep")
+            started = time.monotonic()
+            cpu = isolated_build.construct(
+                isolated_build.IsolationSession(),
+                build_request(
+                    script="while :; do :; done\n",
+                    key="idem-w03-cpu",
+                    run_id="run-w03-cpu",
+                ),
+                parent=parent,
+            )
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertIn(cpu["detail_code"], {"SCRIPT_FAILED", "RESOURCE_LIMIT"})
+            self.assertTrue(cpu["process_tree_terminated"])
+            self.assertNotEqual(cpu["exit_code"], 0)
+            disk = isolated_build.construct(
+                isolated_build.IsolationSession(),
+                build_request(
+                    script="while :; do echo hello >> /work/output/big.txt; done\n",
+                    key="idem-w03-disk",
+                    run_id="run-w03-disk",
+                ),
+                parent=parent,
+            )
+            self.assertEqual(disk["detail_code"], "RESOURCE_LIMIT")
+            self.assertTrue(disk["process_tree_terminated"])
+            self.assertEqual(disk["exit_code"], -9)
+            retained = parent / disk["artifact_retain"]["relative_root"] / "output" / "big.txt"
+            self.assertTrue(retained.is_file())
+            self.assertGreater(retained.stat().st_size, 0)
+            self.assertLessEqual(retained.stat().st_size, isolated_build.LIMIT_FSIZE_BYTES)
+            self.assertTrue(disk["artifact_retain"]["verified"])
+            self.assertEqual(sentinel.read_bytes(), b"keep")
+
+    def test_timeout_confirms_the_isolated_process_tree_is_dead(self):
+        with tempfile.TemporaryDirectory(prefix="w03-build-") as folder:
+            workspace = Path(folder) / "ws"
+            workspace.mkdir(mode=0o700)
+            fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                started = time.monotonic()
+                result = isolated_build.execute_isolated(
+                    fd,
+                    workspace,
+                    "read blocked_line\n",
+                    timeout=2,
+                    hold_stdin=True,
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                os.close(fd)
+            self.assertEqual(result.reason, "timeout")
+            self.assertTrue(result.tree_terminated)
+            self.assertTrue(result.started)
+            self.assertIsNone(result.exit_code)
+            self.assertLess(elapsed, 8)
+            self.assertFalse(result.blocked)
+
+    def test_unconfirmed_reap_is_not_success(self):
+        with tempfile.TemporaryDirectory(prefix="w03-build-") as folder:
+            parent = Path(folder)
+            original = isolated_build.execute_isolated
+
+            def unconfirmed(ws_fd, workspace, script, **kwargs):
+                kwargs["confirm_tree"] = lambda: False
+                return original(ws_fd, workspace, script, **kwargs)
+
+            isolated_build.execute_isolated = unconfirmed
+            try:
+                receipt = isolated_build.construct(
+                    isolated_build.IsolationSession(),
+                    build_request(script="exit 0\n", key="idem-w03-reap", run_id="run-w03-reap"),
+                    parent=parent,
+                )
+            finally:
+                isolated_build.execute_isolated = original
+            self.assertEqual(receipt["detail_code"], "UNKNOWN_RESULT")
+            self.assertNotEqual(receipt["state"], "SUCCEEDED")
+            self.assertEqual(receipt["commands_executed"], 0)
+
+    def test_missing_adapter_does_not_run_the_candidate_on_the_host(self):
+        with tempfile.TemporaryDirectory(prefix="w03-build-") as folder:
+            parent = Path(folder)
+            sentinel = parent / "host-sentinel"
+            sentinel.write_bytes(b"keep")
+            calls = []
+            original_adapter = isolated_build._select_adapter
+            original_popen = isolated_build.subprocess.Popen
+
+            def wrapped(argv, *args, **kwargs):
+                calls.append(list(argv) if isinstance(argv, (list, tuple)) else [str(argv)])
+                return original_popen(argv, *args, **kwargs)
+
+            isolated_build._select_adapter = lambda: None
+            isolated_build.subprocess.Popen = wrapped
+            try:
+                receipt = isolated_build.construct(
+                    isolated_build.IsolationSession(),
+                    build_request(
+                        script="rm -f " + sentinel.as_posix() + "\n",
+                        key="idem-w03-host",
+                        run_id="run-w03-host",
+                    ),
+                    parent=parent,
+                )
+            finally:
+                isolated_build._select_adapter = original_adapter
+                isolated_build.subprocess.Popen = original_popen
+            self.assertEqual(receipt["detail_code"], "ISOLATION_BLOCKED")
+            self.assertEqual(receipt["commands_executed"], 0)
+            self.assertIsNone(receipt["exit_code"])
+            self.assertEqual(sentinel.read_bytes(), b"keep")
+            self.assertTrue(calls)
+            for argv in calls:
+                blob = " ".join(str(part) for part in argv)
+                self.assertNotIn(sentinel.as_posix(), blob)
+                self.assertNotIn("rm -f", blob)
 
     def _trace(self, fn, events, name):
         def wrapped(*args, **kwargs):

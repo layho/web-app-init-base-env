@@ -4,24 +4,32 @@ This module prepares a candidate build in a caller-supplied temporary
 directory. It is not wired into ``deploy/macci/runner.py`` or
 ``deploy/macmini/manage.sh``. Those host paths stay unchanged until W07.
 
-Untrusted candidate text is never executed on the host. A keyword scan of
-that text is not a security boundary, and ``MockDatabase`` is not one
-either. Execution goes through :func:`probe_isolation`. When a Linux user
-namespace sandbox is actually available, the candidate sees only a
-temporary directory, a synthetic credential, no real database, no network,
-and no capabilities. When that sandbox is not available, the result is
-``BLOCKED`` and the candidate is not started. ``host_acl_effective`` and
-``db_acl_effective`` stay false. A probe on this machine is not MacCI
-evidence and is not an A04 or A05 real-machine measurement.
+The W03 runtime target is macOS. The existing MacCI container boundary is
+the ``docker run`` invocation in ``deploy/macci/runner.py`` (``--network
+none``, ``--cap-drop ALL``, ``no-new-privileges``, ``--pids-limit 256``,
+``--memory 3g``, ``--cpus 2``). This module maps that boundary and does not
+edit ``runner.py``. On a host that cannot exercise it, the MacCI runtime is
+``BLOCKED`` with a precise reason. Linux ``unshare`` is only an optional
+adapter. It is not MacCI evidence and it is not a reason to run an
+untrusted candidate on the host. When neither adapter can isolate, the
+result is ``BLOCKED`` and the candidate is not started.
 
-The same-UID threat boundary is stated on every receipt. Mode bits and
-``O_NOFOLLOW`` opens do not confine another process with this uid.
+The optional adapter applies process, CPU, address-space, file-size, and
+output limits itself. A timeout is not finished until the isolated process
+tree has been confirmed dead. Output is read with a byte cap. Unbounded stdout capture is not used.
+Build products are copied to
+``.w03-artifacts`` and hashed again from that copy. A digest of a tree that
+was then deleted is not the success path.
 
-W02 alignment is pending. Later integration calls the single public
-interface ``app.auth.authorize_request``. This module does not implement a
-second authenticator. ``Actor`` remains a test double (kind ``test``,
-``test-proof://``), not the principal in ``app/control_identity``.
-``production_verification_enabled`` stays false.
+``host_acl_effective`` and ``db_acl_effective`` stay false. A probe on this
+machine is not MacCI evidence and is not an A04 or A05 real-machine
+measurement. ``production_verification_enabled`` stays false.
+
+W02 alignment is pending. The public entry is ``app/control_authz``.
+``app.auth.authorize_request`` is not that entry. This module does not
+implement a second authenticator. ``Actor`` is a tests-only double.
+The self-reported executor label ``Grok`` is not a trusted execution
+identity.
 """
 
 from __future__ import annotations
@@ -33,12 +41,15 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -47,9 +58,28 @@ SCHEMA_VERSION = 3
 BASELINE_SHA = "b2011968a9c14845b89fe6d15dda4a595699e9ec"
 W02_BASELINE_HEAD = "5dd0eb38e175a8a905836fbdbac5633ff9eb19ae"
 W02_ALIGNMENT_STATUS = "pending_final_review"
-W02_PUBLIC_AUTH = "app.auth.authorize_request"
+W02_PUBLIC_AUTH = "app/control_authz"
 EXECUTOR = "Grok"
-BINDING_VERSION = "w03-binding-v1"
+BINDING_VERSION = "w03-binding-v2"
+RUNTIME_TARGET = "macos"
+# Observed in deploy/macci/runner.py test_candidate. This module does not edit that file.
+MACCI_CONTAINER_BOUNDARY = {
+    "source": "deploy/macci/runner.py test_candidate",
+    "network": "none",
+    "cap_drop": "ALL",
+    "security_opt": "no-new-privileges",
+    "pids_limit": "256",
+    "memory": "3g",
+    "cpus": "2",
+    "run_timeout_seconds": 1200,
+}
+# The optional Linux adapter enforces these itself. They are not a MacCI receipt.
+# nproc is an rlimit, not the MacCI cgroup pids limit. CPU is seconds, not --cpus.
+LIMIT_NPROC = 16
+LIMIT_CPU_SECONDS = 2
+LIMIT_AS_BYTES = 128 * 1024 * 1024
+LIMIT_FSIZE_BYTES = 256 * 1024
+LIMIT_OUTPUT_BYTES = 32 * 1024
 SYNTHETIC_CREDENTIAL_NAME = "W03_SYNTHETIC_MARK"
 SYNTHETIC_CREDENTIAL_VALUE = "synthetic-w03-credential"
 EVIDENCE_REF = "test-proof://w03/isolated-build"
@@ -126,6 +156,8 @@ DETAIL_CODES = frozenset({
     "ISOLATION_BLOCKED",
     "UNKNOWN_RESULT",
     "SCRIPT_FAILED",
+    "RESOURCE_LIMIT",
+    "ARTIFACT_NOT_VERIFIED",
     "INPUT_MISSING",
     "WORKSPACE_UNAVAILABLE",
     "SCHEMA_INVALID",
@@ -134,12 +166,28 @@ DETAIL_CODES = frozenset({
 })
 
 W02_ALIGNMENT_PENDING = (
-    "Replace Actor with the W02 app/control_identity principal: generation, scope, and no stored secret.",
-    "Call the single public auth interface app.auth.authorize_request before idempotency. Do not add a second authentication implementation.",
-    "Binding a new proof to authorize_request or a real token is production enablement and stays unauthorized.",
+    "Replace the tests-only Actor double with the W02 app/control_identity principal: generation, scope, and no stored secret.",
+    "Call the single public auth entry app/control_authz before idempotency. app.auth.authorize_request is not that entry. Do not add a second authentication implementation.",
+    "The self-reported executor label Grok is not a trusted execution identity. Test doubles stay tests-only.",
+    "Binding a new proof to app/control_authz or a real token is production enablement and stays unauthorized.",
     "Bind a MacCI signer that is distinct from the shared Owner login.",
     "Keep production_verification_enabled false. A test-proof:// string is not a production credential.",
     "Full integration remains blocked on the W02 identity-boundary final review.",
+)
+OWNERSHIP_EXCEPTIONS = (
+    {
+        "path": "docs/v060/02-architecture-contract.md",
+        "wording": "六行依次为 → 七行依次为",
+        "reason": (
+            "The candidate encoding was already seven lines. The count word was corrected "
+            "under a coordinated ownership exception. Shared-document edits are not expanded "
+            "and tests/fixtures/v060/w00/contract.json is not edited."
+        ),
+        "coordinated": True,
+        "shared_edits_expanded": False,
+        "contract_json": "tests/fixtures/v060/w00/contract.json",
+        "contract_json_edited": False,
+    },
 )
 SAME_UID_THREAT_BOUNDARY = (
     "Same-UID threat boundary: mode 0700, an exclusive mkdir, and O_NOFOLLOW opens from a directory "
@@ -231,10 +279,11 @@ class IsolationError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Actor:
-    """Frozen-contract test identity.
+    """Tests-only double. It is not the W02 principal and not an execution identity.
 
-    W02_ALIGNMENT: swap this double for the reviewed W02 principal. Do not
-    treat ``id`` or a shared Owner login as a MacCI signer.
+    W02_ALIGNMENT: swap this double for the reviewed ``app/control_identity``
+    principal and authorize through ``app/control_authz``. Do not treat ``id``,
+    the self-reported executor label, or a shared Owner login as a MacCI signer.
     """
 
     kind: str
@@ -396,6 +445,7 @@ class ExecResult:
     exit_code: int | None
     blocked: bool
     reason: str
+    tree_terminated: bool = False
 
 
 def candidate_id(candidate: Candidate) -> str:
@@ -648,11 +698,11 @@ def bind_execution_digest(
     exit_code: int | None,
     probe_evidence: Mapping[str, object],
 ) -> dict:
-    """Bind the real output digest to the candidate 4-tuple, executor, exit, and probe.
+    """Bind the output digest to the candidate 4-tuple, exit, and probe.
 
-    The preimage is UTF-8 with no trailing newline. Lines are the version,
-    the input digest, the output digest, head, base, merge, tree, the
-    executor, ``-`` when there is no exit code, and the canonical probe JSON.
+    ``executor`` is a self-reported label. The preimage records that the
+    label is not a trusted execution identity. A matching label does not
+    authorize the run and does not stand in for ``app/control_authz``.
     """
     _require_candidate_shape(candidate)
     if executor != EXECUTOR or not output_digest.startswith("sha256:") or not input_digest.startswith("sha256:"):
@@ -669,7 +719,8 @@ def bind_execution_digest(
         candidate.base,
         candidate.merge,
         candidate.tree,
-        executor,
+        "self-reported:" + executor,
+        "trusted_execution_identity:false",
         exit_line,
         canonical,
     ))
@@ -686,6 +737,10 @@ def bind_execution_digest(
             "tree": candidate.tree,
         },
         "executor": executor,
+        "self_reported_executor": executor,
+        "trusted_execution_identity": False,
+        "execution_identity": None,
+        "self_reported_executor_is_identity": False,
         "exit_code": exit_code,
         "probe_evidence_sha256": "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     }
@@ -704,41 +759,427 @@ def probe_isolation() -> IsolationCapability:
         return _blocked("probe failed closed")
 
 
-def execute_isolated(ws_fd: int, workspace: Path, script: str) -> ExecResult:
-    """Execute candidate text only as a file inside a fresh sandbox."""
+def macci_container_argv(job: str, image: str) -> list[str]:
+    """Argv mapped from the existing MacCI ``docker run``. It is not launched here."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", job):
+        raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,80}", image):
+        raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
+    return [
+        "docker", "run", "--name", job,
+        "--network", MACCI_CONTAINER_BOUNDARY["network"],
+        "--cap-drop", MACCI_CONTAINER_BOUNDARY["cap_drop"],
+        "--security-opt", MACCI_CONTAINER_BOUNDARY["security_opt"],
+        "--pids-limit", MACCI_CONTAINER_BOUNDARY["pids_limit"],
+        "--memory", MACCI_CONTAINER_BOUNDARY["memory"],
+        "--cpus", MACCI_CONTAINER_BOUNDARY["cpus"],
+        image,
+    ]
+
+
+def assess_macci_runtime() -> dict:
+    """Map the MacCI container boundary and mark what this host cannot exercise.
+
+    This does not start Docker, does not edit ``runner.py``, and does not
+    downgrade an untrusted candidate onto the host. ``macci_evidence`` stays
+    ``pending``. A04 and A05 real-machine isolation stay unverified.
+    """
+    gaps = []
+    missing = [
+        "macci_docker_engine",
+        "container_output_cap",
+        "container_disk_quota",
+        "container_timeout_tree_reap",
+        "a04_real_mac_host_isolation",
+        "a05_real_database_role_isolation",
+    ]
+    if sys.platform != "darwin":
+        gaps.append(f"runtime target is macOS; this host is {sys.platform}")
+        missing.insert(0, "macos_host")
+    else:
+        gaps.append("this process is not the MacCI host and will not launch a container")
+        missing.insert(0, "macci_launch_not_performed")
+    if shutil.which("docker") is None:
+        gaps.append("the MacCI docker engine is not available on this host")
+    else:
+        gaps.append("docker is installed but this module will not launch a container or edit runner.py")
+    gaps.append(
+        "the existing docker run has no output byte cap, no disk quota, and no confirmation "
+        "that the process tree is dead after timeout"
+    )
+    gaps.append("A04 real Mac host isolation and A05 real database-role isolation were not measured")
+    return {
+        "status": "BLOCKED",
+        "runtime_target": RUNTIME_TARGET,
+        "reason": "; ".join(gaps),
+        "boundary": dict(MACCI_CONTAINER_BOUNDARY),
+        "missing_capabilities": missing,
+        "host_downgrade": False,
+        "macci_evidence": "pending",
+        "optional_adapter": "linux-unshare" if _linux_unshare_adapter_available() else "none",
+    }
+
+
+def _linux_unshare_adapter_available() -> bool:
+    return sys.platform.startswith("linux") and _unshare_argv() is not None and _trusted_shell_files() is not None
+
+
+def _select_adapter() -> str | None:
+    """Return the optional Linux adapter, or None. Never return a host path."""
+    if _linux_unshare_adapter_available():
+        return "linux-unshare"
+    return None
+
+
+def _resource_limit_record(timeout: float | None = None) -> dict:
+    return {
+        "nproc": LIMIT_NPROC,
+        "cpu_seconds": LIMIT_CPU_SECONDS,
+        "address_space_bytes": LIMIT_AS_BYTES,
+        "file_size_bytes": LIMIT_FSIZE_BYTES,
+        "output_bytes": LIMIT_OUTPUT_BYTES,
+        "timeout_seconds": SANDBOX_TIMEOUT_SECONDS if timeout is None else timeout,
+        "enforced_by": "linux-unshare-rlimit",
+        "macci_cgroup_limits": "BLOCKED",
+    }
+
+
+def _runtime_evidence(adapter: str) -> dict:
+    assessment = assess_macci_runtime()
+    return {
+        "runtime_target": RUNTIME_TARGET,
+        "macci_runtime": assessment["status"],
+        "macci_runtime_reason": assessment["reason"],
+        "macci_missing_capabilities": list(assessment["missing_capabilities"]),
+        "macci_boundary": assessment["boundary"],
+        "optional_adapter": adapter,
+        "host_downgrade": False,
+        "capture_output_unbounded": False,
+        "trusted_execution_identity": False,
+        "self_reported_executor_is_identity": False,
+        "a04_a05_real_machine_status": "pending",
+        "production_verification_enabled": False,
+        "macci_evidence": "pending",
+        "host_acl_effective": False,
+        "db_acl_effective": False,
+    }
+
+
+def _apply_candidate_limits(nproc: int, cpu: int, address: int, fsize: int) -> None:
+    pairs = (
+        (resource.RLIMIT_NPROC, nproc),
+        (resource.RLIMIT_CPU, cpu),
+        (resource.RLIMIT_AS, address),
+        (resource.RLIMIT_FSIZE, fsize),
+        (resource.RLIMIT_CORE, 0),
+    )
+    for which, value in pairs:
+        resource.setrlimit(which, (value, value))
+        soft, hard = resource.getrlimit(which)
+        if soft != value or hard != value:
+            raise OSError(errno.EPERM, "limit did not stick")
+
+
+def _read_exec_limits() -> tuple[int, int, int, int] | None:
+    specs = (
+        ("W03_LIMIT_NPROC", LIMIT_NPROC, 4, 64),
+        ("W03_LIMIT_CPU", LIMIT_CPU_SECONDS, 1, 30),
+        ("W03_LIMIT_AS", LIMIT_AS_BYTES, 32 * 1024 * 1024, 256 * 1024 * 1024),
+        ("W03_LIMIT_FSIZE", LIMIT_FSIZE_BYTES, 4096, 1024 * 1024),
+    )
+    values = []
+    for name, default, low, high in specs:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            values.append(default)
+            continue
+        if not raw.isdigit():
+            return None
+        number = int(raw)
+        if not low <= number <= high:
+            return None
+        values.append(number)
+    return values[0], values[1], values[2], values[3]
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    found: list[int] = []
+    stack = [pid]
+    seen = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        path = f"/proc/{current}/task/{current}/children"
+        try:
+            with open(path, "r", encoding="ascii") as handle:
+                raw = handle.read().split()
+        except OSError:
+            continue
+        for item in raw:
+            if item.isdigit():
+                child = int(item)
+                found.append(child)
+                stack.append(child)
+    if found and found[0] == pid:
+        return found[1:]
+    return [item for item in found if item != pid]
+
+
+def _pid_namespace(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/ns/pid")
+    except OSError:
+        return None
+
+
+def _processes_in_namespace(namespace: str) -> list[int]:
+    found = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return [-1]
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            if os.readlink(f"/proc/{name}/ns/pid") == namespace:
+                found.append(int(name))
+        except OSError:
+            continue
+    return found
+
+
+def _reap_process_tree(proc: subprocess.Popen) -> bool:
+    """SIGKILL the session and confirm the isolated pid namespace is empty.
+
+    ``unshare --kill-child`` is not treated as proof. A timeout that only
+    returns from ``wait`` is not complete reaping.
+    """
+    pid = proc.pid
+    descendants = _descendant_pids(pid)
+    namespaces = []
+    for item in descendants:
+        namespace = _pid_namespace(item)
+        if namespace and namespace not in namespaces:
+            namespaces.append(namespace)
+    for target in (pid, *descendants):
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except OSError:
+            pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        return False
+    for _ in range(10):
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        for item in descendants:
+            if _pid_alive(item):
+                try:
+                    os.kill(item, signal.SIGKILL)
+                except OSError:
+                    pass
+        leftovers = []
+        for namespace in namespaces:
+            found = _processes_in_namespace(namespace)
+            if any(item < 0 for item in found):
+                return False
+            leftovers.extend(found)
+            for leftover in found:
+                try:
+                    os.kill(leftover, signal.SIGKILL)
+                except OSError:
+                    pass
+        if not _pid_alive(pid) and not any(_pid_alive(item) for item in descendants) and not leftovers:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _run_isolated(
+    argv: list[str],
+    env: dict[str, str],
+    cwd: str,
+    timeout: float,
+    *,
+    hold_stdin: bool = False,
+    confirm_tree: Callable[[], bool] | None = None,
+) -> dict:
+    """Run an isolated argv with a bounded pipe and a confirmed reap.
+
+    Stdout and stderr are discarded after they are counted. They are not
+    stored and they are not collected with ``capture_output``.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if hold_stdin else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=cwd,
+        start_new_session=True,
+    )
+    state = {"total": 0}
+    lock = threading.Lock()
+    exceeded = threading.Event()
+
+    def consume(pipe) -> None:
+        try:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                with lock:
+                    state["total"] += len(chunk)
+                    if state["total"] > LIMIT_OUTPUT_BYTES:
+                        exceeded.set()
+                        break
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    threads = (
+        threading.Thread(target=consume, args=(proc.stdout,), daemon=True),
+        threading.Thread(target=consume, args=(proc.stderr,), daemon=True),
+    )
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + timeout
+    try:
+        while proc.poll() is None:
+            if exceeded.is_set() or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        timed_out = proc.poll() is None and not exceeded.is_set()
+        output_exceeded = exceeded.is_set()
+        if proc.poll() is None:
+            tree_terminated = _reap_process_tree(proc)
+        else:
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                tree_terminated = False
+            else:
+                tree_terminated = not _pid_alive(proc.pid)
+        if confirm_tree is not None:
+            tree_terminated = bool(confirm_tree())
+        return {
+            "returncode": proc.returncode,
+            "timed_out": timed_out,
+            "output_exceeded": output_exceeded,
+            "tree_terminated": tree_terminated,
+        }
+    finally:
+        if hold_stdin and proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        if proc.poll() is None:
+            _reap_process_tree(proc)
+        for thread in threads:
+            thread.join(timeout=1)
+
+
+def _run_capped(argv: list[str], *, timeout: float, env: dict[str, str], cap: int = 65536) -> subprocess.CompletedProcess:
+    """Read a trusted helper's output only up to ``cap``. Do not use ``capture_output``."""
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _reap_process_tree(proc)
+        raise
+    if len(out) > cap or len(err) > cap:
+        _reap_process_tree(proc)
+        raise OSError(errno.EFBIG, "helper output exceeded the cap")
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def execute_isolated(
+    ws_fd: int,
+    workspace: Path,
+    script: str,
+    *,
+    timeout: float | None = None,
+    hold_stdin: bool = False,
+    force_limit_failure: bool = False,
+    confirm_tree: Callable[[], bool] | None = None,
+) -> ExecResult:
+    """Execute candidate text only inside the optional Linux adapter.
+
+    The MacCI container path stays ``BLOCKED`` on a host that cannot exercise
+    it. There is no host-shell fallback. Output is capped. After a timeout
+    or an output overrun the isolated process tree must be confirmed dead,
+    or the result stays unconfirmed.
+    """
+    if assess_macci_runtime()["host_downgrade"]:
+        return ExecResult(False, None, True, "host execution refused", False)
+    if _select_adapter() != "linux-unshare":
+        return ExecResult(False, None, True, "no isolation adapter; host execution refused", False)
     libs = _trusted_shell_files()
     argv = _unshare_argv()
     if not libs or argv is None:
-        return ExecResult(False, None, True, "sandbox unavailable")
+        return ExecResult(False, None, True, "sandbox unavailable", False)
     if script.encode("utf-8") and any(script in part for part in argv):
-        return ExecResult(False, None, True, "candidate text leaked into argv")
+        return ExecResult(False, None, True, "candidate text leaked into argv", False)
     try:
         _write_exclusive_at(ws_fd, "candidate.sh", script.encode("utf-8"), 0o600)
     except IsolationError:
-        return ExecResult(False, None, True, "candidate file was not created")
+        return ExecResult(False, None, True, "candidate file was not created", False)
     env = _sandbox_env(workspace, "exec", libs, None)
+    if force_limit_failure:
+        env["W03_FORCE_LIMIT_FAILURE"] = "1"
+    limit = SANDBOX_TIMEOUT_SECONDS if timeout is None else timeout
+    if type(limit) not in {int, float} or not 0.2 <= float(limit) <= SANDBOX_TIMEOUT_SECONDS:
+        return ExecResult(False, None, True, "sandbox unavailable", False)
     try:
-        completed = subprocess.run(
+        completed = _run_isolated(
             argv,
-            check=False,
-            capture_output=True,
-            env=env,
-            cwd=str(workspace),
-            timeout=SANDBOX_TIMEOUT_SECONDS,
-            start_new_session=True,
+            env,
+            str(workspace),
+            float(limit),
+            hold_stdin=hold_stdin,
+            confirm_tree=confirm_tree,
         )
-    except subprocess.TimeoutExpired:
-        started = _marker_present(ws_fd)
-        _remove_jail_mountpoint(workspace)
-        return ExecResult(started, None, not started, "timeout")
     except OSError:
         _remove_jail_mountpoint(workspace)
-        return ExecResult(False, None, True, "sandbox failed to start")
+        return ExecResult(False, None, True, "sandbox failed to start", False)
+    finally:
+        _remove_jail_mountpoint(workspace)
     started = _marker_present(ws_fd)
-    _remove_jail_mountpoint(workspace)
+    if not completed["tree_terminated"]:
+        return ExecResult(started, None, True, "reap_unconfirmed", False)
+    if completed["output_exceeded"]:
+        return ExecResult(True, None, False, "output_limit", True)
+    if completed["timed_out"]:
+        return ExecResult(started, None, False, "timeout", True)
     if not started:
-        return ExecResult(False, None, True, "sandbox did not start the candidate")
-    return ExecResult(True, int(completed.returncode), False, "executed")
+        return ExecResult(False, None, True, "sandbox did not start the candidate", True)
+    code = completed["returncode"]
+    if code is None:
+        return ExecResult(True, None, True, "reap_unconfirmed", False)
+    return ExecResult(True, int(code), False, "executed", True)
 
 
 def sandbox_launch() -> int:
@@ -822,6 +1263,7 @@ def _commit_success(
         exit_code=exit_code,
         probe_evidence=probe_evidence,
     )
+    retained = retain_build_artifacts(workspace.parent, request.run_id, ws_fd, output_digest)
     receipt = _success_receipt(request, env, database_probe, output_digest)
     receipt["commands_executed"] = commands
     receipt["exit_code"] = exit_code
@@ -829,6 +1271,10 @@ def _commit_success(
     receipt["probe_evidence"] = probe_evidence
     receipt["isolation_status"] = "available" if commands else "not_invoked"
     receipt["candidate_tuple"] = dict(binding["candidate_tuple"])
+    receipt["artifact_retain"] = retained
+    receipt["process_tree_terminated"] = True if commands else None
+    if commands:
+        receipt["resource_limits"] = _resource_limit_record()
     cleanup_state, cleanup_error = _cleanup(workspace, remover)
     workspace_left = workspace if cleanup_state == "failed" else None
     _apply_cleanup(receipt, cleanup_state, cleanup_error, workspace_left)
@@ -864,12 +1310,30 @@ def _fail_after_claim(
             output_digest = _output_digest_fd(ws_fd)
         except IsolationError:
             output_digest = _empty_output_digest()
+    retained = None
+    if (
+        workspace is not None
+        and ws_fd is not None
+        and isinstance(request, BuildRequest)
+        and exc.detail in {"SCRIPT_FAILED", "RESOURCE_LIMIT", "CROSS_APP_DENIED"}
+    ):
+        try:
+            retained = retain_build_artifacts(workspace.parent, request.run_id, ws_fd, output_digest)
+        except IsolationError:
+            retained = {
+                "verified": False,
+                "digest": output_digest,
+                "relative_root": None,
+                "files": [],
+            }
     if workspace is not None:
         cleanup_state, cleanup_error = _cleanup(workspace, remover)
         if cleanup_state == "failed":
             workspace_left = workspace
     receipt = _failure_receipt(request, exc, cleanup_state, "skipped", cleanup_error, workspace_left)
-    known_script = script_started and exc.detail == "SCRIPT_FAILED" and exit_code is not None
+    if retained is not None:
+        receipt["artifact_retain"] = retained
+    known_script = script_started and exc.detail in {"SCRIPT_FAILED", "RESOURCE_LIMIT"} and exit_code is not None
     if known_script:
         probe_evidence = _evidence_for_binding(capability, 1)
         receipt["commands_executed"] = 1
@@ -877,6 +1341,9 @@ def _fail_after_claim(
         receipt["probe_evidence"] = probe_evidence
         receipt["isolation_status"] = "available"
         receipt["failure"]["commands_executed"] = 1
+        receipt["process_tree_terminated"] = True
+        if exc.detail == "RESOURCE_LIMIT":
+            receipt["resource_limits"] = _resource_limit_record()
         try:
             receipt["execution_binding"] = bind_execution_digest(
                 output_digest=output_digest,
@@ -920,7 +1387,7 @@ def _evidence_for_binding(capability: IsolationCapability | None, commands: int)
 
 
 def _not_run_evidence() -> dict:
-    return {
+    evidence = {
         "status": "not_run",
         "macci_evidence": "pending",
         "candidate_executed": False,
@@ -930,6 +1397,8 @@ def _not_run_evidence() -> dict:
         "production_verification_enabled": False,
         "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
     }
+    evidence.update(_runtime_evidence("not_invoked"))
+    return evidence
 
 
 def _probe_canonical(evidence: Mapping[str, object]) -> str:
@@ -956,6 +1425,7 @@ def _blocked(reason: str) -> IsolationCapability:
         "production_verification_enabled": False,
         "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
     }
+    evidence.update(_runtime_evidence("none"))
     return IsolationCapability("BLOCKED", "none", reason, evidence)
 
 
@@ -979,17 +1449,17 @@ def _probe_isolation() -> IsolationCapability:
         home_file = root / "host-home" / "marker.txt"
         home_file.parent.mkdir(mode=0o700)
         home_file.write_bytes(b"home-marker\n")
-        host_read = subprocess.run(
-            [sys.executable, "-I", "-B", "-c",
-             "import pathlib,sys; sys.stdout.write(pathlib.Path(sys.argv[1]).read_text())",
-             str(external)],
-            check=False,
-            capture_output=True,
-            text=True,
-            env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
-            timeout=5,
-        )
-        if host_read.stdout != "external-marker\n":
+        try:
+            host_read = _run_capped(
+                [sys.executable, "-I", "-B", "-c",
+                 "import pathlib,sys; sys.stdout.write(pathlib.Path(sys.argv[1]).read_text())",
+                 str(external)],
+                timeout=5,
+                env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return _blocked("host control could not read the external file")
+        if host_read.stdout != b"external-marker\n":
             return _blocked("host control could not read the external file")
         targets = {
             "home": str(home_file),
@@ -1001,16 +1471,12 @@ def _probe_isolation() -> IsolationCapability:
         if any(_is_credential_name(name) for name in env):
             return _blocked("probe environment contained a credential name")
         try:
-            completed = subprocess.run(
-                argv,
-                check=False,
-                capture_output=True,
-                env=env,
-                cwd=str(workspace),
-                timeout=SANDBOX_TIMEOUT_SECONDS,
-                start_new_session=True,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            completed = _run_isolated(argv, env, str(workspace), SANDBOX_TIMEOUT_SECONDS)
+        except OSError:
+            return _blocked("probe subprocess did not finish")
+        if not completed["tree_terminated"]:
+            return _blocked("probe process tree was not confirmed dead")
+        if completed["timed_out"] or completed["output_exceeded"] or completed["returncode"] != 0:
             return _blocked("probe subprocess did not finish")
         probe_path = workspace / "probe-result.json"
         raw = b""
@@ -1026,7 +1492,7 @@ def _probe_isolation() -> IsolationCapability:
             data = json.loads(raw.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError):
             return _blocked("probe evidence was not json")
-        if not isinstance(data, dict) or completed.returncode != 0:
+        if not isinstance(data, dict):
             return _blocked("probe process failed")
         return _capability_from_probe(data, host_net)
 
@@ -1046,10 +1512,16 @@ def _capability_from_probe(data: dict, host_net: str) -> IsolationCapability:
     unprivileged = data.get("cap_eff_zero") is True and data.get("no_new_privs") is True and data.get("mount_denied") is True
     environment_ok = data.get("credential_env_present") is False and data.get("synthetic_present") is True
     same_uid = data.get("mapped_uid") == os.getuid() and data.get("only_lo") is True
-    passed = all((home_ok, external_ok, cross_ok, network_ok, unprivileged, environment_ok, same_uid))
+    limits_ok = (
+        data.get("nproc_hard") == LIMIT_NPROC
+        and data.get("cpu_hard") == LIMIT_CPU_SECONDS
+        and data.get("as_hard") == LIMIT_AS_BYTES
+        and data.get("fsize_hard") == LIMIT_FSIZE_BYTES
+    )
+    passed = all((home_ok, external_ok, cross_ok, network_ok, unprivileged, environment_ok, same_uid, limits_ok))
     evidence = {
         "status": "available" if passed else "BLOCKED",
-        "backend": "linux-user-namespace" if passed else "none",
+        "backend": "linux-unshare-optional" if passed else "none",
         "reason": "probe passed" if passed else "probe counterexample failed",
         "executed_probe": True,
         "candidate_executed": False,
@@ -1070,7 +1542,10 @@ def _capability_from_probe(data: dict, host_net: str) -> IsolationCapability:
         "real_database": False,
         "production_verification_enabled": False,
         "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
+        "resource_limits_applied": limits_ok,
+        "resource_limits": _resource_limit_record() if limits_ok else None,
     }
+    evidence.update(_runtime_evidence("linux-unshare" if passed else "none"))
     status = "available" if passed else "BLOCKED"
     return IsolationCapability(status, evidence["backend"], evidence["reason"], evidence)
 
@@ -1135,20 +1610,17 @@ def _trusted_shell_files() -> list[tuple[str, str]] | None:
     if not dash_real.startswith("/usr/") or not os.path.isfile(dash_real):
         return None
     try:
-        completed = subprocess.run(
+        completed = _run_capped(
             ["ldd", dash_real],
-            check=False,
-            capture_output=True,
-            text=True,
-            env={"PATH": "/usr/bin:/bin", "LANG": "C"},
             timeout=5,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C"},
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
     if completed.returncode != 0:
         return None
     pairs = [(dash_real, "/usr/bin/dash")]
-    for line in completed.stdout.splitlines():
+    for line in completed.stdout.decode("utf-8", "replace").splitlines():
         path = _ldd_path(line.strip())
         if path and os.path.isfile(path) and _abs_safe(path):
             pairs.append((os.path.realpath(path), path))
@@ -1341,6 +1813,10 @@ def _write_probe_result() -> None:
     net = open("/proc/net/dev", "r", encoding="ascii").read().splitlines()
     faces = [line.split(":", 1)[0].strip() for line in net if ":" in line]
     result["only_lo"] = faces == ["lo"]
+    limits = _probe_limits()
+    result["limits_applied"] = limits is not None
+    if limits is not None:
+        result.update(limits)
     external = os.environ.get("W03_TRY_EXTERNAL", "")
     shell = subprocess.run(
         ["/bin/sh", "-c", "cat \"$1\" > /work/shell-out 2> /work/shell-err", "sh", external],
@@ -1373,7 +1849,56 @@ def _attempt_open(path: str) -> str:
     return "opened"
 
 
+def _probe_limits() -> dict | None:
+    """Apply the candidate rlimits in a child and record the hard values that stuck."""
+    pid = os.fork()
+    if pid == 0:
+        try:
+            _apply_candidate_limits(LIMIT_NPROC, LIMIT_CPU_SECONDS, LIMIT_AS_BYTES, LIMIT_FSIZE_BYTES)
+            payload = json.dumps({
+                "nproc_hard": resource.getrlimit(resource.RLIMIT_NPROC)[1],
+                "cpu_hard": resource.getrlimit(resource.RLIMIT_CPU)[1],
+                "as_hard": resource.getrlimit(resource.RLIMIT_AS)[1],
+                "fsize_hard": resource.getrlimit(resource.RLIMIT_FSIZE)[1],
+            }).encode("utf-8")
+            fd = os.open("/work/limits.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+        except Exception:
+            os._exit(1)
+        os._exit(0)
+    _child, status = os.waitpid(pid, 0)
+    if status != 0:
+        return None
+    try:
+        with open("/work/limits.json", "rb") as handle:
+            raw = handle.read()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    expected = {
+        "nproc_hard": LIMIT_NPROC,
+        "cpu_hard": LIMIT_CPU_SECONDS,
+        "as_hard": LIMIT_AS_BYTES,
+        "fsize_hard": LIMIT_FSIZE_BYTES,
+    }
+    if data != expected:
+        return None
+    return data
+
+
 def _exec_candidate() -> int:
+    if os.environ.get("W03_FORCE_LIMIT_FAILURE") == "1":
+        return 3
+    limits = _read_exec_limits()
+    if limits is None:
+        return 3
+    try:
+        _apply_candidate_limits(*limits)
+    except (OSError, ValueError):
+        return 3
     fd = os.open("/work/.isolation-started", os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     os.write(fd, b"1")
     os.close(fd)
@@ -1565,12 +2090,21 @@ def construct(
         if script:
             result = execute_isolated(ws_fd, workspace, script)
             script_started = result.started
-            if result.exit_code is None:
-                if result.started:
+            if result.reason == "reap_unconfirmed" or (result.started and not result.tree_terminated):
+                return _unknown_receipt(request)
+            if result.reason in {"output_limit", "timeout"}:
+                if not result.tree_terminated:
                     return _unknown_receipt(request)
+                exit_code = -signal.SIGKILL
+                raise IsolationError("EXECUTION_FAILED", "RESOURCE_LIMIT", 409, "execute")
+            if result.exit_code is None:
                 raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+            if not result.tree_terminated:
+                return _unknown_receipt(request)
             exit_code = result.exit_code
             commands = 1
+            if exit_code < 0 and -exit_code in {signal.SIGXCPU, signal.SIGXFSZ, signal.SIGKILL}:
+                raise IsolationError("EXECUTION_FAILED", "RESOURCE_LIMIT", 409, "execute")
             if exit_code != 0:
                 raise IsolationError("EXECUTION_FAILED", "SCRIPT_FAILED", 409, "execute")
         return _commit_success(
@@ -1719,14 +2253,25 @@ def run_isolation_verification(observations: Mapping[str, Mapping[str, object]] 
         "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
         "macci_evidence": "pending",
         "a04_a05_real_machine_status": "pending",
+        "production_verification_enabled": False,
+        "runtime_target": RUNTIME_TARGET,
+        "macci_runtime": "BLOCKED",
+        "host_downgrade": False,
+        "trusted_execution_identity": False,
+        "self_reported_executor_is_identity": False,
+        "ownership_exceptions": [dict(item) for item in OWNERSHIP_EXCEPTIONS],
         "linux_namespace_probe_is_macci_evidence": False,
         "linux_namespace_probe_is_host_acl_proof": False,
         "isolation_probe": exercises.get("isolation_probe"),
         "blockers": [
             "W02 identity-boundary final review is still required before full integration.",
-            "A04 and A05 real-machine isolation evidence is still pending and is listed separately from the Linux probe.",
+            "The public auth entry for later alignment is app/control_authz. app.auth.authorize_request is not that entry.",
+            "The self-reported executor label is not a trusted execution identity.",
+            "A04 and A05 real Mac host and database-role isolation remain unverified and are listed separately from the Linux probe.",
+            "The W03 runtime target is macOS. Linux unshare is an optional adapter. MacCI container capabilities this host cannot exercise stay BLOCKED.",
             "A Linux user-namespace probe, when it runs, is not MacCI evidence and is not a host or database ACL.",
             "Simulated source checks do not show that host or database ACLs are in effect.",
+            "The docs/v060/02-architecture-contract.md wording change from 六行 to 七行 is a coordinated ownership exception and is not expanded.",
             "manage.sh remains the host build path and stays reserved for W07.",
             "The existing MacCI runner was not modified.",
             "Production enablement, deployment, and database migration were not authorized.",
@@ -1880,6 +2425,22 @@ def _run_fixture_exercises() -> dict:
             raise IsolationError("EVIDENCE_MISSING", "SCHEMA_INVALID", 409, "execute")
         if capability.evidence.get("candidate_executed") is not False:
             raise IsolationError("POLICY_DENIED", "SCRIPT_EXECUTION_DENIED", 403, "execute")
+        if capability.evidence.get("runtime_target") != "macos":
+            raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+        if capability.evidence.get("macci_runtime") != "BLOCKED":
+            raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+        if capability.evidence.get("host_downgrade") is not False:
+            raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+        if capability.evidence.get("trusted_execution_identity") is not False:
+            raise IsolationError("POLICY_DENIED", "IDENTITY_REJECTED", 403, "execute")
+        if capability.evidence.get("a04_a05_real_machine_status") != "pending":
+            raise IsolationError("EVIDENCE_MISSING", "SCHEMA_INVALID", 409, "execute")
+        if capability.evidence.get("production_verification_enabled") is not False:
+            raise IsolationError("POLICY_DENIED", "PERMISSION_DENIED", 403, "execute")
+        if capability.evidence.get("capture_output_unbounded") is not False:
+            raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+        if "macOS" not in str(capability.evidence.get("macci_runtime_reason")):
+            raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
         worked = _unshare_works()
         if worked and capability.status != "available":
             raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
@@ -1887,6 +2448,10 @@ def _run_fixture_exercises() -> dict:
             raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
         if capability.status != "available":
             return
+        if capability.evidence.get("resource_limits_applied") is not True:
+            raise IsolationError("POLICY_DENIED", "RESOURCE_LIMIT", 403, "execute")
+        if capability.evidence.get("optional_adapter") != "linux-unshare":
+            raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
         for key in (
             "home_inaccessible", "environment_inaccessible", "external_file_inaccessible",
             "network_inaccessible", "cross_app_inaccessible", "unprivileged",
@@ -2219,6 +2784,144 @@ def _read_no_follow(root_fd: int, relative: str) -> bytes:
             os.close(fd)
 
 
+def retain_build_artifacts(parent: Path, run_id: str, ws_fd: int, output_digest: str) -> dict:
+    """Copy ``output/`` aside and hash that copy before the workspace can be removed."""
+    if not isinstance(parent, Path) or not _RUN_ID.fullmatch(run_id):
+        raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
+    if not output_digest.startswith("sha256:") or output_digest != _output_digest_fd(ws_fd):
+        raise IsolationError("EVIDENCE_MISSING", "ARTIFACT_NOT_VERIFIED", 409, "execute")
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        artifacts_fd = _ensure_child_dir(parent_fd, ".w03-artifacts")
+        try:
+            try:
+                os.mkdir(run_id, 0o700, dir_fd=artifacts_fd)
+            except FileExistsError as exc:
+                raise IsolationError("SIDE_EFFECT_UNKNOWN", "WORKSPACE_UNAVAILABLE", 409, "execute") from exc
+            retain_fd = os.open(run_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=artifacts_fd)
+            try:
+                _copy_output_tree(ws_fd, retain_fd)
+            finally:
+                os.close(retain_fd)
+        finally:
+            os.close(artifacts_fd)
+    finally:
+        os.close(parent_fd)
+    checked = verify_retained_artifacts(parent, run_id, output_digest)
+    if not checked["verified"]:
+        raise IsolationError("EVIDENCE_MISSING", "ARTIFACT_NOT_VERIFIED", 409, "execute")
+    return checked
+
+
+def verify_retained_artifacts(parent: Path, run_id: str, expected_digest: str) -> dict:
+    """Re-read a retained output tree and compare its digest. The workspace is not required."""
+    if not isinstance(parent, Path) or not _RUN_ID.fullmatch(run_id) or not str(expected_digest).startswith("sha256:"):
+        raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
+    root_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        artifacts_fd = os.open(".w03-artifacts", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            retain_fd = os.open(run_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=artifacts_fd)
+        finally:
+            os.close(artifacts_fd)
+    finally:
+        os.close(root_fd)
+    try:
+        digest = _output_digest_fd(retain_fd)
+        files = _retained_file_records(retain_fd)
+    finally:
+        os.close(retain_fd)
+    return {
+        "verified": digest == expected_digest,
+        "digest": digest,
+        "relative_root": ".w03-artifacts/" + run_id,
+        "files": files,
+    }
+
+
+def _copy_output_tree(src_root: int, dst_root: int) -> None:
+    src = os.open("output", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=src_root)
+    try:
+        dst = _ensure_child_dir(dst_root, "output")
+        try:
+            _copy_dir(src, dst)
+        finally:
+            os.close(dst)
+    finally:
+        os.close(src)
+
+
+def _copy_dir(src: int, dst: int) -> None:
+    for name in sorted(os.listdir(f"/proc/self/fd/{src}")):
+        if name in {".", ".."} or name.startswith("."):
+            continue
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=src)
+        try:
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode):
+                child = _ensure_child_dir(dst, name)
+                try:
+                    _copy_dir(fd, child)
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+            payload = _read_capped(fd)
+            _write_exclusive_at(dst, name, payload, stat.S_IMODE(info.st_mode))
+        finally:
+            os.close(fd)
+
+
+def _read_capped(fd: int) -> bytes:
+    chunks = []
+    total = 0
+    while True:
+        block = os.read(fd, 65536)
+        if not block:
+            break
+        total += len(block)
+        if total > LIMIT_FSIZE_BYTES:
+            raise IsolationError("EXECUTION_FAILED", "RESOURCE_LIMIT", 409, "execute")
+        chunks.append(block)
+    return b"".join(chunks)
+
+
+def _retained_file_records(root_fd: int) -> list[dict]:
+    records: list[dict] = []
+    out = os.open("output", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+    try:
+        _record_tree(out, "output", records)
+    finally:
+        os.close(out)
+    records.sort(key=lambda item: item["path"])
+    return records
+
+
+def _record_tree(dir_fd: int, prefix: str, records: list[dict]) -> None:
+    for name in sorted(os.listdir(f"/proc/self/fd/{dir_fd}")):
+        if name in {".", ".."} or name.startswith("."):
+            continue
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        try:
+            info = os.fstat(fd)
+            relative = prefix + "/" + name
+            if stat.S_ISDIR(info.st_mode):
+                _record_tree(fd, relative, records)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+            payload = _read_capped(fd)
+            records.append({
+                "path": relative,
+                "mode": f"{stat.S_IMODE(info.st_mode):04o}",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "bytes": len(payload),
+            })
+        finally:
+            os.close(fd)
+
+
 def _output_digest_fd(ws_fd: int) -> str:
     lines: list[str] = []
     try:
@@ -2250,10 +2953,14 @@ def _collect_output(dir_fd: int, prefix: str, lines: list[str]) -> None:
             if not stat.S_ISREG(info.st_mode):
                 raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
             chunks = []
+            total = 0
             while True:
                 block = os.read(fd, 65536)
                 if not block:
                     break
+                total += len(block)
+                if total > LIMIT_FSIZE_BYTES:
+                    raise IsolationError("EXECUTION_FAILED", "RESOURCE_LIMIT", 409, "execute")
                 chunks.append(block)
             digest = hashlib.sha256(b"".join(chunks)).hexdigest()
             lines.append(f"{stat.S_IMODE(info.st_mode):04o} {digest} {relative}")
@@ -2270,16 +2977,20 @@ def _unshare_works() -> bool:
     if not unshare:
         return False
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             [unshare, "--user", "--map-root-user", "--mount", "--net", "--pid", "--fork", "--kill-child", "true"],
-            check=False,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env={"PATH": "/usr/bin:/bin"},
-            timeout=5,
+            start_new_session=True,
         )
+        proc.wait(timeout=5)
     except (OSError, subprocess.TimeoutExpired):
+        if "proc" in locals() and proc.poll() is None:
+            _reap_process_tree(proc)
         return False
-    return completed.returncode == 0
+    return proc.returncode == 0
 
 
 def _cleanup(workspace: Path, remover) -> tuple[str, str | None]:
@@ -2498,6 +3209,17 @@ def _common_fields(request: BuildRequest | None) -> dict:
         "w02_bundled": False,
         "production_verification_enabled": False,
         "executor": EXECUTOR,
+        "trusted_execution_identity": False,
+        "execution_identity": None,
+        "self_reported_executor_is_identity": False,
+        "w02_public_auth": W02_PUBLIC_AUTH,
+        "actor_double_tests_only": True,
+        "runtime_target": RUNTIME_TARGET,
+        "macci_runtime": "BLOCKED",
+        "host_downgrade": False,
+        "a04_a05_real_machine_status": "pending",
+        "artifact_retain": None,
+        "process_tree_terminated": None,
         "exit_code": None,
         "execution_binding": None,
         "probe_evidence": None,
