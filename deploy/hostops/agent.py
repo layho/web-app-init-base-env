@@ -17,6 +17,8 @@ from urllib.error import URLError, HTTPError
 
 from diagnostics import execute
 
+USER_AGENT = "HostOps-Agent/0.5.0"
+
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
@@ -110,7 +112,7 @@ def send_heartbeat(host, origin, token, opener=None):
         raise ValueError("heartbeat exceeds bound")
     request = Request(origin + "/api/hostops/v1/agent/heartbeat", data=body,
                       headers={"Authorization": "Bearer " + token,
-                               "Content-Type": "application/json"}, method="POST")
+                               "Content-Type": "application/json", "User-Agent": USER_AGENT}, method="POST")
     with (opener or build_opener(NoRedirect())).open(request, timeout=10) as response:
         raw = response.read(4097)
         if len(raw) > 4096:
@@ -127,7 +129,7 @@ def post_json(origin, token, route, payload):
     if len(body)>32768:
         raise ValueError("request too large")
     request=Request(origin+"/api/hostops/v1/agent/"+route,data=body,method="POST",
-                    headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"})
+                    headers={"Authorization":"Bearer "+token,"Content-Type":"application/json","User-Agent":USER_AGENT})
     with build_opener(NoRedirect()).open(request,timeout=10) as response:
         raw=response.read(32769)
     if len(raw)>32768:
@@ -249,8 +251,10 @@ def main():
             delay = 15
             if args.once:
                 return 0
-        except (OSError, URLError, ValueError, sqlite3.Error):
-            print("HostOps heartbeat unavailable; retry deferred", flush=True)
+        except (OSError, URLError, ValueError, sqlite3.Error) as exc:
+            # Never log response bodies, URLs, credentials or arbitrary exception text.
+            reason = f"HTTP {exc.code}" if isinstance(exc, HTTPError) else type(exc).__name__
+            print(f"HostOps heartbeat or task unavailable ({reason}); retry deferred", flush=True)
             delay = min(delay * 2, 60)
             if args.once:
                 return 1
