@@ -8,7 +8,7 @@ BASE = "b" * 40
 MERGE = "c" * 40
 
 
-def setup(monkeypatch, *, draft=False, base=BASE, mergeable=True, status="success", main=BASE):
+def setup(monkeypatch, *, draft=False, base=BASE, mergeable=True, status="success", main=BASE, published=False):
     monkeypatch.setattr(m.pr_tracking, "target", lambda: (m.REPO, "preview"))
     monkeypatch.setenv("APP_BASE_PREVIEW", "1")
     monkeypatch.setenv("APP_PUBLIC_ORIGIN", "https://base.layho.com")
@@ -25,6 +25,16 @@ def setup(monkeypatch, *, draft=False, base=BASE, mergeable=True, status="succes
                     "head": {"sha": HEAD, "repo": {"full_name": m.REPO}},
                     "base": {"ref": "preview"}, "merge_commit_sha": MERGE,
                     "user": {"login": "layho"}}
+        if main != base and path == "/git/commits/" + main:
+            return {"sha": main, "tree": {"sha": "e"*40},
+                    "parents": [{"sha": "d"*40}, {"sha": base}],
+                    "message": "Merge pull request #194 from layho/preview"}
+        if main != base and path == "/git/commits/" + base:
+            return {"sha": base, "tree": {"sha": "e"*40}}
+        if path == "/pulls/194":
+            return {"merged": published, "state": "closed", "merge_commit_sha": main,
+                    "head": {"sha": base, "ref": "preview", "repo": {"full_name": m.REPO}},
+                    "base": {"ref": "main", "repo": {"full_name": m.REPO}}}
         if path == "/git/commits/" + MERGE:
             return {"parents": [{"sha": BASE}, {"sha": HEAD}]}
         if path == "/commits/" + HEAD + "/statuses?per_page=100":
@@ -281,3 +291,11 @@ def test_other_app_and_untrusted_origin_never_access_github(monkeypatch):
     assert not m.configured()
     with pytest.raises(m.ManualActionError, match="授权"):
         m.current_pr(71, HEAD, BASE)
+
+
+def test_manual_merge_recognizes_exact_published_preview(monkeypatch):
+    setup(monkeypatch, main="f"*40, published=True)
+    commands = []
+    monkeypatch.setattr(m.subprocess, "run", lambda args, **kw: commands.append(args))
+    assert m.request_merge(71, HEAD, BASE)["accepted"] is True
+    assert len(commands) == 1
