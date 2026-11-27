@@ -19,6 +19,10 @@ def _sha(value):
         raise ValueError("invalid SHA")
     return value
 
+class ReservationBlocked(ValueError):
+    """A known pre-push reservation gate, not an uncertain remote result."""
+
+
 class PreviewJournal:
     def __init__(self,path):
         self.path=Path(path)
@@ -85,32 +89,35 @@ class PreviewJournal:
                 raise ValueError("previous push unresolved")
             old=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
             if old and (old["version"]!=version or old["head"]!=head):
-                raise ValueError("candidate registration changed")
+                raise ReservationBlocked("candidate registration changed")
             others=db.execute("SELECT id,files,state FROM integration_jobs WHERE version=? AND id!=? AND state NOT IN ('INTEGRATED','CANCELLED')",(version,job)).fetchall()
             if any(row["state"] in ("CLAIMED","UNKNOWN","PREPARED") for row in others):
-                raise ValueError("another integration is active")
+                raise ReservationBlocked("another integration is active")
             if any(p==r or p.startswith(r+"/") or r.startswith(p+"/") for row in others for r in json.loads(row["files"]) for p in paths):
-                raise ValueError("candidate conflicts with reservation")
+                raise ReservationBlocked("candidate conflicts with reservation")
             if old is None:
                 # Do not leapfrog previously queued tasks.
                 if others:
-                    raise ValueError("registered work takes precedence")
+                    raise ReservationBlocked("registered work takes precedence")
                 db.execute("INSERT INTO integration_jobs VALUES(?,?,?,?,?,?,'QUEUED',NULL,NULL,NULL,?)",
                            (job,version,head,"[]",json.dumps(paths),0,now))
                 db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,"QUEUED",now))
                 reserved=paths
             else:
                 if old["state"] not in ("QUEUED","PREPARED"):
-                    raise ValueError("candidate not eligible for preparation")
+                    raise ReservationBlocked("candidate not eligible for preparation")
                 if old["state"]=="PREPARED" and old["base"]!=base:
-                    raise ValueError("prepared base changed")
+                    # No pending push exists, and the caller just verified the new exact candidate.
+                    db.execute("UPDATE integration_jobs SET state='QUEUED',base=NULL WHERE id=?",(job,))
+                    db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,"PREPARATION_RETRY",now))
+                    old=dict(old,state="QUEUED",base=None)
                 reserved=json.loads(old["files"])
                 for dep in json.loads(old["dependencies"]):
                     row=db.execute("SELECT state FROM integration_jobs WHERE id=?",(dep,)).fetchone()
                     if row is None or row["state"]!="INTEGRATED":
-                        raise ValueError("dependency unfinished")
+                        raise ReservationBlocked("dependency unfinished")
             if any(not any(p==r or p.startswith(r+"/") for r in reserved) for p in paths):
-                raise ValueError("candidate exceeds reservation")
+                raise ReservationBlocked("candidate exceeds reservation")
             if old is None or old["state"]=="QUEUED":
                 db.execute("UPDATE integration_jobs SET state='PREPARED',base=?,lease=NULL,expires=NULL WHERE id=?",(base,job))
                 db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,"PREPARED",now))
@@ -206,6 +213,28 @@ class PreviewJournal:
                        (int(time.time()),row["seq"]))
             self._finish_reservation(db,row["pr"],row["head"],row["base"])
             return True
+
+    def pending(self):
+        with self.tx() as db:
+            return db.execute("SELECT 1 FROM preview_attempts WHERE state='PENDING'").fetchone() is not None
+
+    def refresh_prepared_base(self,number,head,old_base,new_base):
+        """A prepared reservation has no remote side effect until prepare().
+        Under the host lock, requeue it when its tested base becomes stale.
+        Never alter UNKNOWN or any reservation with a pending push.
+        """
+        _sha(head); _sha(old_base); _sha(new_base)
+        if old_base==new_base:
+            return False
+        with self.tx() as db:
+            if db.execute("SELECT 1 FROM preview_attempts WHERE state='PENDING'").fetchone():
+                return False
+            job="pr-"+str(number)
+            changed=db.execute("UPDATE integration_jobs SET state='QUEUED',base=NULL WHERE id=? AND head=? AND base=? AND state='PREPARED'",
+                               (job,head,old_base)).rowcount
+            if changed:
+                db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,"PREPARATION_RETRY",int(time.time())))
+            return changed==1
 
     def history(self):
         with self.tx() as db:

@@ -460,7 +460,12 @@ def merge_one(token, number, dry_run=False, journal=None, managed_queue=False):
                 # preserves paths with spaces; invalid paths cannot match a reservation.
                 changed_files=git(folder,"diff","--no-renames","--name-only","-z",base,merge).split("\0")
                 changed_files=[p for p in changed_files if p]
-                journal.stage(number,head,base,changed_files)
+                from preview_journal import ReservationBlocked
+                try:
+                    journal.stage(number,head,base,changed_files)
+                except ReservationBlocked as exc:
+                    print(f"PR #{number}: reservation deferred: {exc}",flush=True)
+                    return False
             journal.prepare(number, head, base, merge, changed_files=changed_files)
         try:
             git(folder, "push", "--porcelain", REMOTE, merge + ":" + TARGET)
@@ -536,15 +541,16 @@ def main():
             prs = all_pages(token, "/pulls?state=open&base=preview&sort=created&direction=asc")
             for pr in prs:
                 number = pr.get("number")
-                if type(number) is not int or number <= 0 or pr.get("draft"):
+                if type(number) is not int or number <= 0 or pr.get("draft") is not False:
                     continue
                 try:
                     if merge_one(token, number, args.dry_run, journal=journal, managed_queue=managed_queue):
                         return 0  # New base requires fresh tests for following PRs.
                 except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError, sqlite3.Error) as exc:
                     print(f"PR #{number}: gate/push blocked: {type(exc).__name__}", flush=True)
-                    if journal is not None:
+                    if journal is not None and journal.pending():
                         return 1  # A possibly completed push must be reconciled on the next tick.
+                    # Known pre-push failures must not starve later independent candidates.
             return 0
     except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError, sqlite3.Error) as exc:
         print(f"Preview coordinator blocked: {type(exc).__name__}", flush=True)

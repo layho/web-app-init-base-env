@@ -44,12 +44,16 @@ class ManagedStageTests(unittest.TestCase):
             self.assertEqual(journal.stage(196,H,B,["app/core.py"]),"pr-196")
             with self.assertRaises(ValueError):
                 journal.stage(197,H,B,["app/other.py"])
-            journal.prepare(196,H,B,C,changed_files=["app/core.py"])
-            self.assertFalse(journal.reconcile(lambda:B))
+            self.assertFalse(journal.pending())
+            new_base="d"*40
+            self.assertEqual(journal.stage(196,H,new_base,["app/core.py"]),"pr-196")
+            journal.prepare(196,H,new_base,C,changed_files=["app/core.py"])
+            self.assertTrue(journal.pending())
+            self.assertFalse(journal.reconcile(lambda:new_base))
             self.assertTrue(journal.reconcile(lambda:C))
             with sqlite3.connect(path) as db:
                 self.assertEqual(db.execute("SELECT state FROM integration_jobs").fetchone()[0],"INTEGRATED")
-                self.assertEqual([r[0] for r in db.execute("SELECT event FROM integration_events ORDER BY seq")],["QUEUED","PREPARED","PUSH_STARTED","INTEGRATED"])
+                self.assertEqual([r[0] for r in db.execute("SELECT event FROM integration_events ORDER BY seq")],["QUEUED","PREPARED","PREPARATION_RETRY","PREPARED","PUSH_STARTED","INTEGRATED"])
 
 
 class RejectionTests(unittest.TestCase):

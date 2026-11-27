@@ -36,3 +36,6 @@ Definitive single-ref porcelain rejection plus a fresh observation of the origin
 
 
 Host preview push receipts are independently readable through the authenticated system-log API and UI. Configure APP_PREVIEW_JOURNAL_FILE to the existing private same-user journal (or managed ledger). The UI displays exact head/base/candidate, state, timestamps, filtering and details, with explicit unavailable and pending states. It never treats integration as deployment or release. Cross-UID transport, automatic configuration and host runtime provisioning still require integration work; no production access is granted by this reader.
+
+
+A stale PREPARED reservation can be re-prepared at a freshly verified base when no pending push exists. Known pre-push reservation conflicts defer that candidate rather than starving all following PRs; a pending remote push still blocks the entire coordinator. Missing Draft metadata fails closed. Tests cover the stale-base transition and pending distinction.
