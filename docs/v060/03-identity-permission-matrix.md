@@ -79,3 +79,13 @@ W02 的只读核对清单：
 5. 403、空列表和未查询组织规则，都保持“未证实”，产品门禁继续 fail closed。
 
 应用内的冻结、精确 status 和 Owner 审查是现有门禁，不是 GitHub 服务端强制规则的替代证明。
+
+## 证明的最小契约
+
+生产身份验证尚未实现。在 `production_verification_enabled` 变为 true 之前，契约只接受隔离测试身份：kind 为 test，并且 proof_ref 以 `test-proof://` 开头。agent、共享 Owner 登录名和评论标记都不能通过。
+
+证明字段是 signer_id、scope、issued_at、expires_at、nonce、payload_hash、alg。草案中的 alg 名称是 ed25519。服务端用自己的时钟拒绝过期证明，拒绝重复 nonce，并拒绝已撤销的 signer_id。撤销立即生效。
+
+处理顺序是先认证、再授权、最后才查幂等记录。前两步失败时不创建幂等记录。重放返回当时的公开结果和对象的当前状态，不返回明文租约。
+
+用户验收的 signer kind 是 `user_acceptance`。MacCI、Agent、候选和网页会话都不是这条通道。验证实现之前，即使带上 `user_acceptance` 也不能放行生产发布。本文件不改 `app/auth.py`，也不启用这套证明。

@@ -4,7 +4,7 @@
 
 基线：`main` = `preview` = `db19bff19307fa763fd50e94b4cedfda7181a141`。本文档集只描述草案和盘点。W01–W11 尚未实施。运行门禁、凭据、宿主配置和生产数据库都没有改。
 
-契约在 ChatGPT 评审前不是冻结接口。`tests/fixtures/v060/w00/contract.json` 的 `normative` 为 false。
+契约仍是草案。schema_version = 2，对应评审评论 7216272486。`normative` 为 false，REVIEW_APPROVED 之前不冻结，也不启动 W01/W02。
 
 | 文档 | 内容 |
 | --- | --- |

@@ -1,223 +1,161 @@
 # V0.6.0 架构契约草案
 
-执行者：Grok。状态：草案，schema_version = 1。机器可读副本是 `tests/fixtures/v060/w00/contract.json`。评审改语义时递增 schema_version，不静默改已发布的 v1 含义。
+执行者：Grok。状态：草案，schema_version = 2。对应评审评论 7216272486。`normative` 仍为 false。未经 REVIEW_APPROVED 不得冻结，不得据此启动 W01/W02。
 
-本草案不挂路由，不新建数据库，不替换现有 `integration_queue`、HostOps 任务或反馈状态。现有状态如何读旧、写新，见兼容方案。
+机器可读副本是 `tests/fixtures/v060/w00/contract.json`。夹具测试会执行其中的转换、幂等、候选身份和流投影，而不是只检查字段是否存在。路径没有挂到 `app/main.py`。
 
 ## 根规则
 
-七个对象分开建模：Task、Run、Candidate、Release、Deployment、Resource、Event。任何一个对象的 status 都不能代替另一个对象的证据。
+Task、Run、Candidate、Release、Deployment、Resource、Event 分开建模。Event 的事实和投递回执也分开。一个对象的状态不能代替另一个对象的证据。
 
-每条写请求带调用身份、scope、expected_revision、idempotency_key，并返回 request_id 和真实执行状态。读请求无副作用。事件正文、PR 正文和候选文件都不能授予权限。
+写请求带调用身份、scope、expected_revision、idempotency_key。读请求无副作用。事件正文和候选文件不能授予权限。
 
-跨 GitHub 和数据库不承诺 exactly-once。投递是至少一次，加上幂等和可重建投影。远端结果未知时进入对账，不猜测成功。
+时钟只用服务端时间判断租约、证明过期和 received_at。调用方的 occurred_at 只作记录，不能延长租约，也不能冒充 received_at。调用方若自行填写 received_at，请求被拒绝。
 
-涉及候选的记录必须同时有 head、base、merge、tree。涉及部署的记录必须有 artifact digest、deployment_id 和上一健康 SHA。
+跨 GitHub 和数据库不承诺 exactly-once。投递至少一次，加上幂等和对账。
 
 ## 标识
 
 | 字段 | 规则 |
 | --- | --- |
-| task_id / run_id / event_id / deployment_id / resource_id | 服务端生成，调用方不能挑选已存在的值来覆盖历史 |
-| producer_id + producer_seq | 每个生产者单调递增。序号是整数，从 1 起 |
-| schema_version | 正整数。接收方只接受自己声明支持的版本 |
-| occurred_at | 生产者时钟，ISO-8601 UTC |
-| received_at | 接收方时钟，由服务端填写，调用方填写无效 |
-| idempotency_key | 调用方提供，作用域是 actor + scope + 操作名 |
-| expected_revision | 调用方看到的对象修订号。不一致返回 CONFLICT_REVISION |
+| run_id | 一次 attempt 一个新值。旧 run 不能继续执行 |
+| attempt | 在同一个 task、阶段和 subject 上单调增加 |
+| lease_generation | 每次成功领取或续租加一。只有当前代次的令牌有效 |
+| candidate_id | 见下方规范编码。任务或仓库不同就是不同候选 |
+| stream_id | `{producer_id}:{channel}`。channel 是 task、candidate、deployment、resource、diagnostic、authorization 之一 |
+| stream_epoch | 从 1 开始。生产者确认序号不能连续时才能加一，不能把旧序号重新从 1 写回同一 epoch |
+| producer_seq | 在同一个 stream_id 和 stream_epoch 内单调增加，并且先落盘再确认 |
 
-candidate 的身份是四元组的哈希，不是自增号。四元组任一变化都是新候选，旧候选进入 SUPERSEDED，证据不迁移。
+候选规范编码是 UTF-8，没有结尾换行，六行依次为：
 
-## Task
+```text
+v1
+repo_id
+task_id
+head
+base
+merge
+tree
+```
 
-阶段顺序：
+`candidate_id` 等于 `cand_` 加上这段文本的 sha256 十六进制。SHA 必须是小写。只改仓库或只改 task_id 都会得到另一个 id。证据不能跨这个 id 复用。
 
-`feedback_sync → claim → develop → review → test → integrate → preview_merge → deploy → accept → publish → close`
+## Task 与候选链
 
-除下面这一条，禁止跳阶段：
+阶段词仍然是 feedback_sync、claim、develop、review、test、integrate、preview_merge、deploy、accept、publish、close。它们描述聚合，不表示只有一个 PR。
 
-- `accept → develop`，仅当独立策略已经记录 `repair_authorized`。这不是候选自己声明的修复。
-
-`close` 没有出边。多 PR 任务在全部必要候选都已发布、且任务验收已记录之前，不能进入 `close`。
-
-阶段上的执行词是当前 Run 的投影，不是第二套可随意覆盖的 status：
-
-| 阶段执行词 | Run 状态 |
-| --- | --- |
-| READY | 没有未完成 Run，或 Run 为 PENDING |
-| RUNNING | LEASED 或 RUNNING |
-| SUCCEEDED / FAILED / RETRY_WAIT / BLOCKED / UNKNOWN / SUPERSEDED / CANCELLED | 同名 Run 状态 |
-
-未知执行器保持 READY 或 BLOCKED，并返回 UNKNOWN_EXECUTOR。催促只追加一条可追踪请求，不把阶段改成 RUNNING。
-
-## Run
-
-状态：`PENDING`、`LEASED`、`RUNNING`、`SUCCEEDED`、`FAILED`、`RETRY_WAIT`、`BLOCKED`、`UNKNOWN`、`SUPERSEDED`、`CANCELLED`。
-
-终态是 `SUCCEEDED`、`FAILED`、`SUPERSEDED`、`CANCELLED`。终态没有出边。新的尝试使用新 run_id。
+每个必要 PR 或修复线是一条候选链，状态为 OPEN、TESTING、INTEGRATING、DEPLOYING、ACCEPTING、SATISFIED、FAILED、REJECTED、SUPERSEDED。
 
 | 从 | 到 | 条件 |
 | --- | --- | --- |
-| PENDING | LEASED | 颁发新 fencing 令牌 |
-| LEASED | RUNNING | 同一令牌的开始心跳 |
-| LEASED | PENDING | 尚未开始，持有者主动释放 |
-| LEASED | CANCELLED / SUPERSEDED | 授权取消或新修订替换 |
-| RUNNING | SUCCEEDED / FAILED / RETRY_WAIT / BLOCKED | 执行器在租约有效期内用同一令牌提交终态或等待 |
-| RUNNING | UNKNOWN | 租约到期且没有终态回执 |
-| RUNNING | CANCELLED / SUPERSEDED | 授权取消或替换 |
-| RETRY_WAIT | RUNNING / FAILED / BLOCKED / CANCELLED | 新的有效租约或明确结束 |
-| BLOCKED | PENDING | 重新授权之后才能再领取 |
-| BLOCKED | CANCELLED | 授权取消 |
-| UNKNOWN | RETRY_WAIT | fencing 证明旧执行器已停，且副作用未发生或已完整回滚 |
-| UNKNOWN | FAILED | fencing 证明副作用已经失败且可核对 |
-| UNKNOWN | CANCELLED | 对账之后的人工关闭 |
-| PENDING | CANCELLED / SUPERSEDED | 尚未领取时取消或替换 |
+| OPEN | TESTING | 开始这一条链的测试 |
+| TESTING | INTEGRATING | 这一条链的测试成功 |
+| TESTING | FAILED | 测试失败 |
+| FAILED | SUPERSEDED | 新 attempt 使用新 run_id，旧链结束 |
+| TESTING / INTEGRATING / OPEN | SUPERSEDED | 候选四元组或任务关联变了 |
+| INTEGRATING | DEPLOYING | 精确远端观察 |
+| DEPLOYING | ACCEPTING | 部署已 COMMIT |
+| ACCEPTING | SATISFIED | 用户验收 |
+| ACCEPTING | REJECTED | 用户拒绝 |
+| REJECTED | SUPERSEDED | 已授权修复，并且新候选使用新链 |
 
-UNKNOWN 不能因为超时回到 PENDING。没有证明时保持 UNKNOWN，错误码 SIDE_EFFECT_UNKNOWN。
+同一条链没有从 REJECTED 回到 TESTING 的边。修复是新链。旧测试和旧验收不复用。
 
-租约规则：
+聚合边只有在对应的必要链都已经满足时才能走。部分交付保持任务打开，并同时列出已满足和未满足的链。close 没有出边，任务不能重开。关闭之后的新要求使用新 task_id，可以带 follows_task_id 指向旧任务。
 
-- 令牌只在领取响应里出现一次，存储哈希，比较使用恒定时间比较。
-- 续租必须带当前令牌、当前 base 和未过期时间。过期令牌不能续、不能完成。
-- 新令牌使旧令牌失效。旧令牌的完成请求返回 LEASE_FENCE_REJECTED，对象保持原状态；若到期点已经把 Run 写成 UNKNOWN，则保持 UNKNOWN。
-- 一个 Run 同时只有一个有效租约。
+## Run
 
-## Candidate
+状态：PENDING、LEASED、RUNNING、SUCCEEDED、FAILED、RETRY_WAIT、BLOCKED、UNKNOWN、SUPERSEDED、CANCELLED。
 
-状态：`REGISTERED → SUPERSEDED | INVALID | INTEGRATED`。后三个是终态。
+终态是 SUCCEEDED、FAILED、SUPERSEDED、CANCELLED。RETRY_WAIT 不是继续执行的状态。
 
-`INTEGRATED` 只允许精确远端观察：仓库、head、base、merge、tree 和父提交关系都匹配。测试通过、审查通过或本地 journal 都不是 INTEGRATED。
+| 从 | 到 | 条件 |
+| --- | --- | --- |
+| PENDING | LEASED | 领取。颁发新代次，明文令牌只在这一次响应出现 |
+| LEASED | RUNNING | 同一代次的开始心跳 |
+| LEASED 或 RUNNING | 同一状态 | 续租。代次加一，旧令牌立即失效。这不是新 run |
+| LEASED | PENDING | 尚未产生外部副作用，持有者释放 |
+| LEASED | UNKNOWN | 服务端时钟上租约到期，或取消、替换时还不能证明没有副作用 |
+| RUNNING | UNKNOWN | 同上 |
+| LEASED | CANCELLED 或 SUPERSEDED | 已 fencing，并且证明没有外部副作用 |
+| RUNNING | CANCELLED | 已 fencing，并且副作用不存在或已经补偿 |
+| RUNNING | SUPERSEDED | 已 fencing，并且副作用已经分类且不是成功完成 |
+| RUNNING | SUCCEEDED / FAILED / RETRY_WAIT / BLOCKED | 当前令牌在过期前提交，并且副作用已经分类 |
+| UNKNOWN | SUCCEEDED | 可信对账证明副作用已经成功 |
+| UNKNOWN | FAILED | 可信对账证明副作用已经失败 |
+| UNKNOWN | RETRY_WAIT | 可信对账证明副作用没有发生 |
+| RETRY_WAIT | SUPERSEDED | 新 attempt 已经创建了新 run_id |
+| RETRY_WAIT | RUNNING | 不存在。这条边会绕过领取和开始 |
+| BLOCKED | SUPERSEDED | 重新授权之后创建新 run |
+| PENDING | CANCELLED 或 SUPERSEDED | 还没有领到租约 |
 
-新的 head 或 base 创建新候选。旧测试回执、旧验收和旧部署成功都不能复用。
+外部副作用必须带上 run_id 和 lease_generation。旧代次不能提交副作用。若旧代次可能已经发出外部动作，Run 进入 UNKNOWN，直到对账把它分成成功、失败或未发生。没有证明时不能取消成 CANCELLED。
 
-## Release
+丢失明文令牌时，同一幂等键的重放不返回明文租约。恢复方法是把该 run 对账到 UNKNOWN 或确认没有副作用，然后用新 run_id 和新的幂等键重新领取。同一幂等键不能签发第二个令牌。
 
-状态：`PLANNED → ACTIVE → INTEGRATING → ACCEPTANCE → PUBLISHING → PUBLISHED → ARCHIVED`。
+## Candidate、Release、Deployment、Resource
 
-另外两条带条件的回边：
+Candidate：REGISTERED 只能到 SUPERSEDED、INVALID 或 INTEGRATED。INTEGRATED 需要精确远端观察。
 
-- `ACCEPTANCE → INTEGRATING`：只在 `repair_replacement` 已由策略记录时。
-- `PUBLISHING → ACCEPTANCE`：发布没有形成可信回执，fail closed。
+Release 增加 PUBLISH_UNKNOWN。PUBLISHING 不能因为缺少回执直接回到 ACCEPTANCE。推送结果未知时进入 PUBLISH_UNKNOWN。只有对账证明推送没有发生，才能从 PUBLISH_UNKNOWN 回到 ACCEPTANCE。精确观察到 main 之后才到 PUBLISHED。
 
-同一时刻只有一个版本可以处于 ACTIVE、INTEGRATING、ACCEPTANCE 或 PUBLISHING。其他版本可以停留在 PLANNED。PLANNED 不能直接进入 INTEGRATING。`ARCHIVED` 没有出边。
+Deployment 在 HEALTH 成功后进入 COMMIT_PENDING。提交回执落盘才到 COMMIT。回执丢失进入 RECONCILE，不把未知写成 COMMIT。ROLLBACK 失败进入 SAFE_FROZEN。SAFE_FROZEN 没有出边。授权后的恢复是新的 deployment_id，并引用 recovers_deployment_id。
 
-同版本的不同 SHA 仍是不同候选，必须各自验证。
+首次安装没有 previous healthy SHA。这时 previous_healthy_sha 为空，install_kind 必须是 first_install。首次安装不能走 no_change 的 PLAN → COMMIT。若不能证明部分资源已经移除，首次安装的回滚停在 SAFE_FROZEN，不能编造上一健康 SHA。
 
-## Deployment
-
-`PLAN → STAGE → VERIFY → SWITCH → HEALTH → COMMIT`
-
-失败边：
-
-- `STAGE`、`VERIFY`、`SWITCH`、`HEALTH` 都可以进入 `RECONCILE`。
-- `RECONCILE → ROLLBACK`，或在结果无法证明时 `RECONCILE → SAFE_FROZEN`。
-- `ROLLBACK → VERIFY_OLD → ROLLED_BACK`。旧健康无法证明时 `VERIFY_OLD → SAFE_FROZEN`。
-
-`PLAN → COMMIT` 只表示 no_change，并且同时满足：工作树与上一健康清单一致、服务健康、没有未决 journal。Git HEAD 相等本身不够。
-
-`COMMIT`、`ROLLED_BACK`、`SAFE_FROZEN` 是终态。生产数据库迁移不在这些边上自动执行；请求若包含自动迁移，返回 PRODUCTION_DB_FORBIDDEN。
-
-## Resource
-
-`PLANNED → RESERVED → APPLYING → APPLIED`
-
-`APPLYING → UNKNOWN → RECONCILE`。对账之后进入 `APPLIED`、`ROLLED_BACK` 或 `SAFE_FROZEN`。
-
-预约可以 `RESERVED → RELEASED`。已应用资源进入 `RELEASING` 必须带 `explicit_authorization`。卸载默认先产生 dry-run 计划，dry-run 不是 `RELEASING`。
-
-重建保留业务数据和凭据，除非授权范围明确包含删除。
+Resource 的 RELEASING 可以到 RELEASED、RELEASE_FAILED、PARTIAL 或 SAFE_FROZEN。PARTIAL 只有在再次授权后才能回到 RELEASING。部分释放不能标成全部 RELEASED。
 
 ## Event
 
-`DURABLE_LOCAL → OUTBOX → DELIVERED | DELIVERY_UNKNOWN | QUARANTINED`
+事实被接受之后状态只有 ACCEPTED，没有出边，载荷不能改。
 
-`DELIVERY_UNKNOWN` 可以用同一 event_id 回到 `OUTBOX`，或进入 `QUARANTINED`。`DELIVERED` 和 `QUARANTINED` 没有出边。新的业务事实使用新 event_id，不改旧事件。
+投递是另一张表，键是 event_id 加通道：DURABLE_LOCAL → OUTBOX → DELIVERED、DELIVERY_UNKNOWN 或 QUARANTINED。一个通道隔离或卡住，不推进、也不阻塞其他通道和其他 stream。
 
-必填：event_id、schema_version、event_type、producer_id、producer_seq、occurred_at、idempotency_key。候选类事件再加四元组。部署类事件再加 deployment_id、artifact digest、previous_healthy_sha。
+始终必填：event_id、schema_version、event_type、event_class、repo_id、producer_id、stream_id、stream_epoch、producer_seq、occurred_at、idempotency_key。received_at 只由服务端填写。
 
-投影水位等于已连续应用到的 producer_seq。缺口事件可以落盘，但 `applied` 为 false，水位不前进。旧序号不能把水位拉回去。
+按 event_class 再必填：
 
-同一 producer_seq 再次到达：
+| 类 | 附加字段 |
+| --- | --- |
+| task | app_id、host_id、task_id、run_id、attempt、revision、stage、state。host_id 可以空 |
+| candidate | task_id、candidate_id、head、base、merge、tree、revision |
+| deployment | deployment_id、app_id、host_id、artifact_digest、previous_healthy_sha、install_kind、stage、state。previous_healthy_sha 只有首次安装可以为空 |
+| resource | resource_id、app_id、host_id、stage、state |
+| evidence | evidence_ref、run_id |
+| authorization | task_id、revision、stage、state、evidence_ref |
 
-- 载荷哈希相同：返回原 request_id，码 IDEMPOTENCY_REPLAY。
-- 载荷哈希不同：IDEMPOTENCY_PAYLOAD_MISMATCH，原事件保持不变。
+每个 stream 有自己的水位。序号正好等于水位加一才应用。缺口只挡住这条 stream。其他生产者的事件照常应用。authorization 流不允许用 never_existed 补洞来跳过未证实的授权事实。诊断流可以用对账事件声明某个序号从未存在，而且只能补本流的洞。
 
-## 幂等、并发和重放
+进程重启必须读回已落盘的 epoch 和序号。计数丢失时增加 epoch，旧 epoch 的缺口继续保持，不用新 epoch 的 1 去填旧洞。
 
-- 写操作的幂等范围是 actor、scope、操作名和 idempotency_key。
-- 相同键和相同规范化载荷返回第一次的 request_id 与状态。
-- 相同键和不同载荷返回 IDEMPOTENCY_PAYLOAD_MISMATCH。
-- expected_revision 不匹配返回 CONFLICT_REVISION，不部分写入。
-- 重放不创建第二个 Run、不推动第二次外部副作用。
-- 乱序事件按上一节只落盘不应用。
-- 读接口不写水位、不续租、不发外部请求。
+## 幂等与身份顺序
 
-## 错误码
+处理顺序固定为：先验证身份，再判断授权，最后才查幂等键。身份或授权失败时不创建、不读取、不改变幂等记录。
 
-完整表在 `contract.json` 的 `error_codes`。草案包含：CONFLICT_REVISION、LEASE_FENCE_REJECTED、IDEMPOTENCY_REPLAY、IDEMPOTENCY_PAYLOAD_MISMATCH、CANDIDATE_STALE、EVIDENCE_MISSING、POLICY_DENIED、NOT_AUTHORIZED、UNKNOWN_EXECUTOR、SIDE_EFFECT_UNKNOWN、SCHEMA_UNSUPPORTED、RATE_LIMITED、DEPENDENCY_UNSATISFIED、RESERVATION_CONFLICT、FREEZE_ACTIVE、PRODUCTION_DB_FORBIDDEN、PLATFORM_UNSUPPORTED。
+幂等键的范围是已认证主体、scope 和操作名。重放返回 original_result 和 current_state 两个字段。前者是当时的公开结果，后者是对象现在的状态。重放不返回明文租约。
 
-IDEMPOTENCY_REPLAY 的 HTTP 状态沿用第一次成功响应。其余冲突使用 409，拒绝使用 403，调用方载荷不合法使用 422。
+证明至少包含 signer_id、scope、issued_at、expires_at、nonce、payload_hash、alg。草案把 alg 记为 ed25519。服务端检查过期、nonce 不重复、以及撤销名单。撤销按 signer_id 立即生效。
+
+用户验收使用独立的 signer kind `user_acceptance`。agent、MacCI、候选和网页会话都不能充当它。在身份验证实现并被单独授权之前，`production_verification_enabled` 为 false，只接受 kind 为 test、proof_ref 以 `test-proof://` 开头的隔离身份。这时连 `user_acceptance` 也不能把生产发布放行。
 
 ## 提议路径
 
-下列路径是逻辑草案，当前进程没有这些路由。现有 `/api/v1/feedback`、`/api/v1/development-tasks`、`/api/v1/system-logs`、`/api/v1/deploy/*` 和 `/api/v1/releases/*` 保持原样。
+这些路径仍未实现。现有 `/api/v1/feedback`、`/api/v1/development-tasks`、`/api/v1/system-logs` 和 `/api/v1/deploy/*` 保持原样。
 
-| 操作 | 方法与路径 | 副作用 |
-| --- | --- | --- |
-| Task.claim | POST `/api/v1/control/tasks/{task_id}:claim` | 有，颁发租约 |
-| Task.renew | POST `/api/v1/control/tasks/{task_id}:renew` | 有，只延长当前租约 |
-| Task.complete | POST `/api/v1/control/runs/{run_id}:complete` | 有，提交本轮结果 |
-| Task.request_action | POST `/api/v1/control/tasks/{task_id}:request-action` | 有，只记录催促或重试请求 |
-| Event.append | POST `/api/v1/control/events` | 有，先本地落盘 |
-| Event.query | GET `/api/v1/control/events` | 无 |
-| Policy.evaluate | POST `/api/v1/control/policy:evaluate` | 无 |
-| Policy.authorize / revoke | POST `/api/v1/control/policy:authorize` 与 `:revoke` | 有，且不能由候选身份调用 |
-| Candidate.register / supersede | POST `/api/v1/control/candidates` 与 `/{id}:supersede` | 有 |
-| Candidate.next | GET `/api/v1/control/candidates:next` | 无 |
-| CI.test / build / attest | POST `/api/v1/control/ci:test`、`:build`、`:attest` | 有，只接受可信 CI 身份 |
-| Deploy.plan / apply / reconcile / rollback | POST `/api/v1/control/deployments:plan` 与 `/{id}:apply|:reconcile|:rollback` | 有 |
-| Diagnostic.query | GET `/api/v1/control/diagnostics` | 无 |
-| Resource.plan / apply / inspect | POST `:plan`、`/{id}:apply`，GET `/{id}` | plan 与 apply 有副作用，inspect 无 |
-| Release.accept / reject / publish | POST `/api/v1/control/releases/{version}:accept|:reject|:publish` | 有 |
-| Upgrade.plan / reconcile | POST `/api/v1/control/upgrades:plan|:reconcile` | 有 |
+每个包将来使用自己的 APIRouter。`app/main.py` 只在串行窗口里增加 include。W10 不代替各包注册路由。
 
-## 请求与响应示例
+写接口都在夹具 examples 里有最小请求和响应，并带 http 和 acceptance_owner：
 
-占位 SHA 不是真实提交。`proof_ref` 不是凭据。
+Task.claim、Task.renew、Run.complete、Task.request_action、Event.append、Policy.authorize、Policy.revoke、Candidate.register、Candidate.supersede、CI.test、CI.build、CI.attest、Deploy.plan、Deploy.apply、Deploy.reconcile、Deploy.rollback、Resource.plan、Resource.apply、Release.accept、Release.reject、Release.publish、Upgrade.plan、Upgrade.reconcile。
 
-领取：
+读接口：Event.query、Candidate.next、Resource.inspect、Policy.evaluate。Policy.evaluate 没有副作用。候选身份请求发布时返回 POLICY_DENIED。
 
-```json
-{
-  "schema_version": 1,
-  "actor": {"kind": "agent", "id": "grok", "proof_ref": "test-proof://agent/grok/1"},
-  "scope": {"repo": "layho/web-app-init-base-env", "task_id": "tsk_example_w00"},
-  "expected_revision": 3,
-  "idempotency_key": "idem-w00-claim-example",
-  "phase": "develop",
-  "candidate": {
-    "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "merge": "cccccccccccccccccccccccccccccccccccccccc",
-    "tree": "dddddddddddddddddddddddddddddddddddddddd"
-  }
-}
-```
+Diagnostic.subscribe 不在本草案提供。替代是游标轮询：GET `/api/v1/control/diagnostics?subject=&after_seq=`。响应含 watermark_seq、gap、items、side_effect=false。没有推送通道，客户端用 after_seq 接着读。
 
-首次响应 `state=LEASED`、`replayed=false`。同一请求再送一次，响应同一 `request_id` 与 `run_id`，`replayed=true`，码 `IDEMPOTENCY_REPLAY`。只改 `expected_revision` 再复用同一幂等键，响应 `IDEMPOTENCY_PAYLOAD_MISMATCH`。
+## 示例
 
-过期租约完成：
+领取的第一次响应可以包含 lease_token。同一幂等键的重放示例 `task_claim_replay` 把 lease_token 设为 null，original_result 仍是 LEASED，current_state 可以已经是 RUNNING。
 
-请求 `idempotency_key` 为 `idem-w00-stale-lease`，`lease_token` 为 `expired-or-replaced-token`。响应码 `LEASE_FENCE_REJECTED`，`state` 保持 `UNKNOWN`。
+过期或旧代次完成的示例 `run_finish_stale_lease` 返回 LEASE_FENCE_REJECTED，状态 UNKNOWN。
 
-乱序事件：
-
-`producer_seq` 为 9 且 `gap_after_seq` 为 7 时，响应 `state=DURABLE_LOCAL`、`applied=false`、`watermark_seq=7`。随后的 GET `/api/v1/control/events?producer_id=macci-test&after_seq=7` 返回 `side_effect=false` 和 `gap=true`，不补写远端。
-
-策略拒绝：
-
-候选身份请求 `release.publish` 时，`policy:evaluate` 返回 `allow=false`、`code=POLICY_DENIED`、`side_effect=false`。评估本身不发布。
-
-部署计划请求必须带 `previous_healthy_sha` 和 `artifact_digest`。响应停在 `PLAN`，不表示已经切换流量。
-
-以上示例与夹具中的同名样例一致。夹具测试检查写请求含四个必填字段，并检查终态没有出边。
+正例和反例都在 contract.json 的 cases 里，包括 LEASED 到期进入 UNKNOWN、没有 fencing 的取消被拒绝、UNKNOWN 在对账证明成功后进入 SUCCEEDED、RETRY_WAIT 不能进入 RUNNING、缺少回执不能从 PUBLISHING 回到 ACCEPTANCE。

@@ -6,6 +6,8 @@
 
 `logs/operations.tsv` 继续按 `app/operations.py` 的三列或四列解析。已知 `EVENT_CODES` 保持可显示。未知代码保留在原始文件里，投影标成“未识别”，不能丢行，也不能因此中断整个文件。
 
+新模型把不可变事实和每条通道的投递回执分开。一条坏回执只进入自己通道的隔离区，不挡住其他生产者。授权流上的缺口不能用“从未存在”跳过。旧 tsv 没有这些字段，读模型标 legacy_unscoped，不编造序号。
+
 新事件使用 schema_version 1 的字段。旧行没有 run_id、producer_id 和 producer_seq。读模型把它们标成 `legacy_unscoped`，不编造序号。新投影的水位不把旧行算进生产者序号。
 
 `recent_operations()` 今天只返回最后 100 条解析结果。兼容期读接口必须能说明这是截断视图，而不是“只有 100 条历史”。完整保留期限等有基线测量后再定，本文件不写一个没有样本的天数。
@@ -63,6 +65,8 @@ HostOps 保持现有三个只读操作。非 Darwin 返回 unsupported，不执�
 5. 回滚本身失败时进入 SAFE_FROZEN，保留备份，不删除 journal。
 
 `scripts/apply_migrations.py --check` 继续只按文件名比对。它不证明 SQL 内容、ACL 或数据无损。生产库的任何迁移仍要人工批准。
+
+首次安装没有上一份健康 SHA。部署计划必须写明 install_kind 为 first_install，previous_healthy_sha 为空。这种安装不能记成 no_change。若回滚时不能证明新资源已经移除，结果是 SAFE_FROZEN，不能编造一个旧 SHA。已有安装仍然必须带上一健康 SHA。
 
 ## Linux 平台适配契约（#197）
 
