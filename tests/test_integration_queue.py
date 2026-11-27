@@ -126,3 +126,23 @@ def test_integration_requires_independent_observation(queue):
     assert queue.claim("0.5.0",BASE,now=103) is None
     queue.record_integrated("one",HEAD,BASE,candidate="c"*40,verify=lambda *a:True,now=104)
     assert queue.claim("0.5.0","c"*40,now=105)["id"]=="two"
+
+
+def test_actual_preview_journal_consumes_reservation_atomically(queue):
+    from deploy.macci.preview_journal import PreviewJournal
+    queue.register("pr-196","0.5.0",HEAD,[],["app/core"])
+    c=queue.claim("0.5.0",BASE,now=100)
+    queue.finish(c["id"],c["lease"],BASE,["app/core"],now=101)
+    journal=PreviewJournal(queue.db_path)
+    with pytest.raises(ValueError):
+        journal.prepare(197,HEAD,BASE,"c"*40,changed_files=["app/core"])
+    with pytest.raises(ValueError):
+        journal.prepare(196,HEAD,BASE,"c"*40,changed_files=["app/other"])
+    assert queue.snapshot("0.5.0")[0]["state"]=="PREPARED"
+    journal.prepare(196,HEAD,BASE,"c"*40,changed_files=["app/core"])
+    assert queue.snapshot("0.5.0")[0]["state"]=="UNKNOWN"
+    assert not journal.reconcile(lambda:BASE)
+    assert queue.claim("0.5.0",BASE) is None
+    assert journal.reconcile(lambda:"c"*40)
+    assert queue.snapshot("0.5.0")[0]["state"]=="INTEGRATED"
+    assert journal.history()[0]["state"]=="INTEGRATED"

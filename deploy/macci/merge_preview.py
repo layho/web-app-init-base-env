@@ -400,7 +400,7 @@ def verify_candidate(folder, base, head, candidate, required):
         git(folder, "merge-base", "--is-ancestor", required, base)
 
 
-def merge_one(token, number, dry_run=False, journal=None):
+def merge_one(token, number, dry_run=False, journal=None, managed_queue=False):
     frozen = preview_frozen(token)
     gate = authorization(token, number)
     if gate is None:
@@ -436,7 +436,13 @@ def merge_one(token, number, dry_run=False, journal=None):
         # still apply. A failed push must never be retried with force.
         if journal is not None:
             # Persist exact authorized candidate before any remote side effect.
-            journal.prepare(number, head, base, merge)
+            changed_files = None
+            if managed_queue:
+                # --no-renames includes both sides of a rename. NUL separation
+                # preserves paths with spaces; invalid paths cannot match a reservation.
+                changed_files=git(folder,"diff","--no-renames","--name-only","-z",base,merge).split("\0")
+                changed_files=[p for p in changed_files if p]
+            journal.prepare(number, head, base, merge, changed_files=changed_files)
         git(folder, "push", "--porcelain", REMOTE, merge + ":" + TARGET)
         actual = api(token, "/branches/preview")["commit"]["sha"]
         if actual != merge:
@@ -492,9 +498,10 @@ def main():
             except BlockingIOError:
                 return 0
             journal = None
-            if os.getenv("MACCI_INTEGRATION_JOURNAL") == "1" and not args.dry_run:
+            managed_queue = os.getenv("MACCI_MANAGED_QUEUE") == "1"
+            if (managed_queue or os.getenv("MACCI_INTEGRATION_JOURNAL") == "1") and not args.dry_run:
                 from preview_journal import PreviewJournal
-                journal = PreviewJournal(ROOT / "preview-integration.sqlite3")
+                journal = PreviewJournal(ROOT / ("integration-queue.sqlite3" if managed_queue else "preview-integration.sqlite3"))
                 # Never dispatch another push while an earlier outcome is unknown.
                 if not journal.reconcile(lambda: api(token, "/branches/preview")["commit"]["sha"]):
                     print("Preview coordinator blocked: unresolved integration journal", flush=True)
@@ -505,7 +512,7 @@ def main():
                 if type(number) is not int or number <= 0 or pr.get("draft"):
                     continue
                 try:
-                    if merge_one(token, number, args.dry_run, journal=journal):
+                    if merge_one(token, number, args.dry_run, journal=journal, managed_queue=managed_queue):
                         return 0  # New base requires fresh tests for following PRs.
                 except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError) as exc:
                     print(f"PR #{number}: gate/push blocked: {type(exc).__name__}", flush=True)
