@@ -1,0 +1,93 @@
+.workspace-shell {
+  min-height: 100vh;
+  background: #f6f8fc;
+}
+
+.workspace-sider {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  border-right: 1px solid #e9edf4;
+}
+
+.workspace-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 18px;
+  min-height: 72px;
+  border-bottom: 1px solid #eff1f5;
+}
+
+.workspace-mark {
+  display: grid;
+  flex: 0 0 39px;
+  place-items: center;
+  width: 39px;
+  height: 39px;
+  border-radius: 11px;
+  background: #3979ec;
+  color: #fff;
+  font-weight: 700;
+}
+
+.workspace-name {
+  color: #25334a;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.workspace-sider .workspace-menu {
+  margin-top: 12px;
+  border-inline-end: 0;
+}
+
+.workspace-body {
+  min-width: 0;
+}
+
+.workspace-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: auto;
+  min-height: 64px;
+  line-height: normal;
+  padding: 8px 26px;
+  border-bottom: 1px solid #e9edf4;
+}
+
+.workspace-header-actions {
+  justify-content: flex-end;
+}
+
+.workspace-content {
+  width: 100%;
+  max-width: 1500px;
+  margin-inline: auto;
+  padding: 26px;
+}
+
+@media (max-width: 767px) {
+  .workspace-brand {
+    justify-content: center;
+    padding-inline: 8px;
+  }
+
+  .workspace-header {
+    flex-wrap: wrap;
+    padding-inline: 12px;
+  }
+
+  .workspace-user {
+    display: none;
+  }
+
+  .workspace-content {
+    padding: 12px;
+  }
+}
