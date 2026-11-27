@@ -85,3 +85,33 @@ def test_private_storage(tmp_path):
     link.symlink_to(p)
     with pytest.raises(OSError):
         IntegrationQueue(link)
+
+def test_unknown_reconciliation_requires_fencing_and_fresh_evidence(queue):
+    queue.register("one","0.5.0",HEAD,[],["app/core"])
+    old=queue.claim("0.5.0",BASE,ttl=15,now=100)
+    assert queue.claim("0.5.0",BASE,now=115) is None
+    with pytest.raises(QueueConflict):
+        queue.reconcile_unknown("one",HEAD,BASE,evidence_id="receipt-1",verify_stopped=lambda *a:False,now=116)
+    assert queue.snapshot("0.5.0")[0]["state"]=="UNKNOWN"
+    calls=[]
+    def verified(*args):
+        calls.append(args)
+        return True
+    queue.reconcile_unknown("one",HEAD,BASE,evidence_id="receipt-1",verify_stopped=verified,now=117)
+    assert calls[0][:3]==("one",HEAD,BASE)
+    fresh=queue.claim("0.5.0",BASE,ttl=15,now=118)
+    assert fresh["lease"]!=old["lease"]
+    with pytest.raises(QueueConflict):
+        queue.finish("one",old["lease"],BASE,["app/core"],now=119)
+    assert queue.claim("0.5.0",BASE,now=133) is None
+    with pytest.raises(QueueConflict):
+        queue.reconcile_unknown("one",HEAD,BASE,evidence_id="receipt-1",verify_stopped=verified,now=134)
+    assert len(calls)==1
+    assert queue.snapshot("0.5.0")[0]["state"]=="UNKNOWN"
+
+def test_unknown_reconciliation_rejects_stale_candidate(queue):
+    queue.register("one","0.5.0",HEAD,[],["app/core"])
+    queue.claim("0.5.0",BASE,ttl=15,now=100)
+    queue.claim("0.5.0",BASE,now=115)
+    with pytest.raises(QueueConflict):
+        queue.reconcile_unknown("one",BASE,BASE,evidence_id="receipt-2",verify_stopped=lambda *a:True)

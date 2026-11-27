@@ -208,6 +208,27 @@ class IntegrationQueue:
         with self.transaction() as db:
             return [dict(r) for r in db.execute("SELECT e.seq,e.job,e.event,e.at FROM integration_events e JOIN integration_jobs j ON j.id=e.job WHERE j.version=? AND e.seq>? ORDER BY e.seq LIMIT 100",(version,after))]
 
+    def reconcile_unknown(self, job, expected_head, expected_base, *, evidence_id, verify_stopped, now=None):
+        """Trusted local adapter only. Never expose as a browser mutation.
+        
+        verify_stopped must independently confirm that the exact previous
+        executor is fenced, stopped and produced no integration side effect.
+        The callback is not a client-supplied assertion. Failure leaves UNKNOWN.
+        """
+        _sha(expected_head); _sha(expected_base); _id(evidence_id)
+        now=int(time.time()) if now is None else int(now)
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
+            if not row or row["state"]!="UNKNOWN" or row["head"]!=expected_head or row["base"]!=expected_base:
+                raise QueueConflict("unknown candidate changed")
+            if db.execute("SELECT 1 FROM integration_events WHERE job=? AND event=?", (job,"RECONCILED:"+evidence_id)).fetchone():
+                raise QueueConflict("reconciliation evidence already consumed")
+            expired=db.execute("SELECT MAX(seq) FROM integration_events WHERE job=? AND event='LEASE_EXPIRED'",(job,)).fetchone()[0]
+            if expired is None or verify_stopped(job,expected_head,expected_base,expired,evidence_id) is not True:
+                raise QueueConflict("previous executor not independently fenced")
+            db.execute("UPDATE integration_jobs SET state='QUEUED',base=NULL,lease=NULL,expires=NULL WHERE id=?",(job,))
+            self._event(db,job,"RECONCILED:"+evidence_id,now)
+
     def snapshot(self, version):
         with self.transaction() as db:
             rows=db.execute("SELECT id,version,head,dependencies,files,priority,state,base,expires,created FROM integration_jobs WHERE version=? ORDER BY priority DESC,created,id",(version,)).fetchall()
