@@ -4,21 +4,30 @@ This module prepares a candidate build in a caller-supplied temporary
 directory. It is not wired into ``deploy/macci/runner.py`` or
 ``deploy/macmini/manage.sh``. Those host paths stay unchanged until W07.
 
-The checks here use the frozen V0.6.0 contract and test doubles. They do
-not read host credential files, open a production database, create a host
-account, or enable a gate. A passing run is simulated verification only:
-``host_acl_effective`` and ``db_acl_effective`` stay false.
+Untrusted candidate text is never executed on the host. A keyword scan of
+that text is not a security boundary, and ``MockDatabase`` is not one
+either. Execution goes through :func:`probe_isolation`. When a Linux user
+namespace sandbox is actually available, the candidate sees only a
+temporary directory, a synthetic credential, no real database, no network,
+and no capabilities. When that sandbox is not available, the result is
+``BLOCKED`` and the candidate is not started. ``host_acl_effective`` and
+``db_acl_effective`` stay false. A probe on this machine is not MacCI
+evidence and is not an A04 or A05 real-machine measurement.
 
-W02 alignment is pending. The approved isolated baseline for later
-integration is ``5dd0eb38e175a8a905836fbdbac5633ff9eb19ae``. This branch
-does not import or vendor that tree. ``Actor`` is a test double of the
-frozen identity fields (kind ``test``, ``test-proof://``), not the W02
-principal in ``app/control_identity``.
+The same-UID threat boundary is stated on every receipt. Mode bits and
+``O_NOFOLLOW`` opens do not confine another process with this uid.
+
+W02 alignment is pending. Later integration calls the single public
+interface ``app.auth.authorize_request``. This module does not implement a
+second authenticator. ``Actor`` remains a test double (kind ``test``,
+``test-proof://``), not the principal in ``app/control_identity``.
+``production_verification_enabled`` stays false.
 """
 
 from __future__ import annotations
 
 import copy
+import ctypes
 import errno
 import hashlib
 import json
@@ -27,16 +36,22 @@ import re
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BASELINE_SHA = "b2011968a9c14845b89fe6d15dda4a595699e9ec"
 W02_BASELINE_HEAD = "5dd0eb38e175a8a905836fbdbac5633ff9eb19ae"
 W02_ALIGNMENT_STATUS = "pending_final_review"
+W02_PUBLIC_AUTH = "app.auth.authorize_request"
+EXECUTOR = "Grok"
+BINDING_VERSION = "w03-binding-v1"
+SYNTHETIC_CREDENTIAL_NAME = "W03_SYNTHETIC_MARK"
+SYNTHETIC_CREDENTIAL_VALUE = "synthetic-w03-credential"
 EVIDENCE_REF = "test-proof://w03/isolated-build"
 FIXED_PATH = "/usr/bin:/bin"
 FIXED_LANG = "C.UTF-8"
@@ -49,6 +64,21 @@ MAX_ARTIFACT_BYTES = 64 * 1024
 MAX_PLAN_STEPS = 16
 MAX_SCRIPT_CHARS = 2000
 HOLD_TIMEOUT_SECONDS = 10
+SANDBOX_TIMEOUT_SECONDS = 10
+_CONTRACT_CODES = frozenset({
+    "NOT_AUTHORIZED", "POLICY_DENIED", "PRODUCTION_DB_FORBIDDEN",
+    "EVIDENCE_MISSING", "CONFLICT_REVISION", "RESERVATION_CONFLICT",
+    "IDEMPOTENCY_PAYLOAD_MISMATCH", "SCHEMA_UNSUPPORTED", "SIDE_EFFECT_UNKNOWN",
+    "EXECUTION_FAILED",
+})
+_MS_RDONLY = 1
+_MS_NOSUID = 2
+_MS_NODEV = 4
+_MS_NOEXEC = 8
+_MS_BIND = 4096
+_MS_REC = 16384
+_MS_PRIVATE = 1 << 18
+_MS_REMOUNT = 32
 
 # Names observed in the frozen baseline. Values are never read or stored.
 CREDENTIAL_ENV_NAMES = frozenset({
@@ -93,6 +123,9 @@ DETAIL_CODES = frozenset({
     "CLEANUP_FAILED",
     "CONCURRENCY_CONFLICT",
     "HOLD_TIMEOUT",
+    "ISOLATION_BLOCKED",
+    "UNKNOWN_RESULT",
+    "SCRIPT_FAILED",
     "INPUT_MISSING",
     "WORKSPACE_UNAVAILABLE",
     "SCHEMA_INVALID",
@@ -102,10 +135,17 @@ DETAIL_CODES = frozenset({
 
 W02_ALIGNMENT_PENDING = (
     "Replace Actor with the W02 app/control_identity principal: generation, scope, and no stored secret.",
-    "Call the W02 policy authorize step before idempotency. This gate only follows the frozen order.",
+    "Call the single public auth interface app.auth.authorize_request before idempotency. Do not add a second authentication implementation.",
+    "Binding a new proof to authorize_request or a real token is production enablement and stays unauthorized.",
     "Bind a MacCI signer that is distinct from the shared Owner login.",
     "Keep production_verification_enabled false. A test-proof:// string is not a production credential.",
     "Full integration remains blocked on the W02 identity-boundary final review.",
+)
+SAME_UID_THREAT_BOUNDARY = (
+    "Same-UID threat boundary: mode 0700, an exclusive mkdir, and O_NOFOLLOW opens from a directory "
+    "fd do not confine another process running as this uid. That peer can replace a directory entry "
+    "before it is opened. lstat-then-open is not used. Untrusted candidate text runs only inside the "
+    "isolation adapter. This does not claim host_acl_effective."
 )
 
 # Source review of the frozen ancestor. Not a live host or database measurement.
@@ -173,29 +213,11 @@ _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,80}\Z")
 _REPO_ID = re.compile(r"[A-Za-z0-9_.-]{1,40}(?:/[A-Za-z0-9_.-]{1,80})?\Z")
 _PROOF = re.compile(r"test-proof://[A-Za-z0-9][A-Za-z0-9_./-]{0,80}\Z")
 _REL_PART = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,79}\Z")
-_CREDENTIAL_TEXT = re.compile(
-    r"github-token|APP_GITHUB|\.env|load_env|\.npmrc|\.netrc|id_rsa|SSH_AUTH_SOCK|macmini-github",
-    re.IGNORECASE,
-)
-_DATABASE_TEXT = re.compile(r"postgresql|\bpsql\b|app_owner|/private/tmp|DATABASE_URL", re.IGNORECASE)
-_LIFECYCLE_TEXT = re.compile(
-    r"\bnpm\b|\bpreinstall\b|\bpostinstall\b|\bprepare\b|\bprepublish\b",
-    re.IGNORECASE,
-)
-_ESCAPE_TEXT = re.compile(r"\.\.|~|/etc(?:/|$)|/private/|/tmp/|/home/|/Users/|/root/")
-_NETWORK_TEXT = re.compile(r"\bcurl\b|\bwget\b|\bssh\b|https?://")
-_EXEC_TEXT = re.compile(r"\bsubprocess\b|\bos\.system\b|\beval\s*\(|\bexec\s*\(|`")
-
-
 class IsolationError(Exception):
     """Bounded failure. ``str`` is the detail code and never a secret value."""
 
     def __init__(self, code: str, detail: str, http: int, phase: str):
-        if detail not in DETAIL_CODES or code not in {
-            "NOT_AUTHORIZED", "POLICY_DENIED", "PRODUCTION_DB_FORBIDDEN",
-            "EVIDENCE_MISSING", "CONFLICT_REVISION", "RESERVATION_CONFLICT",
-            "IDEMPOTENCY_PAYLOAD_MISMATCH", "SCHEMA_UNSUPPORTED", "SIDE_EFFECT_UNKNOWN",
-        }:
+        if detail not in DETAIL_CODES or code not in _CONTRACT_CODES:
             detail = "SCHEMA_INVALID"
             code = "SCHEMA_UNSUPPORTED"
             http = 422
@@ -287,7 +309,12 @@ class BuildRequest:
 
 
 class MockDatabase:
-    """In-memory per-app double. It has no socket and no production role."""
+    """In-memory per-app double. It is not a security boundary.
+
+    It has no socket and no production role. A cross-app denial here is an
+    in-process check only. Cross-app isolation for untrusted code is the
+    sandbox probe, or ``BLOCKED`` when that probe cannot run.
+    """
 
     def __init__(self) -> None:
         self._rows: dict[str, dict[str, str]] = {}
@@ -305,7 +332,11 @@ class MockDatabase:
 
 
 class IsolationSession:
-    """In-process reservation and idempotency. Not a host flock and not W01 storage."""
+    """In-process view only. Lookup does not execute and does not touch the store.
+
+    A second process has an empty session. Durable replay, crash recovery, and
+    cleanup failure live in :class:`DurableStore`.
+    """
 
     def __init__(self, revision: int = 1) -> None:
         self.revision = revision
@@ -315,6 +346,7 @@ class IsolationSession:
         self._lock = threading.Lock()
 
     def lookup(self, key: tuple[str, ...], payload_hash: str) -> tuple[str, dict | None]:
+        """Read this process's memory. Do not execute and do not write the store."""
         with self._lock:
             stored = self._idem.get(key)
             if stored is None:
@@ -328,7 +360,8 @@ class IsolationSession:
                 }
             return "replay", copy.deepcopy(stored["receipt"])
 
-    def store(self, key: tuple[str, ...], payload_hash: str, receipt: Mapping[str, object]) -> str:
+    def remember(self, key: tuple[str, ...], payload_hash: str, receipt: Mapping[str, object]) -> None:
+        """Cache a result this process already committed to the durable store."""
         with self._lock:
             current = self._idem.get(key)
             if current is None:
@@ -336,14 +369,37 @@ class IsolationSession:
                     "payload_hash": payload_hash,
                     "receipt": copy.deepcopy(dict(receipt)),
                 }
-                return "stored"
-            if current["payload_hash"] == payload_hash:
-                return "exists"
-            return "mismatch"
+                return
+            if current["payload_hash"] != payload_hash:
+                return
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimDecision:
+    kind: str
+    receipt: dict | None = None
+    info: dict | None = None
+    claim_dir: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IsolationCapability:
+    status: str
+    backend: str
+    reason: str
+    evidence: dict
+
+
+@dataclass(frozen=True, slots=True)
+class ExecResult:
+    started: bool
+    exit_code: int | None
+    blocked: bool
+    reason: str
 
 
 def candidate_id(candidate: Candidate) -> str:
-    """Frozen encoding: six lines, no trailing newline, then ``cand_`` + sha256."""
+    """Frozen encoding: seven lines, no trailing newline, then ``cand_`` + sha256."""
     _require_candidate_shape(candidate)
     text = "\n".join((
         "v1",
@@ -378,27 +434,6 @@ def build_environment(workspace: Path, allowlist: tuple[str, ...]) -> dict[str, 
     return {key: assignments[key] for key in allowlist}
 
 
-def classify_script(script_text: str) -> str | None:
-    """Return a denial detail, or None when the text has no hostile pattern.
-
-    The caller still does not execute the text. None only means the closed
-    pattern set did not match.
-    """
-    if _CREDENTIAL_TEXT.search(script_text):
-        return "HOST_TOKEN_INHERITANCE_DENIED"
-    if _DATABASE_TEXT.search(script_text):
-        return "DATABASE_DENIED"
-    if _LIFECYCLE_TEXT.search(script_text):
-        return "LIFECYCLE_SCRIPT_DENIED"
-    if _ESCAPE_TEXT.search(script_text):
-        return "WORKSPACE_ESCAPE_DENIED"
-    if _NETWORK_TEXT.search(script_text):
-        return "NETWORK_DENIED"
-    if _EXEC_TEXT.search(script_text):
-        return "SCRIPT_EXECUTION_DENIED"
-    return None
-
-
 def classify_database_target(target: str) -> None:
     """Classify a caller-supplied database target and refuse it.
 
@@ -415,59 +450,1025 @@ def classify_database_target(target: str) -> None:
 
 
 def resolve_contained(workspace: Path, relative: str) -> Path:
-    """Resolve ``relative`` under ``workspace`` without following symlinks."""
-    workspace = _directory(workspace)
+    """Reject a symlink by opening each component with ``O_NOFOLLOW``.
+
+    The returned path is not a capability. Callers that write or read must
+    use the directory fd of a workspace this process created. A same-UID peer
+    is outside this check; see ``SAME_UID_THREAT_BOUNDARY``.
+    """
     relative = _pure_relative(relative)
-    info = workspace.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
-    current = workspace
-    parts = relative.split("/")
-    for index, part in enumerate(parts):
-        current = current / part
-        is_final = index == len(parts) - 1
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            if not is_final:
-                raise IsolationError("EVIDENCE_MISSING", "INPUT_MISSING", 409, "execute") from None
-            break
-        if stat.S_ISLNK(info.st_mode):
-            raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
-        if not is_final and not stat.S_ISDIR(info.st_mode):
-            raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
-    workspace_abs = os.path.abspath(workspace)
-    target_abs = os.path.abspath(current)
-    if os.path.commonpath((workspace_abs, target_abs)) != workspace_abs:
-        raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
-    return current
+    root = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _walk_no_follow(root, relative, allow_missing_final=True)
+    finally:
+        os.close(root)
+    return workspace.joinpath(*relative.split("/"))
 
 
-def create_temporary_database(workspace: Path, app_id: str) -> Path:
-    """Create a sqlite file inside ``workspace``. This is not a host cluster."""
+def create_temporary_database(workspace: Path, app_id: str, *, root_fd: int | None = None) -> Path:
+    """Create a sqlite file inside ``workspace`` through a directory fd.
+
+    This is not a host cluster. The connection uses the open fd, not a later
+    path open.
+    """
     if not _APP_ID.fullmatch(app_id):
         raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
-    database_dir = resolve_contained(workspace, "db")
-    database_dir.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(database_dir, 0o700)
-    path = resolve_contained(workspace, "db/app.sqlite")
-    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    os.close(fd)
-    os.chmod(path, 0o600)
-    connection = sqlite3.connect(path)
+    owns = root_fd is None
+    if root_fd is None:
+        root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    row = None
     try:
-        connection.execute("create table probe(app_id text primary key)")
-        connection.execute("insert into probe(app_id) values (?)", (app_id,))
-        connection.commit()
-        row = connection.execute("select app_id from probe").fetchone()
+        db_fd = _ensure_child_dir(root_fd, "db")
+        try:
+            flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
+            fd = os.open("app.sqlite", flags, 0o600, dir_fd=db_fd)
+            try:
+                os.fchmod(fd, 0o600)
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise IsolationError("POLICY_DENIED", "DATABASE_DENIED", 403, "execute")
+                connection = sqlite3.connect(f"file:/proc/self/fd/{fd}?mode=rw", uri=True)
+                try:
+                    connection.execute("create table probe(app_id text primary key)")
+                    connection.execute("insert into probe(app_id) values (?)", (app_id,))
+                    connection.commit()
+                    row = connection.execute("select app_id from probe").fetchone()
+                finally:
+                    connection.close()
+            finally:
+                os.close(fd)
+        finally:
+            os.close(db_fd)
     finally:
-        connection.close()
+        if owns and root_fd is not None:
+            os.close(root_fd)
     if row != (app_id,):
         raise IsolationError("EVIDENCE_MISSING", "DATABASE_DENIED", 409, "execute")
-    return path
+    return workspace / "db" / "app.sqlite"
+
+
+class DurableStore:
+    """Filesystem claims keyed by the business key, not by app or run.
+
+    A missing result is an unknown outcome. A live pid is a conflict. The
+    same key with another run replays only after a result file is durable.
+    """
+
+    def __init__(self, root: Path) -> None:
+        if not isinstance(root, Path):
+            raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
+        self.root = root
+
+    def begin(self, business_key: tuple[str, ...], payload_hash: str, run_id: str) -> ClaimDecision:
+        name = _claim_name(business_key)
+        root_fd = self._root_fd()
+        try:
+            try:
+                os.mkdir(name, 0o700, dir_fd=root_fd)
+                created = True
+            except FileExistsError:
+                created = False
+            claim_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            try:
+                os.fchmod(claim_fd, 0o700)
+                if created:
+                    _write_new_file(claim_fd, "claim.json", {
+                        "v": 1,
+                        "state": "started",
+                        "payload_hash": payload_hash,
+                        "run_id": run_id,
+                        "pid": os.getpid(),
+                        "executor": EXECUTOR,
+                    })
+                    return ClaimDecision("fresh", claim_dir=self.root / name)
+                return self._read_existing(claim_fd, payload_hash)
+            finally:
+                os.close(claim_fd)
+        finally:
+            os.close(root_fd)
+
+    def commit(self, decision: ClaimDecision, receipt: Mapping[str, object], cleanup: Mapping[str, object] | None) -> None:
+        if decision.kind != "fresh" or decision.claim_dir is None:
+            raise IsolationError("SIDE_EFFECT_UNKNOWN", "UNKNOWN_RESULT", 409, "reserve")
+        claim_fd = os.open(decision.claim_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if _fd_exists(claim_fd, "result.json"):
+                return
+            if cleanup is not None:
+                _replace_file(claim_fd, "cleanup.json", dict(cleanup))
+            _replace_file(claim_fd, "result.json", dict(receipt))
+            os.fsync(claim_fd)
+        finally:
+            os.close(claim_fd)
+
+    def abort(self, decision: ClaimDecision) -> None:
+        if decision.kind != "fresh" or decision.claim_dir is None:
+            return
+        try:
+            claim_fd = os.open(decision.claim_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            return
+        try:
+            if _fd_exists(claim_fd, "result.json"):
+                return
+            claim = _read_json_fd(claim_fd, "claim.json")
+            if not isinstance(claim, dict) or claim.get("pid") != os.getpid():
+                return
+            for name in ("claim.json", "cleanup.json", "result.tmp", "cleanup.tmp"):
+                try:
+                    os.unlink(name, dir_fd=claim_fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(claim_fd)
+        try:
+            os.rmdir(decision.claim_dir)
+        except OSError:
+            pass
+
+    def cleanup_record(self, business_key: tuple[str, ...]) -> dict | None:
+        name = _claim_name(business_key)
+        try:
+            root_fd = self._root_fd()
+        except IsolationError:
+            return None
+        try:
+            try:
+                claim_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            except OSError:
+                return None
+            try:
+                data = _read_json_fd(claim_fd, "cleanup.json")
+            finally:
+                os.close(claim_fd)
+        finally:
+            os.close(root_fd)
+        return data if isinstance(data, dict) else None
+
+    def _root_fd(self) -> int:
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os.fchmod(fd, 0o700)
+        return fd
+
+    def _read_existing(self, claim_fd: int, payload_hash: str) -> ClaimDecision:
+        claim = _read_json_fd(claim_fd, "claim.json")
+        result = _read_json_fd(claim_fd, "result.json")
+        if not isinstance(claim, dict):
+            return ClaimDecision("unknown")
+        if not isinstance(result, dict):
+            pid = claim.get("pid")
+            if isinstance(pid, int) and _pid_alive(pid):
+                return ClaimDecision("conflict")
+            return ClaimDecision("unknown")
+        if claim.get("payload_hash") != payload_hash:
+            state = result.get("state")
+            return ClaimDecision("mismatch", info={"original_result": state, "current_state": state})
+        return ClaimDecision("replay", receipt=result)
+
+
+def leave_unfinished_claim(parent: Path, request: BuildRequest) -> None:
+    """Record a started claim and no result, as a crash before commit would."""
+    _check_parent(parent)
+    DurableStore(Path(parent) / ".w03-claims").begin(
+        _business_key(request), _payload_hash(request), request.run_id,
+    )
+
+
+def business_key_for(request: BuildRequest) -> tuple[str, ...]:
+    return _business_key(request)
+
+
+def bind_execution_digest(
+    *,
+    output_digest: str,
+    input_digest: str,
+    candidate: Candidate,
+    executor: str,
+    exit_code: int | None,
+    probe_evidence: Mapping[str, object],
+) -> dict:
+    """Bind the real output digest to the candidate 4-tuple, executor, exit, and probe.
+
+    The preimage is UTF-8 with no trailing newline. Lines are the version,
+    the input digest, the output digest, head, base, merge, tree, the
+    executor, ``-`` when there is no exit code, and the canonical probe JSON.
+    """
+    _require_candidate_shape(candidate)
+    if executor != EXECUTOR or not output_digest.startswith("sha256:") or not input_digest.startswith("sha256:"):
+        raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
+    if exit_code is not None and (type(exit_code) is not int or not -128 <= exit_code <= 255):
+        raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
+    canonical = _probe_canonical(probe_evidence)
+    exit_line = "-" if exit_code is None else str(exit_code)
+    preimage = "\n".join((
+        BINDING_VERSION,
+        input_digest,
+        output_digest,
+        candidate.head,
+        candidate.base,
+        candidate.merge,
+        candidate.tree,
+        executor,
+        exit_line,
+        canonical,
+    ))
+    digest = "sha256:" + hashlib.sha256(preimage.encode("utf-8")).hexdigest()
+    return {
+        "version": BINDING_VERSION,
+        "digest": digest,
+        "input_digest": input_digest,
+        "output_digest": output_digest,
+        "candidate_tuple": {
+            "head": candidate.head,
+            "base": candidate.base,
+            "merge": candidate.merge,
+            "tree": candidate.tree,
+        },
+        "executor": executor,
+        "exit_code": exit_code,
+        "probe_evidence_sha256": "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+
+def probe_isolation() -> IsolationCapability:
+    """Run a trusted probe inside the sandbox. Never run candidate text.
+
+    A missing sandbox, or a probe that cannot show the five denials, is
+    ``BLOCKED``. This does not set a host or database ACL, and it is not
+    MacCI evidence.
+    """
+    try:
+        return _probe_isolation()
+    except Exception:
+        return _blocked("probe failed closed")
+
+
+def execute_isolated(ws_fd: int, workspace: Path, script: str) -> ExecResult:
+    """Execute candidate text only as a file inside a fresh sandbox."""
+    libs = _trusted_shell_files()
+    argv = _unshare_argv()
+    if not libs or argv is None:
+        return ExecResult(False, None, True, "sandbox unavailable")
+    if script.encode("utf-8") and any(script in part for part in argv):
+        return ExecResult(False, None, True, "candidate text leaked into argv")
+    try:
+        _write_exclusive_at(ws_fd, "candidate.sh", script.encode("utf-8"), 0o600)
+    except IsolationError:
+        return ExecResult(False, None, True, "candidate file was not created")
+    env = _sandbox_env(workspace, "exec", libs, None)
+    try:
+        completed = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            env=env,
+            cwd=str(workspace),
+            timeout=SANDBOX_TIMEOUT_SECONDS,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        started = _marker_present(ws_fd)
+        _remove_jail_mountpoint(workspace)
+        return ExecResult(started, None, not started, "timeout")
+    except OSError:
+        _remove_jail_mountpoint(workspace)
+        return ExecResult(False, None, True, "sandbox failed to start")
+    started = _marker_present(ws_fd)
+    _remove_jail_mountpoint(workspace)
+    if not started:
+        return ExecResult(False, None, True, "sandbox did not start the candidate")
+    return ExecResult(True, int(completed.returncode), False, "executed")
+
+
+def sandbox_launch() -> int:
+    """Entrypoint inside ``unshare``. Refuses to run on the host namespace."""
+    import socket  # Load before chroot. The jail has no Python library tree.
+    del socket
+    try:
+        uid_map = open("/proc/self/uid_map", "r", encoding="ascii").read().strip()
+    except OSError:
+        return 2
+    if os.geteuid() != 0:
+        return 2
+    parts = uid_map.split()
+    if len(parts) != 3 or parts[0] != "0" or parts[2] != "1":
+        return 2
+    mode = os.environ.get("W03_MODE", "")
+    workspace = os.environ.get("W03_WORKSPACE", "")
+    libs = []
+    for item in os.environ.get("W03_LIBS", "").split(":"):
+        if not item or "|" not in item:
+            continue
+        src, dst = item.split("|", 1)
+        libs.append((src, dst))
+    if mode not in {"probe", "exec"} or not _abs_safe(workspace):
+        return 2
+    if not libs or any(not _abs_safe(src) or not _abs_safe(dst) for src, dst in libs):
+        return 2
+    try:
+        _enter_jail(workspace, libs, mount_proc=(mode == "probe"))
+    except Exception:
+        return 3
+    try:
+        if mode == "probe":
+            _write_probe_result()
+            return 0
+        if not _mount_denied():
+            return 3
+        return _exec_candidate()
+    except Exception:
+        return 3
+
+
+def _decision_receipt(request, session, business_key, payload_hash, decision: ClaimDecision) -> dict | None:
+    if decision.kind == "fresh":
+        return None
+    if decision.kind == "replay" and isinstance(decision.receipt, dict):
+        session.remember(business_key, payload_hash, decision.receipt)
+        return _replay_receipt(decision.receipt)
+    if decision.kind == "mismatch" and isinstance(decision.info, dict):
+        return _mismatch_receipt(request, decision.info)
+    if decision.kind == "conflict":
+        return _failure_receipt(
+            request,
+            IsolationError("RESERVATION_CONFLICT", "CONCURRENCY_CONFLICT", 409, "reserve"),
+            "not_started",
+            "skipped",
+        )
+    return _unknown_receipt(request)
+
+
+def _unknown_receipt(request: BuildRequest) -> dict:
+    return _failure_receipt(
+        request,
+        IsolationError("SIDE_EFFECT_UNKNOWN", "UNKNOWN_RESULT", 409, "reserve"),
+        "not_started",
+        "unknown",
+    )
+
+
+def _commit_success(
+    session, store, decision, business_key, payload_hash, request, env,
+    database_probe, ws_fd, capability, commands, exit_code, workspace, remover,
+) -> dict:
+    probe_evidence = _evidence_for_binding(capability, commands)
+    output_digest = _output_digest_fd(ws_fd)
+    binding = bind_execution_digest(
+        output_digest=output_digest,
+        input_digest=request.declared_digest,
+        candidate=request.candidate,
+        executor=EXECUTOR,
+        exit_code=exit_code,
+        probe_evidence=probe_evidence,
+    )
+    receipt = _success_receipt(request, env, database_probe, output_digest)
+    receipt["commands_executed"] = commands
+    receipt["exit_code"] = exit_code
+    receipt["execution_binding"] = binding
+    receipt["probe_evidence"] = probe_evidence
+    receipt["isolation_status"] = "available" if commands else "not_invoked"
+    receipt["candidate_tuple"] = dict(binding["candidate_tuple"])
+    cleanup_state, cleanup_error = _cleanup(workspace, remover)
+    workspace_left = workspace if cleanup_state == "failed" else None
+    _apply_cleanup(receipt, cleanup_state, cleanup_error, workspace_left)
+    cleanup_record = None
+    if cleanup_state == "failed":
+        cleanup_record = {
+            "state": "failed",
+            "error_class": cleanup_error,
+            "detail_code": "CLEANUP_FAILED",
+            "workspace_path": str(workspace),
+        }
+    stored = copy.deepcopy(receipt)
+    try:
+        store.commit(decision, stored, cleanup_record)
+    except OSError:
+        return _unknown_receipt(request)
+    session.remember(business_key, payload_hash, stored)
+    return copy.deepcopy(stored)
+
+
+def _fail_after_claim(
+    session, store, decision, business_key, payload_hash, request, exc,
+    workspace, ws_fd, remover, capability, script_started, exit_code,
+) -> dict:
+    if script_started and exit_code is None:
+        return _unknown_receipt(request)
+    cleanup_state = "not_started"
+    cleanup_error = None
+    workspace_left = None
+    output_digest = _empty_output_digest()
+    if ws_fd is not None:
+        try:
+            output_digest = _output_digest_fd(ws_fd)
+        except IsolationError:
+            output_digest = _empty_output_digest()
+    if workspace is not None:
+        cleanup_state, cleanup_error = _cleanup(workspace, remover)
+        if cleanup_state == "failed":
+            workspace_left = workspace
+    receipt = _failure_receipt(request, exc, cleanup_state, "skipped", cleanup_error, workspace_left)
+    known_script = script_started and exc.detail == "SCRIPT_FAILED" and exit_code is not None
+    if known_script:
+        probe_evidence = _evidence_for_binding(capability, 1)
+        receipt["commands_executed"] = 1
+        receipt["exit_code"] = exit_code
+        receipt["probe_evidence"] = probe_evidence
+        receipt["isolation_status"] = "available"
+        receipt["failure"]["commands_executed"] = 1
+        try:
+            receipt["execution_binding"] = bind_execution_digest(
+                output_digest=output_digest,
+                input_digest=request.declared_digest,
+                candidate=request.candidate,
+                executor=EXECUTOR,
+                exit_code=exit_code,
+                probe_evidence=probe_evidence,
+            )
+            receipt["candidate_tuple"] = dict(receipt["execution_binding"]["candidate_tuple"])
+        except IsolationError:
+            receipt["execution_binding"] = None
+        cleanup_record = None
+        if cleanup_state == "failed":
+            cleanup_record = {
+                "state": "failed",
+                "error_class": cleanup_error,
+                "detail_code": "CLEANUP_FAILED",
+                "workspace_path": str(workspace) if workspace is not None else "",
+            }
+        try:
+            stored = copy.deepcopy(receipt)
+            store.commit(decision, stored, cleanup_record)
+            session.remember(business_key, payload_hash, stored)
+        except OSError:
+            return _unknown_receipt(request)
+        return copy.deepcopy(stored)
+    if not script_started:
+        store.abort(decision)
+    return receipt
+
+
+def _evidence_for_binding(capability: IsolationCapability | None, commands: int) -> dict:
+    if capability is None or commands == 0:
+        evidence = _not_run_evidence()
+        return evidence
+    evidence = copy.deepcopy(capability.evidence)
+    evidence["candidate_executed"] = True
+    evidence["status"] = "available"
+    return evidence
+
+
+def _not_run_evidence() -> dict:
+    return {
+        "status": "not_run",
+        "macci_evidence": "pending",
+        "candidate_executed": False,
+        "host_acl_effective": False,
+        "db_acl_effective": False,
+        "real_database": False,
+        "production_verification_enabled": False,
+        "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
+    }
+
+
+def _probe_canonical(evidence: Mapping[str, object]) -> str:
+    return json.dumps(dict(evidence), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _blocked(reason: str) -> IsolationCapability:
+    evidence = {
+        "status": "BLOCKED",
+        "backend": "none",
+        "reason": reason,
+        "executed_probe": False,
+        "candidate_executed": False,
+        "home_inaccessible": False,
+        "environment_inaccessible": False,
+        "external_file_inaccessible": False,
+        "network_inaccessible": False,
+        "cross_app_inaccessible": False,
+        "unprivileged": False,
+        "host_acl_effective": False,
+        "db_acl_effective": False,
+        "macci_evidence": "pending",
+        "real_database": False,
+        "production_verification_enabled": False,
+        "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
+    }
+    return IsolationCapability("BLOCKED", "none", reason, evidence)
+
+
+def _probe_isolation() -> IsolationCapability:
+    argv = _unshare_argv()
+    libs = _trusted_shell_files()
+    if argv is None or not libs:
+        return _blocked("user-namespace sandbox is not available")
+    host_net = _loopback_result()
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="w03-probe-") as folder:
+        root = Path(folder)
+        workspace = root / "workspace"
+        workspace.mkdir(mode=0o700)
+        external = root / "outside" / "external.txt"
+        external.parent.mkdir(mode=0o700)
+        external.write_bytes(b"external-marker\n")
+        cross = root / "app_beta" / "data.txt"
+        cross.parent.mkdir(mode=0o700)
+        cross.write_bytes(b"cross-app-marker\n")
+        home_file = root / "host-home" / "marker.txt"
+        home_file.parent.mkdir(mode=0o700)
+        home_file.write_bytes(b"home-marker\n")
+        host_read = subprocess.run(
+            [sys.executable, "-I", "-B", "-c",
+             "import pathlib,sys; sys.stdout.write(pathlib.Path(sys.argv[1]).read_text())",
+             str(external)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+            timeout=5,
+        )
+        if host_read.stdout != "external-marker\n":
+            return _blocked("host control could not read the external file")
+        targets = {
+            "home": str(home_file),
+            "real_home": str(Path.home()),
+            "external": str(external),
+            "cross": str(cross),
+        }
+        env = _sandbox_env(workspace, "probe", libs, targets)
+        if any(_is_credential_name(name) for name in env):
+            return _blocked("probe environment contained a credential name")
+        try:
+            completed = subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                env=env,
+                cwd=str(workspace),
+                timeout=SANDBOX_TIMEOUT_SECONDS,
+                start_new_session=True,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return _blocked("probe subprocess did not finish")
+        probe_path = workspace / "probe-result.json"
+        raw = b""
+        try:
+            raw = probe_path.read_bytes()
+        except OSError:
+            return _blocked("probe did not return evidence")
+        if b"external-marker" in raw or b"cross-app-marker" in raw or b"home-marker" in raw:
+            return _blocked("probe evidence contained a marker value")
+        if external.read_bytes() != b"external-marker\n" or cross.read_bytes() != b"cross-app-marker\n":
+            return _blocked("probe changed a file outside the workspace")
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return _blocked("probe evidence was not json")
+        if not isinstance(data, dict) or completed.returncode != 0:
+            return _blocked("probe process failed")
+        return _capability_from_probe(data, host_net)
+
+
+def _capability_from_probe(data: dict, host_net: str) -> IsolationCapability:
+    tokens = {
+        key: data.get(key) for key in (
+            "real_home", "fake_home", "external", "shell_external", "cross", "loopback",
+        )
+    }
+    if any(not isinstance(value, str) or len(value) > 32 for value in tokens.values()):
+        return _blocked("probe tokens were not bounded")
+    home_ok = data.get("home") == "/work" and tokens["real_home"] != "opened" and tokens["fake_home"] != "opened"
+    external_ok = tokens["external"] != "opened" and tokens["shell_external"] != "opened"
+    cross_ok = tokens["cross"] != "opened"
+    network_ok = tokens["loopback"] == "ENETUNREACH" and host_net not in {"ENETUNREACH", "opened", ""}
+    unprivileged = data.get("cap_eff_zero") is True and data.get("no_new_privs") is True and data.get("mount_denied") is True
+    environment_ok = data.get("credential_env_present") is False and data.get("synthetic_present") is True
+    same_uid = data.get("mapped_uid") == os.getuid() and data.get("only_lo") is True
+    passed = all((home_ok, external_ok, cross_ok, network_ok, unprivileged, environment_ok, same_uid))
+    evidence = {
+        "status": "available" if passed else "BLOCKED",
+        "backend": "linux-user-namespace" if passed else "none",
+        "reason": "probe passed" if passed else "probe counterexample failed",
+        "executed_probe": True,
+        "candidate_executed": False,
+        "home_inaccessible": home_ok,
+        "environment_inaccessible": environment_ok,
+        "external_file_inaccessible": external_ok,
+        "network_inaccessible": network_ok,
+        "cross_app_inaccessible": cross_ok,
+        "unprivileged": unprivileged,
+        "no_new_privs": data.get("no_new_privs") is True,
+        "same_uid_maps_host_user": data.get("mapped_uid") == os.getuid(),
+        "mapped_uid": data.get("mapped_uid") if isinstance(data.get("mapped_uid"), int) else None,
+        "sandbox_loopback": tokens["loopback"] if tokens["loopback"] in {"ENETUNREACH", "ECONNREFUSED", "opened"} else "OSError",
+        "host_loopback": host_net,
+        "host_acl_effective": False,
+        "db_acl_effective": False,
+        "macci_evidence": "pending",
+        "real_database": False,
+        "production_verification_enabled": False,
+        "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
+    }
+    status = "available" if passed else "BLOCKED"
+    return IsolationCapability(status, evidence["backend"], evidence["reason"], evidence)
+
+
+def _loopback_result() -> str:
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    try:
+        sock.connect(("127.0.0.1", 1))
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, "OSError")
+    else:
+        return "opened"
+    finally:
+        sock.close()
+
+
+def _sandbox_env(workspace: Path, mode: str, libs: list[tuple[str, str]], targets: dict | None) -> dict[str, str]:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/work",
+        "LANG": "C.UTF-8",
+        "TMPDIR": "/tmp",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "W03_MODE": mode,
+        "W03_WORKSPACE": str(workspace),
+        "W03_LIBS": ":".join(src + "|" + dst for src, dst in libs),
+        SYNTHETIC_CREDENTIAL_NAME: SYNTHETIC_CREDENTIAL_VALUE,
+    }
+    if targets is not None:
+        env["W03_TRY_HOME"] = targets["home"]
+        env["W03_TRY_REAL_HOME"] = targets["real_home"]
+        env["W03_TRY_EXTERNAL"] = targets["external"]
+        env["W03_TRY_CROSS"] = targets["cross"]
+    return env
+
+
+def _unshare_argv() -> list[str] | None:
+    unshare = shutil.which("unshare")
+    if not unshare:
+        return None
+    return [
+        unshare,
+        "--user", "--map-root-user",
+        "--mount", "--net", "--pid",
+        "--fork", "--kill-child",
+        "--propagation", "private",
+        sys.executable, "-I", "-B",
+        str(Path(__file__).resolve()),
+        "--sandbox-launch",
+    ]
+
+
+def _trusted_shell_files() -> list[tuple[str, str]] | None:
+    """Return ``(host file, jail path)`` pairs for dash and its loader.
+
+    The jail path is the path the kernel and dynamic linker look up, not a
+    realpath that would hide a ``/lib64`` interpreter entry.
+    """
+    dash_real = os.path.realpath("/usr/bin/dash")
+    if not dash_real.startswith("/usr/") or not os.path.isfile(dash_real):
+        return None
+    try:
+        completed = subprocess.run(
+            ["ldd", dash_real],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    pairs = [(dash_real, "/usr/bin/dash")]
+    for line in completed.stdout.splitlines():
+        path = _ldd_path(line.strip())
+        if path and os.path.isfile(path) and _abs_safe(path):
+            pairs.append((os.path.realpath(path), path))
+    interp = _elf_interpreter(dash_real)
+    if interp and os.path.isfile(interp) and _abs_safe(interp):
+        pairs.append((os.path.realpath(interp), interp))
+    unique = []
+    seen = set()
+    for item in pairs:
+        if item[1] not in seen:
+            seen.add(item[1])
+            unique.append(item)
+    if len(unique) < 2:
+        return None
+    return unique
+
+
+def _elf_interpreter(path: str) -> str | None:
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        return None
+    little = data[5] == 1
+    endian = "<" if little else ">"
+    import struct
+    e_phoff = struct.unpack_from(endian + "Q", data, 32)[0]
+    e_phentsize = struct.unpack_from(endian + "H", data, 54)[0]
+    e_phnum = struct.unpack_from(endian + "H", data, 56)[0]
+    for index in range(e_phnum):
+        start = e_phoff + index * e_phentsize
+        p_type = struct.unpack_from(endian + "I", data, start)[0]
+        if p_type != 3:
+            continue
+        p_offset = struct.unpack_from(endian + "Q", data, start + 8)[0]
+        p_filesz = struct.unpack_from(endian + "Q", data, start + 32)[0]
+        raw = data[p_offset:p_offset + p_filesz].split(b"\x00", 1)[0]
+        try:
+            return raw.decode("ascii")
+        except UnicodeError:
+            return None
+    return None
+
+
+def _ldd_path(line: str) -> str | None:
+    if "=>" in line:
+        right = line.split("=>", 1)[1].strip().split()
+        if right and right[0].startswith("/"):
+            return right[0]
+        return None
+    if line.startswith("/"):
+        return line.split()[0]
+    return None
+
+
+def _abs_safe(path: str) -> bool:
+    if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
+        return False
+    return ".." not in path.split("/")
+
+
+def _remove_jail_mountpoint(workspace: Path) -> None:
+    jail = Path(str(workspace).rstrip("/") + ".jail")
+    if jail.is_symlink() or not jail.exists():
+        return
+    try:
+        shutil.rmtree(jail)
+    except OSError:
+        pass
+
+
+def _marker_present(ws_fd: int) -> bool:
+    try:
+        fd = os.open(".isolation-started", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=ws_fd)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def _enter_jail(workspace: str, libs: list[tuple[str, str]], *, mount_proc: bool) -> None:
+    _mount("none", "/", None, _MS_REC | _MS_PRIVATE)
+    jail = workspace.rstrip("/") + ".jail"
+    os.makedirs(jail, 0o755, exist_ok=True)
+    _mount("tmpfs", jail, "tmpfs", _MS_NOSUID | _MS_NODEV, "size=32m,mode=755")
+    for name in ("work", "tmp", "proc", "bin", "dev", "lib", "lib64", "usr", "usr/bin"):
+        os.makedirs(jail + "/" + name, 0o755, exist_ok=True)
+    os.chmod(jail + "/tmp", 0o1777)
+    _mount(workspace, jail + "/work", None, _MS_BIND)
+    for src, dst in libs:
+        os.makedirs(os.path.dirname(jail + dst), 0o755, exist_ok=True)
+        _bind_ro(src, jail + dst)
+    _bind_ro(libs[0][0], jail + "/bin/sh")
+    _bind_ro("/dev/null", jail + "/dev/null")
+    if mount_proc:
+        _mount("proc", jail + "/proc", "proc", _MS_NOSUID | _MS_NODEV | _MS_NOEXEC)
+    os.chroot(jail)
+    os.chdir("/work")
+    _drop_caps()
+
+
+def _bind_ro(src: str, dst: str) -> None:
+    fd = os.open(dst, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+    os.close(fd)
+    _mount(src, dst, None, _MS_BIND)
+    _mount(None, dst, None, _MS_BIND | _MS_REMOUNT | _MS_RDONLY | _MS_NOSUID | _MS_NODEV)
+
+
+def _mount(src: str | None, target: str, fstype: str | None, flags: int, data: str | None = None) -> None:
+    libc = _libc()
+    src_b = None if src is None else src.encode()
+    fs_b = None if fstype is None else fstype.encode()
+    data_b = None if data is None else data.encode()
+    if libc.mount(src_b, target.encode(), fs_b, ctypes.c_ulong(flags), data_b) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), target)
+
+
+def _libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_char_p]
+    libc.mount.restype = ctypes.c_int
+    libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    libc.prctl.restype = ctypes.c_int
+    libc.capset.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    libc.capset.restype = ctypes.c_int
+    return libc
+
+
+def _drop_caps() -> None:
+    libc = _libc()
+    for cap in range(64):
+        libc.prctl(24, ctypes.c_ulong(cap), 0, 0, 0)
+    if libc.prctl(38, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "no_new_privs")
+
+    class Header(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+    class Data(ctypes.Structure):
+        _fields_ = [
+            ("effective", ctypes.c_uint32),
+            ("permitted", ctypes.c_uint32),
+            ("inheritable", ctypes.c_uint32),
+        ]
+
+    header = Header(0x20080522, 0)
+    data = (Data * 2)()
+    if libc.capset(ctypes.byref(header), data) != 0:
+        raise OSError(ctypes.get_errno(), "capset")
+
+
+def _mount_denied() -> bool:
+    try:
+        _mount("tmpfs", "/tmp", "tmpfs", _MS_NOSUID | _MS_NODEV)
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return False
+
+
+def _write_probe_result() -> None:
+    import socket
+    result = {
+        "home": os.environ.get("HOME"),
+        "real_home": _attempt_open(os.environ.get("W03_TRY_REAL_HOME", "")),
+        "fake_home": _attempt_open(os.environ.get("W03_TRY_HOME", "")),
+        "external": _attempt_open(os.environ.get("W03_TRY_EXTERNAL", "")),
+        "cross": _attempt_open(os.environ.get("W03_TRY_CROSS", "")),
+        "credential_env_present": any(_is_credential_name(name) for name in os.environ),
+        "synthetic_present": os.environ.get(SYNTHETIC_CREDENTIAL_NAME) == SYNTHETIC_CREDENTIAL_VALUE,
+        "mount_denied": _mount_denied(),
+    }
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    try:
+        sock.connect(("127.0.0.1", 1))
+        result["loopback"] = "opened"
+    except OSError as exc:
+        result["loopback"] = errno.errorcode.get(exc.errno, "OSError")
+    finally:
+        sock.close()
+    status = open("/proc/self/status", "r", encoding="ascii").read().splitlines()
+    cap = next((line.split(":", 1)[1].strip() for line in status if line.startswith("CapEff:")), "")
+    nnp = next((line.split(":", 1)[1].strip() for line in status if line.startswith("NoNewPrivs:")), "")
+    result["cap_eff_zero"] = cap == "0000000000000000"
+    result["no_new_privs"] = nnp == "1"
+    mapped = open("/proc/self/uid_map", "r", encoding="ascii").read().split()
+    result["mapped_uid"] = int(mapped[1]) if len(mapped) >= 2 else -1
+    net = open("/proc/net/dev", "r", encoding="ascii").read().splitlines()
+    faces = [line.split(":", 1)[0].strip() for line in net if ":" in line]
+    result["only_lo"] = faces == ["lo"]
+    external = os.environ.get("W03_TRY_EXTERNAL", "")
+    shell = subprocess.run(
+        ["/bin/sh", "-c", "cat \"$1\" > /work/shell-out 2> /work/shell-err", "sh", external],
+        check=False,
+        env={"PATH": "/bin:/usr/bin", "HOME": "/work"},
+        timeout=5,
+    )
+    del shell
+    try:
+        size = os.path.getsize("/work/shell-out")
+    except OSError:
+        size = 0
+    result["shell_external"] = "opened" if size else "denied"
+    encoded = json.dumps(result, sort_keys=True).encode("utf-8")
+    fd = os.open("/work/probe-result.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, encoded)
+    finally:
+        os.close(fd)
+
+
+def _attempt_open(path: str) -> str:
+    if not path:
+        return "absent"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, "OSError")
+    os.close(fd)
+    return "opened"
+
+
+def _exec_candidate() -> int:
+    fd = os.open("/work/.isolation-started", os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    os.write(fd, b"1")
+    os.close(fd)
+    clean = {
+        "PATH": "/bin:/usr/bin",
+        "HOME": "/work",
+        "LANG": "C.UTF-8",
+        "TMPDIR": "/tmp",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        SYNTHETIC_CREDENTIAL_NAME: SYNTHETIC_CREDENTIAL_VALUE,
+    }
+    try:
+        os.execve("/bin/sh", ["sh", "/work/candidate.sh"], clean)
+    except OSError:
+        try:
+            os.unlink("/work/.isolation-started")
+        except OSError:
+            pass
+        return 3
+    return 3
+
+
+def _claim_name(business_key: tuple[str, ...]) -> str:
+    if not business_key or any((not isinstance(part, str) or "\n" in part) for part in business_key):
+        raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
+    return hashlib.sha256("\n".join(business_key).encode("utf-8")).hexdigest()
+
+
+def _write_new_file(dir_fd: int, name: str, payload: dict) -> None:
+    body = json.dumps(payload, sort_keys=True).encode("utf-8")
+    fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        os.write(fd, body)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(dir_fd)
+
+
+def _replace_file(dir_fd: int, name: str, payload: dict) -> None:
+    body = json.dumps(payload, sort_keys=True).encode("utf-8")
+    temporary = name + ".tmp"
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        os.write(fd, body)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(temporary, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    os.fsync(dir_fd)
+
+
+def _fd_exists(dir_fd: int, name: str) -> bool:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def _read_json_fd(dir_fd: int, name: str):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        chunks = []
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            chunks.append(block)
+            if sum(len(item) for item in chunks) > 1024 * 1024:
+                return None
+    finally:
+        os.close(fd)
+    try:
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def construct(
@@ -479,72 +1480,111 @@ def construct(
     remover=None,
     paused: threading.Event | None = None,
     hold: threading.Event | None = None,
+    store: DurableStore | None = None,
+    probe: Callable[[], IsolationCapability] | None = None,
 ) -> dict:
     """Construct one isolated build and return a public receipt.
 
-    Identity and policy failures do not read or write idempotency state.
-    Candidate shell text is classified and never executed. ``commands_executed``
-    stays 0. Cleanup failure after an otherwise successful build becomes
-    ``SIDE_EFFECT_UNKNOWN`` and does not claim the workspace was removed.
+    Session lookup, execution, and the durable store are separate steps.
+    The session is in-process only. Identity and policy failures do not
+    write a claim. An untrusted script runs only after a fresh durable
+    claim and only inside a probed sandbox; otherwise the result is
+    ``ISOLATION_BLOCKED`` and the candidate is not started.
     """
     try:
         _validate_request(request)
         _authorize(request, host_environ)
         _reject_embedded_credentials(request, host_environ)
-        _reject_script(request, host_environ)
         if request.expected_revision != session.revision:
             raise IsolationError("CONFLICT_REVISION", "REVISION_CONFLICT", 409, "validate")
     except IsolationError as exc:
         return _failure_receipt(request, exc, "not_started", "skipped")
 
     payload_hash = _payload_hash(request)
-    idem_key = _idempotency_key(request)
-    status, looked_up = session.lookup(idem_key, payload_hash)
+    business_key = _business_key(request)
+    status, looked_up = session.lookup(business_key, payload_hash)
     if status == "mismatch" and looked_up is not None:
         return _mismatch_receipt(request, looked_up)
     if status == "replay" and looked_up is not None:
         return _replay_receipt(looked_up)
 
+    try:
+        _check_parent(parent)
+    except IsolationError as exc:
+        return _failure_receipt(request, exc, "not_started", "skipped")
+
+    if store is None:
+        store = DurableStore(Path(parent) / ".w03-claims")
+    try:
+        decision = store.begin(business_key, payload_hash, request.run_id)
+    except IsolationError as exc:
+        return _failure_receipt(request, exc, "not_started", "skipped")
+    early = _decision_receipt(request, session, business_key, payload_hash, decision)
+    if early is not None:
+        return early
+
+    script = request.script_text or ""
+    capability: IsolationCapability | None = None
+    if script:
+        capability = probe() if probe is not None else probe_isolation()
+        if capability.status != "available":
+            store.abort(decision)
+            receipt = _failure_receipt(
+                request,
+                IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "authorize"),
+                "not_started",
+                "skipped",
+            )
+            receipt["isolation_status"] = "BLOCKED"
+            receipt["probe_evidence"] = copy.deepcopy(capability.evidence)
+            receipt["commands_executed"] = 0
+            receipt["exit_code"] = None
+            return receipt
+
     lock_fd: int | None = None
     lock_path: Path | None = None
     workspace: Path | None = None
+    ws_fd: int | None = None
+    script_started = False
+    exit_code: int | None = None
     try:
         lock_fd, lock_path = _acquire_lock(parent, request.candidate.app_id, request.run_id)
         if paused is not None:
             paused.set()
         if hold is not None and not hold.wait(HOLD_TIMEOUT_SECONDS):
             raise IsolationError("SIDE_EFFECT_UNKNOWN", "HOLD_TIMEOUT", 409, "reserve")
-        workspace = _prepare_workspace(parent, request)
+        workspace, ws_fd = _prepare_workspace(parent, request)
         env = build_environment(workspace, request.env_allowlist)
         _reject_inherited_values(env, host_environ)
         if env.get("HOME") == str(Path.home()):
             raise IsolationError("POLICY_DENIED", "HOST_TOKEN_INHERITANCE_DENIED", 403, "execute")
-        _materialize(workspace, request.artifacts, host_environ)
-        database_probe = _apply_database(session, workspace, request)
-        _execute_plan(workspace, request)
-        receipt = _success_receipt(request, env, database_probe, workspace)
-        cleanup_state, cleanup_error = _cleanup(workspace, remover)
-        workspace_left = workspace if cleanup_state == "failed" else None
-        workspace = None
-        _apply_cleanup(receipt, cleanup_state, cleanup_error, workspace_left)
-        if session.store(idem_key, payload_hash, receipt) == "mismatch":
-            return _mismatch_receipt(request, {
-                "original_result": "SUCCEEDED",
-                "current_state": "SUCCEEDED",
-            })
-        return copy.deepcopy(receipt)
+        _materialize(ws_fd, request.artifacts, host_environ)
+        database_probe = _apply_database(session, workspace, ws_fd, request)
+        _execute_plan(ws_fd, request)
+        commands = 0
+        if script:
+            result = execute_isolated(ws_fd, workspace, script)
+            script_started = result.started
+            if result.exit_code is None:
+                if result.started:
+                    return _unknown_receipt(request)
+                raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+            exit_code = result.exit_code
+            commands = 1
+            if exit_code != 0:
+                raise IsolationError("EXECUTION_FAILED", "SCRIPT_FAILED", 409, "execute")
+        return _commit_success(
+            session, store, decision, business_key, payload_hash, request, env,
+            database_probe, ws_fd, capability, commands, exit_code, workspace, remover,
+        )
     except IsolationError as exc:
-        cleanup_state = "not_started"
-        cleanup_error = None
-        workspace_left = None
-        if workspace is not None:
-            cleanup_state, cleanup_error = _cleanup(workspace, remover)
-            if cleanup_state == "failed":
-                workspace_left = workspace
-            workspace = None
-        receipt = _failure_receipt(request, exc, cleanup_state, "skipped", cleanup_error, workspace_left)
-        return receipt
+        return _fail_after_claim(
+            session, store, decision, business_key, payload_hash, request, exc,
+            workspace, ws_fd, remover, capability, script_started, exit_code,
+        )
     finally:
+        if ws_fd is not None:
+            os.close(ws_fd)
         if lock_fd is not None:
             os.close(lock_fd)
         if lock_path is not None:
@@ -672,11 +1712,21 @@ def run_isolation_verification(observations: Mapping[str, Mapping[str, object]] 
             "approved_isolated_baseline_head": W02_BASELINE_HEAD,
             "bundled": False,
             "uses": "frozen_contract_test_double",
+            "public_auth_interface": W02_PUBLIC_AUTH,
+            "second_authentication_implementation": False,
             "pending": list(W02_ALIGNMENT_PENDING),
         },
+        "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
+        "macci_evidence": "pending",
+        "a04_a05_real_machine_status": "pending",
+        "linux_namespace_probe_is_macci_evidence": False,
+        "linux_namespace_probe_is_host_acl_proof": False,
+        "isolation_probe": exercises.get("isolation_probe"),
         "blockers": [
             "W02 identity-boundary final review is still required before full integration.",
-            "Simulated checks do not show that host or database ACLs are in effect.",
+            "A04 and A05 real-machine isolation evidence is still pending and is listed separately from the Linux probe.",
+            "A Linux user-namespace probe, when it runs, is not MacCI evidence and is not a host or database ACL.",
+            "Simulated source checks do not show that host or database ACLs are in effect.",
             "manage.sh remains the host build path and stays reserved for W07.",
             "The existing MacCI runner was not modified.",
             "Production enablement, deployment, and database migration were not authorized.",
@@ -693,6 +1743,8 @@ def run_isolation_verification(observations: Mapping[str, Mapping[str, object]] 
 def main(argv: list[str] | None = None) -> int:
     """Execute the isolation verification and print a JSON report."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--sandbox-launch"]:
+        return sandbox_launch()
     if args != ["--verify"]:
         sys.stderr.write("usage: isolated_build.py --verify\n")
         return 2
@@ -778,10 +1830,13 @@ def _run_fixture_exercises() -> dict:
                 sample("app_alpha", "exercise-script", "idem-w03-exercise-script", script="cat ../../sentinel"),
                 parent=Path(folder),
             )
-            if receipt["detail_code"] != "WORKSPACE_ESCAPE_DENIED" or receipt["commands_executed"] != 0:
-                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
             if sentinel.read_bytes() != b"keep":
                 raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+            executed = receipt["commands_executed"]
+            if executed and receipt.get("isolation_status") != "available":
+                raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+            if not executed and receipt["detail_code"] not in {"ISOLATION_BLOCKED", "UNKNOWN_RESULT"}:
+                raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
 
     def database() -> None:
         with tempfile.TemporaryDirectory(prefix="w03-exercise-") as folder:
@@ -814,15 +1869,43 @@ def _run_fixture_exercises() -> dict:
             else:
                 raise IsolationError("POLICY_DENIED", "CROSS_APP_DENIED", 403, "authorize")
 
+    probe_box: dict[str, dict] = {}
+
+    def isolation() -> None:
+        capability = probe_isolation()
+        probe_box["evidence"] = capability.evidence
+        if capability.evidence.get("host_acl_effective") or capability.evidence.get("db_acl_effective"):
+            raise IsolationError("POLICY_DENIED", "PERMISSION_DENIED", 403, "execute")
+        if capability.evidence.get("macci_evidence") != "pending":
+            raise IsolationError("EVIDENCE_MISSING", "SCHEMA_INVALID", 409, "execute")
+        if capability.evidence.get("candidate_executed") is not False:
+            raise IsolationError("POLICY_DENIED", "SCRIPT_EXECUTION_DENIED", 403, "execute")
+        worked = _unshare_works()
+        if worked and capability.status != "available":
+            raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+        if not worked and capability.status != "BLOCKED":
+            raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+        if capability.status != "available":
+            return
+        for key in (
+            "home_inaccessible", "environment_inaccessible", "external_file_inaccessible",
+            "network_inaccessible", "cross_app_inaccessible", "unprivileged",
+        ):
+            if capability.evidence.get(key) is not True:
+                raise IsolationError("POLICY_DENIED", "ISOLATION_BLOCKED", 403, "execute")
+
     check("scrub_host_token", scrub)
     check("deny_escape_script", script)
     check("deny_production_database", database)
     check("mock_database_is_app_scoped", mock)
+    check("isolation_probe", isolation)
     return {
         "passed": len(names) - len(failures),
         "failed": len(failures),
         "names": names,
         "failures": failures,
+        "isolation_probe": probe_box.get("evidence"),
+        "mock_database_is_security_boundary": False,
     }
 
 
@@ -939,18 +2022,6 @@ def _reject_embedded_credentials(request: BuildRequest, host_environ: Mapping[st
         raise IsolationError("POLICY_DENIED", "HOST_TOKEN_INHERITANCE_DENIED", 403, "authorize")
 
 
-def _reject_script(request: BuildRequest, host_environ: Mapping[str, str] | None) -> None:
-    script = request.script_text
-    if script is None or script == "":
-        return
-    if _text_contains_credential(script, host_environ):
-        raise IsolationError("POLICY_DENIED", "HOST_TOKEN_INHERITANCE_DENIED", 403, "authorize")
-    detail = classify_script(script) or "SCRIPT_EXECUTION_DENIED"
-    production_database = detail == "DATABASE_DENIED" and "postgres" in script.lower()
-    code = "PRODUCTION_DB_FORBIDDEN" if production_database else "POLICY_DENIED"
-    raise IsolationError(code, detail, 403, "authorize")
-
-
 def _reject_inherited_values(env: Mapping[str, str], host_environ: Mapping[str, str] | None) -> None:
     for value in _credential_values(host_environ):
         for env_value in env.values():
@@ -962,33 +2033,44 @@ def _reject_inherited_values(env: Mapping[str, str], host_environ: Mapping[str, 
                 raise IsolationError("POLICY_DENIED", "HOST_TOKEN_INHERITANCE_DENIED", 403, "execute")
 
 
-def _prepare_workspace(parent: Path, request: BuildRequest) -> Path:
+def _prepare_workspace(parent: Path, request: BuildRequest) -> tuple[Path, int]:
+    """Create an exclusive workspace and return a directory fd for it.
+
+    ``O_NOFOLLOW`` rejects a symlink. It does not stop a same-UID peer from
+    substituting another directory that uid owns. See ``SAME_UID_THREAT_BOUNDARY``.
+    """
     _check_parent(parent)
-    workspace = Path(parent) / f"build-{request.run_id}"
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    name = f"build-{request.run_id}"
     try:
-        os.mkdir(workspace, 0o700)
-    except FileExistsError as exc:
-        raise IsolationError("SIDE_EFFECT_UNKNOWN", "WORKSPACE_UNAVAILABLE", 409, "execute") from exc
-    os.chmod(workspace, 0o700)
-    for relative in ("tmp", "inputs", "output"):
-        path = resolve_contained(workspace, relative)
-        path.mkdir(mode=0o700)
-        os.chmod(path, 0o700)
-    return workspace
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise IsolationError("SIDE_EFFECT_UNKNOWN", "WORKSPACE_UNAVAILABLE", 409, "execute") from exc
+        ws_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    info = os.fstat(ws_fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        os.close(ws_fd)
+        raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+    os.fchmod(ws_fd, 0o700)
+    for child in ("tmp", "inputs", "output"):
+        child_fd = _ensure_child_dir(ws_fd, child)
+        os.close(child_fd)
+    return Path(parent) / name, ws_fd
 
 
-def _materialize(workspace: Path, artifacts: tuple[InputArtifact, ...], host_environ: Mapping[str, str] | None) -> None:
+def _materialize(ws_fd: int, artifacts: tuple[InputArtifact, ...], host_environ: Mapping[str, str] | None) -> None:
     values = _credential_values(host_environ)
     for artifact in artifacts:
         if any(value.encode("utf-8") in artifact.content for value in values):
             raise IsolationError("POLICY_DENIED", "HOST_TOKEN_INHERITANCE_DENIED", 403, "execute")
         relative = "inputs/" + _pure_relative(artifact.relative_path)
-        path = resolve_contained(workspace, relative)
-        _mkdir_parents(workspace, path.parent)
-        _write_exclusive(path, artifact.content, artifact.mode)
+        _write_tree_file(ws_fd, relative, artifact.content, artifact.mode)
 
 
-def _apply_database(session: IsolationSession, workspace: Path, request: BuildRequest) -> dict:
+def _apply_database(session: IsolationSession, workspace: Path, ws_fd: int, request: BuildRequest) -> dict:
     mode = request.database_mode
     app_id = request.candidate.app_id
     if mode == "denied":
@@ -998,8 +2080,8 @@ def _apply_database(session: IsolationSession, workspace: Path, request: BuildRe
         seen = session.mock_db.get(app_id, app_id, "probe")
         if seen != app_id or session.live_database_connects != 0:
             raise IsolationError("POLICY_DENIED", "DATABASE_DENIED", 403, "execute")
-        return {"engine": "mock", "contained": True, "same_app": True}
-    path = create_temporary_database(workspace, app_id)
+        return {"engine": "mock", "contained": True, "same_app": True, "security_boundary": False}
+    path = create_temporary_database(workspace, app_id, root_fd=ws_fd)
     if os.path.commonpath((os.path.abspath(workspace), os.path.abspath(path))) != os.path.abspath(workspace):
         raise IsolationError("POLICY_DENIED", "DATABASE_DENIED", 403, "execute")
     if stat.S_IMODE(path.stat().st_mode) != 0o600 or session.live_database_connects != 0:
@@ -1007,63 +2089,203 @@ def _apply_database(session: IsolationSession, workspace: Path, request: BuildRe
     return {"engine": "sqlite", "contained": True, "same_app": True}
 
 
-def _execute_plan(workspace: Path, request: BuildRequest) -> None:
+def _execute_plan(ws_fd: int, request: BuildRequest) -> None:
     app_id = request.candidate.app_id
     for step in request.plan:
         if step.target_app_id and step.target_app_id != app_id:
             raise IsolationError("POLICY_DENIED", "CROSS_APP_DENIED", 403, "execute")
-        path = resolve_contained(workspace, step.relative_path)
+        relative = _pure_relative(step.relative_path)
         if step.op == "read_input":
-            if not step.relative_path.startswith("inputs/"):
+            if not relative.startswith("inputs/"):
                 raise IsolationError("POLICY_DENIED", "PERMISSION_DENIED", 403, "execute")
-            try:
-                info = path.lstat()
-            except FileNotFoundError as exc:
-                raise IsolationError("EVIDENCE_MISSING", "INPUT_MISSING", 409, "execute") from exc
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
-            with open(path, "rb") as handle:
-                handle.read(MAX_ARTIFACT_BYTES + 1)
+            _read_no_follow(ws_fd, relative)
             continue
-        if not step.relative_path.startswith("output/") or step.relative_path == "output":
+        if not relative.startswith("output/") or relative == "output":
             raise IsolationError("POLICY_DENIED", "PERMISSION_DENIED", 403, "execute")
-        _mkdir_parents(workspace, path.parent)
-        _write_exclusive(path, step.content, 0o644)
+        _write_tree_file(ws_fd, relative, step.content, 0o644)
 
 
-def _mkdir_parents(workspace: Path, directory: Path) -> None:
-    workspace_abs = os.path.abspath(workspace)
-    current = workspace
-    relative = directory.relative_to(workspace)
-    for part in relative.parts:
-        current = current / part
-        if current.is_symlink():
-            raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
-        if current.exists():
-            info = current.lstat()
-            if not stat.S_ISDIR(info.st_mode):
-                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
-            continue
-        os.mkdir(current, 0o700)
-        os.chmod(current, 0o700)
-        if os.path.commonpath((workspace_abs, os.path.abspath(current))) != workspace_abs:
-            raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+def _translate_open_error(exc: OSError) -> IsolationError:
+    if exc.errno == errno.ENOENT:
+        return IsolationError("EVIDENCE_MISSING", "INPUT_MISSING", 409, "execute")
+    if exc.errno == errno.EEXIST:
+        return IsolationError("SIDE_EFFECT_UNKNOWN", "WORKSPACE_UNAVAILABLE", 409, "execute")
+    return IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
 
 
-def _write_exclusive(path: Path, content: bytes, mode: int) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, mode)
+def _walk_no_follow(root_fd: int, relative: str, *, allow_missing_final: bool) -> None:
+    parts = relative.split("/")
+    fd = os.dup(root_fd)
     try:
-        os.write(fd, content)
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if not last:
+                flags |= os.O_DIRECTORY
+            try:
+                nxt = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if last and allow_missing_final:
+                    return
+                raise IsolationError("EVIDENCE_MISSING", "INPUT_MISSING", 409, "execute") from None
+            except OSError as exc:
+                raise _translate_open_error(exc) from None
+            info = os.fstat(nxt)
+            if not last and not stat.S_ISDIR(info.st_mode):
+                os.close(nxt)
+                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+            if last and stat.S_ISLNK(info.st_mode):
+                os.close(nxt)
+                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+            os.close(fd)
+            fd = nxt
     finally:
         os.close(fd)
-    os.chmod(path, mode)
+
+
+def _ensure_child_dir(dir_fd: int, name: str) -> int:
+    if "/" in name or name in {"", ".", ".."}:
+        raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o700, dir_fd=dir_fd)
+        except OSError as exc:
+            raise _translate_open_error(exc) from None
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except OSError as exc:
+            raise _translate_open_error(exc) from None
+    except OSError as exc:
+        raise _translate_open_error(exc) from None
+    os.fchmod(fd, 0o700)
+    return fd
+
+
+def _write_exclusive_at(dir_fd: int, name: str, content: bytes, mode: int) -> None:
+    if "/" in name or name in {"", ".", ".."}:
+        raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        fd = os.open(name, flags, mode, dir_fd=dir_fd)
+    except OSError as exc:
+        raise _translate_open_error(exc) from None
+    try:
+        os.write(fd, content)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _write_tree_file(root_fd: int, relative: str, content: bytes, mode: int) -> None:
+    parts = relative.split("/")
+    parent = root_fd
+    opened: list[int] = []
+    try:
+        for part in parts[:-1]:
+            parent = _ensure_child_dir(parent, part)
+            opened.append(parent)
+        _write_exclusive_at(parent, parts[-1], content, mode)
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
+def _read_no_follow(root_fd: int, relative: str) -> bytes:
+    parts = relative.split("/")
+    parent = root_fd
+    opened: list[int] = []
+    try:
+        for part in parts[:-1]:
+            try:
+                parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            except OSError as exc:
+                raise _translate_open_error(exc) from None
+            opened.append(parent)
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        except OSError as exc:
+            raise _translate_open_error(exc) from None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+            return os.read(fd, MAX_ARTIFACT_BYTES + 1)
+        finally:
+            os.close(fd)
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
+def _output_digest_fd(ws_fd: int) -> str:
+    lines: list[str] = []
+    try:
+        out = os.open("output", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=ws_fd)
+    except OSError as exc:
+        raise _translate_open_error(exc) from None
+    try:
+        _collect_output(out, "output", lines)
+    finally:
+        os.close(out)
+    lines.sort()
+    return "sha256:" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _collect_output(dir_fd: int, prefix: str, lines: list[str]) -> None:
+    for name in sorted(os.listdir(f"/proc/self/fd/{dir_fd}")):
+        if name in {".", ".."} or name.startswith("."):
+            continue
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except OSError as exc:
+            raise _translate_open_error(exc) from None
+        try:
+            info = os.fstat(fd)
+            relative = prefix + "/" + name
+            if stat.S_ISDIR(info.st_mode):
+                _collect_output(fd, relative, lines)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+            chunks = []
+            while True:
+                block = os.read(fd, 65536)
+                if not block:
+                    break
+                chunks.append(block)
+            digest = hashlib.sha256(b"".join(chunks)).hexdigest()
+            lines.append(f"{stat.S_IMODE(info.st_mode):04o} {digest} {relative}")
+        finally:
+            os.close(fd)
+
+
+def _empty_output_digest() -> str:
+    return "sha256:" + hashlib.sha256(b"").hexdigest()
+
+
+def _unshare_works() -> bool:
+    unshare = shutil.which("unshare")
+    if not unshare:
+        return False
+    try:
+        completed = subprocess.run(
+            [unshare, "--user", "--map-root-user", "--mount", "--net", "--pid", "--fork", "--kill-child", "true"],
+            check=False,
+            capture_output=True,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
 
 
 def _cleanup(workspace: Path, remover) -> tuple[str, str | None]:
     try:
+        if workspace.is_symlink():
+            return "failed", "OSError"
         if remover is None:
             shutil.rmtree(workspace)
         else:
@@ -1099,13 +2321,28 @@ def _check_parent(parent: Path) -> None:
     if not isinstance(parent, Path):
         raise IsolationError("SCHEMA_UNSUPPORTED", "SCHEMA_INVALID", 422, "validate")
     try:
-        info = parent.lstat()
+        fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EMLINK}:
+            raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute") from exc
         raise IsolationError("SIDE_EFFECT_UNKNOWN", "WORKSPACE_UNAVAILABLE", 409, "execute") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
-    if (parent / ".git").exists():
-        raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+        try:
+            git = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        except FileNotFoundError:
+            git = None
+        except OSError as exc:
+            if exc.errno != errno.ELOOP:
+                raise
+            raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute") from exc
+        if git is not None:
+            os.close(git)
+            raise IsolationError("POLICY_DENIED", "WORKSPACE_ESCAPE_DENIED", 403, "execute")
+    finally:
+        os.close(fd)
     real = Path(os.path.realpath(parent))
     home = Path(os.path.realpath(Path.home()))
     if real == home or real.as_posix() in TMP_ROOTS or (set(real.parts) & FORBIDDEN_PARENT_PARTS):
@@ -1201,18 +2438,6 @@ def _text_contains_credential(text: str, host_environ: Mapping[str, str] | None)
     return any(value in text for value in _credential_values(host_environ))
 
 
-def _output_digest(workspace: Path) -> str:
-    lines = []
-    output = workspace / "output"
-    for path in sorted(output.rglob("*")):
-        if not path.is_file() or path.is_symlink():
-            continue
-        relative = path.relative_to(workspace).as_posix()
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        lines.append(f"0644 {digest} {relative}")
-    return "sha256:" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
-
-
 def _payload_hash(request: BuildRequest) -> str:
     script = request.script_text or ""
     plan_lines = [
@@ -1236,7 +2461,6 @@ def _payload_hash(request: BuildRequest) -> str:
         ",".join(flags),
         "\n".join(plan_lines),
         hashlib.sha256(script.encode("utf-8")).hexdigest(),
-        request.run_id,
         str(request.expected_revision),
         request.actor.id,
         request.actor.app_id,
@@ -1244,7 +2468,7 @@ def _payload_hash(request: BuildRequest) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _idempotency_key(request: BuildRequest) -> tuple[str, ...]:
+def _business_key(request: BuildRequest) -> tuple[str, ...]:
     return (
         request.actor.id,
         request.actor.app_id,
@@ -1273,6 +2497,14 @@ def _common_fields(request: BuildRequest | None) -> dict:
         "w02_baseline_head": W02_BASELINE_HEAD,
         "w02_bundled": False,
         "production_verification_enabled": False,
+        "executor": EXECUTOR,
+        "exit_code": None,
+        "execution_binding": None,
+        "probe_evidence": None,
+        "isolation_status": None,
+        "candidate_tuple": None,
+        "macci_evidence": "pending",
+        "same_uid_threat_boundary": SAME_UID_THREAT_BOUNDARY,
     }
     if request is not None and isinstance(request, BuildRequest) and isinstance(request.candidate, Candidate):
         try:
@@ -1281,6 +2513,12 @@ def _common_fields(request: BuildRequest | None) -> dict:
             fields["app_id"] = request.candidate.app_id
             fields["run_id"] = request.run_id
             fields["idempotency_key"] = request.idempotency_key
+            fields["candidate_tuple"] = {
+                "head": request.candidate.head,
+                "base": request.candidate.base,
+                "merge": request.candidate.merge,
+                "tree": request.candidate.tree,
+            }
         except IsolationError:
             fields["candidate_id"] = None
     return fields
@@ -1333,7 +2571,7 @@ def _success_receipt(
     request: BuildRequest,
     env: Mapping[str, str],
     database_probe: Mapping[str, object],
-    workspace: Path,
+    output_digest: str,
 ) -> dict:
     receipt = _common_fields(request)
     receipt.update({
@@ -1350,7 +2588,7 @@ def _success_receipt(
         "env_names": sorted(env),
         "env_path": env.get("PATH"),
         "env_home_is_host_home": env.get("HOME") == str(Path.home()),
-        "output_digest": _output_digest(workspace),
+        "output_digest": output_digest,
         "permissions": {
             "read_workspace": True,
             "write_output": request.permissions.write_output,

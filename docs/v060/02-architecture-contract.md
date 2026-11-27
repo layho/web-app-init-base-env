@@ -26,7 +26,7 @@ Task、Run、Candidate、Release、Deployment、Resource、Event 分开建模。
 | stream_epoch | 从 1 开始。生产者确认序号不能连续时才能加一，不能把旧序号重新从 1 写回同一 epoch |
 | producer_seq | 在同一个 stream_id 和 stream_epoch 内单调增加，并且先落盘再确认 |
 
-候选规范编码是 UTF-8，没有结尾换行，六行依次为：
+候选规范编码是 UTF-8，没有结尾换行，七行依次为：
 
 ```text
 v1
