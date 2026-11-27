@@ -1,0 +1,36 @@
+{
+  "queried_at": "2026-11-27T11:51:20Z",
+  "source": "github-api-readonly",
+  "credential_note": "integration token; values were not recorded",
+  "rules_modified": false,
+  "requests": [
+    {
+      "name": "main_protection",
+      "method": "GET",
+      "path": "/repos/layho/web-app-init-base-env/branches/main/protection",
+      "http_status": 403,
+      "body": {"message": "Resource not accessible by integration", "status": "403"}
+    },
+    {
+      "name": "preview_protection",
+      "method": "GET",
+      "path": "/repos/layho/web-app-init-base-env/branches/preview/protection",
+      "http_status": 403,
+      "body": {"message": "Resource not accessible by integration", "status": "403"}
+    },
+    {
+      "name": "repo_rulesets",
+      "method": "GET",
+      "path": "/repos/layho/web-app-init-base-env/rulesets",
+      "http_status": 200,
+      "body": []
+    },
+    {
+      "name": "org_rulesets",
+      "method": "GET",
+      "path": "/orgs/layho/rulesets",
+      "http_status": 404,
+      "body": {"message": "Not Found", "status": "404"}
+    }
+  ]
+}
