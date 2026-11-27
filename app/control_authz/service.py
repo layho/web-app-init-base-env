@@ -1,7 +1,15 @@
 """AuthzService is constructed only from server configuration.
 
-``authenticate`` verifies a proof against the server registry. Isolated test
-identities verify only when that registry is enabled. Real routes reject them.
+Signature, which W01 adapts to:
+
+    AuthzService(*, registry: PrincipalRegistry, isolated: bool, policy_revision: int)
+    authenticate(*, operation: str, body: dict, route_class: str, now: int, state: dict, write: bool) -> Principal
+    authorize(principal: Principal, operation: str, resource_binding: ResourceBinding) -> None
+    trusted_source_for(principal: Principal) -> str
+
+``policy_revision`` is an int. ``from_request`` always fails. ``authenticate``
+verifies a proof against the server registry. Isolated test identities verify
+only when that registry is enabled. Real routes reject them.
 """
 
 from __future__ import annotations
@@ -10,6 +18,7 @@ from .authorize import authorize, binding_for
 from .canonical import CanonicalError, idempotency_digest
 from .errors import AuthnError, AuthzError
 from .principal import Principal, PrincipalRegistry, server_source
+from .principal import trusted_source_for as server_trusted_source
 from .proof import checked_message, verify_signature
 
 READ_REPLAY_POLICY = "recheck_every_time_without_consuming_nonce_or_idempotency"
@@ -36,6 +45,12 @@ class AuthzService:
         self.registry = registry
         self.isolated = isolated
         self.policy_revision = policy_revision
+
+    @classmethod
+    def from_request(cls, _body: object) -> "AuthzService":
+        raise AuthzError(
+            "NOT_AUTHORIZED", 403, "AuthzService cannot be configured from the request body", reason="server_configuration",
+        )
 
     def authenticate(self, *, operation: str, body: dict, route_class: str, now: int, state: dict, write: bool) -> Principal:
         self._route_gate(body, route_class)
@@ -86,6 +101,9 @@ class AuthzService:
     def authorize(self, principal: Principal, operation: str, resource_binding) -> None:
         authorize(principal, operation, resource_binding)
 
+    def trusted_source_for(self, principal: Principal) -> str:
+        return server_trusted_source(principal)
+
     def binding_for(self, principal: Principal, operation: str, body: dict):
         return binding_for(principal, operation, body)
 
@@ -108,7 +126,7 @@ class AuthzService:
         nonces[slot] = {"principal_id": principal.principal_id, "expires_at": int(proof["expires_at"])}
 
     def _principal_from_record(self, record: dict) -> Principal:
-        scopes = tuple(str(item) for item in record.get("scopes") or [])
+        scopes = frozenset(str(item) for item in record.get("scopes") or [])
         return Principal(
             principal_id=str(record.get("principal_id") or ""),
             kind=str(record.get("kind") or ""),

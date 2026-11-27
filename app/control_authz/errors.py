@@ -1,4 +1,11 @@
-"""Authentication and authorization failures. Default deny."""
+"""Authentication and authorization failures. Default deny.
+
+Both classes use one signature so callers do not keep a second error type:
+
+    Error(code: str, status: int, detail: str, *, reason: str = "", extra: dict | None = None)
+
+``code``, ``status``, ``detail``, ``reason``, and ``extra`` are the attributes.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +21,7 @@ class AuthError(Exception):
 
 
 class AuthnError(AuthError):
-    """The caller is not authenticated. Empty authorizer is this failure."""
+    """The caller is not authenticated. An empty authorizer is this failure."""
 
 
 class AuthzError(AuthError):

@@ -24,7 +24,16 @@ from app.control_authz.service import READ_OPERATIONS, READ_REPLAY_POLICY, WRITE
 from .durable import DurableStore
 from .effects import DurableEffectProxy
 from .errors import ControlError, Result
-from .lease import LEASE_TTL, assert_bound, fence, new_token, token_hash
+from .lease import (
+    CHAIN_PHASES,
+    LEASE_TTL,
+    assert_bound,
+    assert_lease_scope,
+    fence,
+    new_token,
+    phase_subject,
+    token_hash,
+)
 from .policy import decide, denied
 from .proxy import OPERATION_SCOPE, check_proxy, rotate
 
@@ -163,15 +172,45 @@ class ControlIdentityService:
 
     def inject_gate_evidence(self, evidence: dict) -> None:
         required = ("macci_passed", "same_repo", "queue_allowed", "no_conflict", "frozen", "candidate_exact", "test_passed")
-        if not isinstance(evidence, dict) or any(name not in evidence for name in required):
+        binding = ("repo_id", "task_id", "candidate_id", "head", "base", "merge", "tree", "not_before", "not_after")
+        if not isinstance(evidence, dict) or any(name not in evidence for name in required) or any(name not in evidence for name in binding):
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "gate evidence is incomplete", reason="evidence_missing")
         for name in required:
             if not isinstance(evidence[name], bool):
                 raise ControlError("SCHEMA_UNSUPPORTED", 422, "gate evidence types are ambiguous", reason="evidence_type")
+        for name in binding[:7]:
+            if not isinstance(evidence[name], str) or evidence[name] == "":
+                raise ControlError("SCHEMA_UNSUPPORTED", 422, "gate evidence is not bound to a candidate", reason="evidence_missing")
+        start = evidence["not_before"]
+        end = evidence["not_after"]
+        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int) or start >= end:
+            raise ControlError("SCHEMA_UNSUPPORTED", 422, "gate evidence has no validity period", reason="evidence_missing")
 
         def mutate(state):
-            state["policy"]["evidence"] = {name: evidence[name] for name in required}
-            state["policy"]["evidence"]["policy_revision"] = state["policy"]["revision"]
+            stored = {name: evidence[name] for name in required}
+            stored["policy_revision"] = state["policy"]["revision"]
+            for name in binding:
+                stored[name] = evidence[name]
+            state["policy"]["evidence"] = stored
+            return state, None
+
+        self.store.update(mutate)
+
+    def inject_high_risk_grant(self, *, principal_id: str, operation: str, object_id: str, subject: str) -> None:
+        """Server grant. A candidate file cannot add this, and the action name alone is not enough."""
+
+        if any(not isinstance(item, str) or item == "" for item in (principal_id, operation, object_id, subject)):
+            raise ControlError("SCHEMA_UNSUPPORTED", 422, "high risk grant is incomplete", reason="high_risk")
+
+        def mutate(state):
+            grants = state["policy"].setdefault("high_risk_grants", [])
+            grants.append({
+                "principal_id": principal_id,
+                "operation": operation,
+                "object_id": object_id,
+                "subject": subject,
+                "special_authorization": True,
+            })
             return state, None
 
         self.store.update(mutate)
@@ -291,7 +330,7 @@ class ControlIdentityService:
                     "scope": body.get("credential_scope"),
                 })
             else:
-                decision = decide(principal, operation, body, state["policy"])
+                decision = decide(principal, operation, body, state["policy"], now=self.now())
                 if not decision.allow:
                     raise denied(decision)
                 result = self._read_result(principal, declared, {
@@ -337,7 +376,7 @@ class ControlIdentityService:
         if operation in OPERATION_SCOPE or operation == "proxy.authorize":
             self._proxy_gate(state, operation, body)
         if operation not in {"proxy.authorize", "session.check", "diagnostic.read", "branch.read", "pull.read"}:
-            decision = decide(principal, operation, body, state["policy"])
+            decision = decide(principal, operation, body, state["policy"], now=self.now())
             if not decision.allow:
                 raise denied(decision)
         if operation == "release.publish":
@@ -524,7 +563,21 @@ class ControlIdentityService:
         if recovery not in {"", "timeout"}:
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "recovery is not recognized", reason="recovery")
         phase = str(body.get("phase") or "")
-        active = self._active_runs(state, principal.repo_id, str(body.get("task_id") or ""), phase)
+        task_id = str(body.get("task_id") or "")
+        candidate_id = str(body.get("candidate_id") or "")
+        subject = phase_subject(phase, task_id, candidate_id)
+        self._bind_claim_identity(state, principal, body, phase, task_id, candidate_id)
+        scope = {
+            "repo_id": principal.repo_id,
+            "task_id": task_id,
+            "phase": phase,
+            "candidate_id": candidate_id,
+            "app_id": principal.app_id,
+            "producer_id": principal.producer_id,
+            "stream_id": principal.stream_id,
+            "subject": subject,
+        }
+        active = self._active_runs(state, scope)
         if recovery == "timeout":
             current = active[0]["state"] if active else None
             raise ControlError("RECLAIM_DENIED", 409, "timeout does not reclaim a run", reason="timeout",
@@ -543,7 +596,7 @@ class ControlIdentityService:
                                extra={"changed": False, "state": active[0]["state"]})
         if body.get("expected_revision") != 0:
             raise ControlError("CONFLICT_REVISION", 409, "revision rejected", reason="revision", extra={"changed": False})
-        attempt = 1 + max((int(run.get("attempt") or 0) for run in self._scoped_runs(state, principal.repo_id, str(body.get("task_id") or ""), phase)), default=0)
+        attempt = 1 + max((int(run.get("attempt") or 0) for run in self._scoped_runs(state, scope)), default=0)
         run_id = "run_" + secrets.token_hex(16)
         token = new_token()
         state["runs"][run_id] = {
@@ -551,7 +604,7 @@ class ControlIdentityService:
             "attempt": attempt,
             "principal_id": principal.principal_id,
             "repo_id": principal.repo_id,
-            "task_id": str(body.get("task_id") or ""),
+            "task_id": task_id,
             "phase": phase,
             "scope": principal.repo_id,
             "operation_scope": str(body.get("credential_scope") or "") or "run",
@@ -560,10 +613,15 @@ class ControlIdentityService:
             "token_hash": token_hash(token),
             "expires_at": now + LEASE_TTL,
             "revision": 1,
-            "candidate_id": str(body.get("candidate_id") or ""),
+            "candidate_id": candidate_id,
+            "subject": subject,
             "app_id": principal.app_id,
             "producer_id": principal.producer_id,
             "stream_id": principal.stream_id,
+            "head": str(body.get("head") or ""),
+            "base": str(body.get("base") or ""),
+            "merge": str(body.get("merge") or ""),
+            "tree": str(body.get("tree") or ""),
         }
         return {
             "state": "LEASED",
@@ -573,13 +631,41 @@ class ControlIdentityService:
             "revision": 1,
         }, {"lease_token": token, "subject": run_id}
 
-    def _scoped_runs(self, state, repo, task, phase):
+    def _bind_claim_identity(self, state, principal, body, phase, task_id, candidate_id) -> None:
+        if str(body.get("app_id") or "") != principal.app_id:
+            raise ControlError("NOT_AUTHORIZED", 403, "app is outside the server binding", reason="cross_app")
+        if str(body.get("producer_id") or "") != principal.producer_id:
+            raise ControlError("NOT_AUTHORIZED", 403, "producer is outside the server binding", reason="cross_producer")
+        if str(body.get("stream_id") or "") != principal.stream_id:
+            raise ControlError("NOT_AUTHORIZED", 403, "stream is outside the server binding", reason="cross_stream")
+        if phase not in CHAIN_PHASES:
+            return
+        from app.control_authz.canonical import candidate_id_for
+
+        parts = {name: str(body.get(name) or "") for name in ("head", "base", "merge", "tree")}
+        registered = state["candidates"].get(candidate_id)
+        expected = candidate_id_for(principal.repo_id, task_id, parts["head"], parts["base"], parts["merge"], parts["tree"]) if all(parts.values()) else ""
+        mismatch = (
+            not candidate_id
+            or not all(parts.values())
+            or candidate_id != expected
+            or not isinstance(registered, dict)
+            or registered.get("repo_id") != principal.repo_id
+            or registered.get("task_id") != task_id
+            or any(str(registered.get(name) or "") != parts[name] for name in parts)
+        )
+        if mismatch:
+            raise ControlError("CANDIDATE_STALE", 409, "candidate is not the registered candidate", reason="candidate",
+                               extra={"changed": False})
+
+    def _scoped_runs(self, state, scope):
+        keys = ("repo_id", "task_id", "phase", "candidate_id", "app_id", "producer_id", "stream_id", "subject")
         for run in state["runs"].values():
-            if run.get("repo_id") == repo and run.get("task_id") == task and run.get("phase") == phase:
+            if all(run.get(key) == scope[key] for key in keys):
                 yield run
 
-    def _active_runs(self, state, repo, task, phase):
-        return [run for run in self._scoped_runs(state, repo, task, phase) if run["state"] not in TERMINAL_RUNS]
+    def _active_runs(self, state, scope):
+        return [run for run in self._scoped_runs(state, scope) if run["state"] not in TERMINAL_RUNS]
 
     def _bound(self, state, principal, body, now):
         run_id = str(body.get("run_id") or "")
@@ -599,12 +685,22 @@ class ControlIdentityService:
             repo=str(body.get("repo_id") or ""),
             operation_scope=str(body.get("credential_scope") or "") or "run",
         )
-        if run.get("task_id") != str(body.get("task_id") or ""):
-            raise fence(run, "task")
-        if run.get("phase") != str(body.get("phase") or ""):
-            raise fence(run, "phase")
         if run.get("repo_id") != principal.repo_id:
             raise fence(run, "repo")
+        assert_lease_scope(
+            run,
+            candidate_id=str(body.get("candidate_id") or ""),
+            app_id=str(body.get("app_id") or ""),
+            producer_id=str(body.get("producer_id") or ""),
+            stream_id=str(body.get("stream_id") or ""),
+            phase=str(body.get("phase") or ""),
+            task_id=str(body.get("task_id") or ""),
+            repo_id=principal.repo_id,
+            head=str(body.get("head") or ""),
+            base=str(body.get("base") or ""),
+            merge=str(body.get("merge") or ""),
+            tree=str(body.get("tree") or ""),
+        )
         presented = body.get("expected_revision")
         if isinstance(presented, bool) or not isinstance(presented, int) or presented != int(run["revision"]):
             raise ControlError("CONFLICT_REVISION", 409, "revision rejected", reason="revision",

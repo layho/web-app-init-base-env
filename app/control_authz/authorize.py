@@ -1,12 +1,29 @@
-"""Default-deny binding of repo, app, producer, stream, operation, and scope."""
+"""Default-deny binding of repo, app, producer, stream, operation, and scope.
+
+``MATRIX`` is the role map. ``REQUIRED_SCOPES`` is every scope an operation
+requires. Authorization checks the presented scope and the whole set.
+``app_id`` and ``target_app_id`` are checked separately.
+"""
 
 from __future__ import annotations
 
 from .errors import AuthzError
 from .principal import Principal, ResourceBinding
 
+_DIAGNOSTIC = frozenset({
+    "core_session", "app_service", "agent", "macci", "publisher", "host", "hostops", "user_acceptance",
+})
+_EVENT = frozenset({*_DIAGNOSTIC, "policy_service"})
+_REPORT_SUBMIT = frozenset({"agent", "macci", "publisher", "user_acceptance"})
+_REPORT_READ = frozenset({*_DIAGNOSTIC, "policy_service"})
+
 MATRIX = {
-    "diagnostic.read": frozenset({"core_session", "app_service", "agent", "macci", "publisher", "host", "hostops", "user_acceptance"}),
+    "diagnostic.read": _DIAGNOSTIC,
+    "diagnostic.cursor": _DIAGNOSTIC,
+    "event.append": _EVENT,
+    "event.read": _EVENT,
+    "report.submit": _REPORT_SUBMIT,
+    "report.read": _REPORT_READ,
     "feedback.write": frozenset({"core_session", "agent"}),
     "pull.read": frozenset({"app_service", "host"}),
     "run.claim": frozenset({"agent"}),
@@ -38,12 +55,17 @@ MATRIX = {
     "signer.revoke": frozenset({"host"}),
 }
 
-REQUIRED_SCOPE = {
-    "feedback.write": "feedback",
-    "pull.read": "pull",
-    "preview.merge": "merge",
-    "release.publish": "publish",
-    "diagnostic.read": "read",
+REQUIRED_SCOPES = {
+    "feedback.write": frozenset({"feedback"}),
+    "pull.read": frozenset({"pull"}),
+    "preview.merge": frozenset({"merge"}),
+    "release.publish": frozenset({"publish"}),
+    "diagnostic.read": frozenset({"read"}),
+    "diagnostic.cursor": frozenset({"read", "diagnostic.cursor"}),
+    "event.append": frozenset({"event.append"}),
+    "event.read": frozenset({"event.read"}),
+    "report.submit": frozenset({"report.submit"}),
+    "report.read": frozenset({"report.read"}),
 }
 
 
@@ -54,7 +76,6 @@ def _deny(reason: str, detail: str) -> AuthzError:
 def binding_for(principal: Principal, operation: str, body: dict) -> ResourceBinding:
     producer = body["producer_id"] or principal.producer_id
     stream = body["stream_id"] or principal.stream_id
-    target_app = body["target_app_id"] or body["app_id"]
     return ResourceBinding(
         repo_id=body["repo_id"],
         app_id=body["app_id"],
@@ -63,8 +84,18 @@ def binding_for(principal: Principal, operation: str, body: dict) -> ResourceBin
         operation=operation,
         scope=body["credential_scope"],
         task_id=body["task_id"],
-        target_app_id=target_app,
+        target_app_id=body["target_app_id"],
     )
+
+
+def _bound_app(principal: Principal, named: str) -> None:
+    if named == "":
+        return
+    if principal.app_id:
+        if named != principal.app_id:
+            raise _deny("cross_app", "service identity cannot cross apps")
+        return
+    raise _deny("cross_app", "principal has no app binding for that app")
 
 
 def authorize(principal: Principal, operation: str, resource_binding: ResourceBinding) -> None:
@@ -85,16 +116,14 @@ def authorize(principal: Principal, operation: str, resource_binding: ResourceBi
     granted_tasks = {item[5:] for item in principal.scopes if item.startswith("task:") and len(item) > 5}
     if not resource_binding.task_id or resource_binding.task_id not in granted_tasks:
         raise _deny("cross_task", "task is outside the server binding")
-    requested_app = resource_binding.target_app_id or resource_binding.app_id
-    if principal.app_id:
-        if requested_app and requested_app != principal.app_id:
-            raise _deny("cross_app", "service identity cannot cross apps")
-    elif requested_app:
-        raise _deny("cross_app", "principal has no app binding for that app")
+    _bound_app(principal, resource_binding.app_id)
+    _bound_app(principal, resource_binding.target_app_id)
     if resource_binding.producer_id != principal.producer_id:
         raise _deny("cross_producer", "producer is outside the server binding")
     if resource_binding.stream_id != principal.stream_id:
         raise _deny("cross_stream", "stream is outside the server binding")
-    required = REQUIRED_SCOPE.get(operation)
-    if required is not None and (resource_binding.scope != required or required not in principal.scopes):
-        raise _deny("cross_scope", "operation scope is not interchangeable")
+    required = REQUIRED_SCOPES.get(operation)
+    if required is not None:
+        held = set(principal.scopes)
+        if resource_binding.scope not in required or not required <= held:
+            raise _deny("cross_scope", "operation scope is not interchangeable")

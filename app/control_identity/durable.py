@@ -35,6 +35,7 @@ def fresh_state() -> dict:
             "revision": 1,
             "ordinary_allow": ["preview.merge", "deploy.apply", "draft.undraft"],
             "high_risk_allow": [],
+            "high_risk_grants": [],
             "stored_outside_candidate": True,
             "evidence": None,
         },
