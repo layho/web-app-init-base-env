@@ -3,10 +3,18 @@
 The auth and event objects in this file are test doubles. They are not W02,
 not W01, not GitHub, and not MacCI. A passing test does not prove a production
 lease, a GitHub write, or a MacCI receipt.
+
+W01 ``33e65dc0925f03e60518a5c91a0e2254fd0fd12f`` and W02
+``5dd0eb38e175a8a905836fbdbac5633ff9eb19ae`` are not in this tree. A double
+that signs a finished document is not that joint adapter.
 """
 
+import importlib.util
 import json
 import secrets
+import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -53,24 +61,153 @@ class Clock:
 
 
 class AuthDouble:
-    """Stand-in for ControlIdentityService. Not a lease implementation to ship."""
+    """Stand-in for ControlIdentityService. Not a lease implementation to ship.
+
+    ``sign`` accepts only a finished business document. Replay ignores the
+    proof nonce, which is what W02's payload hash does. This object is still
+    not W02.
+    """
 
     github_execution = False
     macci_proof = False
 
-    def __init__(self, clock):
+    def __init__(self, clock, path=None):
         self.clock = clock
+        self.path = Path(path) if path else None
         self.runs = {}
         self.idem = {}
         self.candidates = {}
         self.calls = []
+        self.signed = []
+        self.facts = []
+        self.bindings = {}
+        self.grants = []
+        self.ancestry = {}
+        self.fail_code = None
+        self.drop_after_commit = False
+        self.ambiguous_replay = False
+        self.accept_kind = "user_acceptance"
         self.fence_calls = []
         self.classify_calls = []
+        self._load()
+
+    def _load(self):
+        if self.path is None or not self.path.exists():
+            return
+        saved = json.loads(self.path.read_text())
+        self.runs = saved["runs"]
+        self.idem = {tuple(json.loads(key)): value for key, value in saved["idem"].items()}
+        self.candidates = saved["candidates"]
+        self.facts = saved["facts"]
+        self.bindings = saved["bindings"]
+        self.grants = saved["grants"]
+        self.ancestry = {tuple(json.loads(key)): value for key, value in saved["ancestry"].items()}
+        self.ambiguous_replay = saved["ambiguous_replay"]
+        self.accept_kind = saved["accept_kind"]
+
+    def _save(self):
+        if self.path is None:
+            return
+        payload = {
+            "runs": self.runs,
+            "idem": {json.dumps(list(key)): value for key, value in self.idem.items()},
+            "candidates": self.candidates,
+            "facts": self.facts,
+            "bindings": self.bindings,
+            "grants": self.grants,
+            "ancestry": {json.dumps(list(key)): value for key, value in self.ancestry.items()},
+            "ambiguous_replay": self.ambiguous_replay,
+            "accept_kind": self.accept_kind,
+        }
+        self.path.write_text(json.dumps(payload))
 
     def register_candidate(self, *, repo, task, head, base, merge, tree):
         issued = candidate_id(repo, task, head, base, merge, tree)
         self.candidates[issued] = {"repo": repo, "task": task, "head": head, "base": base, "merge": merge, "tree": tree}
+        self._save()
         return issued
+
+    def sign(self, operation, normalized):
+        if not isinstance(normalized, dict) or "proof" in normalized or "actor" in normalized:
+            raise PortError("SCHEMA_UNSUPPORTED", 422, "request was signed before it was normalized")
+        self.signed.append({"operation": operation, "presented": json.loads(json.dumps(normalized))})
+        signed = dict(normalized)
+        signed["actor"] = {"id": "executor-double", "kind": "executor"}
+        signed["proof"] = {"double": True, "nonce": secrets.token_hex(8), "alg": "double"}
+        return signed
+
+    def note_record(self, kind, **fields):
+        fact = {"kind": kind, **fields}
+        self.facts = [
+            item for item in self.facts
+            if not (
+                item.get("kind") == kind
+                and item.get("ref") == fact.get("ref")
+                and item.get("candidate_id") == fact.get("candidate_id")
+                and item.get("subject") == fact.get("subject")
+            )
+        ]
+        self.facts.append(fact)
+        self._save()
+
+    def note_ancestry(self, *, main_sha, preview_sha, observed_tree, candidate_tree, is_ancestor):
+        self.ancestry[(main_sha, preview_sha, observed_tree, candidate_tree)] = {
+            "is_ancestor": bool(is_ancestor),
+            "main_sha": main_sha,
+            "preview_sha": preview_sha,
+            "observed_tree": observed_tree,
+            "candidate_tree": candidate_tree,
+            "source": "server-observation",
+        }
+        self._save()
+
+    def note_grant(self, action, subject):
+        self.grants.append([action, subject])
+        self._save()
+
+    def bind_subject(self, subject_id, **state):
+        self.bindings[subject_id] = dict(state)
+        self._save()
+
+    def observe_ancestry(self, *, main_sha, preview_sha, observed_tree, candidate_tree):
+        found = self.ancestry.get((main_sha, preview_sha, observed_tree, candidate_tree))
+        if found is None:
+            raise PortError("EVIDENCE_MISSING", 409, "ancestry")
+        return dict(found)
+
+    def verified_record(self, kind, **binding):
+        rows = [fact for fact in self.facts if fact.get("kind") == kind]
+        if binding.get("candidate_id") and kind == "acceptance":
+            rejected = any(
+                fact.get("candidate_id") == binding["candidate_id"] and fact.get("outcome") == "rejected"
+                for fact in rows
+            )
+            if rejected:
+                raise PortError("NOT_AUTHORIZED", 403, "acceptance was rejected")
+        matched = []
+        for fact in rows:
+            if all(fact.get(key) == value for key, value in binding.items() if value is not None):
+                matched.append(fact)
+        if binding.get("ref"):
+            by_ref = [fact for fact in rows if fact.get("ref") == binding["ref"]]
+            if by_ref and not matched:
+                raise PortError("EVIDENCE_INCONSISTENT", 409, "record is bound to a different candidate")
+        if not matched:
+            raise PortError("EVIDENCE_MISSING", 409, "server record missing")
+        fact = dict(matched[-1])
+        if kind == "acceptance" and fact.get("signer_kind") != "user_acceptance":
+            raise PortError("NOT_AUTHORIZED", 403, "signer")
+        if kind == "test" and fact.get("signer_kind") != "macci":
+            raise PortError("NOT_AUTHORIZED", 403, "test signer")
+        return fact
+
+    def reject_acceptance(self, **binding):
+        if self.accept_kind != "user_acceptance":
+            raise PortError("NOT_AUTHORIZED", 403, "signer")
+        fact = {"kind": "acceptance", "outcome": "rejected", "signer_kind": self.accept_kind, **binding}
+        self.facts.append(fact)
+        self._save()
+        return dict(fact)
 
     def execute(self, operation, body, *, route_class):
         self.calls.append({"operation": operation, "route_class": route_class, "body": json.loads(json.dumps(body))})
@@ -80,18 +217,28 @@ class AuthDouble:
             raise PortError("SCHEMA_UNSUPPORTED", 422, "caller tried to own server fields")
         if body.get("state") == "UNKNOWN" or body.get("result") == "UNKNOWN":
             raise PortError("NOT_AUTHORIZED", 403, "caller cannot write UNKNOWN")
+        if self.fail_code:
+            code = self.fail_code
+            self.fail_code = None
+            raise PortError(code, 403, code)
         proof = body.get("proof")
         if not isinstance(proof, dict) or proof.get("double") is not True:
             raise PortError("PROOF_INVALID", 403, "proof")
+        if operation == "policy.evaluate":
+            return self._policy(body)
         if not body.get("idempotency_key"):
             raise PortError("SCHEMA_UNSUPPORTED", 422, "idempotency")
-        key = (body.get("actor", {}).get("id"), operation, body.get("idempotency_key"))
-        digest = json.dumps(body, sort_keys=True)
+        digest = self._business(body)
+        key = ("executor-double", operation, body.get("idempotency_key"))
         existing = self.idem.get(key)
         if existing:
             if existing["digest"] != digest:
                 raise PortError("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "payload")
+            if self.ambiguous_replay:
+                self._save()
+                return AuthResult({"state": "LEASED", "run_id": existing["run_id"]})
             current = self.runs[existing["run_id"]]["state"]
+            self._save()
             return AuthResult({
                 "replayed": True, "lease_token": None, "original_result": dict(existing["public"]),
                 "current_state": current, "github_execution": False, "macci_proof": False,
@@ -111,7 +258,31 @@ class AuthDouble:
         else:
             raise PortError("NOT_AUTHORIZED", 403, "operation")
         self.idem[key] = {"digest": digest, "public": dict(public), "run_id": public["run_id"]}
+        self._save()
+        if self.drop_after_commit:
+            self.drop_after_commit = False
+            self._save()
+            raise OSError("lost response")
         return AuthResult({**public, "lease_token": token, "replayed": False, "github_execution": False, "macci_proof": False})
+
+    def _business(self, body):
+        visible = {key: value for key, value in body.items() if key not in {"proof", "actor"}}
+        return json.dumps(visible, sort_keys=True, separators=(",", ":"))
+
+    def _policy(self, body):
+        subject = body.get("object_id")
+        binding = self.bindings.get(subject)
+        if not isinstance(binding, dict) or binding.get("action") != body.get("action"):
+            raise PortError("EVIDENCE_MISSING", 409, "subject binding")
+        action = binding["action"]
+        if binding.get("version_state") == "FROZEN" and [action, subject] not in self.grants:
+            return AuthResult({
+                "allow": False, "code": "FREEZE_ACTIVE", "changed": False, "replayed": False, "production_enabled": False,
+            })
+        return AuthResult({
+            "allow": True, "code": "OK", "changed": True, "replayed": False, "production_enabled": False,
+            "github_execution": False, "macci_proof": False,
+        })
 
     def trusted_fence(self, run_id, *, fenced, effect_known):
         self.fence_calls.append({"run_id": run_id, "fenced": fenced, "effect_known": effect_known})
@@ -202,41 +373,112 @@ class AuthDouble:
 
 
 class EventDouble:
-    """Stand-in for Engine.append and Engine.query. It does not store W01's outbox."""
+    """Stand-in for Engine.append and Engine.query. It does not store W01's outbox.
+
+    The scheduler supplies ``producer_seq`` and a stable ``event_id``. This
+    double checks that proof was attached after that document existed, then
+    replays the same business document under a new nonce. It is not W01.
+    """
 
     github_execution = False
     macci_proof = False
 
-    def __init__(self):
+    def __init__(self, path=None):
+        self.path = Path(path) if path else None
         self.events = []
         self.hold = set()
-        self._seq = {}
+        self.idem = {}
+        self.presented = []
+        self.reads = []
+        self.reject_next = False
+        self.fail_before_store = False
+        self._load()
+
+    def _load(self):
+        if self.path is None or not self.path.exists():
+            return
+        saved = json.loads(self.path.read_text())
+        self.events = saved["events"]
+        self.idem = saved["idem"]
+
+    def _save(self):
+        if self.path is None:
+            return
+        self.path.write_text(json.dumps({"events": self.events, "idem": self.idem}))
+
+    def sign(self, normalized):
+        if not isinstance(normalized, dict) or "proof" in normalized or "actor" in normalized:
+            raise PortError("SCHEMA_UNSUPPORTED", 422, "event was signed before it was normalized")
+        self.presented.append(json.loads(json.dumps(normalized, default=str)))
+        signed = dict(normalized)
+        signed["actor"] = {"id": "w04-scheduler", "kind": "executor"}
+        signed["proof"] = {"double": True, "nonce": secrets.token_hex(8)}
+        return signed
 
     def append(self, body, crash=None):
+        if self.fail_before_store:
+            self.fail_before_store = False
+            raise OSError("event delivery lost")
         if "received_at" in body or body.get("state") == "UNKNOWN":
             raise PortError("NOT_AUTHORIZED", 403, "caller event rejected")
-        if "producer_seq" in body:
-            raise PortError("NOT_AUTHORIZED", 403, "scheduler assigned an event sequence")
-        key = (body["stream_id"], body["stream_epoch"])
-        self._seq[key] = self._seq.get(key, 0) + 1
-        stored = dict(body)
-        stored["producer_seq"] = self._seq[key]
+        if type(body.get("producer_seq")) is not int or isinstance(body.get("producer_seq"), bool):
+            raise PortError("SCHEMA_UNSUPPORTED", 422, "producer_seq is assigned with the event intent")
+        if not body.get("event_id") or not body.get("idempotency_key"):
+            raise PortError("SCHEMA_UNSUPPORTED", 422, "event identity")
+        proof = body.get("proof")
+        if not isinstance(proof, dict) or proof.get("double") is not True:
+            raise PortError("PROOF_INVALID", 403, "proof")
+        if self.reject_next:
+            self.reject_next = False
+            return {"http": 409, "code": "EVIDENCE_MISSING", "applied": False, "replayed": False, "producer_seq": None}
+        digest = json.dumps({key: value for key, value in body.items() if key not in {"proof", "actor"}}, sort_keys=True, default=str)
+        existing = self.idem.get(body["idempotency_key"])
+        if existing:
+            if existing["digest"] != digest:
+                return {"http": 409, "code": "IDEMPOTENCY_PAYLOAD_MISMATCH", "applied": False, "replayed": False}
+            stored = existing["event"]
+            return {
+                "http": 200, "applied": True, "replayed": True, "event_id": stored["event_id"],
+                "producer_seq": stored["producer_seq"], "trusted_source": stored["trusted_source"],
+                "github_execution": False, "macci_proof": False,
+            }
+        stored = {key: value for key, value in body.items() if key not in {"proof", "actor"}}
+        stored["trusted_source"] = "agent"
         stored["assigned_by"] = "event_port"
         self.events.append(stored)
-        return {"accepted": True, "producer_seq": stored["producer_seq"], "assigned_by": "event_port",
-                "storage": "test-double", "github_execution": False, "macci_proof": False}
+        self.idem[body["idempotency_key"]] = {"digest": digest, "event": stored}
+        self._save()
+        return {
+            "http": 200, "accepted": True, "applied": True, "replayed": False,
+            "producer_seq": stored["producer_seq"], "event_id": stored["event_id"],
+            "trusted_source": "agent", "assigned_by": "event_port", "storage": "test-double",
+            "github_execution": False, "macci_proof": False,
+        }
 
     def query(self, *, request, stream_id, stream_epoch, after_seq=0, task_id=None, limit=100):
+        proof = request.get("proof") if isinstance(request, dict) else None
+        if not isinstance(proof, dict) or proof.get("double") is not True:
+            raise PortError("PROOF_INVALID", 403, "read proof")
+        if request.get("stream_id") != stream_id or request.get("after_seq") != after_seq:
+            raise PortError("EVIDENCE_INCONSISTENT", 409, "cursor")
+        self.reads.append(after_seq)
         items = [
             dict(event) for event in self.events
             if event["stream_id"] == stream_id and event["stream_epoch"] == stream_epoch
             and event["producer_seq"] > after_seq and event["producer_seq"] not in self.hold
         ]
         items.sort(key=lambda event: event["producer_seq"])
-        return {"items": items[:limit], "side_effect": False, "github_execution": False, "macci_proof": False}
+        truncated = len(items) > limit
+        page = items[:limit]
+        return {
+            "items": page, "truncated": truncated,
+            "next_after_seq": page[-1]["producer_seq"] if truncated and page else None,
+            "side_effect": False, "gap": False, "github_execution": False, "macci_proof": False,
+        }
 
     def inject(self, body):
         self.events.append(dict(body))
+        self._save()
 
 
 @pytest.fixture
@@ -249,15 +491,42 @@ def world(tmp_path):
     return scheduler, auth, events, clock, tmp_path
 
 
-def caller(actor="executor-a", **extra):
-    body = {
-        "actor": {"id": actor, "kind": "executor"},
-        "proof": {"double": True},
-        "scope": {"repo": REPO},
-        "authorizer": "w02-double",
-    }
+def caller(**extra):
+    """Holder presentation. Proof and role strings here are not the signature."""
+
+    body = {"presented_by": "holder"}
     body.update(extra)
     return body
+
+
+def external_event(seq, **extra):
+    item = {
+        "repo_id": REPO,
+        "app_id": "app-1",
+        "stream_id": "remote:candidate",
+        "stream_epoch": 1,
+        "producer_seq": seq,
+        "event_id": extra.pop("event_id", f"evt-ext-{seq}"),
+        "event_type": extra.pop("event_type", "run.observed"),
+        "trusted_source": extra.pop("trusted_source", "macci"),
+        "idempotency_key": extra.pop("idempotency_key", f"idem-ext-{seq}"),
+        "state": extra.pop("state", "FAILED"),
+        "stage": extra.pop("stage", "test"),
+        "origin": extra.pop("origin", "remote"),
+    }
+    item.update(extra)
+    return item
+
+
+def note_phase_fact(scheduler, phase, chain):
+    kind = {"test": "test", "accept": "acceptance", "publish": "publish"}[phase]
+    signer = {"test": "macci", "accept": "user_acceptance", "publish": "release"}[phase]
+    outcome = "passed" if phase == "test" else "accepted"
+    scheduler.auth.note_record(
+        kind, candidate_id=chain["candidate_id"], tree=chain["tree"], head=chain["head"], base=chain["base"],
+        merge=chain["merge"], ref=f"evid-{phase}-{chain['chain_id']}", signer_kind=signer, outcome=outcome,
+        subject=chain["chain_id"],
+    )
 
 
 def boot(scheduler, version="0.6.0", task="task-1"):
@@ -272,9 +541,12 @@ def register(scheduler, chain="chain-a", files=None, deps=(), priority=0, pr="pr
     )
 
 
-def run_phase(scheduler, version, phase, chain_id=None, signer=""):
+def run_phase(scheduler, version, phase, chain_id=None):
     claimed = scheduler.claim_next(version=version, phase=phase, caller=caller(), chain_id=chain_id)
     assert claimed["claimed"] is True, claimed
+    if phase in {"test", "accept", "publish"} and claimed.get("chain_id"):
+        chain = next(item for item in scheduler.snapshot(version)["chains"] if item["chain_id"] == claimed["chain_id"])
+        note_phase_fact(scheduler, phase, chain)
     holder = caller(lease_token=claimed["lease_token"], lease_generation=claimed["lease_generation"], expected_revision=claimed["revision"])
     started = scheduler.start(round_id=claimed["round_id"], caller=holder)
     finished = scheduler.complete(
@@ -282,7 +554,6 @@ def run_phase(scheduler, version, phase, chain_id=None, signer=""):
         caller=caller(lease_token=claimed["lease_token"], lease_generation=started["lease_generation"], expected_revision=started["revision"]),
         result="SUCCEEDED",
         evidence_ref=f"evid-{phase}-{claimed['chain_id'] or 'task'}",
-        signer_kind=signer,
     )
     return claimed, finished
 
@@ -302,7 +573,7 @@ def drive_to_published(scheduler, version, chain_id, head=HEAD):
     observed = scheduler.observe_remote(chain_id, kind="exact", observation_seq=1, remote_sha=head, evidence_ref=f"evid-remote-{chain_id}")
     assert observed["state"] == "DEPLOYING"
     run_phase(scheduler, version, "deploy", chain_id)
-    run_phase(scheduler, version, "accept", chain_id, signer="user_acceptance")
+    run_phase(scheduler, version, "accept", chain_id)
     run_phase(scheduler, version, "publish", chain_id)
     return scheduler.snapshot(version)
 
@@ -319,7 +590,7 @@ def test_package_is_not_production_wired():
             stripped = line.strip()
             if not (stripped.startswith("import ") or stripped.startswith("from ")):
                 continue
-            for banned in ("integration_queue", "preview_journal", "merge_preview", "control_routes", "app.main", "manage.sh", "app.operations", "app.auth"):
+            for banned in ("integration_queue", "preview_journal", "merge_preview", "control_routes", "app.main", "manage.sh", "app.operations", "app.auth", "control_identity", "control_events", "control_authz"):
                 assert banned not in stripped
     assert PRODUCTION_WIRED is False
     assert JOINT_INTEGRATION_READY is False
@@ -382,11 +653,11 @@ def test_s02_version_publish_is_more_than_integration_or_equal_trees(world):
         scheduler.activate_version("0.7.0", baseline=BASELINE)
     assert blocked.value.code == "VERSION_NOT_RELEASED"
     scheduler.freeze_version("0.6.0", reason="acceptance freeze", evidence_ref="evid-freeze")
+    scheduler.auth.note_ancestry(main_sha=MAIN, preview_sha=PREVIEW, observed_tree=TREE, candidate_tree=TREE, is_ancestor=False)
+    scheduler.record_publish_observation("0.6.0", main_sha=MAIN, preview_sha=PREVIEW, observed_tree=TREE, candidate_tree=TREE)
     with pytest.raises(SchedulerError) as frozen:
         scheduler.publish_version(
             "0.6.0", observed_tree=TREE, candidate_tree=TREE, main_sha=MAIN, preview_sha=PREVIEW,
-            preview_is_ancestor=False, acceptance_ref="evid-accept-version", publish_ref="evid-publish-version",
-            acceptance_signer="user_acceptance",
         )
     assert frozen.value.code == "FREEZE_ACTIVE"
     assert scheduler.snapshot("0.6.0")["version"]["state"] == "FROZEN"
@@ -486,6 +757,7 @@ def test_s06_timeout_does_not_write_unknown_until_trusted_fence(world):
     assert again["claimed"] is False and again["reason"] == "human_required"
     with pytest.raises(SchedulerError):
         scheduler.start(round_id=running["round_id"], caller=caller(lease_token="stale-token", lease_generation=1, expected_revision=1))
+    auth.note_record("intervention", subject=running["round_id"], ref="evid-retry", permission="retry_phase")
     retried = scheduler.intervene(action="retry_phase", subject_id=running["round_id"], evidence_ref="evid-retry", caller=caller())
     assert retried["claimed"] is True
     assert retried["run_id"] != running["run_id"]
@@ -553,6 +825,7 @@ def test_s08_human_intervention_and_failed_chain(world):
         scheduler.intervene(action="retry_phase", subject_id=claimed["round_id"], evidence_ref="evid-retry", caller=caller())
     assert resumed.value.code == "CONFLICT_REVISION"
     assert auth.runs[claimed["run_id"]]["state"] == "FAILED"
+    auth.note_record("intervention", subject="chain-a", ref="evid-supersede", permission="supersede_failed")
     superseded = scheduler.intervene(action="supersede_failed", subject_id="chain-a", evidence_ref="evid-supersede")
     assert superseded["evidence_copied"] is False
     assert superseded["state"] == "SUPERSEDED"
@@ -643,19 +916,18 @@ def test_out_of_order_events_do_not_publish_ahead_of_failure(world):
         caller=caller(lease_token=claimed["lease_token"], lease_generation=claimed["lease_generation"], expected_revision=claimed["revision"]),
     )
     events.hold.add(1)
-    events.inject({
-        "stream_id": "remote:candidate", "stream_epoch": 1, "producer_seq": 2, "event_type": "run.observed",
-        "state": "PUBLISHED", "stage": "publish", "candidate_id": registered["candidate_id"], "idempotency_key": "idem-ext-2",
-    })
+    events.inject(external_event(
+        2, candidate_id=registered["candidate_id"], state="PUBLISHED", stage="publish", idempotency_key="idem-ext-2",
+    ))
     gap = scheduler.ingest(stream_id="remote:candidate")
     assert gap["gap"] is True
     assert gap["applied"] == []
     assert next(chain["state"] for chain in scheduler.snapshot("0.6.0")["chains"] if chain["chain_id"] == "chain-a") == "TESTING"
     events.hold.clear()
-    events.inject({
-        "stream_id": "remote:candidate", "stream_epoch": 1, "producer_seq": 1, "event_type": "run.observed",
-        "state": "FAILED", "stage": "test", "candidate_id": registered["candidate_id"], "idempotency_key": "idem-ext-1",
-    })
+    events.inject(external_event(
+        1, candidate_id=registered["candidate_id"], state="FAILED", stage="test", idempotency_key="idem-ext-1",
+        origin="control_scheduler",
+    ))
     applied = scheduler.ingest(stream_id="remote:candidate")
     assert applied["applied"] == [1]
     assert applied["reason"] == "illegal"
@@ -672,10 +944,12 @@ def test_close_requires_every_chain_and_user_acceptance(world):
         scheduler.close_task("task-1")
     assert partial.value.code == "EVIDENCE_MISSING"
     assert scheduler.snapshot("0.6.0")["tasks"][0]["closed"] is False
+    scheduler.auth.note_record("task_acceptance", subject="task-1", ref="evid-task-accept", signer_kind="agent", outcome="accepted")
     with pytest.raises(SchedulerError) as signer:
-        scheduler.record_task_acceptance("task-1", evidence_ref="evid-task-accept", signer_kind="agent")
+        scheduler.record_task_acceptance("task-1", evidence_ref="evid-task-accept")
     assert signer.value.code == "NOT_AUTHORIZED"
-    scheduler.record_task_acceptance("task-1", evidence_ref="evid-task-accept", signer_kind="user_acceptance")
+    scheduler.auth.note_record("task_acceptance", subject="task-1", ref="evid-task-accept", signer_kind="user_acceptance", outcome="accepted")
+    scheduler.record_task_acceptance("task-1", evidence_ref="evid-task-accept")
     with pytest.raises(SchedulerError):
         scheduler.close_task("task-1")
     drive_to_published(scheduler, "0.6.0", "chain-b", head=HEAD_B)
@@ -684,10 +958,10 @@ def test_close_requires_every_chain_and_user_acceptance(world):
     with pytest.raises(SchedulerError) as reopened:
         scheduler.close_task("task-1")
     assert reopened.value.code == "CONFLICT_REVISION"
+    scheduler.auth.note_ancestry(main_sha=MAIN, preview_sha=PREVIEW, observed_tree=TREE, candidate_tree=TREE, is_ancestor=True)
+    scheduler.record_publish_observation("0.6.0", main_sha=MAIN, preview_sha=PREVIEW, observed_tree=TREE, candidate_tree=TREE)
     published = scheduler.publish_version(
         "0.6.0", observed_tree=TREE, candidate_tree=TREE, main_sha=MAIN, preview_sha=PREVIEW,
-        preview_is_ancestor=True, acceptance_ref="evid-accept-version", publish_ref="evid-publish-version",
-        acceptance_signer="user_acceptance",
     )
     assert published["state"] == "PUBLISHED"
     assert published["production_enabled"] is False
@@ -732,3 +1006,291 @@ def test_idempotent_register_and_cycle(world):
     with pytest.raises(SchedulerError) as cycle:
         register(scheduler, "right", files=["app/right"], deps=("left",), pr="pr-right", head="6" * 40, merge="7" * 40, tree="8" * 40)
     assert cycle.value.code == "CONFLICT_REVISION"
+
+
+def _intent_rows(root):
+    with sqlite3.connect(root / "scheduler.sqlite3") as db:
+        return db.execute("SELECT event_id, status, payload_json FROM event_intents ORDER BY producer_seq").fetchall()
+
+
+def test_joint_packages_are_not_in_this_tree():
+    assert importlib.util.find_spec("app.control_identity") is None
+    assert importlib.util.find_spec("app.control_events") is None
+    assert importlib.util.find_spec("app.control_authz") is None
+
+
+def test_c1_sign_after_normalize_and_secret_free_intent(world):
+    scheduler, auth, _events, _clock, root = world
+    boot(scheduler)
+    register(scheduler)
+    claimed = scheduler.claim_next(
+        version="0.6.0", phase="develop",
+        caller={"proof": {"double": True, "nonce": "caller-nonce"}, "lease_token": "secret-token", "signer_kind": "user_acceptance"},
+    )
+    assert claimed["claimed"] is True
+    presented = auth.signed[0]["presented"]
+    assert "proof" not in presented and "actor" not in presented
+    assert presented["idempotency_key"].startswith("idem-w04-")
+    assert "secret-token" not in json.dumps(presented)
+    assert "caller-nonce" not in json.dumps(presented)
+    assert auth.calls[0]["body"]["proof"]["nonce"] != "caller-nonce"
+    raw = (root / "scheduler.sqlite3").read_bytes()
+    assert b"caller-nonce" not in raw
+    assert b"secret-token" not in raw
+    assert b"proof" not in raw
+    assert b"lease_token" not in raw
+    assert presented["idempotency_key"].encode() in raw
+
+
+def test_c1_explicit_rejection_releases_and_unknown_holds(world):
+    scheduler, auth, _events, _clock, root = world
+    boot(scheduler)
+    register(scheduler)
+    auth.fail_code = "PROOF_INVALID"
+    with pytest.raises(SchedulerError) as rejected:
+        scheduler.claim_next(version="0.6.0", phase="develop", caller=caller())
+    assert rejected.value.code == "PROOF_INVALID"
+    released = scheduler.snapshot("0.6.0")
+    assert released["rounds"][0]["dispatch"] == "ABORTED"
+    assert next(item["queue"] for item in released["chains"] if item["chain_id"] == "chain-a") == "READY"
+    again = scheduler.claim_next(version="0.6.0", phase="develop", caller=caller())
+    assert again["claimed"] is True
+    assert len(auth.runs) == 1
+
+    auth.drop_after_commit = True
+    register(scheduler, "other", files=["app/other"], pr="pr-other", head=HEAD_B, merge=MERGE_B, tree=TREE_B)
+    with pytest.raises(SchedulerError) as lost:
+        scheduler.claim_next(version="0.6.0", phase="develop", caller=caller(), chain_id="other")
+    assert lost.value.code == "SIDE_EFFECT_UNKNOWN"
+    held = scheduler.snapshot("0.6.0")
+    other = next(item for item in held["rounds"] if item["chain_id"] == "other")
+    assert other["dispatch"] == "DISPATCH_UNKNOWN"
+    assert next(item["queue"] for item in held["chains"] if item["chain_id"] == "other") == "HELD"
+    blocked = scheduler.claim_next(version="0.6.0", phase="develop", caller=caller(), chain_id="other")
+    assert blocked["claimed"] is False
+    assert len(auth.runs) == 2
+    raw = (root / "scheduler.sqlite3").read_bytes()
+    assert all(run["token"].encode() not in raw for run in auth.runs.values())
+    auth.ambiguous_replay = True
+    ambiguous = scheduler.recover()
+    assert ambiguous["restored"] == []
+    assert scheduler.snapshot("0.6.0")["rounds"]
+    assert any(item["dispatch"] == "DISPATCH_UNKNOWN" for item in scheduler.snapshot("0.6.0")["rounds"])
+    auth.ambiguous_replay = False
+    recovered = scheduler.recover()
+    assert recovered["restored"]
+    assert recovered["restored"][0]["lease_token"] is None
+    assert len(auth.runs) == 2
+    assert all(item["dispatch"] != "DISPATCH_UNKNOWN" for item in scheduler.snapshot("0.6.0")["rounds"])
+
+
+def test_c1_cross_process_recover_does_not_guess_success(tmp_path):
+    tmp_path.chmod(0o700)
+    auth = AuthDouble(Clock(), path=tmp_path / "auth-double.json")
+    scheduler = Scheduler.open(tmp_path, auth, EventDouble(), clock=Clock(), repo_id=REPO)
+    boot(scheduler)
+    register(scheduler)
+    auth.drop_after_commit = True
+    with pytest.raises(SchedulerError):
+        scheduler.claim_next(version="0.6.0", phase="develop", caller=caller())
+    auth.ambiguous_replay = True
+    auth._save()
+    script = r"""
+import json, sys
+from pathlib import Path
+from app.control_scheduler.scheduler import Scheduler
+from tests.test_v060_w04_scheduler import AuthDouble, EventDouble, Clock, REPO
+root = Path(sys.argv[1])
+auth = AuthDouble(Clock(), path=root / "auth-double.json")
+scheduler = Scheduler.open(root, auth, EventDouble(), clock=Clock(), repo_id=REPO)
+report = scheduler.recover()
+round_row = scheduler.snapshot("0.6.0")["rounds"][0]
+print(json.dumps({
+    "dispatch": round_row["dispatch"],
+    "restored": len(report["restored"]),
+    "token": None if not report["restored"] else report["restored"][0]["lease_token"],
+    "runs": len(auth.runs),
+}))
+"""
+    repo = Path(__file__).resolve().parents[1]
+
+    def run_child():
+        return subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path)],
+            cwd=repo, check=False, capture_output=True, text=True,
+        )
+
+    first = run_child()
+    assert first.returncode == 0, first.stderr
+    guessed = json.loads(first.stdout)
+    assert guessed == {"dispatch": "DISPATCH_UNKNOWN", "restored": 0, "token": None, "runs": 1}
+    auth.ambiguous_replay = False
+    auth._save()
+    second = run_child()
+    assert second.returncode == 0, second.stderr
+    recovered = json.loads(second.stdout)
+    assert recovered["dispatch"] == "CONFIRMED"
+    assert recovered["restored"] == 1
+    assert recovered["token"] is None
+    assert recovered["runs"] == 1
+
+
+def test_c2_delivery_reconciles_after_loss_and_stops_on_rejection(world):
+    scheduler, _auth, events, _clock, root = world
+    boot(scheduler)
+    scheduler.register_chain(chain_id="early", task_id="task-1", pr_line="pr-early", files=["app/core"], worktree="wt/task-1")
+    events.reject_next = True
+    scheduler.bind_candidate("early", head=HEAD, base=BASE, merge=MERGE, tree=TREE)
+    assert [row[1] for row in _intent_rows(root)] == ["REJECTED"]
+    assert events.events == []
+    events.fail_before_store = True
+    scheduler.freeze_version("0.6.0", reason="hold", evidence_ref="evid-freeze")
+    assert [row[1] for row in _intent_rows(root)] == ["REJECTED", "PENDING"]
+    events.fail_before_store = False
+    restored = Scheduler.open(root, scheduler.auth, events, clock=Clock(), repo_id=REPO)
+    restored.recover()
+    assert [row[1] for row in _intent_rows(root)] == ["REJECTED", "DELIVERED"]
+    assert len(events.events) == 1
+    assert events.events[0]["producer_seq"] == 1
+    assert events.events[0]["trusted_source"] == "agent"
+    assert "proof" not in events.events[0]
+    first_id = events.events[0]["event_id"]
+    restored.recover()
+    assert len(events.events) == 1
+    assert events.events[0]["event_id"] == first_id
+
+
+def test_c2_ingest_pages_past_one_hundred_and_keeps_order(world):
+    scheduler, _auth, events, _clock, root = world
+    boot(scheduler)
+    registered = register(scheduler)
+    for seq in range(1, 106):
+        events.inject(external_event(
+            seq, event_type="diagnostic.observation", trusted_source="hostops_readonly",
+            state="VISIBLE", stage="diagnose", candidate_id=registered["candidate_id"], origin="control_scheduler",
+        ))
+    first = scheduler.ingest(stream_id="remote:candidate", request={"after_seq": 0, "origin": "caller"})
+    assert first["watermark"] == 105
+    assert first["applied"] == list(range(1, 106))
+    assert events.reads[:2] == [0, 100]
+    restarted = Scheduler.open(root, scheduler.auth, events, clock=Clock(), repo_id=REPO)
+    again = restarted.ingest(stream_id="remote:candidate", request={"after_seq": 0, "origin": "control_scheduler"})
+    assert again["applied"] == []
+    assert again["watermark"] == 105
+    events.inject(external_event(107, event_type="diagnostic.observation", trusted_source="hostops_readonly", state="VISIBLE", stage="diagnose", candidate_id=registered["candidate_id"]))
+    gap = restarted.ingest(stream_id="remote:candidate")
+    assert gap["gap"] is True
+    assert gap["watermark"] == 105
+    events.inject(external_event(
+        106, event_id="evt-ext-1", idempotency_key="idem-ext-1", event_type="diagnostic.observation",
+        trusted_source="hostops_readonly", state="VISIBLE", stage="diagnose", candidate_id=registered["candidate_id"],
+    ))
+    events.inject(external_event(
+        108, event_id="evt-different", idempotency_key="idem-ext-1", event_type="diagnostic.observation",
+        trusted_source="hostops_readonly", state="VISIBLE", stage="diagnose", candidate_id=registered["candidate_id"],
+    ))
+    events.inject(external_event(109, trusted_source="", candidate_id=registered["candidate_id"]))
+    paged = restarted.ingest(stream_id="remote:candidate")
+    assert 106 in paged["skipped_duplicates"]
+    assert 108 in paged["applied"]
+    assert paged["reason"] == "rejected"
+    assert paged["watermark"] == 108
+    assert next(item["state"] for item in restarted.snapshot("0.6.0")["chains"] if item["chain_id"] == "chain-a") == "OPEN"
+
+
+def test_c3_publish_binds_server_records_not_caller_strings(world):
+    scheduler, auth, _events, _clock, root = world
+    boot(scheduler)
+    register(scheduler)
+    drive_to_published(scheduler, "0.6.0", "chain-a")
+    with sqlite3.connect(root / "scheduler.sqlite3") as db:
+        raw = db.execute("SELECT evidence_json FROM chains WHERE chain_id='chain-a'").fetchone()[0]
+        evidence = json.loads(raw)
+        evidence["publish"]["tree"] = TREE_B
+        db.execute("UPDATE chains SET evidence_json=? WHERE chain_id='chain-a'", (json.dumps(evidence),))
+    auth.note_ancestry(main_sha=MAIN, preview_sha=PREVIEW, observed_tree=TREE, candidate_tree=TREE, is_ancestor=True)
+    scheduler.record_publish_observation("0.6.0", main_sha=MAIN, preview_sha=PREVIEW, observed_tree=TREE, candidate_tree=TREE)
+    with pytest.raises(SchedulerError) as tampered:
+        scheduler.publish_version("0.6.0", observed_tree=TREE, candidate_tree=TREE, main_sha=MAIN, preview_sha=PREVIEW)
+    assert tampered.value.code == "EVIDENCE_INCONSISTENT"
+    assert scheduler.snapshot("0.6.0")["version"]["state"] == "ACTIVE"
+    chain = next(item for item in scheduler.snapshot("0.6.0")["chains"] if item["chain_id"] == "chain-a")
+    with sqlite3.connect(root / "scheduler.sqlite3") as db:
+        raw = db.execute("SELECT evidence_json FROM chains WHERE chain_id='chain-a'").fetchone()[0]
+        evidence = json.loads(raw)
+        evidence["publish"]["tree"] = chain["tree"]
+        db.execute("UPDATE chains SET evidence_json=? WHERE chain_id='chain-a'", (json.dumps(evidence),))
+    for fact in auth.facts:
+        if fact.get("kind") == "publish" and fact.get("ref") == "evid-publish-chain-a":
+            fact["candidate_id"] = "cand_other"
+    with pytest.raises(SchedulerError) as crossed:
+        scheduler.publish_version("0.6.0", observed_tree=TREE, candidate_tree=TREE, main_sha=MAIN, preview_sha=PREVIEW)
+    assert crossed.value.code == "EVIDENCE_INCONSISTENT"
+
+
+def test_c3_forged_role_wrong_tree_rejected_acceptance_and_frozen_repair(world):
+    scheduler, auth, events, _clock, _root = world
+    boot(scheduler)
+    register(scheduler, "chain-a", files=["app/a"], pr="pr-a")
+    drive_to_integrating(scheduler, "0.6.0", "chain-a")
+    run_phase(scheduler, "0.6.0", "preview_merge", "chain-a")
+    scheduler.observe_remote("chain-a", kind="exact", observation_seq=1, remote_sha=HEAD, evidence_ref="evid-remote-chain-a")
+    run_phase(scheduler, "0.6.0", "deploy", "chain-a")
+    chain = next(item for item in scheduler.snapshot("0.6.0")["chains"] if item["chain_id"] == "chain-a")
+    auth.note_record(
+        "acceptance", candidate_id=chain["candidate_id"], tree=TREE_B, head=chain["head"], base=chain["base"],
+        merge=chain["merge"], ref="evid-accept-chain-a", signer_kind="user_acceptance", outcome="accepted", subject="chain-a",
+    )
+    claimed = scheduler.claim_next(version="0.6.0", phase="accept", caller=caller(), chain_id="chain-a")
+    started = scheduler.start(
+        round_id=claimed["round_id"],
+        caller=caller(lease_token=claimed["lease_token"], lease_generation=claimed["lease_generation"], expected_revision=claimed["revision"]),
+    )
+    with pytest.raises(SchedulerError) as wrong_tree:
+        scheduler.complete(
+            round_id=claimed["round_id"],
+            caller=caller(lease_token=claimed["lease_token"], lease_generation=started["lease_generation"], expected_revision=started["revision"]),
+            result="SUCCEEDED", evidence_ref="evid-accept-chain-a",
+        )
+    assert wrong_tree.value.code == "EVIDENCE_INCONSISTENT"
+    auth.note_record(
+        "acceptance", candidate_id=chain["candidate_id"], tree=chain["tree"], head=chain["head"], base=chain["base"],
+        merge=chain["merge"], ref="evid-accept-chain-a", signer_kind="agent", outcome="accepted", subject="chain-a",
+    )
+    with pytest.raises(SchedulerError) as forged:
+        scheduler.complete(
+            round_id=claimed["round_id"],
+            caller=caller(lease_token=claimed["lease_token"], lease_generation=started["lease_generation"], expected_revision=started["revision"], signer_kind="user_acceptance"),
+            result="SUCCEEDED", evidence_ref="evid-accept-chain-a",
+        )
+    assert forged.value.code == "NOT_AUTHORIZED"
+    auth.note_record(
+        "acceptance", candidate_id=chain["candidate_id"], tree=chain["tree"], head=chain["head"], base=chain["base"],
+        merge=chain["merge"], ref="evid-accept-chain-a", signer_kind="user_acceptance", outcome="rejected", subject="chain-a",
+    )
+    with pytest.raises(SchedulerError) as rejected:
+        scheduler.complete(
+            round_id=claimed["round_id"],
+            caller=caller(lease_token=claimed["lease_token"], lease_generation=started["lease_generation"], expected_revision=started["revision"], signer_kind="user_acceptance"),
+            result="SUCCEEDED", evidence_ref="evid-accept-chain-a",
+        )
+    assert rejected.value.code == "NOT_AUTHORIZED"
+    failed = scheduler.complete(
+        round_id=claimed["round_id"],
+        caller=caller(lease_token=claimed["lease_token"], lease_generation=started["lease_generation"], expected_revision=started["revision"]),
+        result="FAILED", evidence_ref="evid-reject-chain-a",
+    )
+    assert failed["state"] == "FAILED"
+    register(scheduler, "repair", files=["app/repair"], pr="pr-repair", head=HEAD_B, merge=MERGE_B, tree=TREE_B)
+    scheduler.freeze_version("0.6.0", reason="freeze", evidence_ref="evid-freeze-repair")
+    auth.note_record("intervention", subject="chain-a", ref="evid-repair", permission="authorize_repair")
+    with pytest.raises(SchedulerError) as frozen:
+        scheduler.intervene(action="authorize_repair", subject_id="chain-a", successor_id="repair", evidence_ref="evid-repair")
+    assert frozen.value.code == "FREEZE_ACTIVE"
+    assert next(item["state"] for item in scheduler.snapshot("0.6.0")["chains"] if item["chain_id"] == "chain-a") == "REJECTED"
+    auth.note_grant("authorize_repair", "chain-a")
+    repaired = scheduler.intervene(action="authorize_repair", subject_id="chain-a", successor_id="repair", evidence_ref="evid-repair")
+    assert repaired["state"] == "SUPERSEDED"
+    assert repaired["evidence_copied"] is False
+    assert repaired["production_enabled"] is False
+    assert any(event["event_type"] == "intervention.recorded" and event["state"] == "AUTHORIZED" for event in events.events)

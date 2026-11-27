@@ -8,6 +8,7 @@ evidence is allowed to move a chain or a version.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import time
@@ -33,6 +34,35 @@ TERMINAL_AUTH = frozenset({"SUCCEEDED", "FAILED", "SUPERSEDED", "CANCELLED"})
 HUMAN_AUTH = frozenset({"RETRY_WAIT", "BLOCKED", "FAILED"})
 REMOTE_HOLD = frozenset({"PUSH_INTENT", "UNKNOWN_REMOTE", "SHA_MISMATCH", "PENDING"})
 ROUTE_CLASS = "isolated-scheduler"
+EXPLICIT_REJECTION = frozenset({
+    "PROOF_INVALID",
+    "NOT_AUTHORIZED",
+    "SCHEMA_UNSUPPORTED",
+    "CONFLICT_REVISION",
+    "RECLAIM_DENIED",
+    "CANDIDATE_STALE",
+    "LEASE_FENCE_REJECTED",
+    "POLICY_DENIED",
+    "IDEMPOTENCY_PAYLOAD_MISMATCH",
+    "CAPACITY",
+    "PRODUCTION_VERIFICATION_DISABLED",
+    "FREEZE_ACTIVE",
+    "EVIDENCE_MISSING",
+    "EVIDENCE_INCONSISTENT",
+    "SCHEDULER_BYPASS_DENIED",
+    "BLIND_RETRY_DENIED",
+    "UNKNOWN_EXECUTOR",
+})
+AUTHORITY = {
+    "ci.test.finished": "macci",
+    "run.observed": "macci",
+    "deployment.commit": "host_deployer",
+    "deployment.health": "host_deployer",
+    "authorization.granted": "policy_service",
+    "authorization.revoked": "policy_service",
+    "diagnostic.observation": "hostops_readonly",
+}
+_CHANNELS = frozenset({"task", "candidate", "deployment", "resource", "diagnostic", "authorization"})
 
 _PHASE_EVIDENCE = {
     "review": "develop",
@@ -105,35 +135,44 @@ class Scheduler:
                 "UPDATE versions SET state='FROZEN', freeze_reason=?, freeze_evidence=? WHERE version=?",
                 (reason, evidence_ref, version),
             )
-        self._append_event(event_type="version.frozen", event_class="task", task_id="", run_id="", stage="integrate",
-                           state="FROZEN", revision=1, evidence_ref=evidence_ref)
+            self._intend_event(db, event_type="version.frozen", event_class="task", task_id="version", run_id="",
+                               stage="integrate", state="FROZEN", revision=1, evidence_ref=evidence_ref, app_id="scheduler")
+        self._flush_events()
         return self._public({"version": version, "state": "FROZEN"})
 
+    def record_publish_observation(self, version: str, *, main_sha: str, preview_sha: str, observed_tree: str,
+                                   candidate_tree: str) -> dict:
+        report = self._ancestry(main_sha, preview_sha, observed_tree, candidate_tree)
+        with self.store.transaction() as db:
+            self._version(db, version)
+            db.execute("UPDATE versions SET ancestry_json=? WHERE version=?", (_json(report), version))
+        return self._public({"version": version, "ancestry_recorded": True, "is_ancestor": report["is_ancestor"]})
+
     def publish_version(self, version: str, *, observed_tree: str, candidate_tree: str, main_sha: str,
-                        preview_sha: str, preview_is_ancestor: bool, acceptance_ref: str, publish_ref: str,
-                        acceptance_signer: str) -> dict:
+                        preview_sha: str) -> dict:
         observed_tree = require_sha(observed_tree, "tree")
         candidate_tree = require_sha(candidate_tree, "tree")
         main_sha = require_sha(main_sha, "main")
         preview_sha = require_sha(preview_sha, "preview")
-        self._evidence(acceptance_ref)
-        self._evidence(publish_ref)
-        if type(preview_is_ancestor) is not bool:
-            raise SchedulerError("SCHEMA_UNSUPPORTED", "ancestry must be a boolean", status=422)
+        live = self._ancestry(main_sha, preview_sha, observed_tree, candidate_tree)
         with self.store.transaction() as db:
             row = self._version(db, version)
             if row["state"] not in {"ACTIVE", "FROZEN"}:
                 raise SchedulerError("VERSION_NOT_RELEASED", "version cannot be published from this state",
                                      extra={"state": row["state"]})
-            if observed_tree == candidate_tree and not preview_is_ancestor:
+            stored = _load(row["ancestry_json"]) if row["ancestry_json"] else None
+            if stored != live:
+                raise SchedulerError("EVIDENCE_INCONSISTENT", "publish ancestry is not the stored server observation",
+                                     extra={"changed": False, "state": row["state"]})
+            if live["observed_tree"] != observed_tree or live["candidate_tree"] != candidate_tree:
+                raise SchedulerError("EVIDENCE_INCONSISTENT", "ancestry observation does not match the trees",
+                                     extra={"changed": False})
+            if observed_tree == candidate_tree and live["is_ancestor"] is not True:
                 raise SchedulerError("FREEZE_ACTIVE", "equal trees do not unfreeze a version",
                                      extra={"changed": False, "state": row["state"]})
-            if observed_tree != candidate_tree or not preview_is_ancestor:
+            if observed_tree != candidate_tree or live["is_ancestor"] is not True:
                 raise SchedulerError("EVIDENCE_MISSING", "publish requires the observed tree and preview ancestry",
                                      extra={"changed": False, "state": row["state"]})
-            if acceptance_signer != "user_acceptance":
-                raise SchedulerError("NOT_AUTHORIZED", "version acceptance requires user_acceptance", status=403,
-                                     extra={"changed": False})
             unfinished = db.execute(
                 "SELECT chain_id,state FROM chains WHERE version=? AND state!='SUPERSEDED' AND state!='PUBLISHED'",
                 (version,),
@@ -141,24 +180,22 @@ class Scheduler:
             if unfinished:
                 raise SchedulerError("VERSION_NOT_RELEASED", "necessary chains are not published",
                                      extra={"changed": False, "state": row["state"], "chains": [item["chain_id"] for item in unfinished]})
-            published = db.execute("SELECT evidence_json,candidate_id FROM chains WHERE version=? AND state='PUBLISHED'", (version,)).fetchall()
+            published = db.execute("SELECT * FROM chains WHERE version=? AND state='PUBLISHED'", (version,)).fetchall()
             if not published:
                 raise SchedulerError("VERSION_NOT_RELEASED", "a version with no published chain cannot be published",
                                      extra={"changed": False})
+            acceptance_ref = ""
+            publish_ref = ""
             for chain in published:
-                evidence = _load(chain["evidence_json"])
-                record = evidence.get("publish")
-                if not record or record.get("candidate_id") != chain["candidate_id"] or record.get("ref") != record.get("ref"):
-                    raise SchedulerError("EVIDENCE_INCONSISTENT", "published chain is missing publish evidence")
-                if not record.get("ref"):
-                    raise SchedulerError("EVIDENCE_INCONSISTENT", "published chain is missing publish evidence")
+                acceptance_ref, publish_ref = self._require_publish_binding(chain)
             db.execute(
                 """UPDATE versions SET state='PUBLISHED', acceptance_ref=?, publish_ref=?, published_tree=?,
                    main_sha=?, preview_sha=? WHERE version=?""",
                 (acceptance_ref, publish_ref, observed_tree, main_sha, preview_sha, version),
             )
-        self._append_event(event_type="version.published", event_class="task", task_id="", run_id="", stage="publish",
-                           state="PUBLISHED", revision=1, evidence_ref=publish_ref)
+            self._intend_event(db, event_type="version.published", event_class="task", task_id="version", run_id="",
+                               stage="publish", state="PUBLISHED", revision=1, evidence_ref=publish_ref, app_id="scheduler")
+        self._flush_events()
         return self._public({"version": version, "state": "PUBLISHED", "production_enabled": False})
 
     def activate_version(self, version: str, *, baseline: str) -> dict:
@@ -196,20 +233,23 @@ class Scheduler:
             )
         return self._public({"task_id": task_id, "version": version, "worktree": worktree, "closed": False})
 
-    def record_task_acceptance(self, task_id: str, *, evidence_ref: str, signer_kind: str) -> dict:
+    def record_task_acceptance(self, task_id: str, *, evidence_ref: str) -> dict:
         self._evidence(evidence_ref)
+        fact = self._server_fact("task_acceptance", subject=task_id, ref=evidence_ref)
+        if fact.get("signer_kind") != "user_acceptance" or fact.get("outcome") == "rejected":
+            raise SchedulerError("NOT_AUTHORIZED", "task acceptance requires an independent user acceptance", status=403,
+                                 extra={"changed": False})
+        if fact.get("subject") != task_id or fact.get("ref") != evidence_ref:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "task acceptance is not bound to this task", extra={"changed": False})
         with self.store.transaction() as db:
             task = self._task(db, task_id)
             if task["closed"]:
                 raise SchedulerError("CONFLICT_REVISION", "closed task cannot accept a new record")
-            if signer_kind != "user_acceptance":
-                raise SchedulerError("NOT_AUTHORIZED", "task acceptance requires user_acceptance", status=403,
-                                     extra={"changed": False})
             db.execute(
                 "UPDATE tasks SET acceptance_ref=?, acceptance_signer=? WHERE task_id=?",
-                (evidence_ref, signer_kind, task_id),
+                (fact["ref"], fact["signer_kind"], task_id),
             )
-        return self._public({"task_id": task_id, "acceptance_recorded": True, "closed": False})
+        return self._public({"task_id": task_id, "acceptance_recorded": True, "closed": False, "signer_kind": fact["signer_kind"]})
 
     def close_task(self, task_id: str) -> dict:
         with self.store.transaction() as db:
@@ -230,8 +270,9 @@ class Scheduler:
                     raise SchedulerError("EVIDENCE_INCONSISTENT", "publish evidence does not match the chain",
                                          extra={"changed": False, "closed": False})
             db.execute("UPDATE tasks SET closed=1 WHERE task_id=?", (task_id,))
-        self._append_event(event_type="task.closed", event_class="task", task_id=task_id, run_id="", stage="close",
-                           state="CLOSED", revision=1, evidence_ref=task["acceptance_ref"])
+            self._intend_event(db, event_type="task.closed", event_class="task", task_id=task_id, run_id="", stage="close",
+                               state="CLOSED", revision=1, evidence_ref=task["acceptance_ref"], app_id=task["app_id"])
+        self._flush_events()
         return self._public({"task_id": task_id, "closed": True})
 
     def register_chain(self, *, chain_id: str, task_id: str, pr_line: str, files, dependencies=(), priority: int = 0,
@@ -304,8 +345,10 @@ class Scheduler:
                 (candidate, shas[0], shas[1], shas[2], shas[3], state, chain_id),
             )
             self._recompute(db, chain["version"])
-        self._append_event(event_type="candidate.bound", event_class="candidate", task_id=chain["task_id"], run_id="",
-                           stage="develop", state="OPEN", candidate_id=candidate, revision=1)
+            self._intend_event(db, event_type="candidate.bound", event_class="candidate", task_id=chain["task_id"], run_id="",
+                               stage="develop", state="OPEN", candidate_id=candidate, revision=1, app_id=self._app_of(db, chain["task_id"]),
+                               head=shas[0], base=shas[1], merge=shas[2], tree=shas[3])
+        self._flush_events()
         return self._public({"chain_id": chain_id, "candidate_id": candidate, "state": "OPEN"})
 
     def replace_candidate(self, chain_id: str, *, head: str, base: str, merge: str, tree: str, new_chain_id: str,
@@ -346,8 +389,11 @@ class Scheduler:
                  chain["dependencies_json"], chain["priority"], self._stamp(db), candidate, *shas, _json(spec)),
             )
             self._recompute(db, chain["version"])
-        self._append_event(event_type="candidate.superseded", event_class="candidate", task_id=chain["task_id"],
-                           run_id="", stage="develop", state="SUPERSEDED", candidate_id=chain["candidate_id"], revision=1)
+            self._intend_event(db, event_type="candidate.superseded", event_class="candidate", task_id=chain["task_id"],
+                               run_id="", stage="develop", state="SUPERSEDED", candidate_id=chain["candidate_id"], revision=1,
+                               app_id=self._app_of(db, chain["task_id"]), head=chain["head"], base=chain["base"],
+                               merge=chain["merge_sha"], tree=chain["tree"])
+        self._flush_events()
         return self._public({
             "chain_id": chain_id, "state": "SUPERSEDED", "successor": new_chain_id, "candidate_id": candidate,
             "evidence_copied": False,
@@ -402,12 +448,13 @@ class Scheduler:
         result["remote_called"] = False
         return result
 
-    def complete(self, *, round_id: str, caller: dict, result: str, evidence_ref: str, signer_kind: str = "",
+    def complete(self, *, round_id: str, caller: dict, result: str, evidence_ref: str,
                  evidence_candidate: str | None = None) -> dict:
         if result not in {"SUCCEEDED", "FAILED"}:
             raise SchedulerError("SCHEMA_UNSUPPORTED", "result is not a terminal run result", status=422)
         if result == "UNKNOWN":
             raise SchedulerError("NOT_AUTHORIZED", "a caller cannot write UNKNOWN", status=403)
+        fact = None
         with self.store.transaction() as db:
             row = self._round(db, round_id)
             if row["auth_state"] not in {"LEASED", "RUNNING"} or row["dispatch"] != "CONFIRMED":
@@ -421,13 +468,17 @@ class Scheduler:
                                          extra={"changed": False})
                 if chain["state"] == "SUPERSEDED":
                     raise SchedulerError("CANDIDATE_STALE", "evidence cannot move a superseded chain", extra={"changed": False})
-                self._precheck_complete(chain, row["phase"], result, evidence_ref, signer_kind)
+                self._precheck_complete(chain, row["phase"], result, evidence_ref)
+                if result == "SUCCEEDED" and row["phase"] in {"test", "accept", "publish"}:
+                    fact = self._phase_fact(chain, row["phase"], evidence_ref)
+                elif result == "FAILED" and row["phase"] == "accept":
+                    fact = self._reject_acceptance(chain, evidence_ref)
         response = self._bound_call(round_id, caller, operation="run.complete", extra_overlay={"result": result})
         with self.store.transaction() as db:
             row = self._round(db, round_id)
             if row["chain_id"]:
-                self._apply_complete(db, row, result, evidence_ref, signer_kind)
-        response["evidence_ref"] = evidence_ref if result == "SUCCEEDED" else evidence_ref
+                self._apply_complete(db, row, result, evidence_ref, fact)
+        response["evidence_ref"] = evidence_ref
         return response
 
     def report_caller_timeout(self, *, round_id: str) -> dict:
@@ -479,9 +530,9 @@ class Scheduler:
                 (mapped, evidence_ref, row["round_id"]),
             )
             if row["chain_id"] and classification == "succeeded":
-                self._apply_complete(db, row, "SUCCEEDED", evidence_ref, "")
+                self._apply_complete(db, row, "SUCCEEDED", evidence_ref, None)
             elif row["chain_id"] and classification == "failed":
-                self._apply_complete(db, row, "FAILED", evidence_ref, "")
+                self._apply_complete(db, row, "FAILED", evidence_ref, None)
             elif row["chain_id"] and classification == "not_occurred":
                 db.execute("UPDATE chains SET queue='HUMAN_HOLD' WHERE chain_id=? AND queue='HELD'", (row["chain_id"],))
         return self._public({"run_id": run_id, "state": mapped, "resumed": False, "evidence_ref": evidence_ref})
@@ -505,8 +556,11 @@ class Scheduler:
             if chosen is None:
                 return self._public({"advanced": False, "reason": "none_ready", "pinned_pr_ignored": pinned_pr is not None})
             db.execute("UPDATE chains SET state='INTEGRATING', queue='SERIAL' WHERE chain_id=?", (chosen["chain_id"],))
-        self._append_event(event_type="chain.integrating", event_class="candidate", task_id=chosen["task_id"], run_id="",
-                           stage="integrate", state="INTEGRATING", candidate_id=chosen["candidate_id"], revision=1)
+            self._intend_event(db, event_type="chain.integrating", event_class="candidate", task_id=chosen["task_id"], run_id="",
+                               stage="integrate", state="INTEGRATING", candidate_id=chosen["candidate_id"], revision=1,
+                               app_id=self._app_of(db, chosen["task_id"]), head=chosen["head"], base=chosen["base"],
+                               merge=chosen["merge_sha"], tree=chosen["tree"])
+        self._flush_events()
         return self._public({
             "advanced": True, "chain_id": chosen["chain_id"], "pr_line": chosen["pr_line"], "state": "INTEGRATING",
             "pinned_pr_ignored": pinned_pr is not None, "remote_called": False,
@@ -575,61 +629,137 @@ class Scheduler:
         raise SchedulerError("SCHEMA_UNSUPPORTED", "intervention is not recognized", status=422)
 
     def ingest(self, *, stream_id: str, stream_epoch: int = 1, request: dict | None = None) -> dict:
-        request = request or {"side_effect": False}
-        page = self.events.query(request=request, stream_id=stream_id, stream_epoch=stream_epoch, after_seq=0, limit=100)
-        items = sorted(page.get("items") or [], key=lambda item: int(item["producer_seq"]))
-        with self.store.transaction() as db:
-            row = db.execute("SELECT seq FROM watermarks WHERE stream_id=? AND stream_epoch=?", (stream_id, stream_epoch)).fetchone()
-            watermark = 0 if row is None else int(row["seq"])
-            applied = []
-            gap = False
+        del request
+        if type(stream_epoch) is not int or isinstance(stream_epoch, bool) or stream_epoch < 1:
+            raise SchedulerError("SCHEMA_UNSUPPORTED", "stream epoch is invalid", status=422)
+        applied = []
+        skipped = []
+        gap = False
+        reason = None
+        stopped_at = None
+        watermark = 0
+        while True:
+            with self.store.transaction() as db:
+                row = db.execute(
+                    "SELECT seq FROM watermarks WHERE stream_id=? AND stream_epoch=?",
+                    (stream_id, stream_epoch),
+                ).fetchone()
+                cursor = 0 if row is None else int(row["seq"])
+            page = self._query_events(stream_id, stream_epoch, cursor, limit=100)
+            if page.get("side_effect") not in (False, None):
+                raise SchedulerError("SIDE_EFFECT_UNKNOWN", "event read had a side effect", extra={"changed": False})
+            items = sorted(page.get("items") or [], key=lambda item: int(item["producer_seq"]))
+            if not items:
+                gap = bool(page.get("gap")) and cursor == watermark
+                watermark = cursor
+                break
+            progressed = False
+            stop = False
             for item in items:
                 seq = int(item["producer_seq"])
-                if seq <= watermark:
+                if seq <= cursor:
                     continue
-                if seq != watermark + 1:
+                if seq != cursor + 1:
                     gap = True
+                    stop = True
                     break
-                key = str(item.get("idempotency_key") or "")
-                known = key and db.execute("SELECT 1 FROM applied_events WHERE idempotency_key=?", (key,)).fetchone()
-                if known or item.get("origin") == "control_scheduler":
-                    watermark = seq
-                    continue
-                if not self._apply_external(db, item):
-                    gap = False
-                    db.execute(
-                        "INSERT INTO watermarks(stream_id,stream_epoch,seq) VALUES(?,?,?) ON CONFLICT(stream_id,stream_epoch) DO UPDATE SET seq=excluded.seq",
-                        (stream_id, stream_epoch, watermark),
-                    )
-                    return self._public({"applied": applied, "gap": False, "stopped_at": seq, "reason": "illegal", "watermark": watermark})
-                watermark = seq
+                identity = self._event_identity(item, stream_id, stream_epoch)
+                if identity is None:
+                    reason = "rejected"
+                    stopped_at = seq
+                    stop = True
+                    break
+                with self.store.transaction() as db:
+                    if self._event_seen(db, identity):
+                        cursor = seq
+                        self._save_watermark(db, stream_id, stream_epoch, cursor)
+                        skipped.append(seq)
+                        progressed = True
+                        continue
+                    if not self._authoritative(item):
+                        self._remember_event(db, identity)
+                        cursor = seq
+                        self._save_watermark(db, stream_id, stream_epoch, cursor)
+                        skipped.append(seq)
+                        progressed = True
+                        continue
+                    if not self._apply_external(db, item):
+                        reason = "illegal"
+                        stopped_at = seq
+                        stop = True
+                        break
+                    self._remember_event(db, identity)
+                    cursor = seq
+                    self._save_watermark(db, stream_id, stream_epoch, cursor)
                 applied.append(seq)
-            db.execute(
-                "INSERT INTO watermarks(stream_id,stream_epoch,seq) VALUES(?,?,?) ON CONFLICT(stream_id,stream_epoch) DO UPDATE SET seq=excluded.seq",
-                (stream_id, stream_epoch, watermark),
-            )
-        return self._public({"applied": applied, "gap": gap, "watermark": watermark, "side_effect": False})
+                progressed = True
+            watermark = cursor
+            if stop or gap or reason:
+                break
+            truncated = page.get("truncated")
+            if truncated is None:
+                truncated = len(items) >= 100
+            if not truncated or not progressed:
+                break
+        body = {
+            "applied": applied, "skipped_duplicates": skipped, "gap": gap, "watermark": watermark,
+            "side_effect": False,
+        }
+        if reason:
+            body["reason"] = reason
+            body["stopped_at"] = stopped_at
+        return self._public(body)
 
     def recover(self) -> dict:
+        flushed = self._flush_events()
         with self.store.transaction() as db:
-            pending = db.execute("SELECT * FROM rounds WHERE dispatch='INTENT'").fetchall()
+            pending = db.execute(
+                "SELECT * FROM rounds WHERE dispatch IN ('INTENT','DISPATCH_UNKNOWN') ORDER BY created, round_id"
+            ).fetchall()
+            saved = [_materialize(row) for row in pending]
         restored = []
         unknown = []
-        for row in pending:
-            body = _load(row["body_json"])
+        for row in saved:
+            intent = _load(row["intent_json"])
+            self._assert_intent_secret_free(intent)
             try:
-                result = self._execute("run.claim", body)
+                result = self._dispatch(intent["operation"], intent, lease_token="")
             except SchedulerError as exc:
-                with self.store.transaction() as db:
-                    db.execute("UPDATE rounds SET dispatch='DISPATCH_UNKNOWN', auth_state='DISPATCH_UNKNOWN' WHERE round_id=?", (row["round_id"],))
+                self._hold_unknown(row["round_id"])
                 unknown.append({"round_id": row["round_id"], "code": exc.code})
                 continue
-            view = self._auth_view(result.body, replay_required=True)
+            except Exception:
+                self._hold_unknown(row["round_id"])
+                unknown.append({"round_id": row["round_id"], "code": "SIDE_EFFECT_UNKNOWN"})
+                continue
+            try:
+                view = self._recovery_view(result.body)
+            except SchedulerError as exc:
+                self._hold_unknown(row["round_id"])
+                unknown.append({"round_id": row["round_id"], "code": exc.code})
+                continue
+            if view is None or view["auth_state"] in (None, "", "UNKNOWN"):
+                self._hold_unknown(row["round_id"])
+                unknown.append({"round_id": row["round_id"], "code": "DISPATCH_UNKNOWN"})
+                continue
             with self.store.transaction() as db:
                 self._confirm(db, row["round_id"], view)
-            restored.append({"round_id": row["round_id"], "run_id": view["run_id"], "lease_token": None})
+                self._intend_event(
+                    db, event_type="run.claimed", event_class="task", task_id=intent["task_id"], run_id=view["run_id"],
+                    stage=intent.get("phase") or "", state=view["auth_state"], attempt=view["attempt"], revision=view["revision"],
+                    candidate_id=intent.get("candidate_id") or "", idempotency_key=intent["idempotency_key"],
+                    app_id=intent.get("app_id") or "scheduler", head=intent.get("head") or "", base=intent.get("base") or "",
+                    merge=intent.get("merge") or "", tree=intent.get("tree") or "",
+                )
+            self._flush_events()
+            restored.append({
+                "round_id": row["round_id"], "run_id": view["run_id"], "lease_token": view["lease_token"],
+            })
         inconsistent = self.audit()
-        return self._public({"restored": restored, "dispatch_unknown": unknown, "inconsistent": inconsistent, "tokens_stored": False})
+        return self._public({
+            "restored": restored, "dispatch_unknown": unknown, "inconsistent": inconsistent,
+            "tokens_stored": False, "events": flushed,
+        })
 
     def audit(self) -> list:
         found = []
@@ -666,28 +796,40 @@ class Scheduler:
                 raise SchedulerError("CONFLICT_REVISION", "task is not in this version")
             if self._active_subject(db, task_id=task_id, phase=phase, candidate_id=""):
                 return self._public({"claimed": False, "reason": "duplicate_claim", "state": "active"})
-            body = self._auth_body(caller, operation="run.claim", overlay={
-                "task_id": task_id, "phase": phase, "candidate_id": "", "head": "", "base": "", "merge": "", "tree": "",
-                "idempotency_key": self._idem(), "expected_revision": 0, "app_id": task["app_id"], "recovery": "",
-            })
+            self._reject_caller_secrets(caller)
+            body = self._claim_intent(
+                task_id=task_id, app_id=task["app_id"], phase=phase, candidate_id="",
+                head="", base="", merge="", tree="", object_id=task_id,
+            )
             round_id = self._new_round(db, version, None, task_id, phase, "", body)
         return self._finish_claim(round_id, body, fault, None)
 
     def _finish_claim(self, round_id: str, body: dict, fault: str | None, pinned_pr: str | None) -> dict:
         try:
-            result = self._execute("run.claim", body)
+            result = self._dispatch(body["operation"], body, lease_token="")
         except SchedulerError as exc:
-            self._abort_intent(round_id)
+            self._settle_claim_failure(round_id, exc)
             raise SchedulerError(exc.code, exc.message, status=exc.status, extra={**exc.extra, "changed": False}) from exc
+        except Exception as exc:
+            self._hold_unknown(round_id)
+            raise SchedulerError("SIDE_EFFECT_UNKNOWN", "remote claim result is unknown", status=503, extra={"changed": False}) from exc
         if fault == "after-auth-before-confirm":
             raise SchedulerError("CRASH_INJECTED", "isolated fault before confirm", status=500, extra={"changed": False})
         view = self._auth_view(result.body, replay_required=False)
+        if view["auth_state"] in (None, "", "UNKNOWN"):
+            self._hold_unknown(round_id)
+            raise SchedulerError("SIDE_EFFECT_UNKNOWN", "claim result did not name a usable state", extra={"changed": False})
         with self.store.transaction() as db:
             self._confirm(db, round_id, view)
             row = self._round(db, round_id)
-        self._append_event(event_type="run.claimed", event_class="task", task_id=row["task_id"], run_id=view["run_id"],
-                           stage=row["phase"], state=view["auth_state"], attempt=view["attempt"], revision=view["revision"],
-                           candidate_id=row["candidate_id"], idempotency_key=row["idempotency_key"])
+            task = self._task(db, row["task_id"])
+            self._intend_event(
+                db, event_type="run.claimed", event_class="task", task_id=row["task_id"], run_id=view["run_id"],
+                stage=row["phase"], state=view["auth_state"], attempt=view["attempt"], revision=view["revision"],
+                candidate_id=row["candidate_id"], idempotency_key=row["idempotency_key"], app_id=task["app_id"],
+                head=body.get("head") or "", base=body.get("base") or "", merge=body.get("merge") or "", tree=body.get("tree") or "",
+            )
+        self._flush_events()
         return self._public({
             "claimed": True, "round_id": round_id, "run_id": view["run_id"], "attempt": view["attempt"],
             "lease_generation": view["generation"], "revision": view["revision"], "state": view["auth_state"],
@@ -700,31 +842,27 @@ class Scheduler:
             row = self._round(db, round_id)
             if row["dispatch"] != "CONFIRMED" or not row["run_id"]:
                 raise SchedulerError("CONFLICT_REVISION", "round is not confirmed", extra={"changed": False, "state": row["auth_state"]})
-            overlay = {
-                "run_id": row["run_id"],
-                "task_id": row["task_id"],
-                "phase": row["phase"],
-                "candidate_id": row["candidate_id"],
-                "idempotency_key": self._idem(),
-                "expected_revision": row["revision"] if row["revision"] is not None else 0,
-                "lease_generation": row["generation"],
-            }
+            self._reject_caller_secrets(caller)
+            if "lease_token" not in caller or caller.get("lease_token") in (None, ""):
+                raise SchedulerError("LEASE_FENCE_REJECTED", "current token is required", extra={"changed": False, "state": row["auth_state"]})
+            token = str(caller["lease_token"])
+            task = self._task(db, row["task_id"])
+            intent = self._bound_intent(row, task["app_id"], operation)
             if row["chain_id"]:
                 chain = self._chain(db, row["chain_id"])
-                overlay.update({"head": chain["head"], "base": chain["base"], "merge": chain["merge_sha"], "tree": chain["tree"]})
+                intent.update({"head": chain["head"], "base": chain["base"], "merge": chain["merge_sha"], "tree": chain["tree"]})
             if "expected_revision" in caller:
-                overlay["expected_revision"] = caller["expected_revision"]
+                intent["expected_revision"] = caller["expected_revision"]
             if "lease_generation" in caller:
-                overlay["lease_generation"] = caller["lease_generation"]
-            if "lease_token" not in caller:
-                raise SchedulerError("LEASE_FENCE_REJECTED", "current token is required", extra={"changed": False, "state": row["auth_state"]})
-            overlay["lease_token"] = caller["lease_token"]
+                intent["lease_generation"] = caller["lease_generation"]
             if extra_overlay:
-                overlay.update(extra_overlay)
-            body = self._auth_body(caller, operation=operation, overlay=overlay)
+                for key, value in extra_overlay.items():
+                    if key in {"proof", "actor", "lease_token", "signer_kind"}:
+                        continue
+                    intent[key] = value
             before = row["auth_state"]
         try:
-            result = self._execute(operation, body)
+            result = self._dispatch(operation, intent, lease_token=token)
         except SchedulerError as exc:
             raise SchedulerError(exc.code, exc.message, status=exc.status, extra={**exc.extra, "changed": False, "state": before}) from exc
         view = self._auth_view(result.body, replay_required=False)
@@ -739,14 +877,19 @@ class Scheduler:
             "lease_token": view["lease_token"], "changed": True,
         })
 
-    def _apply_complete(self, db, row, result: str, evidence_ref: str, signer_kind: str) -> None:
+    def _apply_complete(self, db, row, result: str, evidence_ref: str, fact) -> None:
         chain = self._chain(db, row["chain_id"])
         phase = row["phase"]
         evidence = _load(chain["evidence_json"])
         if result == "SUCCEEDED":
+            signer = ""
+            ref = evidence_ref
+            if isinstance(fact, dict):
+                signer = str(fact.get("signer_kind") or "")
+                ref = str(fact.get("ref") or evidence_ref)
             evidence[phase] = {
-                "ref": evidence_ref, "candidate_id": chain["candidate_id"], "head": chain["head"],
-                "base": chain["base"], "merge": chain["merge_sha"], "tree": chain["tree"], "signer_kind": signer_kind,
+                "ref": ref, "candidate_id": chain["candidate_id"], "head": chain["head"],
+                "base": chain["base"], "merge": chain["merge_sha"], "tree": chain["tree"], "signer_kind": signer,
             }
         queue = "READY"
         state = chain["state"]
@@ -777,11 +920,9 @@ class Scheduler:
         if queue == "RELEASED":
             self._recompute(db, chain["version"])
 
-    def _precheck_complete(self, chain, phase: str, result: str, evidence_ref: str, signer_kind: str) -> None:
+    def _precheck_complete(self, chain, phase: str, result: str, evidence_ref: str) -> None:
         if result == "SUCCEEDED":
             self._evidence(evidence_ref)
-        if phase == "accept" and result == "SUCCEEDED" and signer_kind != "user_acceptance":
-            raise SchedulerError("NOT_AUTHORIZED", "chain acceptance requires user_acceptance", status=403, extra={"changed": False})
         if phase == "publish" and result == "SUCCEEDED":
             self._evidence(evidence_ref)
             if chain["state"] != "SATISFIED":
@@ -875,20 +1016,38 @@ class Scheduler:
             if row["auth_state"] not in HUMAN_AUTH and action == "retry_phase":
                 raise SchedulerError("CONFLICT_REVISION", "retry requires a finished non-running round",
                                      extra={"changed": False, "state": row["auth_state"]})
-            if row["auth_state"] == "RETRY_WAIT":
-                pass
             chain = self._chain(db, row["chain_id"]) if row["chain_id"] else None
             if chain and chain["state"] in {"FAILED", "REJECTED", "SUPERSEDED"}:
                 raise SchedulerError("CONFLICT_REVISION", "a failed chain needs a new chain", extra={"changed": False, "state": chain["state"]})
-            if chain and chain["queue"] == "HUMAN_HOLD":
-                db.execute("UPDATE chains SET queue='READY' WHERE chain_id=?", (chain["chain_id"],))
-            version = row["version"]
+            version_id = row["version"]
+            version = self._version(db, version_id)
+            held = bool(chain and chain["queue"] == "HUMAN_HOLD")
+            version_state = version["state"]
             phase = row["phase"]
             chain_id = row["chain_id"]
             task_id = row["task_id"]
             previous_run_id = row["run_id"]
+            candidate_id = chain["candidate_id"] if chain else ""
+            tree = chain["tree"] if chain else ""
+            head = chain["head"] if chain else ""
+            base = chain["base"] if chain else ""
+            merge = chain["merge_sha"] if chain else ""
+        self._authorize_manual(
+            action, round_id, evidence_ref, version_state=version_state, candidate_id=candidate_id, tree=tree,
+            task_id=task_id, head=head, base=base, merge=merge,
+        )
+        with self.store.transaction() as db:
+            if held and chain_id:
+                db.execute("UPDATE chains SET queue='READY' WHERE chain_id=? AND queue='HUMAN_HOLD'", (chain_id,))
+            self._intend_event(
+                db, event_type="intervention.recorded", event_class="authorization" if all((head, base, merge, tree)) else "task",
+                task_id=task_id, run_id=previous_run_id or "", stage=action, state="AUTHORIZED", revision=1,
+                evidence_ref=evidence_ref, app_id=self._app_of(db, task_id), candidate_id=candidate_id,
+                head=head, base=base, merge=merge, tree=tree, operation=action,
+            )
+        self._flush_events()
         claimed = self.claim_next(
-            version=version, phase=phase, caller={**caller, "task_id": task_id}, chain_id=chain_id, allow_human=True,
+            version=version_id, phase=phase, caller={**caller, "task_id": task_id}, chain_id=chain_id, allow_human=True,
         )
         claimed["previous_run_id"] = previous_run_id
         claimed["evidence_ref"] = evidence_ref
@@ -901,8 +1060,25 @@ class Scheduler:
             if chain["state"] != "FAILED":
                 raise SchedulerError("CONFLICT_REVISION", "only a failed chain can be superseded this way",
                                      extra={"state": chain["state"], "changed": False})
+            version = self._version(db, chain["version"])
+        self._authorize_manual(
+            "supersede_failed", chain_id, evidence_ref, version_state=version["state"], candidate_id=chain["candidate_id"],
+            tree=chain["tree"], task_id=chain["task_id"], head=chain["head"], base=chain["base"], merge=chain["merge_sha"],
+        )
+        with self.store.transaction() as db:
+            chain = self._chain(db, chain_id)
+            if chain["state"] != "FAILED":
+                raise SchedulerError("CONFLICT_REVISION", "only a failed chain can be superseded this way",
+                                     extra={"state": chain["state"], "changed": False})
             db.execute("UPDATE chains SET state='SUPERSEDED', queue='RELEASED' WHERE chain_id=?", (chain_id,))
             self._recompute(db, chain["version"])
+            self._intend_event(
+                db, event_type="intervention.recorded", event_class="authorization", task_id=chain["task_id"], run_id="",
+                stage="supersede_failed", state="AUTHORIZED", revision=1, evidence_ref=evidence_ref,
+                app_id=self._app_of(db, chain["task_id"]), candidate_id=chain["candidate_id"], head=chain["head"],
+                base=chain["base"], merge=chain["merge_sha"], tree=chain["tree"], operation="supersede_failed",
+            )
+        self._flush_events()
         return self._public({"chain_id": chain_id, "state": "SUPERSEDED", "evidence_ref": evidence_ref, "evidence_copied": False})
 
     def _authorize_repair(self, chain_id: str, successor_id: str, evidence_ref: str) -> dict:
@@ -911,17 +1087,45 @@ class Scheduler:
         with self.store.transaction() as db:
             chain = self._chain(db, chain_id)
             successor = self._chain(db, successor_id)
+            version = self._version(db, chain["version"])
             if chain["state"] != "REJECTED":
                 raise SchedulerError("CONFLICT_REVISION", "repair starts from a rejected chain", extra={"state": chain["state"]})
             if successor["task_id"] != chain["task_id"] or not successor["candidate_id"]:
                 raise SchedulerError("CANDIDATE_STALE", "repair chain is not a new candidate", extra={"changed": False})
             if _load(successor["evidence_json"]):
                 raise SchedulerError("EVIDENCE_INCONSISTENT", "old evidence cannot move to the repair chain", extra={"changed": False})
+        self._authorize_manual(
+            "authorize_repair", chain_id, evidence_ref, version_state=version["state"], candidate_id=successor["candidate_id"],
+            tree=successor["tree"], task_id=chain["task_id"], head=successor["head"], base=successor["base"],
+            merge=successor["merge_sha"],
+        )
+        with self.store.transaction() as db:
+            chain = self._chain(db, chain_id)
+            successor = self._chain(db, successor_id)
+            if chain["state"] != "REJECTED":
+                raise SchedulerError("CONFLICT_REVISION", "repair starts from a rejected chain", extra={"state": chain["state"], "changed": False})
+            if _load(successor["evidence_json"]):
+                raise SchedulerError("EVIDENCE_INCONSISTENT", "old evidence cannot move to the repair chain", extra={"changed": False})
             db.execute("UPDATE chains SET state='SUPERSEDED', queue='RELEASED', superseded_by=? WHERE chain_id=?", (successor_id, chain_id))
             self._recompute(db, chain["version"])
+            self._intend_event(
+                db, event_type="intervention.recorded", event_class="authorization", task_id=chain["task_id"], run_id="",
+                stage="authorize_repair", state="AUTHORIZED", revision=1, evidence_ref=evidence_ref,
+                app_id=self._app_of(db, chain["task_id"]), candidate_id=successor["candidate_id"], head=successor["head"],
+                base=successor["base"], merge=successor["merge_sha"], tree=successor["tree"], operation="authorize_repair",
+            )
+        self._flush_events()
         return self._public({"chain_id": chain_id, "state": "SUPERSEDED", "successor": successor_id, "evidence_copied": False, "evidence_ref": evidence_ref})
 
     def _retarget(self, chain_id: str, successor_id: str, evidence_ref: str) -> dict:
+        with self.store.transaction() as db:
+            chain = self._chain(db, chain_id)
+            successor = self._chain(db, successor_id)
+            version = self._version(db, chain["version"])
+        self._authorize_manual(
+            "retarget_dependency", chain_id, evidence_ref, version_state=version["state"], candidate_id=chain["candidate_id"],
+            tree=chain["tree"], task_id=chain["task_id"], head=chain["head"], base=chain["base"], merge=chain["merge_sha"],
+        )
         with self.store.transaction() as db:
             chain = self._chain(db, chain_id)
             successor = self._chain(db, successor_id)
@@ -934,6 +1138,13 @@ class Scheduler:
             db.execute("UPDATE chains SET dependencies_json=? WHERE chain_id=?", (_json(deps), chain_id))
             self._recompute(db, chain["version"])
             stored = self._chain(db, chain_id)
+            self._intend_event(
+                db, event_type="intervention.recorded", event_class="authorization", task_id=chain["task_id"], run_id="",
+                stage="retarget_dependency", state="AUTHORIZED", revision=1, evidence_ref=evidence_ref,
+                app_id=self._app_of(db, chain["task_id"]), candidate_id=chain["candidate_id"], head=chain["head"],
+                base=chain["base"], merge=chain["merge_sha"], tree=chain["tree"], operation="retarget_dependency",
+            )
+        self._flush_events()
         return self._public({"chain_id": chain_id, "queue": stored["queue"], "dependencies": _load(stored["dependencies_json"]), "evidence_ref": evidence_ref})
 
     def _abandon(self, version: str, evidence_ref: str) -> dict:
@@ -943,7 +1154,19 @@ class Scheduler:
                 raise SchedulerError("SIDE_EFFECT_UNKNOWN", "version has an unknown or open remote effect", extra={"changed": False})
             if db.execute("SELECT 1 FROM chains WHERE version=? AND remote_status='UNKNOWN_REMOTE'", (version,)).fetchone():
                 raise SchedulerError("SIDE_EFFECT_UNKNOWN", "remote outcome is unknown", extra={"changed": False})
+            state = row["state"]
+        self._authorize_manual("abandon_version", version, evidence_ref, version_state=state, task_id="version")
+        with self.store.transaction() as db:
+            row = self._version(db, version)
+            if self._version_blocked(db, version) or self._serial_held(db, version):
+                raise SchedulerError("SIDE_EFFECT_UNKNOWN", "version has an unknown or open remote effect", extra={"changed": False})
             db.execute("UPDATE versions SET state='ABANDONED', publish_ref=? WHERE version=?", (evidence_ref, version))
+            self._intend_event(
+                db, event_type="intervention.recorded", event_class="task", task_id="version", run_id="",
+                stage="abandon_version", state="ABANDONED", revision=1, evidence_ref=evidence_ref, app_id="scheduler",
+                operation="abandon_version",
+            )
+        self._flush_events()
         return self._public({"version": version, "state": "ABANDONED", "evidence_ref": evidence_ref, "production_enabled": False})
 
     def _select_chain(self, db, version: str, phase: str, chain_id: str | None, allow_human: bool = False):
@@ -989,24 +1212,28 @@ class Scheduler:
 
     def _active_subject(self, db, *, task_id: str, phase: str, candidate_id: str, allow_human: bool = False) -> bool:
         row = db.execute(
-            """SELECT auth_state FROM rounds WHERE task_id=? AND phase=? AND candidate_id=? AND dispatch='CONFIRMED'
+            """SELECT auth_state, dispatch FROM rounds WHERE task_id=? AND phase=? AND candidate_id=?
+               AND dispatch IN ('CONFIRMED','DISPATCH_UNKNOWN')
                ORDER BY created DESC LIMIT 1""",
             (task_id, phase, candidate_id),
         ).fetchone()
         if row is None:
             return False
+        if row["dispatch"] == "DISPATCH_UNKNOWN":
+            return True
         if allow_human and row["auth_state"] in HUMAN_AUTH:
             return False
         return row["auth_state"] not in TERMINAL_AUTH
 
     def _insert_intent(self, db, chain, phase: str, caller: dict, *, expected_revision: int):
         task = self._task(db, chain["task_id"])
-        body = self._auth_body(caller, operation="run.claim", overlay={
-            "task_id": chain["task_id"], "phase": phase, "candidate_id": chain["candidate_id"],
-            "head": chain["head"], "base": chain["base"], "merge": chain["merge_sha"], "tree": chain["tree"],
-            "idempotency_key": self._idem(), "expected_revision": expected_revision, "app_id": task["app_id"],
-            "recovery": "",
-        })
+        self._reject_caller_secrets(caller)
+        body = self._claim_intent(
+            task_id=chain["task_id"], app_id=task["app_id"], phase=phase, candidate_id=chain["candidate_id"],
+            head=chain["head"], base=chain["base"], merge=chain["merge_sha"], tree=chain["tree"],
+            object_id=chain["chain_id"],
+        )
+        body["expected_revision"] = expected_revision
         round_id = self._new_round(db, chain["version"], chain["chain_id"], chain["task_id"], phase, chain["candidate_id"], body)
         db.execute("UPDATE chains SET queue='HELD' WHERE chain_id=?", (chain["chain_id"],))
         return round_id, body
@@ -1014,9 +1241,9 @@ class Scheduler:
     def _new_round(self, db, version, chain_id, task_id, phase, candidate_id, body) -> str:
         round_id = "rnd_" + secrets.token_hex(8)
         db.execute(
-            """INSERT INTO rounds(round_id,version,chain_id,task_id,phase,candidate_id,idempotency_key,body_json,dispatch,created)
+            """INSERT INTO rounds(round_id,version,chain_id,task_id,phase,candidate_id,idempotency_key,intent_json,dispatch,created)
                VALUES(?,?,?,?,?,?,?,?,'INTENT',?)""",
-            (round_id, version, chain_id, task_id, phase, candidate_id, body["idempotency_key"], _json(body), self._stamp(db)),
+            (round_id, version, chain_id, task_id, phase, candidate_id, body["idempotency_key"], _json(self._persisted_intent(body)), self._stamp(db)),
         )
         return round_id
 
@@ -1038,28 +1265,378 @@ class Scheduler:
                 chain = self._chain(db, row["chain_id"])
                 self._recompute(db, chain["version"])
 
-    def _auth_body(self, caller: dict, *, operation: str, overlay: dict) -> dict:
+    def _reject_caller_secrets(self, caller: dict) -> None:
         if not isinstance(caller, dict):
             raise SchedulerError("SCHEMA_UNSUPPORTED", "caller is required", status=422)
         if "received_at" in caller:
             raise SchedulerError("SCHEMA_UNSUPPORTED", "received_at is server-owned", status=422)
         if caller.get("state") == "UNKNOWN" or caller.get("result") == "UNKNOWN":
             raise SchedulerError("NOT_AUTHORIZED", "a caller cannot write UNKNOWN", status=403)
-        body = dict(caller)
-        for dropped in ("ttl", "occurred_at", "received_at", "expires_at", "state"):
-            body.pop(dropped, None)
-        if operation == "run.claim":
-            body.pop("run_id", None)
-            body.pop("lease_token", None)
-            body.pop("lease_generation", None)
-            body["recovery"] = ""
-        body["schema_version"] = 2
-        body.update(overlay)
-        body["schema_version"] = 2
-        if operation == "run.claim":
-            body.pop("run_id", None)
-            body["recovery"] = ""
+
+    def _claim_intent(self, *, task_id, app_id, phase, candidate_id, head, base, merge, tree, object_id) -> dict:
+        return {
+            "operation": "run.claim",
+            "task_id": task_id,
+            "app_id": app_id,
+            "phase": phase,
+            "candidate_id": candidate_id or "",
+            "head": head or "",
+            "base": base or "",
+            "merge": merge or "",
+            "tree": tree or "",
+            "object_id": object_id,
+            "idempotency_key": self._idem(),
+            "expected_revision": 0,
+            "recovery": "",
+            "result": "",
+            "run_id": "",
+            "lease_generation": 0,
+            "action": "",
+            "release_version": "",
+        }
+
+    def _bound_intent(self, row, app_id: str, operation: str) -> dict:
+        return {
+            "operation": operation,
+            "task_id": row["task_id"],
+            "app_id": app_id,
+            "phase": row["phase"],
+            "candidate_id": row["candidate_id"] or "",
+            "head": "",
+            "base": "",
+            "merge": "",
+            "tree": "",
+            "object_id": row["chain_id"] or row["task_id"],
+            "idempotency_key": self._idem(),
+            "expected_revision": row["revision"] if row["revision"] is not None else 0,
+            "recovery": "",
+            "result": "",
+            "run_id": row["run_id"] or "",
+            "lease_generation": row["generation"] if row["generation"] is not None else 0,
+            "action": "",
+            "release_version": "",
+        }
+
+    def _persisted_intent(self, intent: dict) -> dict:
+        kept = {
+            "operation": intent.get("operation") or "",
+            "task_id": intent.get("task_id") or "",
+            "app_id": intent.get("app_id") or "",
+            "phase": intent.get("phase") or "",
+            "candidate_id": intent.get("candidate_id") or "",
+            "head": intent.get("head") or "",
+            "base": intent.get("base") or "",
+            "merge": intent.get("merge") or "",
+            "tree": intent.get("tree") or "",
+            "object_id": intent.get("object_id") or "",
+            "idempotency_key": intent.get("idempotency_key") or "",
+            "expected_revision": int(intent.get("expected_revision") or 0),
+            "recovery": intent.get("recovery") or "",
+            "result": intent.get("result") or "",
+            "run_id": "",
+            "lease_generation": 0,
+            "action": intent.get("action") or "",
+            "release_version": intent.get("release_version") or "",
+        }
+        self._assert_intent_secret_free(kept)
+        return kept
+
+    def _assert_intent_secret_free(self, intent: dict) -> None:
+        forbidden = {"proof", "actor", "lease_token", "signature", "nonce", "session_id", "token"}
+        found = sorted(forbidden.intersection(intent))
+        if found:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "persisted intent contains a secret", extra={"changed": False})
+
+    def _normalize(self, operation: str, intent: dict, *, lease_token: str) -> dict:
+        task_id = str(intent.get("task_id") or "")
+        phase = str(intent.get("phase") or "")
+        app_id = str(intent.get("app_id") or "")
+        object_id = str(intent.get("object_id") or task_id)
+        scope_name = "policy" if operation == "policy.evaluate" else "run"
+        scope = {
+            "repo": self.repo_id,
+            "task_id": task_id,
+            "app_id": app_id,
+            "credential_scope": scope_name,
+            "phase": phase,
+            "object_id": object_id,
+        }
+        run_id = "" if operation == "run.claim" else str(intent.get("run_id") or "")
+        generation = 0 if operation == "run.claim" else int(intent.get("lease_generation") or 0)
+        return {
+            "schema_version": 2,
+            "operation": operation,
+            "authorizer": "w04-scheduler",
+            "repo_id": self.repo_id,
+            "task_id": task_id,
+            "app_id": app_id,
+            "target_app_id": "",
+            "producer_id": self.producer_id,
+            "stream_id": f"{self.producer_id}:task",
+            "object_id": object_id,
+            "phase": phase,
+            "action": str(intent.get("action") or ""),
+            "result": str(intent.get("result") or ""),
+            "candidate_id": str(intent.get("candidate_id") or ""),
+            "head": str(intent.get("head") or ""),
+            "base": str(intent.get("base") or ""),
+            "merge": str(intent.get("merge") or ""),
+            "tree": str(intent.get("tree") or ""),
+            "policy_revision": 1,
+            "credential_scope": scope_name,
+            "credential_generation": 0,
+            "scope": scope,
+            "idempotency_key": str(intent.get("idempotency_key") or ""),
+            "expected_revision": int(intent.get("expected_revision") or 0),
+            "run_id": run_id,
+            "lease_generation": generation,
+            "lease_token": lease_token,
+            "session_id": "",
+            "effect_id": "",
+            "requested_operation": "",
+            "scope_to_rotate": "",
+            "target_signer": "",
+            "recovery": "" if operation == "run.claim" else str(intent.get("recovery") or ""),
+            "release_version": str(intent.get("release_version") or ""),
+            "method": "POST",
+            "path": self._route_path(operation, task_id, run_id, str(intent.get("release_version") or "")),
+            "query": "",
+        }
+
+    def _route_path(self, operation: str, task_id: str, run_id: str, version: str) -> str:
+        paths = {
+            "run.claim": f"/api/v1/control/tasks/{task_id}:claim" if task_id else "",
+            "run.renew": f"/api/v1/control/tasks/{task_id}:renew" if task_id else "",
+            "run.start": f"/api/v1/control/runs/{run_id}:start" if run_id else "",
+            "run.complete": f"/api/v1/control/runs/{run_id}:complete" if run_id else "",
+            "run.heartbeat": f"/api/v1/control/runs/{run_id}:heartbeat" if run_id else "",
+            "run.release": f"/api/v1/control/runs/{run_id}:release" if run_id else "",
+            "policy.evaluate": "/api/v1/control/policy:evaluate",
+            "release.accept": f"/api/v1/control/releases/{version}:accept" if version else "",
+            "release.reject": f"/api/v1/control/releases/{version}:reject" if version else "",
+            "release.publish": f"/api/v1/control/releases/{version}:publish" if version else "",
+        }
+        return paths.get(operation, "")
+
+    def _seal(self, operation: str, normalized: dict):
+        if not isinstance(normalized, dict) or "proof" in normalized or "actor" in normalized:
+            raise SchedulerError("SCHEMA_UNSUPPORTED", "a request cannot be signed before it is normalized", status=422)
+        signed = self.auth.sign(operation, dict(normalized))
+        if not isinstance(signed, dict):
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "signer did not return the request", extra={"changed": False})
+        for key, value in normalized.items():
+            if signed.get(key) != value:
+                raise SchedulerError("EVIDENCE_INCONSISTENT", "signer changed the normalized request", extra={"changed": False})
+        if not isinstance(signed.get("proof"), dict) or not signed["proof"]:
+            raise SchedulerError("PROOF_INVALID", "trusted signature is missing", status=403, extra={"changed": False})
+        return signed
+
+    def _dispatch(self, operation: str, intent: dict, *, lease_token: str):
+        normalized = self._normalize(operation, intent, lease_token=lease_token)
+        signed = self._seal(operation, normalized)
+        return self._execute(operation, signed)
+
+    def _settle_claim_failure(self, round_id: str, exc: SchedulerError) -> None:
+        if exc.code in EXPLICIT_REJECTION:
+            self._abort_intent(round_id)
+            return
+        self._hold_unknown(round_id)
+
+    def _hold_unknown(self, round_id: str) -> None:
+        with self.store.transaction() as db:
+            row = self._round(db, round_id)
+            if row["dispatch"] not in {"INTENT", "DISPATCH_UNKNOWN"}:
+                return
+            db.execute(
+                "UPDATE rounds SET dispatch='DISPATCH_UNKNOWN', auth_state='DISPATCH_UNKNOWN' WHERE round_id=?",
+                (round_id,),
+            )
+
+    def _recovery_view(self, body: dict):
+        if not isinstance(body, dict) or type(body.get("replayed")) is not bool:
+            return None
+        if body["replayed"] is True:
+            if body.get("lease_token") is not None:
+                raise SchedulerError("LEASE_REPLAY_LEAKED", "replay returned a lease token", extra={"changed": False})
+            original = body.get("original_result")
+            if not isinstance(original, dict) or "run_id" not in original or "lease_generation" not in original:
+                return None
+            state = body.get("current_state") or original.get("state")
+            if state in (None, ""):
+                return None
+            return {
+                "run_id": original["run_id"],
+                "attempt": original.get("attempt"),
+                "generation": original["lease_generation"],
+                "revision": original.get("revision"),
+                "auth_state": state,
+                "lease_token": None,
+            }
+        if body.get("state") != "LEASED" or "run_id" not in body or "lease_generation" not in body:
+            return None
+        return {
+            "run_id": body["run_id"],
+            "attempt": body.get("attempt"),
+            "generation": body["lease_generation"],
+            "revision": body.get("revision"),
+            "auth_state": "LEASED",
+            "lease_token": body.get("lease_token"),
+        }
+
+    def _server_fact(self, kind: str, **binding) -> dict:
+        try:
+            fact = self.auth.verified_record(kind, **binding)
+        except SchedulerError:
+            raise
+        except Exception as exc:
+            self._reraise(exc)
+        if not isinstance(fact, dict):
+            raise SchedulerError("EVIDENCE_MISSING", "server evidence record is missing", extra={"changed": False})
+        return fact
+
+    def _ancestry(self, main_sha: str, preview_sha: str, observed_tree: str, candidate_tree: str) -> dict:
+        try:
+            report = self.auth.observe_ancestry(
+                main_sha=main_sha, preview_sha=preview_sha, observed_tree=observed_tree, candidate_tree=candidate_tree,
+            )
+        except SchedulerError:
+            raise
+        except Exception as exc:
+            self._reraise(exc)
+        if not isinstance(report, dict) or type(report.get("is_ancestor")) is not bool:
+            raise SchedulerError("EVIDENCE_MISSING", "ancestry observation is missing", extra={"changed": False})
+        if report.get("source") in (None, "", "caller"):
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "ancestry observation has no server source", extra={"changed": False})
+        return {
+            "is_ancestor": report["is_ancestor"],
+            "main_sha": main_sha,
+            "preview_sha": preview_sha,
+            "observed_tree": observed_tree,
+            "candidate_tree": candidate_tree,
+            "source": report["source"],
+        }
+
+    def _binding(self, chain) -> dict:
+        return {
+            "candidate_id": chain["candidate_id"],
+            "tree": chain["tree"],
+            "head": chain["head"],
+            "base": chain["base"],
+            "merge": chain["merge_sha"],
+        }
+
+    def _phase_fact(self, chain, phase: str, evidence_ref: str) -> dict:
+        binding = self._binding(chain)
+        if phase == "test":
+            fact = self._server_fact("test", **binding, ref=evidence_ref)
+            if fact.get("signer_kind") != "macci":
+                raise SchedulerError("NOT_AUTHORIZED", "test evidence requires the independent test signer", status=403,
+                                     extra={"changed": False})
+        elif phase == "accept":
+            fact = self._server_fact("acceptance", **binding, ref=evidence_ref)
+            if fact.get("signer_kind") != "user_acceptance" or fact.get("outcome") == "rejected":
+                raise SchedulerError("NOT_AUTHORIZED", "chain acceptance requires an independent user acceptance", status=403,
+                                     extra={"changed": False})
+        elif phase == "publish":
+            acceptance = self._server_fact("acceptance", **binding)
+            test = self._server_fact("test", **binding)
+            if acceptance.get("signer_kind") != "user_acceptance" or acceptance.get("outcome") != "accepted":
+                raise SchedulerError("NOT_AUTHORIZED", "publish requires an accepted user record for this candidate", status=403,
+                                     extra={"changed": False})
+            if acceptance.get("candidate_id") != chain["candidate_id"] or acceptance.get("tree") != chain["tree"]:
+                raise SchedulerError("EVIDENCE_INCONSISTENT", "acceptance is not bound to this candidate", extra={"changed": False})
+            if test.get("candidate_id") != chain["candidate_id"] or test.get("tree") != chain["tree"] or test.get("signer_kind") != "macci":
+                raise SchedulerError("EVIDENCE_INCONSISTENT", "test evidence is not bound to this candidate", extra={"changed": False})
+            fact = self._server_fact("publish", **binding, ref=evidence_ref)
+        else:
+            raise SchedulerError("SCHEMA_UNSUPPORTED", "phase has no server evidence", status=422)
+        if fact.get("candidate_id") != chain["candidate_id"] or fact.get("tree") != chain["tree"] or fact.get("ref") != evidence_ref:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "evidence is not bound to this candidate", extra={"changed": False})
+        if fact.get("head") not in (None, "", chain["head"]) or fact.get("base") not in (None, "", chain["base"]):
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "evidence tuple does not match the chain", extra={"changed": False})
+        if fact.get("merge") not in (None, "", chain["merge_sha"]):
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "evidence tuple does not match the chain", extra={"changed": False})
+        return fact
+
+    def _reject_acceptance(self, chain, evidence_ref: str) -> dict:
+        self._evidence(evidence_ref)
+        try:
+            fact = self.auth.reject_acceptance(**self._binding(chain), ref=evidence_ref)
+        except SchedulerError:
+            raise
+        except Exception as exc:
+            self._reraise(exc)
+        if not isinstance(fact, dict) or fact.get("outcome") != "rejected" or fact.get("signer_kind") != "user_acceptance":
+            raise SchedulerError("NOT_AUTHORIZED", "rejection was not recorded by the user signer", status=403, extra={"changed": False})
+        if fact.get("candidate_id") != chain["candidate_id"] or fact.get("tree") != chain["tree"]:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "rejection is not bound to this candidate", extra={"changed": False})
+        return fact
+
+    def _require_publish_binding(self, chain) -> tuple:
+        chain = _materialize(chain)
+        evidence = _load(chain["evidence_json"])
+        record = evidence.get("publish")
+        remote = evidence.get("remote")
+        if not isinstance(record, dict) or not record.get("ref"):
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "published chain is missing publish evidence")
+        binding = self._binding(chain)
+        server = self._server_fact("publish", **binding, ref=record.get("ref"))
+        if record.get("ref") != server.get("ref") or record.get("candidate_id") != chain["candidate_id"]:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "publish evidence does not match the server candidate")
+        if server.get("candidate_id") != chain["candidate_id"] or record.get("tree") != chain["tree"] or server.get("tree") != chain["tree"]:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "publish evidence tree does not match the chain")
+        if record.get("head") != chain["head"] or record.get("base") != chain["base"] or record.get("merge") != chain["merge_sha"]:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "publish evidence tuple does not match the chain")
+        acceptance = self._server_fact("acceptance", **binding)
+        if acceptance.get("outcome") != "accepted" or acceptance.get("signer_kind") != "user_acceptance":
+            raise SchedulerError("NOT_AUTHORIZED", "version publish requires an accepted user record", status=403, extra={"changed": False})
+        if acceptance.get("candidate_id") != chain["candidate_id"] or acceptance.get("tree") != chain["tree"]:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "acceptance belongs to a different candidate")
+        test = self._server_fact("test", **binding)
+        if test.get("candidate_id") != chain["candidate_id"] or test.get("tree") != chain["tree"] or test.get("signer_kind") != "macci":
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "test evidence belongs to a different candidate")
+        if not isinstance(remote, dict) or remote.get("candidate_id") != chain["candidate_id"] or remote.get("head") != chain["head"]:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "merge observation is not bound to this candidate")
+        if remote.get("tree") != chain["tree"]:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "merge observation tree does not match the chain")
+        return acceptance.get("ref") or record["ref"], record["ref"]
+
+    def _authorize_manual(self, action: str, subject_id: str, evidence_ref: str, *, version_state: str,
+                          candidate_id: str = "", tree: str = "", task_id: str = "", head: str = "", base: str = "",
+                          merge: str = "") -> dict:
+        self._evidence(evidence_ref)
+        fact = self._server_fact("intervention", subject=subject_id, ref=evidence_ref, permission=action)
+        if fact.get("subject") != subject_id or fact.get("ref") != evidence_ref or fact.get("permission") != action:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "intervention evidence is not bound to this subject", extra={"changed": False})
+        self.auth.bind_subject(
+            subject_id, version_state=version_state, candidate_id=candidate_id, tree=tree,
+            evidence_ref=evidence_ref, action=action,
+        )
+        intent = self._claim_intent(
+            task_id=task_id or subject_id, app_id="scheduler", phase="integrate", candidate_id=candidate_id,
+            head=head, base=base, merge=merge, tree=tree, object_id=subject_id,
+        )
+        intent["operation"] = "policy.evaluate"
+        intent["action"] = action
+        intent["run_id"] = ""
+        result = self._dispatch("policy.evaluate", intent, lease_token="")
+        body = result.body
+        if not body.get("allow"):
+            code = body.get("code") or "NOT_AUTHORIZED"
+            self._audit_intervention(action, subject_id, evidence_ref, state="DENIED", task_id=task_id, candidate_id=candidate_id,
+                                     head=head, base=base, merge=merge, tree=tree)
+            raise SchedulerError(code, "intervention was not authorized", status=403, extra={"changed": False, "production_enabled": False})
         return body
+
+    def _audit_intervention(self, action, subject_id, evidence_ref, *, state, task_id, candidate_id, head, base, merge, tree) -> None:
+        event_class = "authorization" if all((head, base, merge, tree)) else "task"
+        with self.store.transaction() as db:
+            self._intend_event(
+                db, event_type="intervention.recorded", event_class=event_class, task_id=task_id or subject_id,
+                run_id="", stage=action, state=state, revision=1, evidence_ref=evidence_ref, app_id="scheduler",
+                candidate_id=candidate_id, head=head, base=base, merge=merge, tree=tree, operation=action,
+            )
+        self._flush_events()
 
     def _auth_view(self, body: dict, *, replay_required: bool) -> dict:
         replayed = bool(body.get("replayed"))
@@ -1208,40 +1785,213 @@ class Scheduler:
             raise SchedulerError("EVIDENCE_MISSING", "round is not known", status=404)
         return _materialize(row)
 
-    def _append_event(self, **fields) -> None:
+    def _app_of(self, db, task_id: str) -> str:
+        task = self._task(db, task_id)
+        return task["app_id"]
+
+    def _intend_event(self, db, **fields) -> None:
         if fields.get("state") == "UNKNOWN":
             raise SchedulerError("NOT_AUTHORIZED", "scheduler cannot append UNKNOWN", status=403)
-        body = {
+        event_class = fields.get("event_class") or "task"
+        channel = event_class if event_class in _CHANNELS else "task"
+        if event_class == "evidence":
+            channel = "task"
+        stream_id = f"{self.producer_id}:{channel}"
+        epoch = 1
+        seq = self._next_seq(db, stream_id, epoch)
+        event_id = "evt_" + hashlib.sha256(
+            f"{self.repo_id}|{stream_id}|{epoch}|{seq}|{fields['event_type']}".encode()
+        ).hexdigest()[:32]
+        idem = fields.get("idempotency_key") or ("idem-w04-" + hashlib.sha256(event_id.encode()).hexdigest()[:32])
+        app_id = fields.get("app_id") or "scheduler"
+        payload = {
             "schema_version": 2,
-            "event_id": "evt_" + secrets.token_hex(8),
+            "event_id": event_id,
             "event_type": fields["event_type"],
-            "event_class": fields.get("event_class", "task"),
+            "event_class": event_class,
             "repo_id": self.repo_id,
             "producer_id": self.producer_id,
-            "stream_id": self.stream_id,
-            "stream_epoch": 1,
-            "occurred_at": self._now(),
-            "idempotency_key": fields.get("idempotency_key") or self._idem(),
-            "app_id": fields.get("app_id", ""),
-            "host_id": "",
-            "task_id": fields.get("task_id", ""),
-            "run_id": fields.get("run_id", ""),
-            "attempt": fields.get("attempt") or 0,
-            "revision": fields.get("revision") or 0,
-            "stage": fields.get("stage", ""),
-            "state": fields.get("state", ""),
-            "candidate_id": fields.get("candidate_id", ""),
-            "evidence_ref": fields.get("evidence_ref", ""),
-            "origin": "control_scheduler",
-            "github_execution": False,
-            "macci_proof": False,
+            "stream_id": stream_id,
+            "stream_epoch": epoch,
+            "producer_seq": seq,
+            "occurred_at": str(self._now()),
+            "idempotency_key": idem,
+            "app_id": app_id,
+            "host_id": None,
+            "task_id": fields.get("task_id") or "",
+            "run_id": fields.get("run_id") or "",
+            "attempt": int(fields.get("attempt") or 0),
+            "revision": int(fields.get("revision") or 0),
+            "stage": fields.get("stage") or "",
+            "state": fields.get("state") or "",
+            "candidate_id": fields.get("candidate_id") or "",
+            "evidence_ref": fields.get("evidence_ref") or "",
+            "head": fields.get("head") or "",
+            "base": fields.get("base") or "",
+            "merge": fields.get("merge") or "",
+            "tree": fields.get("tree") or "",
+            "operation": fields.get("operation") or fields["event_type"],
+            "policy_revision": 1,
         }
-        result = self.events.append(body)
-        key = body["idempotency_key"]
+        self._assert_intent_secret_free(payload)
+        db.execute(
+            """INSERT INTO event_intents(event_id,idempotency_key,stream_id,stream_epoch,producer_seq,repo_id,app_id,
+               payload_json,status,trusted_source,created) VALUES(?,?,?,?,?,?,?,?,'PENDING','',?)""",
+            (event_id, idem, stream_id, epoch, seq, self.repo_id, app_id, _json(payload), self._stamp(db)),
+        )
+
+    def _next_seq(self, db, stream_id: str, epoch: int) -> int:
+        key = f"seq:{stream_id}:{epoch}"
+        row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        value = 1 if row is None else int(row["value"]) + 1
+        db.execute(
+            "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        return value
+
+    def _flush_events(self) -> dict:
         with self.store.transaction() as db:
-            db.execute("INSERT OR IGNORE INTO applied_events(idempotency_key) VALUES(?)", (key,))
-        if isinstance(result, dict) and result.get("producer_seq") is None and "producer_seq" in result:
-            return
+            rows = db.execute(
+                "SELECT * FROM event_intents WHERE status='PENDING' ORDER BY stream_id, producer_seq, event_id"
+            ).fetchall()
+            pending = [_materialize(row) for row in rows]
+        delivered = []
+        rejected = []
+        waiting = []
+        for intent in pending:
+            payload = _load(intent["payload_json"])
+            try:
+                request = self._event_request(payload)
+                signed = self.events.sign(dict(request))
+                self._assert_signed_same(request, signed)
+                result = self.events.append(signed)
+            except Exception:
+                waiting.append(intent["event_id"])
+                break
+            if self._event_rejected(result):
+                with self.store.transaction() as db:
+                    db.execute("UPDATE event_intents SET status='REJECTED' WHERE event_id=?", (intent["event_id"],))
+                rejected.append(intent["event_id"])
+                break
+            observed = self._reconcile_event(payload)
+            if observed is None:
+                waiting.append(intent["event_id"])
+                break
+            with self.store.transaction() as db:
+                db.execute(
+                    "UPDATE event_intents SET status='DELIVERED', trusted_source=? WHERE event_id=?",
+                    (observed, intent["event_id"]),
+                )
+            delivered.append(intent["event_id"])
+        return {"delivered": delivered, "rejected": rejected, "pending": waiting}
+
+    def _event_request(self, payload: dict) -> dict:
+        request = {
+            "schema_version": 2,
+            "operation": "event.append",
+            "expected_revision": 0,
+            "idempotency_key": payload["idempotency_key"],
+            "scope": {"repo": self.repo_id, "stream_id": payload["stream_id"]},
+            "side_effect": False,
+        }
+        request.update(payload)
+        request.pop("github_execution", None)
+        request.pop("macci_proof", None)
+        return request
+
+    def _assert_signed_same(self, normalized: dict, signed: dict) -> None:
+        if not isinstance(signed, dict) or not isinstance(signed.get("proof"), dict):
+            raise SchedulerError("PROOF_INVALID", "event signature is missing", status=403, extra={"changed": False})
+        for key, value in normalized.items():
+            if signed.get(key) != value:
+                raise SchedulerError("EVIDENCE_INCONSISTENT", "event signer changed the normalized document", extra={"changed": False})
+
+    def _event_rejected(self, result) -> bool:
+        if not isinstance(result, dict):
+            return True
+        if result.get("replayed") is True:
+            return False
+        code = result.get("code")
+        if code and code not in {"OK", "IDEMPOTENCY_REPLAY"}:
+            return True
+        if isinstance(result.get("http"), int) and result["http"] >= 400:
+            return True
+        if result.get("applied") is False:
+            return True
+        return False
+
+    def _reconcile_event(self, payload: dict):
+        page = self._query_events(payload["stream_id"], int(payload["stream_epoch"]), int(payload["producer_seq"]) - 1, limit=10)
+        for item in page.get("items") or []:
+            if all(item.get(key) == payload.get(key) for key in ("event_id", "repo_id", "app_id", "stream_id", "stream_epoch", "producer_seq", "idempotency_key")):
+                source = item.get("trusted_source")
+                if isinstance(source, str) and source:
+                    return source
+        return None
+
+    def _query_events(self, stream_id: str, epoch: int, after_seq: int, limit: int = 100) -> dict:
+        request = {
+            "schema_version": 2,
+            "operation": "event.read",
+            "repo_id": self.repo_id,
+            "app_id": "scheduler",
+            "producer_id": self.producer_id,
+            "stream_id": stream_id,
+            "stream_epoch": epoch,
+            "after_seq": after_seq,
+            "expected_revision": 0,
+            "idempotency_key": "idem-w04-read",
+            "side_effect": False,
+        }
+        signed = self.events.sign(dict(request))
+        self._assert_signed_same(request, signed)
+        return self.events.query(
+            request=signed, stream_id=stream_id, stream_epoch=epoch, after_seq=after_seq, limit=limit,
+        )
+
+    def _event_identity(self, item: dict, stream_id: str, stream_epoch: int):
+        required = ("repo_id", "app_id", "event_id", "trusted_source", "producer_seq")
+        if any(not isinstance(item.get(key), str) or not item.get(key) for key in required if key != "producer_seq"):
+            return None
+        if item.get("stream_id") != stream_id or item.get("stream_epoch") != stream_epoch:
+            return None
+        if type(item.get("producer_seq")) is not int:
+            return None
+        return {
+            "repo_id": item["repo_id"],
+            "app_id": item["app_id"],
+            "stream_id": stream_id,
+            "stream_epoch": stream_epoch,
+            "event_id": item["event_id"],
+            "trusted_source": item["trusted_source"],
+        }
+
+    def _authoritative(self, item: dict) -> bool:
+        expected = AUTHORITY.get(str(item.get("event_type") or ""))
+        return bool(expected) and item.get("trusted_source") == expected
+
+    def _event_seen(self, db, identity: dict) -> bool:
+        row = db.execute(
+            """SELECT 1 FROM applied_events WHERE repo_id=? AND app_id=? AND stream_id=? AND stream_epoch=?
+               AND event_id=? AND trusted_source=?""",
+            (identity["repo_id"], identity["app_id"], identity["stream_id"], identity["stream_epoch"], identity["event_id"], identity["trusted_source"]),
+        ).fetchone()
+        return row is not None
+
+    def _remember_event(self, db, identity: dict) -> None:
+        db.execute(
+            """INSERT OR IGNORE INTO applied_events(repo_id,app_id,stream_id,stream_epoch,event_id,trusted_source)
+               VALUES(?,?,?,?,?,?)""",
+            (identity["repo_id"], identity["app_id"], identity["stream_id"], identity["stream_epoch"], identity["event_id"], identity["trusted_source"]),
+        )
+
+    def _save_watermark(self, db, stream_id: str, stream_epoch: int, seq: int) -> None:
+        db.execute(
+            """INSERT INTO watermarks(stream_id,stream_epoch,seq) VALUES(?,?,?)
+               ON CONFLICT(stream_id,stream_epoch) DO UPDATE SET seq=excluded.seq""",
+            (stream_id, stream_epoch, seq),
+        )
 
     def _files(self, files) -> list:
         if not isinstance(files, (list, tuple)) or not 1 <= len(files) <= 1000:
@@ -1301,6 +2051,7 @@ class Scheduler:
         body["github_execution"] = False
         body["macci_proof"] = False
         body["production_wired"] = False
+        body["production_enabled"] = False
         return body
 
     def _version_view(self, row) -> dict:

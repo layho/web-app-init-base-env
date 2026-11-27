@@ -3,9 +3,11 @@
 This package is preparation only. It does not mount a route, does not edit
 the integration queue, preview journal, merge path, runner, operations, or
 manage.sh, and does not enable production. Authentication, event storage, and
-lease fencing stay behind the W02 and W01 ports. Tests supply doubles for
-those ports. A double result is not a GitHub execution and is not a MacCI
-receipt.
+lease fencing stay behind the W02 and W01 ports. The scheduler normalizes a
+secret-free request and a secret-free event intent, then the adapter signs.
+Tests supply doubles for those ports. A double result is not a GitHub
+execution and is not a MacCI receipt. The cited W01 and W02 commits are not
+in this tree, so these tests do not verify that joint adapter.
 
 Formal integration still requires one tree that contains both:
 

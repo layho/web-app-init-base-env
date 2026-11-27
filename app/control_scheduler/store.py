@@ -1,7 +1,10 @@
 """Private scheduler ledger.
 
-The ledger stores queue, chain, version, and evidence projections. It does
-not store lease tokens, event payloads as an outbox, or credential material.
+The ledger stores queue, chain, version, and evidence projections. It also
+stores a secret-free claim intent and a secret-free event intent. It does
+not store lease tokens, proofs, or credential material. Event durability
+stays in the W01 port; this ledger only remembers what still has to be
+delivered and which external identity was already applied.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS versions (
     published_tree TEXT,
     main_sha TEXT,
     preview_sha TEXT,
+    ancestry_json TEXT,
     created INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tasks (
@@ -72,7 +76,7 @@ CREATE TABLE IF NOT EXISTS rounds (
     phase TEXT NOT NULL,
     candidate_id TEXT NOT NULL DEFAULT '',
     idempotency_key TEXT NOT NULL,
-    body_json TEXT NOT NULL,
+    intent_json TEXT NOT NULL,
     dispatch TEXT NOT NULL,
     run_id TEXT,
     attempt INTEGER,
@@ -89,7 +93,26 @@ CREATE TABLE IF NOT EXISTS watermarks (
     PRIMARY KEY (stream_id, stream_epoch)
 );
 CREATE TABLE IF NOT EXISTS applied_events (
-    idempotency_key TEXT PRIMARY KEY
+    repo_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    stream_epoch INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    trusted_source TEXT NOT NULL,
+    PRIMARY KEY (repo_id, app_id, stream_id, stream_epoch, event_id, trusted_source)
+);
+CREATE TABLE IF NOT EXISTS event_intents (
+    event_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    stream_epoch INTEGER NOT NULL,
+    producer_seq INTEGER NOT NULL,
+    repo_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    trusted_source TEXT NOT NULL DEFAULT '',
+    created INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS observations (
     chain_id TEXT NOT NULL,

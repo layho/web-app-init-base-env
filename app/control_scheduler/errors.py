@@ -19,10 +19,12 @@ class SchedulerError(Exception):
             "github_execution": False,
             "macci_proof": False,
             "production_wired": False,
+            "production_enabled": False,
             "side_effect": False,
         }
         body.update(self.extra)
         body["lease_token"] = None
         body["github_execution"] = False
         body["macci_proof"] = False
+        body["production_enabled"] = False
         return body
