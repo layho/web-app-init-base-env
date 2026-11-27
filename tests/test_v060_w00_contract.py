@@ -336,7 +336,7 @@ class ContractFixtureTest(unittest.TestCase):
         self.assertFalse(contract["freeze"]["merge_authorized"])
         self.assertFalse(contract["freeze"]["release_authorized"])
         self.assertFalse(contract["freeze"]["machine_acceptance"])
-        self.assertFalse(contract["freeze"]["closeout_verified"])
+        self.assertTrue(contract["freeze"]["closeout_verified"])
         self.assertFalse(contract["exactly_once_across_github_and_db"])
         self.assertEqual(contract["clock"], "server")
         self.assertEqual(contract["baseline_sha"], BASE)
