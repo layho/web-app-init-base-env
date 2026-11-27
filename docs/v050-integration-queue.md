@@ -1,0 +1,5 @@
+# V0.5.0 integration queue (#153, #138)
+
+Initial implementation: a transactionally serialized SQLite planning ledger for one active version, immutable task identities, dependency order, path reservations, exact base SHA and expiring leases. A lease expiry enters UNKNOWN and blocks automatic dispatch; preparation completion does not imply testing, merge or deployment.
+
+This module is not yet wired to the production coordinator. Its database must be located in an independently protected private state directory. Do not expose leases in browser responses. Only a trusted coordinator may supply actual Git diff paths and verified candidate evidence. The PREPARED -> INTEGRATED transition, evidence verification, reconciliation, authorization, migration, UI and host integration remain to implement. No existing publication gate is changed.
