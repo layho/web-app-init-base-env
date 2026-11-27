@@ -170,6 +170,48 @@ def latest_status(head):
     return next((s for s in statuses if s.get("context") == CONTEXT), None)
 
 
+def published_preview_equivalent(read, preview, main):
+    """Recognize an exact, officially merged preview-to-main release.
+
+    Equal trees alone are not publication evidence. Only an actual GitHub
+    release merge with the preview as a parent and matching PR is accepted.
+    A missing or inconsistent receipt leaves the candidate frozen.
+    """
+    if not all(isinstance(x, str) and SHA.fullmatch(x) for x in (preview, main)):
+        return False
+    if preview == main:
+        return True
+    published = read("/git/commits/" + main)
+    candidate = read("/git/commits/" + preview)
+    if not isinstance(published, dict) or not isinstance(candidate, dict):
+        return False
+    if published.get("sha") != main or candidate.get("sha") != preview:
+        return False
+    tree = (candidate.get("tree") or {}).get("sha")
+    parents = published.get("parents")
+    if (not isinstance(tree, str) or not SHA.fullmatch(tree)
+            or (published.get("tree") or {}).get("sha") != tree
+            or not isinstance(parents, list) or len(parents) != 2
+            or not all(isinstance(p, dict) for p in parents)
+            or parents[1].get("sha") != preview):
+        return False
+    message = published.get("message")
+    match = re.match(r"Merge pull request #([1-9][0-9]{0,8}) from layho/preview(?:\\n|$)",
+                     message) if isinstance(message, str) else None
+    if not match:
+        return False
+    release = read("/pulls/" + match.group(1))
+    if not isinstance(release, dict):
+        return False
+    source, target = release.get("head") or {}, release.get("base") or {}
+    return (release.get("merged") is True and release.get("state") == "closed"
+            and release.get("merge_commit_sha") == main
+            and source.get("sha") == preview and source.get("ref") == "preview"
+            and target.get("ref") == "main"
+            and (source.get("repo") or {}).get("full_name") == REPO
+            and (target.get("repo") or {}).get("full_name") == REPO)
+
+
 def request_merge(number, head, base):
     pr, merge = current_pr(number, head, base)
     if pr.get("draft"):
@@ -185,8 +227,11 @@ def request_merge(number, head, base):
     scope = action_scope()
     if scope == (REPO, "preview"):
         main = api("/branches/main")["commit"]["sha"]
-        if main != base:
+        if not published_preview_equivalent(api, base, main):
             raise ManualActionError("当前候选版本尚未完成正式验收，合并已冻结")
+        if (api("/branches/main")["commit"]["sha"] != main
+                or api("/branches/preview")["commit"]["sha"] != base):
+            raise ManualActionError("代码或目标版本已变化，请刷新后重试")
         label = MERGE_LABEL
     else:
         label = APP_MERGE_LABEL
