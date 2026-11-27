@@ -44,7 +44,7 @@ tree
 
 阶段词仍然是 feedback_sync、claim、develop、review、test、integrate、preview_merge、deploy、accept、publish、close。它们描述聚合，不表示只有一个 PR。
 
-每个必要 PR 或修复线是一条候选链，状态为 OPEN、TESTING、INTEGRATING、DEPLOYING、ACCEPTING、SATISFIED、FAILED、REJECTED、SUPERSEDED。
+每个必要 PR 或修复线是一条候选链，状态为 OPEN、TESTING、INTEGRATING、DEPLOYING、ACCEPTING、SATISFIED、PUBLISHED、FAILED、REJECTED、SUPERSEDED。REJECTED 不是终态，因为已授权的修复会把它送到 SUPERSEDED。SATISFIED 只表示该链已被用户验收。
 
 | 从 | 到 | 条件 |
 | --- | --- | --- |
@@ -55,13 +55,15 @@ tree
 | TESTING / INTEGRATING / OPEN | SUPERSEDED | 候选四元组或任务关联变了 |
 | INTEGRATING | DEPLOYING | 精确远端观察 |
 | DEPLOYING | ACCEPTING | 部署已 COMMIT |
-| ACCEPTING | SATISFIED | 用户验收 |
+| DEPLOYING | SUPERSEDED | 部署失败后换一条新链。失败链必须可以替换 |
+| ACCEPTING | SATISFIED | 用户验收。这还不是正式发布 |
+| SATISFIED | PUBLISHED | 已有正式发布证据 |
 | ACCEPTING | REJECTED | 用户拒绝 |
 | REJECTED | SUPERSEDED | 已授权修复，并且新候选使用新链 |
 
-同一条链没有从 REJECTED 回到 TESTING 的边。修复是新链。旧测试和旧验收不复用。
+同一条链没有从 REJECTED 回到 TESTING 的边。修复是新链。旧测试和旧验收不复用。下游 PR 不必先在依赖的旧 base 上重测。依赖集成之后，下游按当时的基线测试。
 
-聚合边只有在对应的必要链都已经满足时才能走。部分交付保持任务打开，并同时列出已满足和未满足的链。close 没有出边，任务不能重开。关闭之后的新要求使用新 task_id，可以带 follows_task_id 指向旧任务。
+close 还要同时满足三条：每条必要链都是 PUBLISHED、每条链都有发布证据、任务级验收已经记录。只看到 SATISFIED 不能关闭。部分交付保持任务打开。close 没有出边，任务不能重开。关闭之后的新要求使用新 task_id，可以带 follows_task_id 指向旧任务。
 
 ## Run
 
@@ -75,7 +77,7 @@ tree
 | LEASED | RUNNING | 同一代次的开始心跳 |
 | LEASED 或 RUNNING | 同一状态 | 续租。代次加一，旧令牌立即失效。这不是新 run |
 | LEASED | PENDING | 尚未产生外部副作用，持有者释放 |
-| LEASED | UNKNOWN | 服务端时钟上租约到期，或取消、替换时还不能证明没有副作用 |
+| LEASED | UNKNOWN | 只由可信代理在对账后写入。调用方的过期或旧代次请求不走这条边 |
 | RUNNING | UNKNOWN | 同上 |
 | LEASED | CANCELLED 或 SUPERSEDED | 已 fencing，并且证明没有外部副作用 |
 | RUNNING | CANCELLED | 已 fencing，并且副作用不存在或已经补偿 |
@@ -89,7 +91,13 @@ tree
 | BLOCKED | SUPERSEDED | 重新授权之后创建新 run |
 | PENDING | CANCELLED 或 SUPERSEDED | 还没有领到租约 |
 
-外部副作用必须带上 run_id 和 lease_generation。旧代次不能提交副作用。若旧代次可能已经发出外部动作，Run 进入 UNKNOWN，直到对账把它分成成功、失败或未发生。没有证明时不能取消成 CANCELLED。
+这些规则是模型测试。字符串形式的守卫不等于生产环境里的真实校验。
+
+租约令牌是不透明字符串，并绑定 principal、run_id、scope 和 lease_generation。只带代次、或使用可从代次推出来的字符串，都不能通过。续租和完成请求都必须带上当前令牌。开始、释放和心跳分别是 `runs/{id}:start`、`:release` 和 `:heartbeat`。
+
+过期或旧代次的调用只返回 LEASE_FENCE_REJECTED，并且不改变仍有效的新 Run。被拒绝的请求本身不是 UNKNOWN。UNKNOWN 只能由可信代理在串行对账之后写入。GitHub 没有原生 fencing。把代次附在请求上，并不能阻止远端副作用。可信代理必须先校验令牌绑定，再核对外部结果。
+
+外部副作用必须带上 run_id、代次和令牌绑定。旧代次不能提交副作用。若旧代次可能已经发出外部动作，由可信代理把 Run 记成 UNKNOWN，直到对账把它分成成功、失败或未发生。没有证明时不能取消成 CANCELLED。
 
 丢失明文令牌时，同一幂等键的重放不返回明文租约。恢复方法是把该 run 对账到 UNKNOWN 或确认没有副作用，然后用新 run_id 和新的幂等键重新领取。同一幂等键不能签发第二个令牌。
 
@@ -99,11 +107,11 @@ Candidate：REGISTERED 只能到 SUPERSEDED、INVALID 或 INTEGRATED。INTEGRATE
 
 Release 增加 PUBLISH_UNKNOWN。PUBLISHING 不能因为缺少回执直接回到 ACCEPTANCE。推送结果未知时进入 PUBLISH_UNKNOWN。只有对账证明推送没有发生，才能从 PUBLISH_UNKNOWN 回到 ACCEPTANCE。精确观察到 main 之后才到 PUBLISHED。
 
-Deployment 在 HEALTH 成功后进入 COMMIT_PENDING。提交回执落盘才到 COMMIT。回执丢失进入 RECONCILE，不把未知写成 COMMIT。ROLLBACK 失败进入 SAFE_FROZEN。SAFE_FROZEN 没有出边。授权后的恢复是新的 deployment_id，并引用 recovers_deployment_id。
+Deployment 在 HEALTH 成功后进入 COMMIT_PENDING。提交回执落盘才到 COMMIT。回执丢失进入 RECONCILE，不把未知写成 COMMIT。若对账确认候选仍然健康，RECONCILE 可以补记 COMMIT。没有健康证据时不能从 RECONCILE 进入 COMMIT。ROLLBACK 失败进入 SAFE_FROZEN。SAFE_FROZEN 没有出边。高风险启用仍要单独授权。已经预授权的普通恢复不需要每个动作再请一次用户。授权后的新恢复事务使用新的 deployment_id，并引用 recovers_deployment_id。
 
-首次安装没有 previous healthy SHA。这时 previous_healthy_sha 为空，install_kind 必须是 first_install。首次安装不能走 no_change 的 PLAN → COMMIT。若不能证明部分资源已经移除，首次安装的回滚停在 SAFE_FROZEN，不能编造上一健康 SHA。
+首次安装没有 previous healthy SHA。这时 previous_healthy_sha 为空，install_kind 必须是 first_install。首次安装不能走 no_change 的 PLAN → COMMIT。资源已经清除时，ROLLBACK 可以进入 ROLLED_BACK，守卫是 first_install_resources_removed。没有清除证明时停在 SAFE_FROZEN。旧健康 SHA 不能代替这个证明，也不能编造上一健康 SHA。
 
-Resource 的 RELEASING 可以到 RELEASED、RELEASE_FAILED、PARTIAL 或 SAFE_FROZEN。PARTIAL 只有在再次授权后才能回到 RELEASING。部分释放不能标成全部 RELEASED。
+Resource 的 RELEASING 可以到 RELEASED、RELEASE_FAILED、PARTIAL 或 SAFE_FROZEN。PARTIAL 和 RELEASE_FAILED 在预授权恢复下回到 RELEASING。破坏性释放仍使用单独授权。部分释放不能标成全部 RELEASED。
 
 ## Event
 
@@ -119,14 +127,17 @@ Resource 的 RELEASING 可以到 RELEASED、RELEASE_FAILED、PARTIAL 或 SAFE_FR
 | --- | --- |
 | task | app_id、host_id、task_id、run_id、attempt、revision、stage、state。host_id 可以空 |
 | candidate | task_id、candidate_id、head、base、merge、tree、revision |
-| deployment | deployment_id、app_id、host_id、artifact_digest、previous_healthy_sha、install_kind、stage、state。previous_healthy_sha 只有首次安装可以为空 |
+| deployment | deployment_id、app_id、host_id、candidate_id、head、base、merge、tree、running_sha、artifact_digest、previous_healthy_sha、install_kind、stage、state。previous_healthy_sha 只有首次安装可以为空 |
 | resource | resource_id、app_id、host_id、stage、state |
 | evidence | evidence_ref、run_id |
-| authorization | task_id、revision、stage、state、evidence_ref |
+| authorization | task_id、candidate_id、head、base、merge、tree、operation、policy_revision、revision、stage、state、evidence_ref |
+| diagnostic | diagnostic_class、subject_id、severity |
+
+每个 event_type 还要声明可信来源。`authorization.granted` 和 `authorization.revoked` 来自 policy_service。`deployment.health` 和 `deployment.commit` 来自 host_deployer。`ci.test.finished` 来自 macci。`diagnostic.observation` 来自 hostops_readonly。诊断事件不能覆盖授权、部署或候选事实。同一对象上，更高的 revision 才替换旧事实。revision 相同时，权威来源优先于旁路观察。
 
 每个 stream 有自己的水位。序号正好等于水位加一才应用。缺口只挡住这条 stream。其他生产者的事件照常应用。authorization 流不允许用 never_existed 补洞来跳过未证实的授权事实。诊断流可以用对账事件声明某个序号从未存在，而且只能补本流的洞。
 
-进程重启必须读回已落盘的 epoch 和序号。计数丢失时增加 epoch，旧 epoch 的缺口继续保持，不用新 epoch 的 1 去填旧洞。
+进程重启必须读回已落盘的 epoch 和序号。计数丢失时增加 epoch，旧 epoch 的缺口继续保持，不用新 epoch 的 1 去填旧洞。授权流的新 epoch 在旧 epoch 还没有已应用的 epoch_closed 事件之前不能应用。这是一条反例：旧授权序号缺 1 时，新 epoch 的序号 1 仍然停住。诊断流不使用这道门。诊断读取使用每个 stream_id 自己的 after_seq。只推进一条流的游标，不能跳过另一条流。
 
 ## 幂等与身份顺序
 
@@ -134,9 +145,9 @@ Resource 的 RELEASING 可以到 RELEASED、RELEASE_FAILED、PARTIAL 或 SAFE_FR
 
 幂等键的范围是已认证主体、scope 和操作名。重放返回 original_result 和 current_state 两个字段。前者是当时的公开结果，后者是对象现在的状态。重放不返回明文租约。
 
-证明至少包含 signer_id、scope、issued_at、expires_at、nonce、payload_hash、alg。草案把 alg 记为 ed25519。服务端检查过期、nonce 不重复、以及撤销名单。撤销按 signer_id 立即生效。
+证明至少包含 signer_id、key_id、signature、scope、issued_at、expires_at、nonce、payload_hash、alg。草案把 alg 记为 ed25519。被签名的规范内容绑定 operation、object_id、candidate_id、head、base、merge、tree、policy_revision、scope、nonce 和 expires_at。服务端检查过期、nonce 不重复、以及撤销名单。撤销按 signer_id 立即生效。
 
-用户验收使用独立的 signer kind `user_acceptance`。agent、MacCI、候选和网页会话都不能充当它。在身份验证实现并被单独授权之前，`production_verification_enabled` 为 false，只接受 kind 为 test、proof_ref 以 `test-proof://` 开头的隔离身份。这时连 `user_acceptance` 也不能把生产发布放行。
+用户验收使用独立的 signer kind `user_acceptance`。agent、MacCI、候选和网页会话都不能充当它。测试身份只能出现在隔离配置里。调用方自己带上 `test-proof://` 字符串，不能进入真实路由。在身份验证实现并被单独授权之前，`production_verification_enabled` 为 false。这时连 `user_acceptance` 也不能把生产发布放行。
 
 ## 提议路径
 

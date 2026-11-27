@@ -1,4 +1,8 @@
-"""Execute V0.6.0 W00 contract rules. No network, database, or host access."""
+"""Model-check the V0.6.0 W00 draft. Guards match by string only.
+
+These tests are not production verification. They do not open real routes,
+read host state, or prove that a lease generation by itself fences GitHub.
+"""
 import hashlib
 import json
 import re
@@ -95,7 +99,7 @@ def validate_event(contract, event):
 
 
 def project(events):
-    """Apply each stream independently. A gap holds only that stream."""
+    """Apply each stream independently. Authorization epochs cannot skip a gap."""
     watermark = {}
     applied = []
     rest = list(events)
@@ -104,18 +108,29 @@ def project(events):
         moved = False
         pending = []
         for event in rest:
-            key = (event["stream_id"], event["stream_epoch"])
+            epoch = event.get("stream_epoch", 1)
+            key = (event["stream_id"], epoch)
             if event.get("classification") == "never_existed" and event["channel"] == "authorization":
                 pending.append(event)
                 continue
+            if event["channel"] == "authorization" and epoch > 1:
+                closed = any(
+                    item["stream_id"] == event["stream_id"]
+                    and item.get("stream_epoch", 1) == epoch - 1
+                    and item.get("epoch_closed")
+                    for item in applied
+                )
+                if not closed:
+                    pending.append(event)
+                    continue
             if event["producer_seq"] == watermark.get(key, 0) + 1:
                 watermark[key] = event["producer_seq"]
-                applied.append(event["event_id"])
+                applied.append(event)
                 moved = True
             else:
                 pending.append(event)
         rest = pending
-    return applied, [event["event_id"] for event in rest]
+    return [item["event_id"] for item in applied], [item["event_id"] for item in rest]
 
 
 def no_change_commit_allowed(previous_healthy_sha, install_kind, healthy, pending_journal):
@@ -124,22 +139,78 @@ def no_change_commit_allowed(previous_healthy_sha, install_kind, healthy, pendin
     return bool(healthy) and not pending_journal
 
 
-def first_install_rollback(resources_removed_proven):
-    if resources_removed_proven:
+def first_install_rollback(contract, resources_removed_proven):
+    guards = ["first_install_resources_removed"] if resources_removed_proven else []
+    if allows(contract, "deployment", "ROLLBACK", "ROLLED_BACK", guards):
         return "ROLLED_BACK"
     return "SAFE_FROZEN"
 
 
-def can_close(chain_states):
-    return bool(chain_states) and all(state == "SATISFIED" for state in chain_states)
+def can_close(chain_states, publish_evidence, task_acceptance):
+    if not task_acceptance or not chain_states or len(publish_evidence) != len(chain_states):
+        return False
+    return all(state == "PUBLISHED" for state in chain_states) and all(publish_evidence)
 
 
-def finish_lease(server_now, expires_at, token_generation, current_generation, effect_known):
-    if token_generation != current_generation or server_now >= expires_at:
-        return "UNKNOWN", "LEASE_FENCE_REJECTED"
-    if not effect_known:
-        return "UNKNOWN", "SIDE_EFFECT_UNKNOWN"
-    return "SUCCEEDED", None
+def dependency_may_use_new_base(dependency_integrated, dependent_base, original_base, same_base_required):
+    if same_base_required:
+        return dependency_integrated and dependent_base == original_base
+    return dependency_integrated
+
+
+def prefer_fact(existing, incoming):
+    if incoming["event_class"] == "diagnostic" and existing["event_class"] in {"authorization", "deployment", "candidate"}:
+        return existing
+    if incoming["revision"] != existing["revision"]:
+        return incoming if incoming["revision"] > existing["revision"] else existing
+    if incoming["authoritative"] and not existing["authoritative"]:
+        return incoming
+    return existing
+
+
+def proxy_allow(current_generation, used_generation, scope, operation):
+    return used_generation == current_generation and scope == operation
+
+
+def web_boundary_ok(csp, body):
+    if "script-src" not in csp:
+        return False
+    return "github_pat_" not in body and "BEGIN PRIVATE KEY" not in body
+
+
+def terminals_have_no_outgoing(contract):
+    entities = contract["entities"]
+    machines = [
+        ("task", entities["task"]["terminal_phases"], entities["task"]["transitions"]),
+        ("task_chain", entities["task"]["chains"]["terminal"], entities["task"]["chains"]["transitions"]),
+        ("run", entities["run"]["terminal"], entities["run"]["transitions"]),
+        ("candidate", entities["candidate"]["terminal"], entities["candidate"]["transitions"]),
+        ("release", entities["release"]["terminal"], entities["release"]["transitions"]),
+        ("deployment", entities["deployment"]["terminal"], entities["deployment"]["transitions"]),
+        ("resource", entities["resource"]["terminal"], entities["resource"]["transitions"]),
+        ("event", entities["event"]["terminal"], entities["event"]["transitions"]),
+        ("event_delivery", entities["event"]["delivery"]["terminal"], entities["event"]["delivery"]["transitions"]),
+    ]
+    problems = []
+    for name, terminals, transitions in machines:
+        outgoing = {edge["from"] for edge in transitions}
+        problems.extend(f"{name}:{state}" for state in terminals if state in outgoing)
+    return problems
+
+
+def client_lease_request(current_state, current_generation, request_generation, server_now, expires_at, token_matches):
+    """A rejected caller does not write UNKNOWN and does not touch a newer run."""
+    if request_generation != current_generation or server_now >= expires_at or not token_matches:
+        return {"changed": False, "state": current_state, "code": "LEASE_FENCE_REJECTED"}
+    return {"changed": True, "state": current_state, "code": None}
+
+
+def proxy_confirm_unknown(actor_role, effect_known):
+    if actor_role != "trusted_proxy":
+        return {"changed": False, "state": None, "code": "NOT_AUTHORIZED"}
+    if effect_known:
+        return {"changed": False, "state": None, "code": "EVIDENCE_MISSING"}
+    return {"changed": True, "state": "UNKNOWN", "code": "SIDE_EFFECT_UNKNOWN"}
 
 
 def renew_lease(server_now, expires_at, token_generation, current_generation):
@@ -152,10 +223,12 @@ class Store(dict):
     pass
 
 
-def call_idempotent(store, *, kind, proof_ref, allow, key, payload_hash, secret, server_now, expires_at, nonce, seen_nonces, revoked):
+def call_idempotent(store, *, kind, proof_ref, allow, key, payload_hash, secret, server_now, expires_at, nonce, seen_nonces, revoked, isolated=False, route="real"):
     before = json.dumps(store, sort_keys=True)
     identity_ok = (
-        kind == "test"
+        route != "real"
+        and isolated
+        and kind == "test"
         and isinstance(proof_ref, str)
         and proof_ref.startswith("test-proof://")
         and expires_at > server_now
@@ -234,7 +307,10 @@ class ContractFixtureTest(unittest.TestCase):
         self.assertFalse(contract["exactly_once_across_github_and_db"])
         self.assertEqual(contract["clock"], "server")
         self.assertEqual(contract["baseline_sha"], BASE)
-        self.assertEqual(contract["revision_comment"], 7216272486)
+        self.assertEqual(contract["revision_comment"], 7216590735)
+        self.assertTrue(contract["model_tests"]["not_production_verification"])
+        self.assertFalse(contract["identity"]["lease"]["github_native_fencing"])
+        self.assertFalse(contract["identity"]["test_identity"]["client_supplied_proof_enters_real_routes"])
         self.assertFalse(contract["identity"]["production_verification_enabled"])
         self.assertFalse(contract["diagnostic"]["subscribe"])
         self.assertEqual(contract["diagnostic"]["mode"], "poll_cursor")
@@ -270,30 +346,51 @@ class ContractFixtureTest(unittest.TestCase):
                 self.assertTrue(all(edge.get("guard") for edge in edges))
 
     def test_lease_generation_uses_server_clock_and_hides_replayed_tokens(self):
-        self.assertEqual(finish_lease(100, 50, 1, 1, True), ("UNKNOWN", "LEASE_FENCE_REJECTED"))
-        self.assertEqual(finish_lease(10, 50, 1, 2, True), ("UNKNOWN", "LEASE_FENCE_REJECTED"))
-        self.assertEqual(finish_lease(10, 50, 2, 2, False), ("UNKNOWN", "SIDE_EFFECT_UNKNOWN"))
-        self.assertEqual(finish_lease(10, 50, 2, 2, True), ("SUCCEEDED", None))
+        stale = client_lease_request("RUNNING", 2, 1, 10, 50, False)
+        self.assertFalse(stale["changed"])
+        self.assertEqual(stale["state"], "RUNNING")
+        self.assertEqual(stale["code"], "LEASE_FENCE_REJECTED")
+        expired = client_lease_request("RUNNING", 1, 1, 100, 50, True)
+        self.assertFalse(expired["changed"])
+        self.assertEqual(expired["state"], "RUNNING")
+        self.assertEqual(proxy_confirm_unknown("agent", False)["code"], "NOT_AUTHORIZED")
+        confirmed = proxy_confirm_unknown("trusted_proxy", False)
+        self.assertTrue(confirmed["changed"])
+        self.assertEqual(confirmed["state"], "UNKNOWN")
         self.assertEqual(renew_lease(10, 50, 2, 2), 3)
         self.assertIsNone(renew_lease(10, 50, 2, 3))
         store, seen, revoked = Store(), set(), set()
+        rejected, store = call_idempotent(
+            store, kind="test", proof_ref="test-proof://w00/fixture", allow=True, key="idem-real",
+            payload_hash="h1", secret=True, server_now=10, expires_at=50, nonce="n0",
+            seen_nonces=seen, revoked=revoked, isolated=True, route="real",
+        )
+        self.assertEqual(rejected["code"], "NOT_AUTHORIZED")
+        self.assertNotIn("idem-real", store)
+        bare, store = call_idempotent(
+            store, kind="test", proof_ref="test-proof://w00/fixture", allow=True, key="idem-bare",
+            payload_hash="h1", secret=True, server_now=10, expires_at=50, nonce="n0b",
+            seen_nonces=seen, revoked=revoked, isolated=False, route="isolated",
+        )
+        self.assertEqual(bare["code"], "NOT_AUTHORIZED")
+        self.assertNotIn("idem-bare", store)
         first, store = call_idempotent(
             store, kind="test", proof_ref="test-proof://w00/fixture", allow=True, key="idem-1",
             payload_hash="h1", secret=True, server_now=10, expires_at=50, nonce="n1",
-            seen_nonces=seen, revoked=revoked,
+            seen_nonces=seen, revoked=revoked, isolated=True, route="isolated",
         )
         self.assertEqual(first["lease_token"], "tok-req-1")
         denied, store = call_idempotent(
             store, kind="agent", proof_ref="test-proof://w00/fixture", allow=True, key="idem-2",
             payload_hash="h2", secret=True, server_now=10, expires_at=50, nonce="n2",
-            seen_nonces=seen, revoked=revoked,
+            seen_nonces=seen, revoked=revoked, isolated=True, route="isolated",
         )
         self.assertEqual(denied["code"], "NOT_AUTHORIZED")
         self.assertNotIn("idem-2", store)
         blocked, store = call_idempotent(
             store, kind="test", proof_ref="test-proof://w00/fixture", allow=False, key="idem-3",
             payload_hash="h3", secret=True, server_now=10, expires_at=50, nonce="n3",
-            seen_nonces=seen, revoked=revoked,
+            seen_nonces=seen, revoked=revoked, isolated=True, route="isolated",
         )
         self.assertEqual(blocked["code"], "POLICY_DENIED")
         self.assertNotIn("idem-3", store)
@@ -301,7 +398,7 @@ class ContractFixtureTest(unittest.TestCase):
         replay, store = call_idempotent(
             store, kind="test", proof_ref="test-proof://w00/fixture", allow=True, key="idem-1",
             payload_hash="h1", secret=True, server_now=11, expires_at=50, nonce="n4",
-            seen_nonces=seen, revoked=revoked,
+            seen_nonces=seen, revoked=revoked, isolated=True, route="isolated",
         )
         self.assertIsNone(replay["lease_token"])
         self.assertEqual(replay["original_result"]["state"], "LEASED")
@@ -310,14 +407,14 @@ class ContractFixtureTest(unittest.TestCase):
         mismatch, store = call_idempotent(
             store, kind="test", proof_ref="test-proof://w00/fixture", allow=True, key="idem-1",
             payload_hash="h-other", secret=True, server_now=12, expires_at=50, nonce="n5",
-            seen_nonces=seen, revoked=revoked,
+            seen_nonces=seen, revoked=revoked, isolated=True, route="isolated",
         )
         self.assertEqual(mismatch["code"], "IDEMPOTENCY_PAYLOAD_MISMATCH")
         self.assertTrue(store["idem-1"]["token_issued"])
         again, _store = call_idempotent(
             store, kind="test", proof_ref="test-proof://w00/fixture", allow=True, key="idem-1",
             payload_hash="h1", secret=True, server_now=13, expires_at=50, nonce="n6",
-            seen_nonces=seen, revoked=revoked,
+            seen_nonces=seen, revoked=revoked, isolated=True, route="isolated",
         )
         self.assertIsNone(again["lease_token"])
         self.assertFalse(self.contract["identity"]["same_key_mints_second_token"])
@@ -353,14 +450,38 @@ class ContractFixtureTest(unittest.TestCase):
         self.assertEqual(validate_event(self.contract, missing), "SCHEMA_UNSUPPORTED")
         stamped = dict(task_event, received_at="2026-11-27T10:00:01Z")
         self.assertEqual(validate_event(self.contract, stamped), "SCHEMA_UNSUPPORTED")
-        first = dict(task_event, event_class="deployment", deployment_id="dep_1", host_id="host-test",
+        sha = "a" * 40
+        first = dict(task_event, event_class="deployment", event_type="deployment.commit",
+                     deployment_id="dep_1", host_id="host-test", candidate_id="cand_example",
+                     head=sha, base="b" * 40, merge="c" * 40, tree="d" * 40, running_sha=sha,
                      artifact_digest="sha256:" + "e" * 64, previous_healthy_sha=None,
-                     install_kind="first_install", stage="PLAN", state="PLAN")
+                     install_kind="first_install", stage="PLAN", state="PLAN",
+                     trusted_source="host_deployer")
         for field in ("run_id", "attempt", "task_id"):
             first.pop(field, None)
         self.assertIsNone(validate_event(self.contract, first))
         upgrade = dict(first, install_kind="upgrade")
         self.assertEqual(validate_event(self.contract, upgrade), "EVIDENCE_MISSING")
+        granted = {
+            "event_id": "evt_auth", "schema_version": 2, "event_type": "authorization.granted",
+            "event_class": "authorization", "repo_id": "layho/web-app-init-base-env",
+            "producer_id": "policy_service", "stream_id": "policy_service:authorization",
+            "stream_epoch": 1, "producer_seq": 1, "occurred_at": "2026-11-27T10:00:00Z",
+            "idempotency_key": "idem-auth", "task_id": "tsk_example_w00", "candidate_id": "cand_example",
+            "head": sha, "base": "b" * 40, "merge": "c" * 40, "tree": "d" * 40,
+            "operation": "preview.merge", "policy_revision": 3, "revision": 3,
+            "stage": "integrate", "state": "RECORDED", "evidence_ref": "policy://3",
+            "trusted_source": "policy_service",
+        }
+        self.assertIsNone(validate_event(self.contract, granted))
+        incomplete = dict(granted)
+        incomplete.pop("operation")
+        incomplete.pop("policy_revision")
+        self.assertEqual(validate_event(self.contract, incomplete), "SCHEMA_UNSUPPORTED")
+        self.assertEqual(
+            self.contract["entities"]["event"]["event_types"]["deployment.commit"]["trusted_source"],
+            "host_deployer",
+        )
         applied, held = project([
             {"event_id": "d1", "stream_id": "macci:diagnostic", "stream_epoch": 1, "producer_seq": 1, "channel": "diagnostic"},
             {"event_id": "a2", "stream_id": "policy:authorization", "stream_epoch": 1, "producer_seq": 2, "channel": "authorization"},
@@ -369,16 +490,39 @@ class ContractFixtureTest(unittest.TestCase):
         ])
         self.assertEqual(applied, ["d1"])
         self.assertCountEqual(held, ["a2", "a1"])
+        bypassed, bypass_held = project([
+            {"event_id": "gap", "stream_id": "policy:authorization", "stream_epoch": 1, "producer_seq": 2, "channel": "authorization"},
+            {"event_id": "new-epoch", "stream_id": "policy:authorization", "stream_epoch": 2, "producer_seq": 1, "channel": "authorization"},
+        ])
+        self.assertEqual(bypassed, [])
+        self.assertCountEqual(bypass_held, ["gap", "new-epoch"])
+        closed, _held = project([
+            {"event_id": "close", "stream_id": "policy:authorization", "stream_epoch": 1, "producer_seq": 1,
+             "channel": "authorization", "epoch_closed": True},
+            {"event_id": "next", "stream_id": "policy:authorization", "stream_epoch": 2, "producer_seq": 1, "channel": "authorization"},
+        ])
+        self.assertEqual(closed, ["close", "next"])
         self.assertFalse(self.contract["entities"]["event"]["transitions"])
         self.assertTrue(self.contract["entities"]["event"]["delivery"]["transitions"])
         self.assertFalse(no_change_commit_allowed(None, "first_install", True, False))
         self.assertFalse(no_change_commit_allowed("b" * 40, "first_install", True, False))
         self.assertTrue(no_change_commit_allowed("b" * 40, "upgrade", True, False))
-        self.assertEqual(first_install_rollback(False), "SAFE_FROZEN")
-        self.assertEqual(first_install_rollback(True), "ROLLED_BACK")
-        self.assertFalse(can_close(["SATISFIED", "TESTING"]))
-        self.assertTrue(can_close(["SATISFIED", "SATISFIED"]))
+        self.assertEqual(first_install_rollback(self.contract, False), "SAFE_FROZEN")
+        self.assertEqual(first_install_rollback(self.contract, True), "ROLLED_BACK")
+        self.assertFalse(allows(self.contract, "deployment", "ROLLBACK", "ROLLED_BACK", ["old_health_proved"]))
+        self.assertFalse(can_close(["SATISFIED", "SATISFIED"], [True, True], True))
+        self.assertTrue(can_close(["PUBLISHED", "PUBLISHED"], [True, True], True))
+        self.assertFalse(can_close(["PUBLISHED"], [True], False))
+        self.assertFalse(self.contract["dependencies"]["same_base_required"])
+        self.assertTrue(dependency_may_use_new_base(True, "new-base", "old-base", False))
+        self.assertFalse(dependency_may_use_new_base(True, "new-base", "old-base", True))
+        kept = prefer_fact(
+            {"event_class": "deployment", "revision": 4, "authoritative": True},
+            {"event_class": "diagnostic", "revision": 9, "authoritative": False},
+        )
+        self.assertEqual(kept["revision"], 4)
         self.assertFalse(self.contract["entities"]["task"]["reopen"])
+        self.assertEqual(terminals_have_no_outgoing(self.contract), [])
 
     def test_examples_cover_writes_and_http_codes(self):
         by_code = {row["code"]: row["http"] for row in self.contract["error_codes"]}
@@ -411,6 +555,26 @@ class ContractFixtureTest(unittest.TestCase):
         self.assertIn("after_seq", poll["path"])
         self.assertEqual(self.contract["acceptance_owners"]["technical_review"], "ChatGPT")
         self.assertEqual(self.contract["acceptance_owners"]["functional_acceptance"], "user")
+        for name in ("task_renew", "run_complete", "run_start", "run_release", "run_heartbeat"):
+            example = next(row for row in self.contract["examples"] if row["name"] == name)
+            token = example["request"]["lease_token"]
+            generation = example["request"]["lease_generation"]
+            binding = example["request"]["lease_binding"]
+            self.assertNotEqual(token, str(generation))
+            self.assertNotIn("shown-once", token)
+            self.assertEqual(binding["principal_id"], example["request"]["actor"]["id"])
+            self.assertEqual(binding["run_id"], example["request"]["run_id"])
+            self.assertEqual(binding["scope"], example["request"]["scope"]["repo"])
+            self.assertEqual(binding["lease_generation"], generation)
+        renew = next(row for row in self.contract["examples"] if row["name"] == "task_renew")
+        self.assertNotEqual(renew["request"]["lease_token"], renew["response"]["lease_token"])
+        stale = next(row for row in self.contract["examples"] if row["name"] == "run_finish_stale_lease")
+        self.assertFalse(stale["response"]["changed"])
+        self.assertNotEqual(stale["response"]["state"], "UNKNOWN")
+        self.assertIn("signature", self.contract["identity"]["proof_fields"])
+        self.assertIn("key_id", self.contract["identity"]["proof_fields"])
+        for field in ("operation", "candidate_id", "policy_revision"):
+            self.assertIn(field, self.contract["identity"]["signed_content"])
 
     def test_inventory_matches_design_and_matrix_rows(self):
         expected = design_ids()
@@ -448,6 +612,25 @@ class ContractFixtureTest(unittest.TestCase):
         self.assertIn("逐条反馈", self.plan)
         self.assertIn("隔离验证", self.plan)
         self.assertNotIn("按小时汇总", self.plan)
+        self.assertIn("轮换后拒绝旧代次", self.plan)
+        self.assertIn("script-src", self.plan)
+        self.assertIn("模型测试", self.architecture)
+        self.assertIn("可信代理", self.architecture)
+        self.assertIn("key_id", self.architecture)
+        self.assertIn("W06 不修改", self.ownership)
+        self.assertIn("app/control_routes_w08.py", self.ownership)
+        self.assertIn("app/control_routes_w09.py", self.ownership)
+        self.assertFalse(proxy_allow(2, 1, "feedback", "feedback"))
+        self.assertFalse(proxy_allow(2, 2, "feedback", "merge"))
+        self.assertTrue(proxy_allow(2, 2, "feedback", "feedback"))
+        durable = {"count": 10, "revoked": {"session-old"}}
+        process = {"count": 0, "revoked": set()}
+        process.clear()
+        self.assertEqual(durable["count"], 10)
+        self.assertIn("session-old", durable["revoked"])
+        self.assertFalse(web_boundary_ok("default-src 'self'", "ok"))
+        self.assertFalse(web_boundary_ok("script-src 'self'", "github_pat_example"))
+        self.assertTrue(web_boundary_ok("script-src 'self'", "request failed"))
 
 
 if __name__ == "__main__":

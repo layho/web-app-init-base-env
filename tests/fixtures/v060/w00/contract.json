@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
   "status": "draft",
-  "revision_comment": 7216272486,
+  "revision_comment": 7216590735,
   "baseline_sha": "db19bff19307fa763fd50e94b4cedfda7181a141",
   "baseline_tree": "c126d37771fa66a832497e6b2814d782fafc1dff",
   "package": "W00",
   "issue": 204,
   "normative": false,
-  "note": "草案第 2 版。评审评论 7216272486 之后修订。未经 REVIEW_APPROVED 不得冻结，不得启动 W01/W02。",
+  "note": "草案第 2 版，评审评论 7216590735 之后仍未冻结。normative 为 false。未经 REVIEW_APPROVED 不得启动 W01/W02。",
   "delivery": "at_least_once_plus_idempotent_reconcile",
   "exactly_once_across_github_and_db": false,
   "clock": "server",
@@ -25,14 +25,47 @@
     "same_key_mints_second_token": false,
     "proof_fields": [
       "signer_id",
+      "key_id",
       "scope",
       "issued_at",
       "expires_at",
       "nonce",
       "payload_hash",
-      "alg"
+      "alg",
+      "signature"
     ],
-    "alg": "ed25519"
+    "alg": "ed25519",
+    "signed_content": [
+      "operation",
+      "object_id",
+      "candidate_id",
+      "head",
+      "base",
+      "merge",
+      "tree",
+      "policy_revision",
+      "scope",
+      "nonce",
+      "expires_at"
+    ],
+    "test_identity": {
+      "isolated_configuration_only": true,
+      "client_supplied_proof_enters_real_routes": false
+    },
+    "lease": {
+      "token_is_opaque": true,
+      "generation_alone_is_not_a_token": true,
+      "binding": [
+        "principal_id",
+        "run_id",
+        "scope",
+        "lease_generation"
+      ],
+      "github_native_fencing": false,
+      "fencing_authority": "trusted_proxy",
+      "stale_request_changes_newer_run": false,
+      "rejected_request_is_not_unknown": true
+    }
   },
   "diagnostic": {
     "subscribe": false,
@@ -48,6 +81,13 @@
       "gap",
       "items",
       "side_effect"
+    ],
+    "cursors": "one after_seq per stream_id",
+    "classifications": [
+      "applied",
+      "held",
+      "gap",
+      "quarantined"
     ]
   },
   "acceptance_owners": {
@@ -58,7 +98,7 @@
   },
   "entities": {
     "task": {
-      "description": "任务是聚合。测试、集成、部署、验收发生在候选链上。全部必要链 SATISFIED 之前不能 close。close 之后不能重开，后续事项使用新 task_id。",
+      "description": "任务是聚合。SATISFIED 只表示该链已验收，不等于已正式发布。全部必要链 PUBLISHED 且任务级验收已记录才能 close。REJECTED 不是终态。",
       "phases": [
         "feedback_sync",
         "claim",
@@ -140,11 +180,11 @@
           "SATISFIED",
           "REJECTED",
           "FAILED",
-          "SUPERSEDED"
+          "SUPERSEDED",
+          "PUBLISHED"
         ],
         "terminal": [
-          "SATISFIED",
-          "REJECTED",
+          "PUBLISHED",
           "SUPERSEDED"
         ],
         "transitions": [
@@ -206,10 +246,25 @@
             "from": "REJECTED",
             "to": "SUPERSEDED",
             "guard": "repair_authorized_new_candidate"
+          },
+          {
+            "from": "SATISFIED",
+            "to": "PUBLISHED",
+            "guard": "formal_publish_evidence"
+          },
+          {
+            "from": "DEPLOYING",
+            "to": "SUPERSEDED",
+            "guard": "deployment_failed_replacement"
           }
         ]
       },
-      "after_close": "new task_id with optional follows_task_id; the closed task has no outgoing phase"
+      "after_close": "new task_id with optional follows_task_id; the closed task has no outgoing phase",
+      "close_requires": [
+        "every required chain is PUBLISHED",
+        "each chain has publish_evidence",
+        "task_acceptance recorded"
+      ]
     },
     "run": {
       "description": "一次 attempt 一个 run_id。lease_generation 在领取和续租时加一。过期和取消以服务端时钟为准。续租不是新 run。重试是新 run。",
@@ -503,7 +558,7 @@
       ]
     },
     "deployment": {
-      "description": "COMMIT 只在提交回执已经落盘后成立。SAFE_FROZEN 没有出边。恢复是新的 deployment_id。首次安装没有 previous healthy SHA。",
+      "description": "COMMIT 可以来自已落盘的回执，或来自对账确认健康后的回执补记。SAFE_FROZEN 没有出边。首次安装在资源已经清除时才能 ROLLED_BACK。",
       "states": [
         "PLAN",
         "STAGE",
@@ -526,7 +581,8 @@
       "first_install": {
         "previous_healthy_sha": null,
         "no_change_commit": false,
-        "rollback_without_removal_proof": "SAFE_FROZEN"
+        "rollback_without_removal_proof": "SAFE_FROZEN",
+        "rolled_back_requires": "first_install_resources_removed"
       },
       "recovery": "new deployment_id with recovers_deployment_id and explicit_authorization",
       "transitions": [
@@ -609,11 +665,21 @@
           "from": "VERIFY_OLD",
           "to": "SAFE_FROZEN",
           "guard": "old_health_unproven"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "COMMIT",
+          "guard": "reconcile_confirms_healthy_and_backfill_commit"
+        },
+        {
+          "from": "ROLLBACK",
+          "to": "ROLLED_BACK",
+          "guard": "first_install_resources_removed"
         }
       ]
     },
     "resource": {
-      "description": "释放可以完成、失败或部分完成。部分完成不能标成全部 RELEASED。",
+      "description": "破坏性释放仍要单独授权。已经预授权的普通恢复不需要每次再请用户批准。",
       "states": [
         "PLANNED",
         "RESERVED",
@@ -702,7 +768,7 @@
         {
           "from": "PARTIAL",
           "to": "RELEASING",
-          "guard": "authorized_resume"
+          "guard": "preauthorized_recovery"
         },
         {
           "from": "PARTIAL",
@@ -712,7 +778,7 @@
         {
           "from": "RELEASE_FAILED",
           "to": "RELEASING",
-          "guard": "authorized_new_release_attempt"
+          "guard": "preauthorized_recovery"
         }
       ]
     },
@@ -765,6 +831,12 @@
           "deployment_id",
           "app_id",
           "host_id",
+          "candidate_id",
+          "head",
+          "base",
+          "merge",
+          "tree",
+          "running_sha",
           "artifact_digest",
           "previous_healthy_sha",
           "install_kind",
@@ -784,10 +856,22 @@
         ],
         "authorization": [
           "task_id",
+          "candidate_id",
+          "head",
+          "base",
+          "merge",
+          "tree",
+          "operation",
+          "policy_revision",
           "revision",
           "stage",
           "state",
           "evidence_ref"
+        ],
+        "diagnostic": [
+          "diagnostic_class",
+          "subject_id",
+          "severity"
         ]
       },
       "nullable": {
@@ -808,7 +892,8 @@
           "authorization"
         ],
         "epoch_start": 1,
-        "authorization_never_existed": false
+        "authorization_never_existed": false,
+        "authorization_epoch_gate": "epoch N>1 cannot apply until epoch N-1 has an applied epoch_closed event"
       },
       "delivery": {
         "scope": [
@@ -853,6 +938,32 @@
             "to": "QUARANTINED"
           }
         ]
+      },
+      "event_types": {
+        "authorization.granted": {
+          "class": "authorization",
+          "trusted_source": "policy_service"
+        },
+        "authorization.revoked": {
+          "class": "authorization",
+          "trusted_source": "policy_service"
+        },
+        "deployment.health": {
+          "class": "deployment",
+          "trusted_source": "host_deployer"
+        },
+        "deployment.commit": {
+          "class": "deployment",
+          "trusted_source": "host_deployer"
+        },
+        "ci.test.finished": {
+          "class": "evidence",
+          "trusted_source": "macci"
+        },
+        "diagnostic.observation": {
+          "class": "diagnostic",
+          "trusted_source": "hostops_readonly"
+        }
       }
     }
   },
@@ -1064,6 +1175,21 @@
       "name": "upgrade_reconcile",
       "method": "POST",
       "path": "/api/v1/control/upgrades:reconcile"
+    },
+    {
+      "name": "run_start",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:start"
+    },
+    {
+      "name": "run_release",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:release"
+    },
+    {
+      "name": "run_heartbeat",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:heartbeat"
     }
   ],
   "examples": [
@@ -1097,8 +1223,14 @@
         "attempt": 1,
         "lease_generation": 1,
         "state": "LEASED",
-        "lease_token": "shown-once",
-        "replayed": false
+        "lease_token": "opaque-lease-claim-7f3a",
+        "replayed": false,
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 1
+        }
       }
     },
     {
@@ -1122,7 +1254,14 @@
         "expected_revision": 1,
         "idempotency_key": "idem-w00-task_renew",
         "run_id": "run_1",
-        "lease_generation": 1
+        "lease_generation": 1,
+        "lease_token": "opaque-lease-claim-7f3a",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 1
+        }
       },
       "response": {
         "schema_version": 2,
@@ -1130,8 +1269,14 @@
         "request_id": "req_renew",
         "lease_generation": 2,
         "state": "LEASED",
-        "lease_token": "shown-once",
-        "replayed": false
+        "lease_token": "opaque-lease-renew-91c2",
+        "replayed": false,
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
       }
     },
     {
@@ -1156,14 +1301,22 @@
         "idempotency_key": "idem-w00-run_complete",
         "run_id": "run_1",
         "lease_generation": 2,
-        "result": "SUCCEEDED"
+        "result": "SUCCEEDED",
+        "lease_token": "opaque-lease-renew-91c2",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
       },
       "response": {
         "schema_version": 2,
         "http": 200,
         "request_id": "req_complete",
         "state": "SUCCEEDED",
-        "replayed": false
+        "replayed": false,
+        "lease_token": null
       }
     },
     {
@@ -1916,7 +2069,7 @@
       "name": "run_finish_stale_lease",
       "method": "POST",
       "path": "/api/v1/control/runs/run_1:complete",
-      "side_effect": true,
+      "side_effect": false,
       "implemented": false,
       "acceptance_owner": "user",
       "request": {
@@ -1934,13 +2087,135 @@
         "idempotency_key": "idem-w00-stale-lease",
         "run_id": "run_1",
         "lease_generation": 1,
-        "result": "SUCCEEDED"
+        "result": "SUCCEEDED",
+        "lease_token": "opaque-lease-old",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 1
+        }
       },
       "response": {
         "schema_version": 2,
         "http": 409,
         "code": "LEASE_FENCE_REJECTED",
-        "state": "UNKNOWN"
+        "state": "RUNNING",
+        "changed": false
+      }
+    },
+    {
+      "name": "run_start",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:start",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-run_start",
+        "run_id": "run_1",
+        "lease_generation": 2,
+        "lease_token": "opaque-lease-renew-91c2",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_start",
+        "state": "RUNNING",
+        "replayed": false
+      }
+    },
+    {
+      "name": "run_release",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:release",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-run_release",
+        "run_id": "run_1",
+        "lease_generation": 2,
+        "lease_token": "opaque-lease-renew-91c2",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_release",
+        "state": "PENDING",
+        "replayed": false
+      }
+    },
+    {
+      "name": "run_heartbeat",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:heartbeat",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-run_heartbeat",
+        "run_id": "run_1",
+        "lease_generation": 2,
+        "lease_token": "opaque-lease-renew-91c2",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_beat",
+        "state": "RUNNING",
+        "replayed": false
       }
     }
   ],
@@ -2142,7 +2417,7 @@
       "from": "PARTIAL",
       "to": "RELEASING",
       "guards": [
-        "authorized_resume"
+        "preauthorized_recovery"
       ],
       "expect": "allow"
     },
@@ -2176,6 +2451,118 @@
       "to": "claim",
       "guards": [],
       "expect": "deny"
+    },
+    {
+      "id": "reconcile_backfill_commit",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "RECONCILE",
+      "to": "COMMIT",
+      "guards": [
+        "reconcile_confirms_healthy_and_backfill_commit"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "reconcile_commit_without_health",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "RECONCILE",
+      "to": "COMMIT",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "first_install_resources_removed",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "ROLLBACK",
+      "to": "ROLLED_BACK",
+      "guards": [
+        "first_install_resources_removed"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "first_install_rollback_without_proof",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "ROLLBACK",
+      "to": "ROLLED_BACK",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "first_install_old_health_is_not_enough",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "ROLLBACK",
+      "to": "ROLLED_BACK",
+      "guards": [
+        "old_health_proved"
+      ],
+      "expect": "deny"
+    },
+    {
+      "id": "chain_formal_publish",
+      "kind": "transition",
+      "machine": "task_chain",
+      "from": "SATISFIED",
+      "to": "PUBLISHED",
+      "guards": [
+        "formal_publish_evidence"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "failed_deployment_chain_replaceable",
+      "kind": "transition",
+      "machine": "task_chain",
+      "from": "DEPLOYING",
+      "to": "SUPERSEDED",
+      "guards": [
+        "deployment_failed_replacement"
+      ],
+      "expect": "allow"
     }
-  ]
+  ],
+  "model_tests": {
+    "guard_matching": "string equality only",
+    "not_production_verification": true,
+    "note": "这些夹具只检验契约模型。字符串守卫不是生产环境里的真实校验。"
+  },
+  "guard_authority": {
+    "lease_expired_or_effect_unproven": "trusted_proxy",
+    "note": "调用方的过期或旧代次请求只被拒绝，不把仍有效的新 Run 改成 UNKNOWN。UNKNOWN 只能由可信代理完成对账后写入。"
+  },
+  "object_projection": {
+    "priority": [
+      "authoritative_source",
+      "revision",
+      "received_at",
+      "producer_id"
+    ],
+    "diagnostic_cannot_override": [
+      "authorization",
+      "deployment",
+      "candidate"
+    ],
+    "same_revision": "authoritative source beats advisory"
+  },
+  "recovery_authorization": {
+    "ordinary_preauthorized_recovery": "no per-action user approval",
+    "high_risk_enablement": "dedicated authorization"
+  },
+  "dependencies": {
+    "same_base_required": false,
+    "rule": "依赖 PR 集成之后，下游可以按当时的基线测试，不必先在依赖的旧 base 上重测。",
+    "failed_deployment_replaceable": true
+  },
+  "isolation_acceptance": {
+    "A01": "隔离代理在轮换后拒绝旧代次，并且操作范围不能互换。",
+    "I07": "同一入口下的拉取与反馈范围在轮换后仍然分开。",
+    "A08": "限流计数和会话撤销在进程重启后仍然有效。",
+    "A09": "响应必须带 script-src，错误正文不得含秘密。",
+    "production_enablement_required": false
+  }
 }

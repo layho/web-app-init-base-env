@@ -84,7 +84,7 @@ W02 的只读核对清单：
 
 生产身份验证尚未实现。在 `production_verification_enabled` 变为 true 之前，契约只接受隔离测试身份：kind 为 test，并且 proof_ref 以 `test-proof://` 开头。agent、共享 Owner 登录名和评论标记都不能通过。
 
-证明字段是 signer_id、scope、issued_at、expires_at、nonce、payload_hash、alg。草案中的 alg 名称是 ed25519。服务端用自己的时钟拒绝过期证明，拒绝重复 nonce，并拒绝已撤销的 signer_id。撤销立即生效。
+证明字段是 signer_id、key_id、signature、scope、issued_at、expires_at、nonce、payload_hash、alg。草案中的 alg 名称是 ed25519。规范签名内容绑定 operation、object_id、candidate_id、四元组、policy_revision、scope、nonce 和 expires_at。服务端用自己的时钟拒绝过期证明，拒绝重复 nonce，并拒绝已撤销的 signer_id。撤销立即生效。测试身份只能由隔离配置打开。客户端自行提交 test-proof 字符串不能进入真实路由。GitHub 没有原生 fencing，代次本身也不是围栏。状态改变前要由可信代理串行校验。
 
 处理顺序是先认证、再授权、最后才查幂等记录。前两步失败时不创建幂等记录。重放返回当时的公开结果和对象的当前状态，不返回明文租约。
 

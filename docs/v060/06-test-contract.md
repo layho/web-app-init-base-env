@@ -2,7 +2,7 @@
 
 执行者：Grok。正式测试走 MacCI 的精确 head、base、merge 回执，不使用 GitHub Actions，不在生产做故障注入，不索取秘密。
 
-W00 已落地的只有本地契约夹具：`tests/test_v060_w00_contract.py` 读取 `tests/fixtures/v060/w00/`。它执行草案里的状态转换、租约代次、幂等顺序、候选编码和分流水位。它不断言生产行为已经改变，也不把草案当成已经冻结。
+W00 已落地的只有本地契约夹具：`tests/test_v060_w00_contract.py` 读取 `tests/fixtures/v060/w00/`。它执行草案里的状态转换、租约绑定、幂等顺序、候选编码和分流水位。守卫只做字符串匹配。这是模型测试，不是生产校验，也不断言宿主或 GitHub 已经被 fencing。草案仍然没有冻结。
 
 ## 分层
 
