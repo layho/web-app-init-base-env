@@ -5,6 +5,7 @@ import os
 import secrets
 import time
 from datetime import timedelta
+from threading import Lock
 from fastapi import HTTPException, Request, Response
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
@@ -13,7 +14,12 @@ from . import admin_settings
 
 COOKIE_NAME = "webapp_session"
 TTL_HOURS = 12
-_failures = []
+SESSION_CLEANUP_BATCH = 100
+_login_attempts = {}
+_login_lock = Lock()
+LOGIN_WINDOW_SECONDS = 900
+LOGIN_CLIENT_LIMIT = 10
+LOGIN_GLOBAL_LIMIT = 100
 
 def hash_password(password: str) -> str:
     if len(password) < 12:
@@ -53,23 +59,47 @@ def require_origin(request: Request):
 
 def login(request: Request, response: Response, db: Session, username: str, password: str):
     require_origin(request)
-    now = time.monotonic()
-    _failures[:] = [t for t in _failures if now - t < 900]
-    if len(_failures) >= 10:
-        raise HTTPException(429, "Too many unsuccessful login attempts; retry later")
     expected_user = os.getenv("APP_ADMIN_USERNAME", "admin")
     encoded = admin_settings.read()["password_hash"] or os.getenv("APP_ADMIN_PASSWORD_HASH", "")
     if not encoded:
         raise HTTPException(503, "Admin password hash not configured")
-    user_ok = hmac.compare_digest(username.encode(), expected_user.encode())
-    password_ok = check_password(password, encoded)
-    if not (user_ok and password_ok):
-        _failures.append(now)
+    # The ASGI server determines the client using its trusted proxy settings.
+    client = request.client.host if request.client else None
+    attempt = object()
+    with _login_lock:
+        now = time.monotonic()
+        for key, (_, failed_at) in tuple(_login_attempts.items()):
+            if failed_at is not None and now - failed_at >= LOGIN_WINDOW_SECONDS:
+                del _login_attempts[key]
+        client_count = sum(source == client for source, _ in _login_attempts.values())
+        if client_count >= LOGIN_CLIENT_LIMIT or len(_login_attempts) >= LOGIN_GLOBAL_LIMIT:
+            raise HTTPException(429, "Too many unsuccessful login attempts; retry later")
+        _login_attempts[attempt] = (client, None)
+
+    failed = False
+    try:
+        user_ok = hmac.compare_digest(username.encode(), expected_user.encode())
+        password_ok = check_password(password, encoded)
+        failed = not (user_ok and password_ok)
+    finally:
+        with _login_lock:
+            if failed:
+                _login_attempts[attempt] = (client, time.monotonic())
+            else:
+                del _login_attempts[attempt]
+    if failed:
         raise HTTPException(401, "Incorrect credentials")
     raw_token = secrets.token_urlsafe(48)
     raw_csrf = session_csrf(raw_token)
+    issued_at = utcnow()
+    expired_ids = (select(AdminSession.id)
+                   .where(AdminSession.expires_at <= issued_at)
+                   .order_by(AdminSession.expires_at, AdminSession.id)
+                   .limit(SESSION_CLEANUP_BATCH))
+    db.execute(delete(AdminSession).where(AdminSession.id.in_(expired_ids)),
+               execution_options={"synchronize_session": False})
     row = AdminSession(token_hash=token_hash(raw_token), csrf_hash=token_hash(raw_csrf), username=expected_user,
-                       expires_at=utcnow() + timedelta(hours=TTL_HOURS))
+                       expires_at=issued_at + timedelta(hours=TTL_HOURS))
     db.add(row)
     db.commit()
     response.set_cookie(key=COOKIE_NAME, value=raw_token, secure=os.getenv("APP_COOKIE_SECURE", "true").lower()=="true",

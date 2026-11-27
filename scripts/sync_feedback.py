@@ -23,6 +23,10 @@ def github(method, path, data=None):
                  "Content-Type":"application/json"})
     with urllib.request.urlopen(req,timeout=20) as resp:
         return json.load(resp)
+def feedback_source():
+    return "base.layho.com" if os.getenv("APP_PREVIEW_FEEDBACK") == "1" else "app.example.com"
+
+
 def issue_body(entry, source="app.example.com"):
     """Construct readable Markdown, not escaped literal backslash-n sequences."""
     attachments=feedback_attachments.listing("feedback",entry.id)
@@ -35,7 +39,23 @@ def issue_body(entry, source="app.example.com"):
             f"{evidence + chr(10) + chr(10) if evidence else ''}"
             "Do not treat this as tested/verified without evidence.")
 
-def find_existing_issue(entry, marker):
+
+def matches_issue(issue, feedback_id, category):
+    if not isinstance(issue, dict) or "pull_request" in issue:
+        return False
+    number = issue.get("number")
+    body = issue.get("body")
+    association = issue.get("author_association")
+    marker = f"[APP-FEEDBACK #{feedback_id}]"
+    return (type(number) is int and number > 0
+            and isinstance(association, str) and association in feedback_progress.TRUSTED_ASSOCIATIONS
+            and issue.get("title") in (marker, f"{marker} {category}")
+            and isinstance(body, str)
+            and body.splitlines()[:3] == [f"Source: {feedback_source()} admin feedback",
+                                         f"Internal feedback ID: {feedback_id}", f"Category: {category}"])
+
+
+def find_existing_issue(entry):
     # An issue can only be created after its feedback row. Allow for clock skew
     # and include closed issues so a retry cannot reopen or duplicate them.
     created_at = entry.created_at
@@ -50,8 +70,7 @@ def find_existing_issue(entry, marker):
         if not isinstance(issues, list):
             raise ValueError("Unexpected GitHub issue list")
         for issue in issues:
-            title = issue.get("title", "")
-            if "pull_request" not in issue and (title == marker or title.startswith(marker + " ")):
+            if matches_issue(issue, entry.id, entry.category):
                 return issue
         if len(issues) < page_size:
             return None
@@ -68,15 +87,17 @@ def main():
             marker=f"[APP-FEEDBACK #{entry.id}]"
             operation = "lookup"
             try:
-                exact = find_existing_issue(entry, marker)
+                exact = find_existing_issue(entry)
                 if exact is None:
                     operation = "create"
                     result=github("POST",f"/repos/{REPO}/issues",{
                       "title":f"{marker} {entry.category}",
-                      "body":issue_body(entry, "base.layho.com" if os.getenv("APP_PREVIEW_FEEDBACK") == "1" else "app.example.com")
+                      "body":issue_body(entry, feedback_source())
                     })
                 else:
                     result=exact
+                if not matches_issue(result, entry.id, entry.category):
+                    raise ValueError("Unverified feedback issue")
                 entry.github_issue_number=result["number"]
                 entry.status="synced"
                 entry.synced_at=utcnow()
@@ -98,15 +119,19 @@ def refresh_progress():
     with SessionLocal() as db:
         rows = db.scalars(select(UserFeedback).where(UserFeedback.github_issue_number.is_not(None))
                           .order_by(UserFeedback.id.desc()).limit(100)).all()
-        linked = [(row.id, row.github_issue_number) for row in rows]
+        linked = [(row.id, row.github_issue_number, row.category) for row in rows]
     # Prioritize the oldest or never refreshed entries, at most 15 each run.
     def checked_at(link):
-        entry = feedback_progress.current_entry(cache, *link)
+        entry = feedback_progress.current_entry(cache, *link[:2])
         return feedback_progress.parse_time(entry.get("checked_at")) or now - timedelta(days=36500)
     due = [link for link in linked if now - checked_at(link) >= feedback_progress.REFRESH_INTERVAL]
     failed = False
-    for feedback_id, issue_number in sorted(due, key=checked_at)[:15]:
+    for feedback_id, issue_number, category in sorted(due, key=checked_at)[:15]:
         try:
+            issue = github("GET", f"/repos/{REPO}/issues/{issue_number}")
+            if not matches_issue(issue, feedback_id, category) or issue["number"] != issue_number:
+                cache.pop(str(issue_number), None)
+                raise ValueError("Unverified feedback issue link")
             comments = []
             page = 1
             while True:
@@ -128,7 +153,7 @@ def refresh_progress():
             failed = True
             print(f"Feedback progress refresh failed for issue {issue_number}: {type(exc).__name__}", flush=True)
     # Retain only entries tied to the currently visible feedback records.
-    cache = {str(number): cache[str(number)] for _, number in linked if str(number) in cache}
+    cache = {str(number): cache[str(number)] for _, number, _ in linked if str(number) in cache}
     feedback_progress.save_cache(cache)
     return 1 if failed else 0
 
