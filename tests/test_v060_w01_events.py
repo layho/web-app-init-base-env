@@ -13,15 +13,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
-from app.control_authz import AuthnError, AuthzError, AuthzService
-from app.control_authz.service import POLICY_REVISION, isolated_registry
-from app.control_events.engine import Engine
+from app.control_authz import AuthnError, AuthzError, AuthzService, MATRIX, Principal, PrincipalRegistry, REQUIRED_SCOPES, SOURCE_BY_KIND
+from app.control_events.auth_bind import POLICY_REVISION, STREAM_REPAIR
+from app.control_events.engine import FOLLOW_UPS, PACKAGE_COMPLETE, Engine
 from app.control_events.errors import BadRecord, ControlError, DeliveryUnknown
 from app.control_events.identity import bound_token_for_directory
 from app.control_events.legacy import KNOWN_AGENTS
-from app.control_events.outbox import FAILURE_PHASES, OutboxLimits
+from app.control_events.outbox import FAILURE_PHASES, OutboxLimits, bound_confirmation
 from app.control_routes_w01 import bind_isolated_engine, clear_binding, router, set_isolated
 from app.feedback_progress import STATUSES
+from tests.w01_isolated_principals import ensure_principals, sign_event, sign_read
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
@@ -32,34 +33,38 @@ SECRET = "github_pat_SHOULDNOTLEAK"
 
 
 def engine(tmp_path, token="generation-1", **kwargs):
-    return Engine.open(tmp_path / "store", token, **kwargs)
+    opened = Engine.open(tmp_path / "store", token, **kwargs)
+    ensure_principals(opened)
+    return opened
 
 
-def actor():
-    return {"kind": "test", "id": "fixture", "proof_ref": "test-proof://w01/fixture"}
+def actor(producer="fixture"):
+    return {"kind": "test", "id": producer, "proof_ref": f"test-proof://w01/{producer}"}
 
 
 def body(eng, **fields):
+    producer = fields.get("producer_id", "fixture")
     request = {
         "schema_version": 2,
-        "actor": actor(),
+        "actor": actor(producer),
         "scope": {"repo": "layho/web-app-init-base-env", "task_id": "tsk_w01"},
         "expected_revision": 1,
         "idempotency_key": "idem-w01",
         "repo_id": eng.repo_id,
+        "authorizer": producer,
     }
     request.update(fields)
-    request["credential"] = eng.credential_for(request.get("producer_id", "fixture"))
-    return request
+    request["authorizer"] = request.get("producer_id", producer)
+    return sign_event(eng, request)
 
 
-def confirm(_channel=None, _payload=None):
-    return {"confirmed": True}
+def confirm(channel, payload):
+    return bound_confirmation(channel, payload)
 
 
 def _bind(eng, payload):
-    payload["credential"] = eng.credential_for(payload.get("producer_id", "fixture"))
-    return payload
+    payload["authorizer"] = payload.get("producer_id", "fixture")
+    return sign_event(eng, payload)
 
 
 def task(eng, **fields):
@@ -101,6 +106,7 @@ def deployment(eng, **fields):
         deployment_id="dep_1",
         app_id="base",
         host_id="host-test",
+        task_id="tsk_w01",
         candidate_id="cand_w01",
         head=SHA,
         base=SHA_B,
@@ -131,6 +137,8 @@ def authorization(eng, **fields):
         stream_epoch=1,
         producer_seq=1,
         occurred_at="2026-11-27T10:00:00Z",
+        app_id="base",
+        host_id=None,
         task_id="tsk_w01",
         candidate_id="cand_w01",
         head=SHA,
@@ -161,6 +169,9 @@ def diagnostic(eng, **fields):
         stream_epoch=1,
         producer_seq=1,
         occurred_at="2026-11-27T10:00:00Z",
+        app_id="base",
+        host_id=None,
+        task_id="tsk_w01",
         diagnostic_class="queue",
         subject_id="tsk_w01",
         severity="info",
@@ -171,7 +182,7 @@ def diagnostic(eng, **fields):
     return _bind(eng, payload)
 
 
-def report(run_id, *, outcome, phase, note=None, **fields):
+def report(eng, run_id, *, outcome, phase, note=None, **fields):
     payload = {
         "repository": "layho/web-app-init-base-env",
         "pr": 206,
@@ -184,6 +195,12 @@ def report(run_id, *, outcome, phase, note=None, **fields):
         "tree": SHA_D,
         "executor_id": "macci-isolated",
         "evidence_ref": "evidence://macci/isolated",
+        "repo_id": eng.repo_id,
+        "app_id": "base",
+        "task_id": "tsk_w01",
+        "stream_id": "macci-isolated:evidence",
+        "host_id": "",
+        "producer_id": "macci-isolated",
     }
     if note:
         payload["note"] = note
@@ -343,15 +360,15 @@ def test_authorization_epoch_gaps_do_not_skip_and_diagnostics_stay_independent(t
     ))
     assert later_epoch["applied"] is False
     assert later_epoch["hold_reason"] == "EPOCH_GATE"
-    auth_query = eng.query(credential=eng.credential_for("policy_service"), stream_id="policy_service:authorization", stream_epoch=1, after_seq=0)
-    diag_query = eng.query(credential=eng.credential_for("hostops"), stream_id="hostops:diagnostic", stream_epoch=1, after_seq=0)
+    auth_query = eng.query(request=sign_read(eng, "policy_service", "event.read", stream_id="policy_service:authorization"), stream_id="policy_service:authorization", stream_epoch=1, after_seq=0)
+    diag_query = eng.query(request=sign_read(eng, "hostops", "event.read", stream_id="hostops:diagnostic"), stream_id="hostops:diagnostic", stream_epoch=1, after_seq=0)
     assert auth_query["gap"] is True and auth_query["watermark_seq"] == 0
     assert diag_query["gap"] is False and diag_query["watermark_seq"] == 1 and diag_query["side_effect"] is False
     filled = eng.append(authorization(eng, event_id="auth_1", idempotency_key="idem-auth-1"))
     assert filled["applied"] is True
     assert eng.watermarks()["policy_service:authorization@1"]["seq"] == 2
     assert eng.watermarks()["policy_service:authorization@1"]["closed"] is False
-    assert eng.query(credential=eng.credential_for("policy_service"), stream_id="policy_service:authorization", stream_epoch=2, after_seq=0)["watermark_seq"] == 0
+    assert eng.query(request=sign_read(eng, "policy_service", "event.read", stream_id="policy_service:authorization"), stream_id="policy_service:authorization", stream_epoch=2, after_seq=0)["watermark_seq"] == 0
     closed = eng.append(authorization(
         eng, event_id="auth_close", idempotency_key="idem-close", producer_seq=3,
         event_type="authorization.epoch_closed", trusted_source=None, revision=3, expected_revision=2,
@@ -438,26 +455,26 @@ def test_diagnostic_cursors_are_keyed_by_stream_and_epoch(tmp_path):
         eng, event_id="evt_b", idempotency_key="idem-b", producer_id="hostops_b",
         stream_id="hostops_b:diagnostic", subject_id="subj",
     ))
-    host = eng.credential_for("hostops")
-    other_cred = eng.credential_for("hostops_b")
-    first = eng.poll_diagnostics(credential=host, subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=1)
+    host = sign_read(eng, "hostops", "diagnostic.read", stream_id="hostops:diagnostic", object_id="subj")
+    other_cred = sign_read(eng, "hostops_b", "diagnostic.read", stream_id="hostops_b:diagnostic", object_id="subj")
+    first = eng.poll_diagnostics(request=host, subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=1)
     assert first["side_effect"] is False and first["cursor_persisted"] is False and first["gap"] is False
     assert len(first["items"]) == 0
     assert eng.cursor("hostops:diagnostic", 1) is None
-    other = eng.poll_diagnostics(credential=other_cred, subject="subj", stream_id="hostops_b:diagnostic", stream_epoch=1, after_seq=0)
+    other = eng.poll_diagnostics(request=other_cred, subject="subj", stream_id="hostops_b:diagnostic", stream_epoch=1, after_seq=0)
     assert len(other["items"]) == 1 and other["side_effect"] is False and eng.cursor("hostops_b:diagnostic", 1) is None
-    saved = eng.commit_cursor(credential=host, subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=1)
+    saved = eng.commit_cursor(request=sign_read(eng, "hostops", "diagnostic.cursor", stream_id="hostops:diagnostic", object_id="subj", method="POST"), subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=1)
     assert saved["side_effect"] is True and saved["cursor_after_seq"] == 1
-    other_saved = eng.commit_cursor(credential=other_cred, subject="subj", stream_id="hostops_b:diagnostic", stream_epoch=1, after_seq=0)
+    other_saved = eng.commit_cursor(request=sign_read(eng, "hostops_b", "diagnostic.cursor", stream_id="hostops_b:diagnostic", object_id="subj", method="POST"), subject="subj", stream_id="hostops_b:diagnostic", stream_epoch=1, after_seq=0)
     assert other_saved["cursor_after_seq"] == 0
     assert eng.cursor("hostops:diagnostic", 1, saved["principal_id"]) == 1
-    rewind = eng.poll_diagnostics(credential=host, subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=0)
+    rewind = eng.poll_diagnostics(request=sign_read(eng, "hostops", "diagnostic.read", stream_id="hostops:diagnostic", object_id="subj"), subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=0)
     assert len(rewind["items"]) == 1 and rewind["side_effect"] is False
     assert eng.cursor("hostops:diagnostic", 1, saved["principal_id"]) == 1
-    skipped = eng.poll_diagnostics(credential=host, subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=5)
+    skipped = eng.poll_diagnostics(request=sign_read(eng, "hostops", "diagnostic.read", stream_id="hostops:diagnostic", object_id="subj"), subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=5)
     assert skipped["gap"] is True and eng.cursor("hostops:diagnostic", 1, saved["principal_id"]) == 1
     with pytest.raises(ControlError) as ignored:
-        eng.poll_diagnostics(credential=host, subject="subj", stream_id="policy_service:authorization", stream_epoch=1, after_seq=0)
+        eng.poll_diagnostics(request=sign_read(eng, "hostops", "diagnostic.read", stream_id="policy_service:authorization"), subject="subj", stream_id="policy_service:authorization", stream_epoch=1, after_seq=0)
     assert ignored.value.code == "NOT_AUTHORIZED"
     assert eng.cursor("policy_service:authorization", 1) is None
     assert eng.cursor("hostops:diagnostic", 2) is None
@@ -526,10 +543,10 @@ def test_reports_hit_disk_before_remote_status_and_survive_restart(tmp_path):
         assert disk["outcome"] == payload["outcome"]
         assert disk["head"] == SHA and disk["phase"] == payload["phase"]
         calls.append((channel, disk["run_id"]))
-        return confirm()
+        return confirm(channel, payload)
 
-    success = report("1" * 32, outcome="success", phase="passed")
-    failure = report("2" * 32, outcome="failure", phase="pytest-failed", note=SECRET)
+    success = report(eng, "1" * 32, outcome="success", phase="passed")
+    failure = report(eng, "2" * 32, outcome="failure", phase="pytest-failed", note=SECRET)
     done = eng.submit_report(success, remote=remote)
     failed = eng.submit_report(failure, remote=remote)
     assert done["complete"] is True and failed["complete"] is True
@@ -540,7 +557,7 @@ def test_reports_hit_disk_before_remote_status_and_survive_restart(tmp_path):
     assert SECRET not in archived_failure.read_text(encoding="utf-8")
     assert not (tmp_path / "store" / "report-outbox" / f"{failure['run_id']}.json").exists()
     assert len(calls) == 4
-    incomplete = report("3" * 32, outcome="failure", phase="pytest-failed")
+    incomplete = report(eng, "3" * 32, outcome="failure", phase="pytest-failed")
     del incomplete["head"]
     before = list((tmp_path / "store" / "report-outbox").glob("*.json"))
     with pytest.raises(ControlError):
@@ -550,9 +567,9 @@ def test_reports_hit_disk_before_remote_status_and_survive_restart(tmp_path):
     def fail_status(channel, _payload):
         if channel == "commit_status":
             raise BadRecord("status record is bad")
-        return confirm()
+        return confirm(channel, _payload)
 
-    mixed = eng.submit_report(report("4" * 32, outcome="failure", phase="compile-failed"), remote=fail_status)
+    mixed = eng.submit_report(report(eng, "4" * 32, outcome="failure", phase="compile-failed"), remote=fail_status)
     by_channel = {item["channel"]: item["state"] for item in mixed["receipts"]}
     assert by_channel["github_comment"] == "DELIVERED"
     assert by_channel["commit_status"] == "QUARANTINED"
@@ -562,9 +579,9 @@ def test_reports_hit_disk_before_remote_status_and_survive_restart(tmp_path):
     assert health["production_protocol_enabled"] is False
 
     limited = engine(tmp_path / "limited", limits=OutboxLimits(max_outbox_reports=1, max_quarantine_reports=1))
-    limited.submit_report(report("5" * 32, outcome="success", phase="passed"), remote=lambda *_args: None)
+    limited.submit_report(report(limited, "5" * 32, outcome="success", phase="passed"), remote=lambda *_args: None)
     with pytest.raises(ControlError) as capacity:
-        limited.submit_report(report("6" * 32, outcome="failure", phase="test-failed"), remote=lambda *_args: None)
+        limited.submit_report(report(limited, "6" * 32, outcome="failure", phase="test-failed"), remote=lambda *_args: None)
     assert capacity.value.code == "CAPACITY_EXHAUSTED"
     assert limited.health()["outbox_remaining_reports"] == 0
     assert (tmp_path / "limited" / "store" / "report-outbox" / f"{'5' * 32}.json").exists()
@@ -575,7 +592,7 @@ def test_reports_hit_disk_before_remote_status_and_survive_restart(tmp_path):
     def both_bad(_channel, _payload):
         raise BadRecord("bad")
 
-    overflowing.submit_report(report("7" * 32, outcome="failure", phase="frontend-failed"), remote=both_bad)
+    overflowing.submit_report(report(overflowing, "7" * 32, outcome="failure", phase="frontend-failed"), remote=both_bad)
     assert overflowing.health()["quarantine_overflow"] >= 1
     assert overflowing.health()["channels"]["github_comment"]["QUARANTINED"] == 1
     assert overflowing.health()["channels"]["commit_status"]["QUARANTINED"] == 1
@@ -591,9 +608,10 @@ def test_reports_hit_disk_before_remote_status_and_survive_restart(tmp_path):
 def test_process_crash_after_durable_report_keeps_the_run(tmp_path):
     root = tmp_path / "crash"
     root.mkdir()
-    Engine.open(root, "generation-1")
+    opened = Engine.open(root, "generation-1")
+    ensure_principals(opened)
     payload = {
-        "report": report("9" * 32, outcome="failure", phase="setup-failed"),
+        "report": report(opened, "9" * 32, outcome="failure", phase="setup-failed"),
         "channels": ["github_comment", "commit_status"],
     }
     request = tmp_path / "report.json"
@@ -601,7 +619,12 @@ def test_process_crash_after_durable_report_keeps_the_run(tmp_path):
     for mode, code in (("after-file", 92), ("before-remote", 91)):
         case = tmp_path / mode
         case.mkdir()
-        Engine.open(case, "generation-1")
+        case_engine = Engine.open(case, "generation-1")
+        ensure_principals(case_engine)
+        request.write_text(json.dumps({
+            "report": report(case_engine, "9" * 32, outcome="failure", phase="setup-failed"),
+            "channels": ["github_comment", "commit_status"],
+        }), encoding="utf-8")
         proc = subprocess.run(
             [sys.executable, "-m", "app.control_events.crash_probe", "--root", str(case),
              "--token", "generation-1", "--mode", mode, "--request", str(request)],
@@ -614,7 +637,7 @@ def test_process_crash_after_durable_report_keeps_the_run(tmp_path):
         assert restored.health()["backlog"] >= 1
         assert "DURABLE_LOCAL" in restored.health()["channels"].get("commit_status", {})
         calls = []
-        receipts = restored.deliver_pending(lambda channel, _report: calls.append(channel) or confirm())
+        receipts = restored.deliver_pending(lambda channel, payload: calls.append(channel) or confirm(channel, payload))
         assert set(calls) == {"github_comment", "commit_status"}
         assert {item["state"] for item in receipts} == {"DELIVERED"}
         assert all(item["complete"] and item["run_id"] == "9" * 32 for item in receipts)
@@ -645,7 +668,7 @@ def test_legacy_dual_read_is_unscoped_and_not_authorization(tmp_path):
         {"id": 4, "author_association": "NONE", "created_at": created, "updated_at": created, "user": {"login": "layho"},
          "body": "[APP_PROGRESS] {\"status\":\"accepted\"}"},
         {"id": 5, "author_association": "OWNER", "created_at": created, "updated_at": created, "user": {"login": "layho"},
-         "body": "[MACCI_REPORT] " + json.dumps(report("a" * 32, outcome="success", phase="passed"))},
+         "body": "[MACCI_REPORT] " + json.dumps(report(eng, "a" * 32, outcome="success", phase="passed"))},
     ]
     empty_read = eng.dual_read(empty, [])
     failed_read = eng.dual_read(missing, [])
@@ -710,7 +733,7 @@ def test_routes_reject_unbound_proofs_and_redact_receipts(tmp_path):
     diag = client.get(
         "/api/v1/control/diagnostics",
         params={"subject": "tsk_w01", "stream_id": "hostops:diagnostic", "stream_epoch": 1, "after_seq": 0},
-        headers={"X-Control-Credential": eng.credential_for("hostops")},
+        headers={"X-Control-Proof": json.dumps(sign_read(eng, "hostops", "diagnostic.read", stream_id="hostops:diagnostic", object_id="tsk_w01"))},
     )
     assert diag.status_code == 200 and diag.json()["side_effect"] is False and diag.json()["cursor_persisted"] is False
     assert eng.cursor("hostops:diagnostic", 1) is None
@@ -742,9 +765,9 @@ def test_delivery_unknown_is_not_success(tmp_path):
     def remote(channel, _payload):
         if channel == "commit_status":
             raise DeliveryUnknown("lost response")
-        return confirm()
+        return confirm(channel, _payload)
 
-    result = eng.submit_report(report("b" * 32, outcome="success", phase="passed"), remote=remote)
+    result = eng.submit_report(report(eng, "b" * 32, outcome="success", phase="passed"), remote=remote)
     states = {item["channel"]: item["state"] for item in result["receipts"]}
     assert states["github_comment"] == "DELIVERED"
     assert states["commit_status"] == "DELIVERY_UNKNOWN"
@@ -770,26 +793,43 @@ def test_client_claims_are_not_authority(tmp_path):
         eng.append(empty)
     assert blank.value.code == "NOT_AUTHORIZED"
     cross = authorization(eng)
-    cross["credential"] = eng.credential_for("fixture")
+    cross["authorizer"] = "fixture"
+    sign_event(eng, cross, signer="fixture")
     with pytest.raises(ControlError):
         eng.append(cross)
     with pytest.raises(AuthzError):
         AuthzService.from_request({"actor": actor(), "trusted_source": "policy_service"})
-    real = AuthzService(registry=isolated_registry(eng.repo_id), isolated=False, policy_revision=POLICY_REVISION)
+    with pytest.raises(AuthzError):
+        AuthzService(registry=PrincipalRegistry(isolated=True), isolated=True, policy_revision="w01-isolated-1")
+    real = AuthzService(registry=PrincipalRegistry(isolated=False), isolated=False, policy_revision=POLICY_REVISION)
     with pytest.raises(AuthnError):
-        real.authenticate(eng.credential_for("fixture"))
-    disabled = isolated_registry(eng.repo_id)
-    disabled.allow_test_identities = False
-    closed = AuthzService(registry=disabled, isolated=True, policy_revision=POLICY_REVISION)
-    with pytest.raises(AuthnError):
-        closed.authenticate(eng.credential_for("policy_service"))
-    snooper = eng.credential_for("hostops")
+        real.authenticate(
+            operation="event.append",
+            body=task(eng, event_id="evt_real_route", idempotency_key="idem-real-route"),
+            route_class="isolated",
+            now=int(time.time()),
+            state=eng.auth_state,
+            write=False,
+        )
+    assert SOURCE_BY_KIND["policy_service"] == "policy_service"
+    for operation in ("event.append", "event.read", "diagnostic.cursor", "report.submit", "report.read"):
+        assert operation in MATRIX and operation in REQUIRED_SCOPES
     eng.append(task(eng))
     with pytest.raises(ControlError) as cross_task:
-        eng.query(credential=snooper, stream_id="hostops:diagnostic", stream_epoch=1, task_id="tsk_other")
+        eng.query(
+            request=sign_read(eng, "hostops", "event.read", stream_id="hostops:diagnostic", task_id="tsk_other"),
+            stream_id="hostops:diagnostic",
+            stream_epoch=1,
+            task_id="tsk_other",
+        )
     assert cross_task.value.code == "NOT_AUTHORIZED"
     with pytest.raises(ControlError):
-        eng.query(credential=eng.credential_for("fixture"), stream_id="hostops:diagnostic", stream_epoch=1, task_id="tsk_w01")
+        eng.query(
+            request=sign_read(eng, "fixture", "event.read", stream_id="hostops:diagnostic"),
+            stream_id="hostops:diagnostic",
+            stream_epoch=1,
+            task_id="tsk_w01",
+        )
 
 
 def test_replay_outoforder_revoke_and_append_after_close(tmp_path):
@@ -860,7 +900,7 @@ def test_unproven_guard_and_illegal_initial_state(tmp_path):
     ))
     assert denied["code"] == "EVIDENCE_MISSING"
     assert eng.fact("task:run_1")["state"] == "PENDING"
-    proven = engine(tmp_path / "proven", proven_guards={"task:run_1": {"claim"}})
+    proven = engine(tmp_path / "proven", proven_guards={("task:run_1", 2, "run.started"): {"claim"}})
     assert proven.append(task(proven, state="PENDING"))["applied"] is True
     moved = proven.append(task(
         proven, event_id="evt_lease", idempotency_key="idem-lease", producer_seq=2,
@@ -872,7 +912,7 @@ def test_unproven_guard_and_illegal_initial_state(tmp_path):
 
 def test_unconnected_stays_pending_until_confirmation(tmp_path):
     eng = engine(tmp_path)
-    pending = eng.submit_report(report("c" * 32, outcome="success", phase="passed"), remote=None)
+    pending = eng.submit_report(report(eng, "c" * 32, outcome="success", phase="passed"), remote=None)
     assert pending["connected"] is False and pending["complete"] is False
     assert {item["state"] for item in pending["receipts"]} == {"DURABLE_LOCAL"}
     assert all(item["complete"] is False and item["exactly_once"] is False and item["tree"] == SHA_D for item in pending["receipts"])
@@ -880,14 +920,14 @@ def test_unconnected_stays_pending_until_confirmation(tmp_path):
     def silent(_channel, _payload):
         return None
 
-    unconfirmed = eng.submit_report(report("d" * 32, outcome="failure", phase="fetch-failed"), remote=silent)
+    unconfirmed = eng.submit_report(report(eng, "d" * 32, outcome="failure", phase="fetch-failed"), remote=silent)
     assert unconfirmed["complete"] is False
     assert {item["state"] for item in unconfirmed["receipts"]} == {"DELIVERY_UNKNOWN"}
     with pytest.raises(ControlError) as executor:
-        eng.submit_report(report("e" * 32, outcome="success", phase="passed", executor_id="caller-chosen"), remote=confirm)
+        eng.submit_report(report(eng, "e" * 32, outcome="success", phase="passed", executor_id="caller-chosen"), remote=confirm)
     assert executor.value.code == "UNKNOWN_EXECUTOR"
     with pytest.raises(ControlError):
-        eng.submit_report(report("f" * 32, outcome="success", phase="passed"), channels=["../escape"], remote=confirm)
+        eng.submit_report(report(eng, "f" * 32, outcome="success", phase="passed"), channels=["../escape"], remote=confirm)
     assert not (tmp_path / "escape").exists()
 
 
@@ -895,7 +935,8 @@ def test_concurrent_dispatch_sends_once(tmp_path):
     root = tmp_path / "race"
     root.mkdir()
     eng = Engine.open(root, "generation-1", abandon_claims=False)
-    payload = report("a" * 32, outcome="success", phase="passed")
+    ensure_principals(eng)
+    payload = report(eng, "a" * 32, outcome="success", phase="passed")
     pending = eng.submit_report(payload, remote=None)
     assert pending["complete"] is False
     request = tmp_path / "request.json"
@@ -918,9 +959,10 @@ def test_concurrent_dispatch_sends_once(tmp_path):
 def test_remote_success_survives_local_receipt_loss(tmp_path):
     root = tmp_path / "loss"
     root.mkdir()
-    Engine.open(root, "generation-1")
+    opened = Engine.open(root, "generation-1")
+    ensure_principals(opened)
     payload = {
-        "report": report("b" * 32, outcome="failure", phase="setup-failed"),
+        "report": report(opened, "b" * 32, outcome="failure", phase="setup-failed"),
         "channels": ["github_comment", "commit_status"],
     }
     request = tmp_path / "report.json"
@@ -940,10 +982,12 @@ def test_remote_success_survives_local_receipt_loss(tmp_path):
     class Remote:
         def __call__(self, channel, _report):
             sends.append(channel)
-            return confirm()
+            return confirm(channel, _report)
 
-        def reconcile(self, channel, _report):
-            return "delivered" if channel == marker["channel"] else "absent"
+        def reconcile(self, channel, report):
+            if channel == marker["channel"]:
+                return bound_confirmation(channel, report)
+            return "absent"
 
     receipts = restored.deliver_pending(Remote())
     assert marker["channel"] not in sends
@@ -954,8 +998,8 @@ def test_remote_success_survives_local_receipt_loss(tmp_path):
 
 def test_archive_capacity_oldest_pending_and_redaction_identity(tmp_path):
     eng = engine(tmp_path, limits=OutboxLimits(max_outbox_reports=1, max_quarantine_reports=0))
-    first = report("1" * 32, outcome="success", phase="passed")
-    second = report("2" * 32, outcome="failure", phase="test-failed")
+    first = report(eng, "1" * 32, outcome="success", phase="passed")
+    second = report(eng, "2" * 32, outcome="failure", phase="test-failed")
     assert eng.submit_report(first, remote=confirm)["complete"] is True
     assert not (tmp_path / "store" / "report-outbox" / f"{first['run_id']}.json").exists()
     assert (tmp_path / "store" / "report-archive" / f"{first['run_id']}.json").exists()
@@ -974,9 +1018,9 @@ def test_archive_capacity_oldest_pending_and_redaction_identity(tmp_path):
     def unknown(channel, _payload):
         if channel == "commit_status":
             raise DeliveryUnknown("lost")
-        return confirm()
+        return confirm(channel, _payload)
 
-    stale.submit_report(report("3" * 32, outcome="success", phase="passed"), remote=unknown)
+    stale.submit_report(report(stale, "3" * 32, outcome="success", phase="passed"), remote=unknown)
     oldest = stale.health()["oldest_pending_at"]
     time.sleep(0.05)
     stale.deliver_pending(unknown)
@@ -987,6 +1031,141 @@ def test_archive_capacity_oldest_pending_and_redaction_identity(tmp_path):
     mismatch = eng.append(other)
     assert mismatch["code"] == "IDEMPOTENCY_PAYLOAD_MISMATCH"
     assert b"github_pat_AAAA" not in (tmp_path / "store" / "events.sqlite3").read_bytes()
-    page = eng.query(credential=eng.credential_for("fixture"), stream_id="fixture:task", stream_epoch=1, after_seq=0, limit=1)
+    page = eng.query(request=sign_read(eng, "fixture", "event.read", stream_id="fixture:task"), stream_id="fixture:task", stream_epoch=1, after_seq=0, limit=1)
     assert page["side_effect"] is False
     assert page["truncated"] is False or page["next_after_seq"]
+
+
+def test_low_authority_does_not_own_or_block_the_fact(tmp_path):
+    eng = engine(tmp_path)
+    observed = eng.append(deployment(
+        eng, producer_id="side_observer", stream_id="side_observer:deployment",
+        event_id="evt_obs_dep", idempotency_key="idem-obs-dep", trusted_source=None,
+    ))
+    assert observed["applied"] is True and observed["projected"] is False
+    assert eng.fact("deployment:dep_1") is None
+    owned = eng.append(deployment(eng))
+    assert owned["applied"] is True
+    fact = eng.fact("deployment:dep_1")
+    assert fact["authoritative"] is True and fact["owner_producer"] == "host_deployer"
+    later = eng.append(deployment(
+        eng, producer_id="side_observer", stream_id="side_observer:deployment",
+        event_id="evt_obs_2", idempotency_key="idem-obs-2", producer_seq=2,
+        revision=9, expected_revision=1, trusted_source=None,
+    ))
+    assert later["applied"] is True
+    assert eng.fact("deployment:dep_1")["revision"] == 1
+    advanced = eng.append(deployment(
+        eng, event_id="evt_own_2", idempotency_key="idem-own-2", producer_seq=2,
+        revision=2, expected_revision=1,
+    ))
+    assert advanced["applied"] is True
+    assert eng.fact("deployment:dep_1")["revision"] == 2
+    handed = eng.append(deployment(
+        eng, event_id="evt_hand", idempotency_key="idem-hand", producer_seq=3,
+        revision=3, expected_revision=2, successor_producer="other_deployer",
+    ))
+    assert handed["applied"] is True
+    assert eng.fact("deployment:dep_1")["successor_producer"] == "other_deployer"
+    moved = eng.append(deployment(
+        eng, producer_id="other_deployer", stream_id="other_deployer:deployment",
+        event_id="evt_next_owner", idempotency_key="idem-next-owner",
+        revision=4, expected_revision=3,
+    ))
+    assert moved["applied"] is True
+    assert eng.fact("deployment:dep_1")["owner_producer"] == "other_deployer"
+    assert eng.fact("deployment:dep_1")["revision"] == 4
+    with eng.store.transaction() as conn:
+        recorded = conn.execute(
+            "SELECT COUNT(*) AS n FROM fact_history WHERE object_key='deployment:dep_1'"
+        ).fetchone()["n"]
+    assert recorded >= 3
+
+
+def test_historical_gap_unproven_close_and_late_revocation(tmp_path):
+    eng = engine(tmp_path)
+    assert eng.append(deployment(eng, revision=2, expected_revision=2))["applied"] is True
+    held = eng.append(deployment(
+        eng, event_id="evt_hist", idempotency_key="idem-hist", producer_seq=3,
+        revision=1, expected_revision=2,
+    ))
+    assert held["applied"] is False and held["hold_reason"] == "GAP"
+    assert eng.append(deployment(
+        eng, event_id="evt_fill", idempotency_key="idem-fill", producer_seq=2,
+        revision=3, expected_revision=2,
+    ))["applied"] is True
+    assert eng.fact("deployment:dep_1")["revision"] == 3
+    assert eng.watermarks()["host_deployer:deployment@1"]["seq"] == 3
+    with eng.store.transaction() as conn:
+        historical = conn.execute(
+            "SELECT authoritative FROM fact_history WHERE event_id='evt_hist'"
+        ).fetchone()
+    assert historical is not None and historical["authoritative"] == 1
+
+    grant = eng.append(authorization(eng, event_id="gap_grant", idempotency_key="idem-gap-grant"))
+    assert grant["applied"] is True
+    parked = eng.append(authorization(
+        eng, event_id="gap_old_grant", idempotency_key="idem-gap-old", producer_seq=3,
+        event_type="authorization.granted", revision=1, expected_revision=1,
+    ))
+    assert parked["applied"] is False and parked["hold_reason"] == "GAP"
+    revoke = eng.append(authorization(
+        eng, event_id="gap_revoke", idempotency_key="idem-gap-revoke", producer_seq=2,
+        event_type="authorization.revoked", revision=2, expected_revision=1,
+    ))
+    assert revoke["applied"] is True
+    assert eng.authorizations()[0]["revoked"] is True
+    assert eng.watermarks()["policy_service:authorization@1"]["seq"] == 3
+    assert eng.fact("authorization:tsk_w01|cand_w01|preview.merge")["revision"] == 2
+
+    bound = engine(tmp_path / "bound", evidence_bindings={
+        ("authorization:tsk_w01|cand_w01|preview.merge", 1, "preview.merge"): "policy://server",
+    })
+    assert bound.append(authorization(bound, evidence_ref="policy://1"))["applied"] is True
+    assert bound.authorizations() == []
+    denied_close = bound.append(authorization(
+        bound, event_id="evt_bad_close", idempotency_key="idem-bad-close", producer_seq=2,
+        event_type="authorization.epoch_closed", epoch_closed=True, closed_through_seq=2,
+    ))
+    assert denied_close["code"] == "EVIDENCE_MISSING"
+    assert bound.watermarks()["policy_service:authorization@1"]["closed"] is False
+    assert bound.append(diagnostic(bound))["applied"] is True
+    with pytest.raises(ControlError):
+        bound.append(task(bound, state="UNKNOWN", event_id="evt_unknown_state", idempotency_key="idem-unknown-state"))
+    repaired = bound.append(task(bound, event_id="evt_repaired", idempotency_key="idem-repaired"))
+    assert repaired["applied"] is True
+    assert bound.watermarks()["hostops:diagnostic@1"]["seq"] == 1
+    assert "do not consume producer_seq" in bound.health()["stream_repair"]
+    assert STREAM_REPAIR == bound.health()["stream_repair"]
+    assert bound.health()["event_delivery_disposition"] == "not_delivered"
+    assert bound.health()["package_complete"] is False
+    assert PACKAGE_COMPLETE is False
+    assert any(item.startswith("D07:") for item in FOLLOW_UPS)
+
+
+def test_claim_token_is_required_and_a_live_claim_survives_recovery(tmp_path):
+    eng = engine(tmp_path)
+    payload = report(eng, "ab" * 16, outcome="success", phase="passed")
+    assert eng.submit_report(payload, remote=None)["complete"] is False
+    event_id = "report-" + payload["run_id"]
+    token = eng.outbox._claim(event_id, "github_comment", payload["run_id"])
+    assert isinstance(token, str) and len(token) == 32
+    assert eng.outbox._claim(event_id, "github_comment", payload["run_id"]) is None
+    assert eng.outbox._set_state(event_id, "github_comment", "DELIVERED", payload["run_id"], None, "forged") is False
+    eng.outbox.recover(abandon_claims=True)
+    assert eng.outbox._channel_state(event_id, "github_comment") == "OUTBOX"
+    assert eng.outbox._set_state(event_id, "github_comment", "DELIVERED", payload["run_id"], None, token) is True
+    other = eng.outbox._claim(event_id, "commit_status", payload["run_id"])
+    with eng.store.transaction() as conn:
+        conn.execute(
+            "UPDATE deliveries SET claim_pid=? WHERE event_id=? AND channel='commit_status'",
+            (2**22, event_id),
+        )
+    eng.outbox.recover(abandon_claims=True)
+    assert eng.outbox._channel_state(event_id, "commit_status") == "DELIVERY_UNKNOWN"
+    bare = eng.submit_report(
+        report(eng, "cd" * 16, outcome="failure", phase="context-failed"),
+        remote=lambda _channel, _payload: {"confirmed": True},
+    )
+    assert {item["state"] for item in bare["receipts"]} == {"DELIVERY_UNKNOWN"}
+    assert other

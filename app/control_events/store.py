@@ -34,9 +34,20 @@ CREATE TABLE IF NOT EXISTS facts (
     event_class TEXT NOT NULL,
     authoritative INTEGER NOT NULL,
     producer_id TEXT NOT NULL,
+    owner_producer TEXT NOT NULL,
+    successor_producer TEXT,
     event_id TEXT NOT NULL,
     state TEXT,
     payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fact_history (
+    object_key TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    authoritative INTEGER NOT NULL,
+    producer_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    state TEXT,
+    recorded_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rounds (
     task_id TEXT NOT NULL,
@@ -70,6 +81,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
     pending_since TEXT NOT NULL,
     run_id TEXT,
     claim_token TEXT,
+    claim_pid INTEGER,
+    claim_expires_at INTEGER,
     PRIMARY KEY (event_id, channel)
 );
 CREATE TABLE IF NOT EXISTS reports (

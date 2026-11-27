@@ -1,8 +1,13 @@
 """Isolated schema 2 event engine.
 
-Authentication and authorization go through ``app.control_authz``. Client
-actor, trusted_source, authorizer, test-proof, and guard strings are not
-authority. This process does not mount production routes.
+Authentication and authorization go through the W02 ``app.control_authz``
+package. This package does not keep a second implementation. Client actor,
+trusted_source, authorizer, test-proof, and guard strings are not authority.
+Binding fields come from the event or the named resource. This process does
+not mount production routes.
+
+The generic event outbox consumer is not delivered. Event rows stay
+``not_delivered``. See ``FOLLOW_UPS``.
 """
 
 from datetime import datetime, timezone
@@ -10,11 +15,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import threading
+import time
 
-from app.control_authz import AuthnError, AuthzError, AuthzService, isolated_registry
-from app.control_authz.service import POLICY_REVISION
+from app.control_authz import AuthnError, AuthzError, AuthzService, Principal, PrincipalRegistry, ResourceBinding
 from app.feedback_progress import STAGES, STATUSES
 
+from .auth_bind import POLICY_REVISION, STREAM_REPAIR, document_for_event, document_for_resource, evidence_key, guard_key, host_text
+from .auth_state import load_state, save_state
 from .errors import ControlError
 from .identity import PRODUCTION_PROTOCOL_ENABLED, RepositoryIdentity
 from .inbox import decide
@@ -29,6 +37,10 @@ _REVISION_CLASSES = {"task", "candidate", "deployment", "resource", "authorizati
 _OPERATION = "event_append"
 _PAGE_LIMIT = 50
 TRUSTED_EXECUTORS = frozenset({"macci-isolated"})
+PACKAGE_COMPLETE = False
+FOLLOW_UPS = (
+    "D07: generic event outbox consumer is not delivered; event rows stay not_delivered",
+)
 
 
 def _now() -> str:
@@ -50,7 +62,18 @@ def _tasks(principal) -> set[str]:
 
 
 class Engine:
-    def __init__(self, root: Path, identity: RepositoryIdentity, store: Store, outbox: ReportOutbox, authorizer=None, *, authz: AuthzService, proven_guards: dict | None = None):
+    def __init__(
+        self,
+        root: Path,
+        identity: RepositoryIdentity,
+        store: Store,
+        outbox: ReportOutbox,
+        authorizer=None,
+        *,
+        authz: AuthzService,
+        proven_guards: dict | None = None,
+        evidence_bindings: dict | None = None,
+    ):
         self.root = root
         self.identity = identity
         self.store = store
@@ -58,6 +81,10 @@ class Engine:
         self.authorizer = authorizer
         self.authz = authz
         self.proven_guards = {key: frozenset(value) for key, value in (proven_guards or {}).items()}
+        self.evidence_bindings = dict(evidence_bindings or {})
+        self.auth_path = root / "auth-state.json"
+        self.auth_state = load_state(self.auth_path)
+        self._auth_lock = threading.Lock()
         self.isolated = True
         self.production_protocol_enabled = False
 
@@ -72,6 +99,7 @@ class Engine:
         production: bool = False,
         authz: AuthzService | None = None,
         proven_guards: dict | None = None,
+        evidence_bindings: dict | None = None,
         trusted_executors: set[str] | None = None,
         abandon_claims: bool = True,
     ) -> "Engine":
@@ -80,7 +108,7 @@ class Engine:
         identity = RepositoryIdentity.open(root, bound_token)
         if authz is None:
             authz = AuthzService(
-                registry=isolated_registry(identity.repo_id),
+                registry=PrincipalRegistry(isolated=True),
                 isolated=True,
                 policy_revision=POLICY_REVISION,
             )
@@ -96,6 +124,7 @@ class Engine:
             authorizer,
             authz=authz,
             proven_guards=proven_guards,
+            evidence_bindings=evidence_bindings,
         )
         engine.outbox.recover(abandon_claims=abandon_claims)
         return engine
@@ -104,19 +133,28 @@ class Engine:
     def repo_id(self) -> str:
         return self.identity.repo_id
 
-    def credential_for(self, producer_id: str) -> str:
-        try:
-            return self.authz.registry.credential_for(producer_id)
-        except AuthnError as exc:
-            raise ControlError("NOT_AUTHORIZED", 403, exc.message) from exc
+    def reload_auth_state(self) -> None:
+        """Reload the server principal file. The request body is not a registry."""
+
+        with self._auth_lock:
+            self.auth_state = load_state(self.auth_path)
 
     def enable_production_protocol(self) -> None:
         raise ControlError("NOT_AUTHORIZED", 403, "unverified schema 2 protocol cannot be enabled in production")
 
     def append(self, body: dict, *, crash: str | None = None) -> dict:
-        principal = self._principal(body)
         event = split_request(body)
-        self._authorize_append(principal, event, body)
+        if "policy_revision" in event and event["policy_revision"] != POLICY_REVISION:
+            raise ControlError("NOT_AUTHORIZED", 403, "policy revision does not match the server")
+        replay_only = False
+        try:
+            principal, proof = self._authenticate(body, event=event, operation="event.append", write=True)
+        except ControlError as exc:
+            if exc.code != "PROOF_REPLAY":
+                raise
+            principal, proof = self._authenticate(body, event=event, operation="event.append", write=False)
+            replay_only = True
+        self._authorize_append(principal, event)
         self.identity.assert_same(event["repo_id"])
         if event.get("state") == "UNKNOWN":
             raise ControlError("NOT_AUTHORIZED", 403, "a caller cannot write UNKNOWN")
@@ -127,9 +165,8 @@ class Engine:
         event.pop("guard", None)
         event["trusted_source"] = server_source or None
         event["_authoritative"] = authorize_source(event, server_source or None)
-        if event["event_class"] == "authorization" and event["event_type"] != "authorization.epoch_closed":
-            if not event["_authoritative"]:
-                raise ControlError("NOT_AUTHORIZED", 403, "authorization events require the server source")
+        if event["event_type"] == "authorization.epoch_closed" and not event["_authoritative"]:
+            raise ControlError("NOT_AUTHORIZED", 403, "stream close requires the policy_service source")
         if self.authorizer is not None and self.authorizer(event) is False:
             raise ControlError("POLICY_DENIED", 403, "policy denied before idempotency")
         digest = _identity(event)
@@ -144,15 +181,21 @@ class Engine:
                     outcome = _error("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "idempotency key was already used with a different payload")
                 else:
                     outcome = _replay(json.loads(existing["result_json"]), self._current_state(conn, event))
+            elif replay_only:
+                raise ControlError("NOT_AUTHORIZED", 403, "nonce was already used")
             else:
                 outcome = self._attempt(conn, event, digest, principal.principal_id, scope)
             if crash == "before-commit":
                 os._exit(90)
+            wrote = bool(outcome.get("_wrote")) and not outcome.get("replayed")
+        if wrote:
+            self._consume_nonce(principal, proof)
         return redact(_public(outcome))
 
     def submit_report(self, report: dict, channels: list[str] | None = None, remote=None, *, crash: str | None = None) -> dict:
         if self.production_protocol_enabled:
             raise ControlError("NOT_AUTHORIZED", 403, "production protocol is disabled")
+        self._authorize_report(report)
         chosen = list(channels or DEFAULT_CHANNELS)
         return self.outbox.submit(report, chosen, remote, crash=crash)
 
@@ -175,11 +218,10 @@ class Engine:
             next_epoch = (max(sealed) + 1) if sealed else 1
         return {"stream_id": stream_id, "sealed": sealed, "next_epoch": next_epoch, "event_written": False}
 
-    def query(self, *, credential: str, stream_id: str, stream_epoch: int, after_seq: int = 0, task_id: str | None = None, limit: int = _PAGE_LIMIT) -> dict:
-        principal = self._principal(credential)
+    def query(self, *, request: dict, stream_id: str, stream_epoch: int, after_seq: int = 0, task_id: str | None = None, limit: int = _PAGE_LIMIT) -> dict:
+        principal = self._authorize_read(request, "event.read", stream_id=stream_id, task_id=task_id)
         allowed = _tasks(principal)
-        selected = task_id or (next(iter(allowed)) if len(allowed) == 1 else None)
-        self._authorize(principal, "event.read", stream_id=stream_id, task_id=selected, scope={"task_id": selected} if selected else {})
+        selected = task_id or request.get("task_id") or (next(iter(allowed)) if len(allowed) == 1 else None)
         limit = _page_limit(limit)
         with self.store.transaction() as conn:
             watermark = self._watermark(conn, stream_id, stream_epoch)["seq"]
@@ -201,13 +243,12 @@ class Engine:
             "lease_token": None,
         }
 
-    def poll_diagnostics(self, *, credential: str, subject: str, stream_id: str, stream_epoch: int, after_seq: int, task_id: str | None = None, limit: int = _PAGE_LIMIT) -> dict:
-        principal = self._principal(credential)
+    def poll_diagnostics(self, *, request: dict, subject: str, stream_id: str, stream_epoch: int, after_seq: int, task_id: str | None = None, limit: int = _PAGE_LIMIT) -> dict:
         if type(after_seq) is not int or after_seq < 0 or type(stream_epoch) is not int:
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "diagnostic cursor is invalid")
+        principal = self._authorize_read(request, "diagnostic.read", stream_id=stream_id, task_id=task_id)
         allowed = _tasks(principal)
-        selected = task_id or (next(iter(allowed)) if len(allowed) == 1 else None)
-        self._authorize(principal, "diagnostic.read", stream_id=stream_id, task_id=selected, scope={"task_id": selected} if selected else {})
+        selected = task_id or request.get("task_id") or (next(iter(allowed)) if len(allowed) == 1 else None)
         limit = _page_limit(limit)
         if not isinstance(stream_id, str) or not stream_id.endswith(":diagnostic"):
             raise ControlError("NOT_AUTHORIZED", 403, "diagnostic read is not authorized for this stream")
@@ -235,13 +276,12 @@ class Engine:
             "lease_token": None,
         }
 
-    def commit_cursor(self, *, credential: str, subject: str, stream_id: str, stream_epoch: int, after_seq: int, task_id: str | None = None) -> dict:
-        principal = self._principal(credential)
+    def commit_cursor(self, *, request: dict, subject: str, stream_id: str, stream_epoch: int, after_seq: int, task_id: str | None = None) -> dict:
         if type(after_seq) is not int or after_seq < 0 or type(stream_epoch) is not int:
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "diagnostic cursor is invalid")
+        principal = self._authorize_read(request, "diagnostic.cursor", stream_id=stream_id, task_id=task_id, method="POST")
         allowed = _tasks(principal)
-        selected = task_id or (next(iter(allowed)) if len(allowed) == 1 else None)
-        self._authorize(principal, "diagnostic.cursor", stream_id=stream_id, task_id=selected, scope={"task_id": selected} if selected else {})
+        selected = task_id or request.get("task_id") or (next(iter(allowed)) if len(allowed) == 1 else None)
         if not stream_id.endswith(":diagnostic"):
             raise ControlError("NOT_AUTHORIZED", 403, "diagnostic cursor is not authorized for this stream")
         with self.store.transaction() as conn:
@@ -386,39 +426,179 @@ class Engine:
         snapshot["production_protocol_enabled"] = False
         snapshot["event_delivery_disposition"] = "not_delivered"
         snapshot["event_outbox_consumer"] = None
+        snapshot["package_complete"] = PACKAGE_COMPLETE
+        snapshot["follow_ups"] = list(FOLLOW_UPS)
+        snapshot["stream_repair"] = STREAM_REPAIR
         return snapshot
 
-    def _principal(self, material: object):
+    def _authenticate(self, body: dict, *, event: dict | None, operation: str, write: bool, resource: dict | None = None, method: str = "POST"):
+        authorizer = body.get("authorizer") if isinstance(body.get("authorizer"), str) else ""
+        if event is not None:
+            document = document_for_event(event, operation=operation, authorizer=authorizer, path="/api/v1/control/events")
+        else:
+            document = document_for_resource(
+                resource or {},
+                operation=operation,
+                authorizer=authorizer,
+                path="/api/v1/control/events",
+                method=method,
+            )
+        if isinstance(body.get("actor"), dict):
+            document["actor"] = body["actor"]
+        if isinstance(body.get("proof"), dict):
+            document["proof"] = body["proof"]
         try:
-            return self.authz.authenticate(material)
+            principal = self.authz.authenticate(
+                operation=operation,
+                body=document,
+                route_class="isolated",
+                now=int(time.time()),
+                state=self.auth_state,
+                write=write,
+            )
         except AuthnError as exc:
-            raise ControlError("NOT_AUTHORIZED", 403, exc.message) from exc
+            code = "PROOF_REPLAY" if exc.reason == "replay" else "NOT_AUTHORIZED"
+            raise ControlError(code, 403, exc.detail) from exc
+        return principal, document.get("proof") if isinstance(document.get("proof"), dict) else {}
 
-    def _authorize(self, principal, operation: str, *, stream_id: str, task_id: str | None, scope: dict | None = None, business: str | None = None) -> None:
-        binding = {
-            "repo_id": self.repo_id,
-            "app_id": principal.app_id,
-            "producer_id": principal.producer_id,
-            "stream_id": stream_id,
-            "task_id": task_id,
-            "scope": scope or {},
-            "business_operation": business,
-        }
+    def _consume_nonce(self, principal, proof: dict) -> None:
+        if not proof:
+            return
+        with self._auth_lock:
+            try:
+                self.authz.consume_nonce(self.auth_state, principal, proof, int(time.time()), max_nonces=10000)
+            except AuthnError as exc:
+                if exc.reason == "replay":
+                    return
+                raise ControlError("NOT_AUTHORIZED", 403, exc.detail) from exc
+            save_state(self.auth_path, self.auth_state)
+
+    def _authorize_read(self, request: dict, operation: str, *, stream_id: str, task_id: str | None, method: str = "GET"):
+        if not isinstance(request, dict):
+            raise ControlError("NOT_AUTHORIZED", 403, "reader is not authenticated")
+        if request.get("stream_id") != stream_id:
+            raise ControlError("NOT_AUTHORIZED", 403, "stream is outside the signed request")
+        if task_id and request.get("task_id") not in (None, "", task_id):
+            raise ControlError("NOT_AUTHORIZED", 403, "task is outside the signed request")
+        resource = dict(request)
+        resource["stream_id"] = stream_id
+        if task_id:
+            resource["task_id"] = task_id
+        principal, _proof = self._authenticate(request, event=None, operation=operation, write=False, resource=resource, method=method)
+        self._bind(
+            principal,
+            operation,
+            repo_id=_text_field(resource, "repo_id"),
+            app_id=_text_field(resource, "app_id"),
+            host_id=resource.get("host_id"),
+            producer_id=_text_field(resource, "producer_id"),
+            stream_id=stream_id,
+            task_id=_text_field(resource, "task_id"),
+            scope_name=operation,
+        )
+        return principal
+
+    def _bind(
+        self,
+        principal,
+        operation: str,
+        *,
+        repo_id: str,
+        app_id: str,
+        host_id: object,
+        producer_id: str,
+        stream_id: str,
+        task_id: str,
+        scope_name: str,
+    ) -> None:
+        if app_id == "" or producer_id == "" or stream_id == "" or repo_id == "":
+            raise ControlError("NOT_AUTHORIZED", 403, "resource binding is incomplete")
+        from .auth_bind import SCOPE_FOR_OPERATION
+
+        scope = SCOPE_FOR_OPERATION[scope_name]
+        binding = ResourceBinding(
+            repo_id=repo_id,
+            app_id=app_id,
+            producer_id=producer_id,
+            stream_id=stream_id,
+            operation=operation,
+            scope=scope,
+            task_id=task_id,
+            target_app_id=app_id,
+        )
         try:
             self.authz.authorize(principal, operation, binding)
         except AuthzError as exc:
-            raise ControlError("NOT_AUTHORIZED", 403, exc.message) from exc
+            raise ControlError("NOT_AUTHORIZED", 403, exc.detail) from exc
+        self._check_host(principal, host_id)
 
-    def _authorize_append(self, principal, event: dict, body: dict) -> None:
-        scope = body.get("scope") if isinstance(body.get("scope"), dict) else {}
-        task_id = event.get("task_id") or scope.get("task_id")
-        business = None
+    def _check_host(self, principal, host_id: object) -> None:
+        record = self.auth_state.get("principals", {}).get(principal.principal_id)
+        if not isinstance(record, dict):
+            raise ControlError("NOT_AUTHORIZED", 403, "principal is not in the server registry")
+        if host_text(host_id) != host_text(record.get("host_id")):
+            raise ControlError("NOT_AUTHORIZED", 403, "host is outside the server binding")
+
+    def _authorize_append(self, principal, event: dict) -> None:
+        task_id = event.get("task_id") if isinstance(event.get("task_id"), str) else ""
         if event["event_class"] == "authorization" and event["event_type"] != "authorization.epoch_closed":
             business = event.get("operation")
-        self._authorize(principal, "event.append", stream_id=event["stream_id"], task_id=task_id, scope=scope, business=business)
+            if not isinstance(business, str) or business not in principal.scopes:
+                raise ControlError("NOT_AUTHORIZED", 403, "authorization operation is outside the server principal")
+        self._bind(
+            principal,
+            "event.append",
+            repo_id=event.get("repo_id") if isinstance(event.get("repo_id"), str) else "",
+            app_id=event.get("app_id") if isinstance(event.get("app_id"), str) else "",
+            host_id=event.get("host_id"),
+            producer_id=event.get("producer_id") if isinstance(event.get("producer_id"), str) else "",
+            stream_id=event.get("stream_id") if isinstance(event.get("stream_id"), str) else "",
+            task_id=task_id,
+            scope_name="event.append",
+        )
+
+    def _authorize_report(self, report: dict) -> None:
+        if not isinstance(report, dict):
+            raise ControlError("SCHEMA_UNSUPPORTED", 422, "report must be an object")
+        executor = report.get("executor_id")
+        record = None
+        for item in self.auth_state.get("principals", {}).values():
+            if isinstance(item, dict) and item.get("producer_id") == executor and item.get("kind") == "macci":
+                record = item
+                break
+        if record is None:
+            raise ControlError("UNKNOWN_EXECUTOR", 409, "report executor is not a server principal")
+        try:
+            principal = Principal(
+                principal_id=str(record.get("principal_id") or ""),
+                kind=str(record.get("kind") or ""),
+                repo_id=str(record.get("repo_id") or ""),
+                app_id=str(record.get("app_id") or ""),
+                producer_id=str(record.get("producer_id") or ""),
+                stream_id=str(record.get("stream_id") or ""),
+                scopes=frozenset(str(item) for item in record.get("scopes") or []),
+                trusted_source="macci",
+            )
+            self.authz.trusted_source_for(principal)
+        except (AuthzError, TypeError) as exc:
+            raise ControlError("UNKNOWN_EXECUTOR", 409, "report executor is not trusted") from exc
+        for field in ("head", "base", "merge", "tree"):
+            if not isinstance(report.get(field), str) or report.get(field) == "":
+                raise ControlError("SCHEMA_UNSUPPORTED", 422, "report candidate is incomplete")
+        self._bind(
+            principal,
+            "report.submit",
+            repo_id=report.get("repo_id") if isinstance(report.get("repo_id"), str) else "",
+            app_id=report.get("app_id") if isinstance(report.get("app_id"), str) else "",
+            host_id=report.get("host_id"),
+            producer_id=report.get("executor_id") if isinstance(report.get("executor_id"), str) else "",
+            stream_id=report.get("stream_id") if isinstance(report.get("stream_id"), str) else "",
+            task_id=report.get("task_id") if isinstance(report.get("task_id"), str) else "",
+            scope_name="report.submit",
+        )
 
     def _guards(self, event: dict) -> set[str]:
-        return set(self.proven_guards.get(object_key(event) or "", frozenset()))
+        return set(self.proven_guards.get(guard_key(event), frozenset()))
 
     def _attempt(self, conn, event: dict, digest: str, principal: str, scope: str) -> dict:
         received_at = _now()
@@ -476,6 +656,7 @@ class Engine:
         projected = False
         if history:
             applied = True
+            self._record_history(conn, event)
             self._drain(conn, event["stream_id"])
         elif action == "apply":
             self._drain(conn, event["stream_id"])
@@ -534,6 +715,8 @@ class Engine:
                     conn.execute("UPDATE events SET hold_reason=? WHERE event_id=?", (verdict.get("code"), event["event_id"]))
                     continue
                 if verdict in {"history", "stream-only"}:
+                    if verdict == "history":
+                        self._record_history(conn, event)
                     conn.execute(
                         "UPDATE events SET applied=1, hold_reason=NULL, epoch_closed=? WHERE event_id=?",
                         (1 if event.get("epoch_closed") else 0, event["event_id"]),
@@ -552,34 +735,63 @@ class Engine:
 
     def _precheck(self, conn, event: dict):
         if event["event_type"] == "authorization.epoch_closed":
+            if not self._epoch_authorizations_proven(conn, event):
+                return _error("EVIDENCE_MISSING", 409, "epoch close requires a proven authorization prefix")
             return "stream-only"
         if event["event_class"] not in _REVISION_CLASSES:
             return None
+        if not event.get("_authoritative"):
+            return "history"
         key = object_key(event)
         current = self._fact(conn, key)
         expected = event.get("expected_revision")
         revision = event.get("revision")
-        authoritative = bool(event.get("_authoritative"))
         try:
-            if current is None:
+            if current is None or not current["authoritative"]:
                 if expected not in (0, revision):
                     return _error("CONFLICT_REVISION", 409, "expected_revision does not match the stored revision")
-                check_transition(event["event_class"], None, event.get("state"), self._guards(event))
+                check_transition(event["event_class"], None if current is None else current["state"], event.get("state"), self._guards(event))
                 return None
-            if authoritative and event["producer_id"] != current["producer_id"]:
+            allowed = {current["owner_producer"]}
+            if current.get("successor_producer"):
+                allowed.add(current["successor_producer"])
+            if event["producer_id"] not in allowed:
                 return _error("CONFLICT_REVISION", 409, "cross-stream revision was rejected")
+            if revision < current["revision"] or not event.get("_authoritative"):
+                return "history"
             if expected != current["revision"]:
                 return _error("CONFLICT_REVISION", 409, "expected_revision does not match the stored revision")
-            if revision == current["revision"] and authoritative and current["authoritative"]:
+            if revision == current["revision"]:
                 return _error("CONFLICT_REVISION", 409, "same revision conflicts with the current fact")
-            if revision <= current["revision"] or not authoritative:
-                return "history"
             check_transition(event["event_class"], current["state"], event.get("state"), self._guards(event))
         except ControlError as exc:
             body = exc.public()
             body["applied"] = False
             return body
         return None
+
+    def _epoch_authorizations_proven(self, conn, event: dict) -> bool:
+        rows = conn.execute(
+            "SELECT payload_json FROM events WHERE stream_id=? AND stream_epoch=? AND applied=1",
+            (event["stream_id"], event["stream_epoch"]),
+        ).fetchall()
+        for row in rows:
+            payload = _rehydrate(json.loads(row["payload_json"]))
+            if payload.get("event_class") != "authorization":
+                continue
+            if payload.get("event_type") not in {"authorization.granted", "authorization.revoked"}:
+                continue
+            if not payload.get("_authoritative") or not self._evidence_proven(payload):
+                return False
+        return True
+
+    def _evidence_proven(self, event: dict) -> bool:
+        if not event.get("_authoritative"):
+            return False
+        bound = self.evidence_bindings.get(evidence_key(event))
+        if bound is None:
+            return True
+        return event.get("evidence_ref") == bound
 
     def _reduce(self, conn, event: dict) -> None:
         if event.get("classification") == "never_existed":
@@ -588,20 +800,33 @@ class Engine:
             self._write_diagnostic(conn, event)
             return
         if event["event_class"] in _REVISION_CLASSES:
+            if not event.get("_authoritative"):
+                self._record_history(conn, event)
+                return
             current = self._fact(conn, object_key(event))
             if current is not None and not _wins(current, event):
+                self._record_history(conn, event)
                 return
             self._write_fact(conn, event)
+            self._record_history(conn, event)
         if event["event_class"] == "task":
             self._write_round(conn, event)
-        if event["event_type"] == "authorization.granted":
+        if event["event_type"] == "authorization.granted" and self._evidence_proven(event):
             self._write_authorization(conn, event, revoked=0)
-        elif event["event_type"] == "authorization.revoked":
+        elif event["event_type"] == "authorization.revoked" and self._evidence_proven(event):
             self._write_authorization(conn, event, revoked=1)
 
     def _write_fact(self, conn, event: dict) -> None:
         key = object_key(event)
         current = self._fact(conn, key)
+        successor = event.get("successor_producer") if isinstance(event.get("successor_producer"), str) else None
+        owner = event["producer_id"]
+        if current is not None and current["authoritative"]:
+            if event["producer_id"] == current["owner_producer"]:
+                owner = current["owner_producer"]
+            elif event["producer_id"] == current.get("successor_producer"):
+                owner = event["producer_id"]
+                successor = successor if event.get("successor_producer") else None
         incoming = {
             "event_class": event["event_class"],
             "revision": event.get("revision") or 0,
@@ -616,11 +841,14 @@ class Engine:
                 return
         conn.execute(
             """
-            INSERT INTO facts (object_key, revision, event_class, authoritative, producer_id, event_id, state, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO facts (
+                object_key, revision, event_class, authoritative, producer_id, owner_producer,
+                successor_producer, event_id, state, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(object_key) DO UPDATE SET
                 revision=excluded.revision, event_class=excluded.event_class, authoritative=excluded.authoritative,
-                producer_id=excluded.producer_id, event_id=excluded.event_id, state=excluded.state,
+                producer_id=excluded.producer_id, owner_producer=excluded.owner_producer,
+                successor_producer=excluded.successor_producer, event_id=excluded.event_id, state=excluded.state,
                 payload_json=excluded.payload_json
             """,
             (
@@ -629,9 +857,31 @@ class Engine:
                 incoming["event_class"],
                 1 if incoming["authoritative"] else 0,
                 incoming["producer_id"],
+                owner,
+                successor,
                 incoming["event_id"],
                 incoming["state"],
                 json.dumps(_stored(event), sort_keys=True),
+            ),
+        )
+
+    def _record_history(self, conn, event: dict) -> None:
+        key = object_key(event)
+        if not key or event["event_class"] not in _REVISION_CLASSES:
+            return
+        conn.execute(
+            """
+            INSERT INTO fact_history (object_key, revision, authoritative, producer_id, event_id, state, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key,
+                event.get("revision") or 0,
+                1 if event.get("_authoritative") else 0,
+                event["producer_id"],
+                event["event_id"],
+                event.get("state"),
+                event.get("received_at") or _now(),
             ),
         )
 
@@ -639,16 +889,19 @@ class Engine:
         key = object_key(event)
         conn.execute(
             """
-            INSERT INTO facts (object_key, revision, event_class, authoritative, producer_id, event_id, state, payload_json)
-            VALUES (?, ?, 'diagnostic', ?, ?, ?, NULL, ?)
+            INSERT INTO facts (
+                object_key, revision, event_class, authoritative, producer_id, owner_producer,
+                successor_producer, event_id, state, payload_json
+            ) VALUES (?, ?, 'diagnostic', ?, ?, ?, NULL, ?, NULL, ?)
             ON CONFLICT(object_key) DO UPDATE SET
-                revision=excluded.revision, producer_id=excluded.producer_id, event_id=excluded.event_id,
-                payload_json=excluded.payload_json, authoritative=excluded.authoritative
+                revision=excluded.revision, producer_id=excluded.producer_id, owner_producer=excluded.owner_producer,
+                event_id=excluded.event_id, payload_json=excluded.payload_json, authoritative=excluded.authoritative
             """,
             (
                 key,
                 event.get("revision") or 0,
                 1 if event.get("_authoritative") else 0,
+                event["producer_id"],
                 event["producer_id"],
                 event["event_id"],
                 json.dumps(_stored(event), sort_keys=True),
@@ -728,6 +981,8 @@ class Engine:
             "event_class": row["event_class"],
             "authoritative": bool(row["authoritative"]),
             "producer_id": row["producer_id"],
+            "owner_producer": row["owner_producer"],
+            "successor_producer": row["successor_producer"],
             "event_id": row["event_id"],
             "state": row["state"],
         }
@@ -822,9 +1077,18 @@ def _wins(current: dict, event: dict) -> bool:
         return False
     if revision == current["revision"]:
         return not current["authoritative"]
-    if event.get("producer_id") != current["producer_id"]:
+    owner = current.get("owner_producer") or current.get("producer_id")
+    allowed = {owner}
+    if current.get("successor_producer"):
+        allowed.add(current["successor_producer"])
+    if event.get("producer_id") not in allowed:
         return False
     return True
+
+
+def _text_field(resource: dict, name: str) -> str:
+    value = resource.get(name)
+    return value if isinstance(value, str) else ""
 
 
 def _rehydrate(payload: dict) -> dict:

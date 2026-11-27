@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 import uuid
 
 from .atomic import atomic_write
@@ -44,6 +45,8 @@ REQUIRED = (
 )
 DEFAULT_CHANNELS = ("github_comment", "commit_status")
 _SHA = set("0123456789abcdef")
+_CLAIM_TTL_SECONDS = 30
+_CANDIDATE_FIELDS = ("head", "base", "merge", "tree", "executor_id")
 
 
 @dataclass(frozen=True)
@@ -98,8 +101,28 @@ def validate_report(report: dict, trusted_executors: set[str] | None = None) -> 
         raise ControlError("SCHEMA_UNSUPPORTED", 422, "report outcome is incomplete")
 
 
-def _confirmed(result: object) -> bool:
-    return isinstance(result, dict) and result.get("confirmed") is True
+def bound_confirmation(channel: str, report: dict) -> dict:
+    """Remote success must name the run, the channel, and the full candidate."""
+
+    return {
+        "run_id": report.get("run_id"),
+        "channel": channel,
+        "head": report.get("head"),
+        "base": report.get("base"),
+        "merge": report.get("merge"),
+        "tree": report.get("tree"),
+        "executor_id": report.get("executor_id"),
+    }
+
+
+def confirmation_binds(result: object, channel: str, report: dict) -> bool:
+    if not isinstance(result, dict):
+        return False
+    expected = bound_confirmation(channel, report)
+    for key, value in expected.items():
+        if not isinstance(value, str) or value == "" or result.get(key) != value:
+            return False
+    return True
 
 
 def _reconcile(remote, channel: str, report: dict) -> str:
@@ -107,9 +130,29 @@ def _reconcile(remote, channel: str, report: dict) -> str:
     if probe is None:
         return "unknown"
     verdict = probe(channel, report)
-    if verdict in {"delivered", "absent", "unknown"}:
-        return verdict
+    if verdict == "absent":
+        return "absent"
+    if isinstance(verdict, dict) and confirmation_binds(verdict, channel, report):
+        return "delivered"
     return "unknown"
+
+
+def _pid_alive(pid: object) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _claim_is_active(pid: object, expires_at: object, now: int) -> bool:
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= now:
+        return False
+    return _pid_alive(pid)
 
 
 class ReportOutbox:
@@ -224,17 +267,38 @@ class ReportOutbox:
                     continue
                 self._adopt(report, chosen)
                 pending.append(report["run_id"])
-        if abandon_claims:
-            with self.store.transaction() as conn:
+        self._retire_dead_claims(abandon_claims=abandon_claims)
+        return pending
+
+    def _retire_dead_claims(self, *, abandon_claims: bool) -> None:
+        """Move a crashed claim to unknown. A live worker keeps its token.
+
+        ``abandon_claims`` does not clear a claim whose worker is still alive.
+        """
+
+        now = int(time.time())
+        with self.store.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_id, channel, claim_token, claim_pid, claim_expires_at
+                FROM deliveries WHERE state='OUTBOX'
+                """
+            ).fetchall()
+            for row in rows:
+                if _claim_is_active(row["claim_pid"], row["claim_expires_at"], now):
+                    continue
+                if row["claim_token"] is None and not abandon_claims:
+                    continue
                 conn.execute(
                     """
                     UPDATE deliveries
-                    SET state='DELIVERY_UNKNOWN', claim_token=NULL, updated_at=?
-                    WHERE state='OUTBOX'
+                    SET state='DELIVERY_UNKNOWN', claim_token=NULL, claim_pid=NULL,
+                        claim_expires_at=NULL, updated_at=?
+                    WHERE event_id=? AND channel=? AND state='OUTBOX'
+                      AND claim_token IS ?
                     """,
-                    (_now(),),
+                    (_now(), row["event_id"], row["channel"], row["claim_token"]),
                 )
-        return pending
 
     def health(self) -> dict:
         reports, report_bytes = self._usage(self.directory, skip_held=True)
@@ -282,30 +346,47 @@ class ReportOutbox:
         if remote is None:
             return self._pending_receipt(report, channel, current or "DURABLE_LOCAL")
         if current == "DELIVERY_UNKNOWN":
+            if self._local_receipt_binds(event_id, channel, report):
+                token = self._claim(event_id, channel, report["run_id"])
+                if token and self._set_state(event_id, channel, "DELIVERED", report["run_id"], None, token):
+                    self._maybe_archive(report["run_id"])
+                found = self._latest_receipt(event_id, channel, "DELIVERED")
+                return found if found is not None else self._pending_receipt(report, channel, "DELIVERY_UNKNOWN")
+            token = self._claim(event_id, channel, report["run_id"])
+            if not token:
+                found = self._latest_receipt(event_id, channel, "DELIVERY_UNKNOWN")
+                return found if found is not None else self._pending_receipt(report, channel, "DELIVERY_UNKNOWN")
             verdict = _reconcile(remote, channel, report)
             if verdict == "delivered":
-                self._set_state(event_id, channel, "DELIVERED", report["run_id"], None)
-                self._maybe_archive(report["run_id"])
-                return self._write_receipt(report, channel, "DELIVERED")
+                receipt = self._write_receipt(report, channel, "DELIVERED")
+                if self._set_state(event_id, channel, "DELIVERED", report["run_id"], None, token):
+                    self._maybe_archive(report["run_id"])
+                return receipt
             if verdict != "absent":
-                self._touch(event_id, channel)
+                self._set_state(event_id, channel, "DELIVERY_UNKNOWN", report["run_id"], "delivery outcome is unknown", token)
                 found = self._latest_receipt(event_id, channel, "DELIVERY_UNKNOWN")
                 return found if found is not None else self._write_receipt(report, channel, "DELIVERY_UNKNOWN")
+            return self._send(report, channel, remote, token, crash=crash)
         if current == "OUTBOX":
             return self._pending_receipt(report, channel, "OUTBOX")
         if current not in {None, "DURABLE_LOCAL", "DELIVERY_UNKNOWN"}:
             return self._pending_receipt(report, channel, current or "DURABLE_LOCAL")
-        if not self._claim(event_id, channel, report["run_id"]):
+        token = self._claim(event_id, channel, report["run_id"])
+        if not token:
             raced = self._channel_state(event_id, channel) or "OUTBOX"
             found = self._latest_receipt(event_id, channel, raced)
             return found if found is not None else self._pending_receipt(report, channel, raced)
+        return self._send(report, channel, remote, token, crash=crash)
+
+    def _send(self, report: dict, channel: str, remote, token: str, *, crash: str | None) -> dict:
+        event_id = f"report-{report['run_id']}"
         state = "DELIVERY_UNKNOWN"
         detail = "remote returned no trusted confirmation"
         try:
             result = remote(channel, report)
             if crash == "after-remote":
                 os._exit(93)
-            if _confirmed(result):
+            if confirmation_binds(result, channel, report):
                 state = "DELIVERED"
                 detail = None
         except BadRecord as exc:
@@ -318,26 +399,34 @@ class ReportOutbox:
         except Exception:
             state = "DELIVERY_UNKNOWN"
             detail = "delivery outcome is unknown"
-        self._set_state(event_id, channel, state, report["run_id"], detail)
-        if state == "DELIVERED":
+        receipt = self._write_receipt(report, channel, state)
+        if self._set_state(event_id, channel, state, report["run_id"], detail, token) and state == "DELIVERED":
             self._maybe_archive(report["run_id"])
-        return self._write_receipt(report, channel, state)
+        return receipt
 
-    def _claim(self, event_id: str, channel: str, run_id: str) -> bool:
+    def _claim(self, event_id: str, channel: str, run_id: str) -> str | None:
         token = uuid.uuid4().hex
+        now = int(time.time())
+        expires = now + _CLAIM_TTL_SECONDS
         with self.store.transaction() as conn:
             before = conn.total_changes
             conn.execute(
                 """
                 UPDATE deliveries
-                SET state='OUTBOX', detail=?, updated_at=?, claim_token=?
+                SET state='OUTBOX', detail=?, updated_at=?, claim_token=?, claim_pid=?, claim_expires_at=?
                 WHERE event_id=? AND channel=? AND state IN ('DURABLE_LOCAL', 'DELIVERY_UNKNOWN')
                 """,
-                (token, _now(), token, event_id, channel),
+                (token, _now(), token, os.getpid(), expires, event_id, channel),
             )
             if conn.total_changes == before:
-                return False
-        return True
+                return None
+        return token
+
+    def _local_receipt_binds(self, event_id: str, channel: str, report: dict) -> bool:
+        receipt = self._latest_receipt(event_id, channel, "DELIVERED")
+        if receipt is None:
+            return False
+        return confirmation_binds(receipt, channel, report)
 
     def _touch(self, event_id: str, channel: str) -> None:
         with self.store.transaction() as conn:
@@ -394,23 +483,38 @@ class ReportOutbox:
             ).fetchone()
         return None if row is None else row["state"]
 
-    def _set_state(self, event_id: str, channel: str, state: str, run_id: str, detail: str | None) -> None:
+    def _set_state(self, event_id: str, channel: str, state: str, run_id: str, detail: str | None, claim_token: str) -> bool:
         with self.store.transaction() as conn:
             current = conn.execute(
-                "SELECT state FROM deliveries WHERE event_id=? AND channel=?", (event_id, channel)
+                "SELECT state, claim_token FROM deliveries WHERE event_id=? AND channel=?",
+                (event_id, channel),
             ).fetchone()
-            if current and current["state"] in {"DELIVERED", "QUARANTINED"} and state != current["state"]:
-                return
-            self._upsert(conn, event_id, channel, state, run_id, detail, _now())
+            if current and current["state"] in {"DELIVERED", "QUARANTINED"}:
+                return current["state"] == state
+            if current is None or current["claim_token"] != claim_token:
+                return False
+            cursor = conn.execute(
+                """
+                UPDATE deliveries
+                SET state=?, detail=?, updated_at=?, claim_token=NULL, claim_pid=NULL, claim_expires_at=NULL
+                WHERE event_id=? AND channel=? AND claim_token=?
+                """,
+                (state, detail, _now(), event_id, channel, claim_token),
+            )
+            return cursor.rowcount == 1
 
     def _upsert(self, conn, event_id: str, channel: str, state: str, run_id: str, detail: str | None, now: str | None = None) -> None:
         moment = now or _now()
         conn.execute(
             """
-            INSERT INTO deliveries (event_id, channel, state, detail, updated_at, pending_since, run_id, claim_token)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+            INSERT INTO deliveries (
+                event_id, channel, state, detail, updated_at, pending_since, run_id,
+                claim_token, claim_pid, claim_expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
             ON CONFLICT(event_id, channel) DO UPDATE SET
                 state=excluded.state, detail=excluded.detail, updated_at=excluded.updated_at
+            WHERE deliveries.state NOT IN ('OUTBOX', 'DELIVERED', 'QUARANTINED')
             """,
             (event_id, channel, state, detail, moment, moment, run_id),
         )

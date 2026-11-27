@@ -18,6 +18,9 @@ OPTIONAL = (
     "candidate_id",
     "revision",
     "rollback",
+    "app_id",
+    "host_id",
+    "successor_producer",
 )
 
 
@@ -162,6 +165,10 @@ def _strict_types(event: dict) -> None:
         _text(event["stage"], "stage")
     if "host_id" in event and event["host_id"] is not None:
         _text(event["host_id"], "host_id")
+    if "app_id" in event and event["app_id"] is not None:
+        _text(event["app_id"], "app_id")
+    if "successor_producer" in event and event["successor_producer"] is not None:
+        _text(event["successor_producer"], "successor_producer")
     if "note" in event and event["note"] is not None:
         _text(event["note"], "note")
     if "guard" in event and event["guard"] is not None:
@@ -202,19 +209,31 @@ def _channel(stream_id: str) -> str:
 
 
 def authorize_source(event: dict, server_source: str | None = None) -> bool:
-    """Server source is the only authority. The client field cannot grant trust."""
+    """Server source is the only authority. The client field cannot grant trust.
+
+    A server source that is real but is not the type's authority is an
+    observation: it is stored as history and is not authoritative. A client
+    that claims some other source is rejected. ``run.started`` is authoritative
+    only for the server source ``agent``. Closing an authorization epoch is
+    authoritative only for ``policy_service``.
+    """
     registered = event_spec()["event_types"].get(event["event_type"])
     claimed = event.get("trusted_source")
-    if claimed not in (None, "", server_source) and server_source is not None:
-        raise ControlError("NOT_AUTHORIZED", 403, "trusted source does not match the server principal")
     if server_source in (None, ""):
         if claimed not in (None, ""):
             raise ControlError("NOT_AUTHORIZED", 403, "client trusted source is not authority")
-        return event.get("event_type") == "run.started"
+        return False
+    if claimed not in (None, "", server_source):
+        raise ControlError("NOT_AUTHORIZED", 403, "trusted source does not match the server principal")
+    event_type = event.get("event_type")
+    if event_type == "run.started":
+        return server_source == "agent"
+    if event_type == "authorization.epoch_closed":
+        return server_source == "policy_service"
     if registered is None:
         return False
     if server_source != registered["trusted_source"]:
-        raise ControlError("NOT_AUTHORIZED", 403, "server source does not match the event type")
+        return False
     return True
 
 

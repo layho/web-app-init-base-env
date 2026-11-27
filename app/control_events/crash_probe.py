@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.control_events.atomic import atomic_write
 from app.control_events.engine import Engine
+from app.control_events.outbox import bound_confirmation
 
 
 def _remote(root: Path):
@@ -35,14 +36,14 @@ def main(argv=None) -> int:
                 handle.write(channel + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            return {"confirmed": True}
+            return bound_confirmation(channel, report)
 
         engine.deliver_pending(remote)
         return 0
     if args.mode == "after-remote":
         def remote(channel, report):
             atomic_write(root / "remote-ok.json", json.dumps({"channel": channel, "run_id": report.get("run_id")}).encode())
-            return {"confirmed": True}
+            return bound_confirmation(channel, report)
 
         engine.deliver_pending(remote, crash="after-remote")
         return 0

@@ -5,6 +5,8 @@ isolated engine has been bound in-process. The schema 2 protocol stays off
 in production.
 """
 
+import json
+
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 
@@ -43,6 +45,18 @@ def _engine():
     return _state["engine"]
 
 
+def _signed_request(raw: str | None) -> dict:
+    if not isinstance(raw, str) or raw.strip() == "":
+        raise ControlError("NOT_AUTHORIZED", 403, "reader is not authenticated")
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        raise ControlError("NOT_AUTHORIZED", 403, "reader is not authenticated") from exc
+    if not isinstance(body, dict):
+        raise ControlError("NOT_AUTHORIZED", 403, "reader is not authenticated")
+    return body
+
+
 @router.post("/api/v1/control/events")
 async def append_event(request: Request):
     try:
@@ -61,12 +75,12 @@ def query_events(
     after_seq: int = 0,
     task_id: str | None = None,
     limit: int = 50,
-    x_control_credential: str | None = Header(default=None),
+    x_control_proof: str | None = Header(default=None),
 ):
     try:
         engine = _engine()
         result = engine.query(
-            credential=x_control_credential or "",
+            request=_signed_request(x_control_proof),
             stream_id=stream_id,
             stream_epoch=stream_epoch,
             after_seq=after_seq,
@@ -86,12 +100,12 @@ def poll_diagnostics(
     after_seq: int = 0,
     task_id: str | None = None,
     limit: int = 50,
-    x_control_credential: str | None = Header(default=None),
+    x_control_proof: str | None = Header(default=None),
 ):
     try:
         engine = _engine()
         result = engine.poll_diagnostics(
-            credential=x_control_credential or "",
+            request=_signed_request(x_control_proof),
             subject=subject,
             stream_id=stream_id,
             stream_epoch=stream_epoch,
@@ -105,14 +119,15 @@ def poll_diagnostics(
 
 
 @router.post("/api/v1/control/diagnostics/cursor")
-async def commit_cursor(request: Request, x_control_credential: str | None = Header(default=None)):
+async def commit_cursor(request: Request, x_control_proof: str | None = Header(default=None)):
     try:
         engine = _engine()
         body = await request.json()
+        signed = _signed_request(x_control_proof) if x_control_proof else body
         result = engine.commit_cursor(
-            credential=x_control_credential or body.get("credential") or "",
+            request=signed,
             subject=body.get("subject") or "",
-            stream_id=body.get("stream_id") or "",
+            stream_id=body.get("stream_id") or signed.get("stream_id") or "",
             stream_epoch=body.get("stream_epoch"),
             after_seq=body.get("after_seq"),
             task_id=body.get("task_id"),
