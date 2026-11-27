@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from app.control_authz.proof import sign_request
-from app.control_events.auth_bind import document_for_event, document_for_resource
+from app.control_events.auth_bind import document_for_event, document_for_report, document_for_resource
 from app.control_events.auth_state import save_state
 
 _PRODUCERS = (
@@ -89,7 +89,7 @@ def ensure_principals(engine) -> dict:
     return keys
 
 
-def sign_event(engine, payload: dict, *, signer: str | None = None) -> dict:
+def sign_event(engine, payload: dict, *, signer: str | None = None, nonce: str | None = None) -> dict:
     keys = ensure_principals(engine)
     signer = signer or payload.get("producer_id") or "fixture"
     authorizer = payload["authorizer"] if "authorizer" in payload else signer
@@ -116,11 +116,35 @@ def sign_event(engine, payload: dict, *, signer: str | None = None) -> dict:
         declared_proof_ref=payload["actor"]["proof_ref"],
         issued_at=int(time.time()) - 5,
         expires_at=int(time.time()) + 86400,
-        nonce=secrets.token_hex(16),
+        nonce=nonce or secrets.token_hex(16),
     )
     payload["proof"] = signed["proof"]
     payload["actor"] = signed["actor"]
     return payload
+
+
+def sign_report(engine, report: dict, *, nonce: str | None = None) -> dict:
+    keys = ensure_principals(engine)
+    signer = "macci-isolated"
+    report["authorizer"] = signer
+    report["producer_id"] = report.get("producer_id") or signer
+    document = document_for_report(report)
+    signed = sign_request(
+        keys[signer],
+        signer_id=signer,
+        key_id=signer + "-key",
+        operation="report.submit",
+        body=document,
+        declared_kind="test",
+        declared_id=signer,
+        declared_proof_ref=f"test-proof://w01/{signer}",
+        issued_at=int(time.time()) - 5,
+        expires_at=int(time.time()) + 86400,
+        nonce=nonce or secrets.token_hex(16),
+    )
+    report["proof"] = signed["proof"]
+    report["actor"] = signed["actor"]
+    return report
 
 
 def sign_read(engine, producer: str, operation: str, **fields) -> dict:
@@ -155,7 +179,7 @@ def sign_read(engine, producer: str, operation: str, **fields) -> dict:
         declared_proof_ref=f"test-proof://w01/{producer}",
         issued_at=int(time.time()) - 5,
         expires_at=int(time.time()) + 86400,
-        nonce=secrets.token_hex(16),
+        nonce=fields.pop("nonce", None) or secrets.token_hex(16),
     )
     signed["host_id"] = resource["host_id"]
     return signed

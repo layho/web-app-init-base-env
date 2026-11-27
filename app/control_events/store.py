@@ -115,6 +115,30 @@ CREATE TABLE IF NOT EXISTS counters (
     name TEXT PRIMARY KEY,
     value INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS consumed_nonces (
+    slot TEXT PRIMARY KEY,
+    principal_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    payload_hash TEXT NOT NULL,
+    operation TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS event_outbox (
+    event_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    stream_epoch INTEGER NOT NULL,
+    producer_seq INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    detail TEXT,
+    updated_at TEXT NOT NULL,
+    pending_since TEXT NOT NULL,
+    claim_token TEXT,
+    claim_pid INTEGER,
+    claim_expires_at INTEGER,
+    payload_bytes INTEGER NOT NULL,
+    PRIMARY KEY (event_id, channel)
+);
 """
 
 
@@ -156,7 +180,7 @@ class Store:
                 conn.close()
 
     def count(self, table: str) -> int:
-        if table not in {"events", "idempotency", "authorizations", "facts", "deliveries", "receipts"}:
+        if table not in {"events", "idempotency", "authorizations", "facts", "deliveries", "receipts", "consumed_nonces", "event_outbox", "reports"}:
             raise ValueError("unknown table")
         with self.transaction() as conn:
             return conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]

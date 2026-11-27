@@ -6,8 +6,10 @@ trusted_source, authorizer, test-proof, and guard strings are not authority.
 Binding fields come from the event or the named resource. This process does
 not mount production routes.
 
-The generic event outbox consumer is not delivered. Event rows stay
-``not_delivered``. See ``FOLLOW_UPS``.
+A write commits its nonce in the same SQLite transaction as the event,
+authorization row, report row, or cursor. The registry file is not a second
+commit for that nonce. The generic event outbox queues the event in that
+same transaction and is not wired to production delivery.
 """
 
 from datetime import datetime, timezone
@@ -15,15 +17,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import threading
 import time
 
 from app.control_authz import AuthnError, AuthzError, AuthzService, Principal, PrincipalRegistry, ResourceBinding
 from app.feedback_progress import STAGES, STATUSES
 
-from .auth_bind import POLICY_REVISION, STREAM_REPAIR, document_for_event, document_for_resource, evidence_key, guard_key, host_text
-from .auth_state import load_state, save_state
+from .auth_bind import POLICY_REVISION, STREAM_REPAIR, document_for_event, document_for_report, document_for_resource, evidence_key, guard_key, host_text, report_business_digest
+from .auth_state import load_state
 from .errors import ControlError
+from .event_outbox import EventOutbox
 from .identity import PRODUCTION_PROTOCOL_ENABLED, RepositoryIdentity
 from .inbox import decide
 from .legacy import parse_comments, read_operations
@@ -37,10 +41,8 @@ _REVISION_CLASSES = {"task", "candidate", "deployment", "resource", "authorizati
 _OPERATION = "event_append"
 _PAGE_LIMIT = 50
 TRUSTED_EXECUTORS = frozenset({"macci-isolated"})
-PACKAGE_COMPLETE = False
-FOLLOW_UPS = (
-    "D07: generic event outbox consumer is not delivered; event rows stay not_delivered",
-)
+PACKAGE_COMPLETE = True
+FOLLOW_UPS = ()
 
 
 def _now() -> str:
@@ -78,6 +80,7 @@ class Engine:
         self.identity = identity
         self.store = store
         self.outbox = outbox
+        self.events = EventOutbox(root, store, outbox.limits)
         self.authorizer = authorizer
         self.authz = authz
         self.proven_guards = {key: frozenset(value) for key, value in (proven_guards or {}).items()}
@@ -102,6 +105,7 @@ class Engine:
         evidence_bindings: dict | None = None,
         trusted_executors: set[str] | None = None,
         abandon_claims: bool = True,
+        event_channels: tuple[str, ...] | None = None,
     ) -> "Engine":
         if production or PRODUCTION_PROTOCOL_ENABLED:
             raise ControlError("NOT_AUTHORIZED", 403, "unverified schema 2 protocol cannot be enabled in production")
@@ -126,7 +130,11 @@ class Engine:
             proven_guards=proven_guards,
             evidence_bindings=evidence_bindings,
         )
+        if event_channels is not None:
+            engine.events = EventOutbox(root, store, engine.outbox.limits, event_channels)
+        engine._import_file_nonces()
         engine.outbox.recover(abandon_claims=abandon_claims)
+        engine.events.recover(abandon_claims=abandon_claims)
         return engine
 
     @property
@@ -138,6 +146,7 @@ class Engine:
 
         with self._auth_lock:
             self.auth_state = load_state(self.auth_path)
+            self._import_file_nonces()
 
     def enable_production_protocol(self) -> None:
         raise ControlError("NOT_AUTHORIZED", 403, "unverified schema 2 protocol cannot be enabled in production")
@@ -182,25 +191,36 @@ class Engine:
                 else:
                     outcome = _replay(json.loads(existing["result_json"]), self._current_state(conn, event))
             elif replay_only:
-                raise ControlError("NOT_AUTHORIZED", 403, "nonce was already used")
+                raise ControlError("PROOF_REPLAY", 403, "nonce already used")
             else:
+                self._commit_nonce(conn, principal, proof, digest, "event.append")
                 outcome = self._attempt(conn, event, digest, principal.principal_id, scope)
+                if outcome.get("_wrote") and not outcome.get("replayed"):
+                    self.events.enqueue(conn, event, digest)
             if crash == "before-commit":
                 os._exit(90)
-            wrote = bool(outcome.get("_wrote")) and not outcome.get("replayed")
-        if wrote:
-            self._consume_nonce(principal, proof)
+        if crash == "after-commit":
+            os._exit(94)
         return redact(_public(outcome))
 
     def submit_report(self, report: dict, channels: list[str] | None = None, remote=None, *, crash: str | None = None) -> dict:
         if self.production_protocol_enabled:
             raise ControlError("NOT_AUTHORIZED", 403, "production protocol is disabled")
         self._authorize_report(report)
+        principal, proof, replay_only = self._authenticate_report(report)
+        digest = report_business_digest(report)
+
+        def nonce_commit(conn) -> None:
+            self._commit_nonce(conn, principal, proof, digest, "report.submit")
+
         chosen = list(channels or DEFAULT_CHANNELS)
-        return self.outbox.submit(report, chosen, remote, crash=crash)
+        return self.outbox.submit(report, chosen, remote, crash=crash, nonce_commit=nonce_commit, replay_only=replay_only)
 
     def deliver_pending(self, remote, *, crash: str | None = None) -> list[dict]:
         return self.outbox.deliver_pending(remote, crash=crash)
+
+    def deliver_events(self, remote, *, crash: str | None = None) -> list[dict]:
+        return self.events.deliver_pending(remote, crash=crash)
 
     def declare_counter_loss(self, stream_id: str) -> dict:
         with self.store.transaction() as conn:
@@ -219,7 +239,7 @@ class Engine:
         return {"stream_id": stream_id, "sealed": sealed, "next_epoch": next_epoch, "event_written": False}
 
     def query(self, *, request: dict, stream_id: str, stream_epoch: int, after_seq: int = 0, task_id: str | None = None, limit: int = _PAGE_LIMIT) -> dict:
-        principal = self._authorize_read(request, "event.read", stream_id=stream_id, task_id=task_id)
+        principal, _proof = self._authorize_read(request, "event.read", stream_id=stream_id, task_id=task_id)
         allowed = _tasks(principal)
         selected = task_id or request.get("task_id") or (next(iter(allowed)) if len(allowed) == 1 else None)
         limit = _page_limit(limit)
@@ -246,7 +266,7 @@ class Engine:
     def poll_diagnostics(self, *, request: dict, subject: str, stream_id: str, stream_epoch: int, after_seq: int, task_id: str | None = None, limit: int = _PAGE_LIMIT) -> dict:
         if type(after_seq) is not int or after_seq < 0 or type(stream_epoch) is not int:
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "diagnostic cursor is invalid")
-        principal = self._authorize_read(request, "diagnostic.read", stream_id=stream_id, task_id=task_id)
+        principal, _proof = self._authorize_read(request, "diagnostic.read", stream_id=stream_id, task_id=task_id)
         allowed = _tasks(principal)
         selected = task_id or request.get("task_id") or (next(iter(allowed)) if len(allowed) == 1 else None)
         limit = _page_limit(limit)
@@ -279,15 +299,25 @@ class Engine:
     def commit_cursor(self, *, request: dict, subject: str, stream_id: str, stream_epoch: int, after_seq: int, task_id: str | None = None) -> dict:
         if type(after_seq) is not int or after_seq < 0 or type(stream_epoch) is not int:
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "diagnostic cursor is invalid")
-        principal = self._authorize_read(request, "diagnostic.cursor", stream_id=stream_id, task_id=task_id, method="POST")
+        signed = dict(request)
+        signed["expected_revision"] = after_seq
+        principal, proof = self._authorize_read(signed, "diagnostic.cursor", stream_id=stream_id, task_id=task_id, method="POST", write=True)
         allowed = _tasks(principal)
-        selected = task_id or request.get("task_id") or (next(iter(allowed)) if len(allowed) == 1 else None)
+        selected = task_id or signed.get("task_id") or (next(iter(allowed)) if len(allowed) == 1 else None)
         if not stream_id.endswith(":diagnostic"):
             raise ControlError("NOT_AUTHORIZED", 403, "diagnostic cursor is not authorized for this stream")
+        digest = hashlib.sha256(json.dumps({
+            "operation": "diagnostic.cursor",
+            "principal_id": principal.principal_id,
+            "stream_id": stream_id,
+            "stream_epoch": stream_epoch,
+            "after_seq": after_seq,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         with self.store.transaction() as conn:
             watermark = self._watermark(conn, stream_id, stream_epoch)["seq"]
             if after_seq > watermark:
                 raise ControlError("EVIDENCE_MISSING", 409, "cursor is past the watermark")
+            self._commit_nonce(conn, principal, proof, digest, "diagnostic.cursor")
             row = conn.execute(
                 "SELECT after_seq FROM cursors WHERE principal_id=? AND stream_id=? AND stream_epoch=?",
                 (principal.principal_id, stream_id, stream_epoch),
@@ -424,8 +454,7 @@ class Engine:
             for row in gaps
         ]
         snapshot["production_protocol_enabled"] = False
-        snapshot["event_delivery_disposition"] = "not_delivered"
-        snapshot["event_outbox_consumer"] = None
+        snapshot.update(self.events.health())
         snapshot["package_complete"] = PACKAGE_COMPLETE
         snapshot["follow_ups"] = list(FOLLOW_UPS)
         snapshot["stream_repair"] = STREAM_REPAIR
@@ -447,13 +476,16 @@ class Engine:
             document["actor"] = body["actor"]
         if isinstance(body.get("proof"), dict):
             document["proof"] = body["proof"]
+        return self._authenticate_document(document, operation=operation, write=write)
+
+    def _authenticate_document(self, document: dict, *, operation: str, write: bool):
         try:
             principal = self.authz.authenticate(
                 operation=operation,
                 body=document,
                 route_class="isolated",
                 now=int(time.time()),
-                state=self.auth_state,
+                state=self._state_for_auth(),
                 write=write,
             )
         except AuthnError as exc:
@@ -461,19 +493,89 @@ class Engine:
             raise ControlError(code, 403, exc.detail) from exc
         return principal, document.get("proof") if isinstance(document.get("proof"), dict) else {}
 
-    def _consume_nonce(self, principal, proof: dict) -> None:
-        if not proof:
-            return
-        with self._auth_lock:
-            try:
-                self.authz.consume_nonce(self.auth_state, principal, proof, int(time.time()), max_nonces=10000)
-            except AuthnError as exc:
-                if exc.reason == "replay":
-                    return
-                raise ControlError("NOT_AUTHORIZED", 403, exc.detail) from exc
-            save_state(self.auth_path, self.auth_state)
+    def _authenticate_report(self, report: dict):
+        if not isinstance(report.get("proof"), dict) or not isinstance(report.get("actor"), dict):
+            raise ControlError("NOT_AUTHORIZED", 403, "report proof is required")
+        document = document_for_report(report)
+        document["actor"] = report["actor"]
+        document["proof"] = report["proof"]
+        try:
+            principal, proof = self._authenticate_document(document, operation="report.submit", write=True)
+            return principal, proof, False
+        except ControlError as exc:
+            if exc.code != "PROOF_REPLAY":
+                raise
+        principal, proof = self._authenticate_document(document, operation="report.submit", write=False)
+        return principal, proof, True
 
-    def _authorize_read(self, request: dict, operation: str, *, stream_id: str, task_id: str | None, method: str = "GET"):
+    def _state_for_auth(self) -> dict:
+        with self.store.transaction() as conn:
+            nonces = self._load_nonces(conn)
+        return {
+            "policy": self.auth_state.get("policy") or {"revision": POLICY_REVISION},
+            "principals": self.auth_state.get("principals") or {},
+            "revoked_signers": list(self.auth_state.get("revoked_signers") or []),
+            "nonces": nonces,
+        }
+
+    def _load_nonces(self, conn) -> dict:
+        rows = conn.execute("SELECT slot, principal_id, expires_at FROM consumed_nonces").fetchall()
+        return {row["slot"]: {"principal_id": row["principal_id"], "expires_at": row["expires_at"]} for row in rows}
+
+    def _import_file_nonces(self) -> None:
+        """Copy registry-file nonce slots into SQLite. SQLite remains the authority."""
+
+        file_nonces = self.auth_state.get("nonces") or {}
+        if not file_nonces:
+            return
+        with self.store.transaction() as conn:
+            for slot, row in file_nonces.items():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO consumed_nonces (slot, principal_id, expires_at, payload_hash, operation)
+                    VALUES (?, ?, ?, '', 'imported')
+                    """,
+                    (slot, row["principal_id"], int(row["expires_at"])),
+                )
+
+    def _commit_nonce(self, conn, principal, proof: dict, payload_hash: str, operation: str) -> None:
+        """Insert the nonce in the caller's transaction. A conflict rolls that transaction back."""
+
+        if not proof:
+            raise ControlError("NOT_AUTHORIZED", 403, "write proof is required")
+        current = self._load_nonces(conn)
+        state = {
+            "policy": self.auth_state.get("policy") or {"revision": POLICY_REVISION},
+            "principals": self.auth_state.get("principals") or {},
+            "revoked_signers": list(self.auth_state.get("revoked_signers") or []),
+            "nonces": {slot: dict(row) for slot, row in current.items()},
+        }
+        try:
+            self.authz.consume_nonce(state, principal, proof, int(time.time()), max_nonces=10000)
+        except AuthnError as exc:
+            if exc.reason == "replay":
+                raise ControlError("PROOF_REPLAY", 403, exc.detail) from exc
+            code = exc.code or "NOT_AUTHORIZED"
+            http = 429 if exc.reason == "capacity" else 403
+            raise ControlError(code, http, exc.detail) from exc
+        for slot, row in state["nonces"].items():
+            if slot in current:
+                continue
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO consumed_nonces (slot, principal_id, expires_at, payload_hash, operation)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (slot, row["principal_id"], int(row["expires_at"]), payload_hash, operation),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ControlError("PROOF_REPLAY", 403, "nonce already used") from exc
+        for slot in current:
+            if slot not in state["nonces"]:
+                conn.execute("DELETE FROM consumed_nonces WHERE slot=?", (slot,))
+
+    def _authorize_read(self, request: dict, operation: str, *, stream_id: str, task_id: str | None, method: str = "GET", write: bool = False):
         if not isinstance(request, dict):
             raise ControlError("NOT_AUTHORIZED", 403, "reader is not authenticated")
         if request.get("stream_id") != stream_id:
@@ -484,7 +586,7 @@ class Engine:
         resource["stream_id"] = stream_id
         if task_id:
             resource["task_id"] = task_id
-        principal, _proof = self._authenticate(request, event=None, operation=operation, write=False, resource=resource, method=method)
+        principal, proof = self._authenticate(request, event=None, operation=operation, write=write, resource=resource, method=method)
         self._bind(
             principal,
             operation,
@@ -496,7 +598,7 @@ class Engine:
             task_id=_text_field(resource, "task_id"),
             scope_name=operation,
         )
-        return principal
+        return principal, proof
 
     def _bind(
         self,
@@ -675,8 +777,8 @@ class Engine:
             "http": 200,
             "fact_state": "ACCEPTED" if applied else None,
             "delivery_state": "DURABLE_LOCAL",
-            "delivery_disposition": "not_delivered",
-            "outbox_consumer": None,
+            "delivery_disposition": "DURABLE_LOCAL",
+            "outbox_consumer": "generic",
             "applied": applied,
             "projected": projected,
             "hold_reason": None if applied else reason,

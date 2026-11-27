@@ -7,6 +7,9 @@ a request registry, or a hash of the producer id.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 POLICY_REVISION = 1
 
 SCOPE_FOR_OPERATION = {
@@ -117,6 +120,50 @@ def document_for_event(event: dict, *, operation: str, authorizer: str, path: st
         method="POST",
         path=path,
     )
+
+
+_REPORT_UNSIGNED = {"actor", "proof", "channels", "payload_hash"}
+
+
+def report_business_digest(report: dict) -> str:
+    """Hash the report body the nonce commits with. Proof fields stay outside it."""
+
+    business = {key: value for key, value in report.items() if key not in _REPORT_UNSIGNED}
+    raw = json.dumps(business, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def document_for_report(report: dict) -> dict:
+    """Signed report.submit document. The digest binds outcome, phase, and candidate."""
+
+    digest = report_business_digest(report)
+    authorizer = _text(report.get("authorizer")) or _text(report.get("executor_id"))
+    document = document_for_resource(
+        {
+            "repo_id": _text(report.get("repo_id")),
+            "app_id": _text(report.get("app_id")),
+            "producer_id": _text(report.get("producer_id")) or _text(report.get("executor_id")),
+            "stream_id": _text(report.get("stream_id")),
+            "task_id": _text(report.get("task_id")),
+            "object_id": _text(report.get("run_id")),
+            "phase": _text(report.get("phase")),
+            "candidate_id": _text(report.get("candidate_id")),
+            "head": _text(report.get("head")),
+            "base": _text(report.get("base")),
+            "merge": _text(report.get("merge")),
+            "tree": _text(report.get("tree")),
+            "idempotency_key": digest,
+            "run_id": _text(report.get("run_id")),
+            "expected_revision": 0,
+        },
+        operation="report.submit",
+        authorizer=authorizer,
+        path="/api/v1/control/reports",
+        method="POST",
+    )
+    outcome = report.get("outcome")
+    document["result"] = outcome if isinstance(outcome, str) else ""
+    return document
 
 
 def document_for_resource(

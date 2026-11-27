@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import time
 
 from fastapi import FastAPI
@@ -19,10 +20,11 @@ from app.control_events.engine import FOLLOW_UPS, PACKAGE_COMPLETE, Engine
 from app.control_events.errors import BadRecord, ControlError, DeliveryUnknown
 from app.control_events.identity import bound_token_for_directory
 from app.control_events.legacy import KNOWN_AGENTS
+from app.control_events.event_outbox import confirmation_binds, exact_confirmation
 from app.control_events.outbox import FAILURE_PHASES, OutboxLimits, bound_confirmation
 from app.control_routes_w01 import bind_isolated_engine, clear_binding, router, set_isolated
 from app.feedback_progress import STATUSES
-from tests.w01_isolated_principals import ensure_principals, sign_event, sign_read
+from tests.w01_isolated_principals import ensure_principals, sign_event, sign_read, sign_report
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
@@ -205,7 +207,7 @@ def report(eng, run_id, *, outcome, phase, note=None, **fields):
     if note:
         payload["note"] = note
     payload.update(fields)
-    return payload
+    return sign_report(eng, payload)
 
 
 def test_repo_identity_is_stable_and_not_reusable_after_rebuild(tmp_path):
@@ -268,7 +270,8 @@ def test_reducer_rejects_illegal_transition_and_keeps_current_round(tmp_path):
     first = eng.append(task(eng, state="PENDING", run_id="run_old", progress_status="submitted", attempt=2))
     assert first["applied"] is True
     assert first["fact_state"] == "ACCEPTED"
-    assert first["delivery_disposition"] == "not_delivered"
+    assert first["delivery_disposition"] == "DURABLE_LOCAL"
+    assert first["outbox_consumer"] == "generic"
     illegal = eng.append(task(
         eng, event_id="evt_back", idempotency_key="idem-back", producer_seq=2, run_id="run_old",
         state="RETRY_WAIT", expected_revision=1, revision=2, progress_status="claimed",
@@ -463,7 +466,7 @@ def test_diagnostic_cursors_are_keyed_by_stream_and_epoch(tmp_path):
     assert eng.cursor("hostops:diagnostic", 1) is None
     other = eng.poll_diagnostics(request=other_cred, subject="subj", stream_id="hostops_b:diagnostic", stream_epoch=1, after_seq=0)
     assert len(other["items"]) == 1 and other["side_effect"] is False and eng.cursor("hostops_b:diagnostic", 1) is None
-    saved = eng.commit_cursor(request=sign_read(eng, "hostops", "diagnostic.cursor", stream_id="hostops:diagnostic", object_id="subj", method="POST"), subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=1)
+    saved = eng.commit_cursor(request=sign_read(eng, "hostops", "diagnostic.cursor", stream_id="hostops:diagnostic", object_id="subj", method="POST", expected_revision=1), subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=1)
     assert saved["side_effect"] is True and saved["cursor_after_seq"] == 1
     other_saved = eng.commit_cursor(request=sign_read(eng, "hostops_b", "diagnostic.cursor", stream_id="hostops_b:diagnostic", object_id="subj", method="POST"), subject="subj", stream_id="hostops_b:diagnostic", stream_epoch=1, after_seq=0)
     assert other_saved["cursor_after_seq"] == 0
@@ -529,6 +532,8 @@ def test_transaction_rolls_back_when_the_process_dies_before_commit(tmp_path):
     reopened = Engine.open(tmp_path / "store", "generation-1")
     assert reopened.store.count("events") == 0
     assert reopened.store.count("idempotency") == 0
+    assert reopened.store.count("consumed_nonces") == 0
+    assert reopened.store.count("event_outbox") == 0
     recovered = reopened.append(payload)
     assert recovered["applied"] is True and recovered.get("replayed") is not True
     assert reopened.store.count("events") == 1
@@ -1137,10 +1142,13 @@ def test_historical_gap_unproven_close_and_late_revocation(tmp_path):
     assert bound.watermarks()["hostops:diagnostic@1"]["seq"] == 1
     assert "do not consume producer_seq" in bound.health()["stream_repair"]
     assert STREAM_REPAIR == bound.health()["stream_repair"]
-    assert bound.health()["event_delivery_disposition"] == "not_delivered"
-    assert bound.health()["package_complete"] is False
-    assert PACKAGE_COMPLETE is False
-    assert any(item.startswith("D07:") for item in FOLLOW_UPS)
+    assert bound.health()["event_outbox_consumer"] == "generic"
+    assert bound.health()["event_delivery_disposition"] == "DURABLE_LOCAL"
+    assert bound.health()["event_backlog"] >= 1
+    assert bound.health()["package_complete"] is True
+    assert PACKAGE_COMPLETE is True
+    assert FOLLOW_UPS == ()
+    assert bound.health()["production_protocol_enabled"] is False
 
 
 def test_claim_token_is_required_and_a_live_claim_survives_recovery(tmp_path):
@@ -1169,3 +1177,249 @@ def test_claim_token_is_required_and_a_live_claim_survives_recovery(tmp_path):
     )
     assert {item["state"] for item in bare["receipts"]} == {"DELIVERY_UNKNOWN"}
     assert other
+
+
+def _over_the_barrier(calls):
+    barrier = threading.Barrier(len(calls))
+
+    def run(fn):
+        barrier.wait(timeout=5)
+        try:
+            return ("ok", fn())
+        except ControlError as exc:
+            return ("err", exc.code)
+
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        return list(pool.map(run, calls))
+
+
+def test_concurrent_same_nonce_different_signed_payloads_commit_once(tmp_path):
+    eng = engine(tmp_path)
+    nonce = "cd" * 16
+    first = sign_event(eng, task(eng, event_id="evt_race_a", idempotency_key="idem-race-a", note="alpha"), nonce=nonce)
+    second = sign_event(eng, task(eng, event_id="evt_race_b", idempotency_key="idem-race-b", note="beta"), nonce=nonce)
+    assert first["proof"]["nonce"] == second["proof"]["nonce"] == nonce
+    assert first["proof"]["payload_hash"] != second["proof"]["payload_hash"]
+    results = _over_the_barrier((lambda: eng.append(first), lambda: eng.append(second)))
+    oks = [item for item in results if item[0] == "ok" and item[1].get("applied") is True]
+    errs = [item for item in results if item[0] == "err"]
+    assert len(oks) == 1 and len(errs) == 1
+    assert errs[0][1] == "PROOF_REPLAY"
+    assert eng.store.count("events") == 1
+    assert eng.store.count("consumed_nonces") == 1
+    assert eng.store.count("event_outbox") == 1
+    assert json.loads((tmp_path / "store" / "auth-state.json").read_text(encoding="utf-8"))["nonces"] == {}
+
+
+def test_crash_after_commit_keeps_nonce_event_and_authorization(tmp_path):
+    eng = engine(tmp_path)
+    payload = authorization(eng, event_id="evt_atomic", idempotency_key="idem-atomic")
+    (tmp_path / "request.json").write_text(json.dumps(payload), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-m", "app.control_events.crash_probe", "--root", str(tmp_path / "store"),
+         "--token", "generation-1", "--mode", "after-commit", "--request", str(tmp_path / "request.json")],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 94, proc.stderr
+    reopened = Engine.open(tmp_path / "store", "generation-1")
+    assert reopened.store.count("events") == 1
+    assert reopened.store.count("consumed_nonces") == 1
+    assert reopened.store.count("event_outbox") == 1
+    assert reopened.authorizations()[0]["event_id"] == "evt_atomic"
+    assert reopened.authorizations()[0]["revoked"] is False
+    assert json.loads((tmp_path / "store" / "auth-state.json").read_text(encoding="utf-8"))["nonces"] == {}
+    replay = reopened.append(payload)
+    assert replay["replayed"] is True
+    assert reopened.store.count("events") == 1
+    other = sign_event(
+        reopened,
+        authorization(reopened, event_id="evt_other_nonce", idempotency_key="idem-other-nonce", producer_seq=2),
+        nonce=payload["proof"]["nonce"],
+    )
+    with pytest.raises(ControlError) as rejected:
+        reopened.append(other)
+    assert rejected.value.code == "PROOF_REPLAY"
+    assert reopened.store.count("events") == 1
+    assert reopened.authorizations()[0]["event_id"] == "evt_atomic"
+    assert reopened.fact("authorization:tsk_w01|cand_w01|preview.merge")["event_id"] == "evt_atomic"
+
+
+def test_corrupt_auth_state_fails_closed_and_does_not_drop_nonce(tmp_path):
+    from app.control_events.auth_state import load_state
+
+    eng = engine(tmp_path)
+    payload = task(eng, event_id="evt_keep", idempotency_key="idem-keep")
+    assert eng.append(payload)["applied"] is True
+    path = tmp_path / "store" / "auth-state.json"
+    original = path.read_text(encoding="utf-8")
+    assert load_state(tmp_path / "missing-auth.json")["nonces"] == {}
+    path.write_text("{", encoding="utf-8")
+    with pytest.raises(ControlError) as corrupt:
+        load_state(path)
+    assert corrupt.value.code == "AUTH_STATE_CORRUPT"
+    with pytest.raises(ControlError) as opened:
+        Engine.open(tmp_path / "store", "generation-1")
+    assert opened.value.code == "AUTH_STATE_CORRUPT"
+    path.write_text("null", encoding="utf-8")
+    with pytest.raises(ControlError) as nulled:
+        Engine.open(tmp_path / "store", "generation-1")
+    assert nulled.value.code == "AUTH_STATE_CORRUPT"
+    path.write_text(original, encoding="utf-8")
+    reopened = Engine.open(tmp_path / "store", "generation-1")
+    assert reopened.store.count("events") == 1
+    assert reopened.store.count("consumed_nonces") == 1
+    assert reopened.append(payload)["replayed"] is True
+    stolen = sign_event(
+        reopened,
+        task(reopened, event_id="evt_stolen", idempotency_key="idem-stolen"),
+        nonce=payload["proof"]["nonce"],
+    )
+    with pytest.raises(ControlError) as rejected:
+        reopened.append(stolen)
+    assert rejected.value.code == "PROOF_REPLAY"
+    assert reopened.store.count("events") == 1
+
+
+def test_report_and_cursor_writes_commit_the_nonce_with_the_row(tmp_path):
+    eng = engine(tmp_path)
+    nonce = "ef" * 16
+    left = sign_report(eng, report(eng, "11" * 16, outcome="success", phase="passed"), nonce=nonce)
+    right = sign_report(eng, report(eng, "22" * 16, outcome="failure", phase="test-failed"), nonce=nonce)
+    assert left["proof"]["payload_hash"] != right["proof"]["payload_hash"]
+    results = _over_the_barrier((
+        lambda: eng.submit_report(left, channels=["github_comment"], remote=None),
+        lambda: eng.submit_report(right, channels=["github_comment"], remote=None),
+    ))
+    oks = [item for item in results if item[0] == "ok"]
+    errs = [item for item in results if item[0] == "err"]
+    assert len(oks) == 1 and len(errs) == 1
+    assert errs[0][1] == "PROOF_REPLAY"
+    assert eng.store.count("reports") == 1
+
+    root = tmp_path / "report-crash"
+    root.mkdir()
+    opened = Engine.open(root, "generation-1")
+    ensure_principals(opened)
+    submitted = report(opened, "33" * 16, outcome="failure", phase="setup-failed")
+    request = tmp_path / "report-request.json"
+    request.write_text(json.dumps({"report": submitted, "channels": ["github_comment"]}), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-m", "app.control_events.crash_probe", "--root", str(root),
+         "--token", "generation-1", "--mode", "after-report-commit", "--request", str(request)],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 94, proc.stderr
+    restored = Engine.open(root, "generation-1")
+    assert restored.store.count("reports") == 1
+    assert restored.store.count("consumed_nonces") == 1
+    assert not (root / "report-outbox" / f"{'33' * 16}.json").exists()
+    other = sign_report(
+        restored,
+        report(restored, "44" * 16, outcome="success", phase="passed"),
+        nonce=submitted["proof"]["nonce"],
+    )
+    with pytest.raises(ControlError) as rejected:
+        restored.submit_report(other, channels=["github_comment"], remote=None)
+    assert rejected.value.code == "PROOF_REPLAY"
+    assert restored.store.count("reports") == 1
+    again = restored.submit_report(submitted, channels=["github_comment"], remote=None)
+    assert again["run_id"] == "33" * 16
+    assert restored.store.count("reports") == 1
+
+    cursor_eng = engine(tmp_path / "cursor")
+    cursor_eng.append(diagnostic(cursor_eng, subject_id="subj"))
+    before = cursor_eng.store.count("consumed_nonces")
+    shared = "ab" * 16
+    low = sign_read(
+        cursor_eng, "hostops", "diagnostic.cursor", stream_id="hostops:diagnostic",
+        object_id="subj", method="POST", expected_revision=0, nonce=shared,
+    )
+    high = sign_read(
+        cursor_eng, "hostops", "diagnostic.cursor", stream_id="hostops:diagnostic",
+        object_id="subj", method="POST", expected_revision=1, nonce=shared,
+    )
+    assert low["proof"]["payload_hash"] != high["proof"]["payload_hash"]
+    raced = _over_the_barrier((
+        lambda: cursor_eng.commit_cursor(request=low, subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=0),
+        lambda: cursor_eng.commit_cursor(request=high, subject="subj", stream_id="hostops:diagnostic", stream_epoch=1, after_seq=1),
+    ))
+    assert len([item for item in raced if item[0] == "ok"]) == 1
+    assert [item[1] for item in raced if item[0] == "err"] == ["PROOF_REPLAY"]
+    assert cursor_eng.store.count("consumed_nonces") == before + 1
+    assert cursor_eng.cursor("hostops:diagnostic", 1) in {0, 1}
+
+
+def test_generic_event_outbox_claims_exact_receipts_and_backpressure(tmp_path):
+    eng = engine(tmp_path, limits=OutboxLimits(max_event_outbox=1))
+    first = eng.append(task(eng, event_id="evt_box", idempotency_key="idem-box"))
+    assert first["delivery_disposition"] == "DURABLE_LOCAL"
+    assert eng.health()["event_backlog"] == 1
+    assert eng.health()["event_oldest_pending_at"]
+    blocked = task(
+        eng, event_id="evt_over", idempotency_key="idem-over", producer_id="fixture_b",
+        stream_id="fixture_b:task", producer_seq=1, run_id="run_over",
+    )
+    with pytest.raises(ControlError) as full:
+        eng.append(blocked)
+    assert full.value.code == "CAPACITY_EXHAUSTED"
+    assert eng.store.count("events") == 1
+    assert eng.store.count("consumed_nonces") == 1
+    assert eng.store.count("event_outbox") == 1
+    vague = eng.deliver_events(lambda _channel, _envelope: {"ok": True})
+    assert vague[0]["state"] == "DELIVERY_UNKNOWN"
+    assert eng.store.count("events") == 1
+    sends = []
+
+    class Remote:
+        def __call__(self, channel, envelope):
+            sends.append(channel)
+            return exact_confirmation(channel, envelope)
+
+        def reconcile(self, channel, envelope):
+            return exact_confirmation(channel, envelope)
+
+    exact = eng.deliver_events(Remote())
+    assert sends == []
+    assert exact[0]["state"] == "DELIVERED"
+    assert exact[0]["exact"] is True
+    assert confirmation_binds(exact[0], "event_sink", exact[0])
+    assert list((tmp_path / "store" / "event-receipts").glob("*.json"))
+    assert eng.health()["event_backlog"] == 0
+
+    tiny = engine(tmp_path / "tiny", limits=OutboxLimits(max_event_outbox_bytes=1))
+    with pytest.raises(ControlError) as too_small:
+        tiny.append(task(tiny, event_id="evt_tiny", idempotency_key="idem-tiny"))
+    assert too_small.value.code == "CAPACITY_EXHAUSTED"
+    assert tiny.store.count("events") == 0
+    assert tiny.store.count("consumed_nonces") == 0
+
+    split = engine(tmp_path / "split", event_channels=("event_sink", "event_mirror"))
+    assert split.append(task(split, event_id="evt_split", idempotency_key="idem-split"))["applied"] is True
+
+    def one_bad(channel, envelope):
+        if channel == "event_mirror":
+            raise BadRecord("mirror record is bad")
+        return exact_confirmation(channel, envelope)
+
+    isolated = {item["channel"]: item["state"] for item in split.deliver_events(one_bad)}
+    assert isolated == {"event_sink": "DELIVERED", "event_mirror": "QUARANTINED"}
+    assert split.store.count("events") == 1
+    assert (tmp_path / "split" / "store" / "event-quarantine" / "event_mirror" / "evt_split.json").exists()
+
+    held = engine(tmp_path / "held-claim")
+    accepted = held.append(task(held, event_id="evt_claim", idempotency_key="idem-claim"))
+    assert accepted["applied"] is True
+    token = held.events._claim("evt_claim", "event_sink")
+    assert isinstance(token, str) and len(token) == 32
+    assert held.events._claim("evt_claim", "event_sink") is None
+    held.events.recover(abandon_claims=True)
+    assert held.events._state("evt_claim", "event_sink") == "OUTBOX"
+    assert held.events._set_state("evt_claim", "event_sink", "DELIVERED", None, "forged") is False
+    with held.store.transaction() as conn:
+        conn.execute(
+            "UPDATE event_outbox SET claim_pid=? WHERE event_id='evt_claim' AND channel='event_sink'",
+            (2**22,),
+        )
+    held.events.recover(abandon_claims=True)
+    assert held.events._state("evt_claim", "event_sink") == "DELIVERY_UNKNOWN"
+    assert held.store.count("events") == 1

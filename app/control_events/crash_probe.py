@@ -23,7 +23,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--token", required=True)
-    parser.add_argument("--mode", required=True, choices=("before-commit", "after-file", "before-remote", "dispatch", "after-remote"))
+    parser.add_argument("--mode", required=True, choices=("before-commit", "after-commit", "after-report-commit", "after-file", "before-remote", "dispatch", "after-remote"))
     parser.add_argument("--request", required=True)
     args = parser.parse_args(argv)
     root = Path(args.root)
@@ -50,6 +50,10 @@ def main(argv=None) -> int:
     payload = json.loads(Path(args.request).read_text(encoding="utf-8"))
     if args.mode == "before-commit":
         engine.append(payload, crash="before-commit")
+    elif args.mode == "after-commit":
+        engine.append(payload, crash="after-commit")
+    elif args.mode == "after-report-commit":
+        engine.submit_report(payload["report"], channels=payload["channels"], remote=None, crash="after-commit")
     else:
         engine.submit_report(payload["report"], channels=payload["channels"], remote=_remote(root), crash=args.mode)
     return 0

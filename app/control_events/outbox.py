@@ -56,6 +56,8 @@ class OutboxLimits:
     max_outbox_bytes: int = 1_200_000
     max_quarantine_reports: int = 20
     max_quarantine_bytes: int = 1_200_000
+    max_event_outbox: int = 1000
+    max_event_outbox_bytes: int = 5_000_000
 
 
 def _now() -> str:
@@ -169,16 +171,17 @@ class ReportOutbox:
         for folder in (self.directory, self.archive, self.held, self.quarantine, self.receipts):
             folder.mkdir(parents=True, mode=0o700, exist_ok=True)
 
-    def submit(self, report: dict, channels: list[str], remote, *, crash: str | None = None) -> dict:
+    def submit(self, report: dict, channels: list[str], remote, *, crash: str | None = None, nonce_commit=None, replay_only: bool = False) -> dict:
         validate_report(report, self.trusted_executors)
         chosen = [_safe_channel(channel) for channel in channels]
         if not chosen or len(set(chosen)) != len(chosen):
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "delivery channel is invalid")
-        canonical = json.dumps({key: value for key, value in report.items() if key not in {"channels", "payload_hash"}}, sort_keys=True, separators=(",", ":")).encode()
+        unsigned = {"channels", "payload_hash", "actor", "proof"}
+        canonical = json.dumps({key: value for key, value in report.items() if key not in unsigned}, sort_keys=True, separators=(",", ":")).encode()
         if len(canonical) > self.limits.max_report_bytes:
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "report exceeds size limit")
         digest = hashlib.sha256(canonical).hexdigest()
-        envelope = redact({key: value for key, value in report.items() if key not in {"channels", "payload_hash"}})
+        envelope = redact({key: value for key, value in report.items() if key not in unsigned})
         envelope["channels"] = chosen
         envelope["payload_hash"] = digest
         file_bytes = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
@@ -190,6 +193,10 @@ class ReportOutbox:
                 if row["payload_hash"] != digest or json.loads(row["channels_json"]) != chosen:
                     raise ControlError("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "report run_id already has a different payload")
             else:
+                if replay_only:
+                    raise ControlError("PROOF_REPLAY", 403, "nonce already used")
+                if nonce_commit is not None:
+                    nonce_commit(conn)
                 pending = conn.execute("SELECT COUNT(*) AS n FROM reports WHERE archived=0").fetchone()["n"]
                 if pending >= self.limits.max_outbox_reports:
                     raise ControlError("CAPACITY_EXHAUSTED", 409, "outbox capacity is exhausted")
@@ -200,6 +207,8 @@ class ReportOutbox:
                 )
                 for channel in chosen:
                     self._upsert(conn, f"report-{report['run_id']}", channel, "DURABLE_LOCAL", report["run_id"], None, now)
+        if crash == "after-commit":
+            os._exit(94)
         if path.exists():
             if path.read_bytes() != file_bytes:
                 raise ControlError("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "report run_id already has a different payload")
@@ -332,8 +341,6 @@ class ReportOutbox:
             "quarantine_limit_reports": self.limits.max_quarantine_reports,
             "quarantine_limit_bytes": self.limits.max_quarantine_bytes,
             "quarantine_overflow": 0 if overflow is None else overflow["value"],
-            "event_outbox_consumer": None,
-            "event_delivery_disposition": "not_delivered",
         }
 
     def _dispatch(self, report: dict, channel: str, remote, *, crash: str | None = None) -> dict:
