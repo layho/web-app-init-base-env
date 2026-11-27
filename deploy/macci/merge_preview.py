@@ -401,6 +401,23 @@ def verify_candidate(folder, base, head, candidate, required):
         git(folder, "merge-base", "--is-ancestor", required, base)
 
 
+def definitive_push_rejection(exc):
+    """Only parse a single porcelain status for the exact target ref.
+
+    Never infer rejection from generic stderr, transport failure or timeout.
+    """
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return False
+    output=exc.output
+    if not isinstance(output,str):
+        return False
+    statuses=[line.split("\t") for line in output.splitlines() if len(line)>1 and line[1]=="\t"]
+    return (len(statuses)==1 and len(statuses[0])==3 and statuses[0][0]=="!"
+            and statuses[0][1].endswith(":"+TARGET)
+            and statuses[0][2] in ("[remote rejected] (pre-receive hook declined)",
+                                   "[rejected] (non-fast-forward)", "[rejected] (fetch first)"))
+
+
 def merge_one(token, number, dry_run=False, journal=None, managed_queue=False):
     frozen = preview_frozen(token)
     gate = authorization(token, number)
@@ -445,7 +462,15 @@ def merge_one(token, number, dry_run=False, journal=None, managed_queue=False):
                 changed_files=[p for p in changed_files if p]
                 journal.stage(number,head,base,changed_files)
             journal.prepare(number, head, base, merge, changed_files=changed_files)
-        git(folder, "push", "--porcelain", REMOTE, merge + ":" + TARGET)
+        try:
+            git(folder, "push", "--porcelain", REMOTE, merge + ":" + TARGET)
+        except subprocess.CalledProcessError as exc:
+            if journal is not None and definitive_push_rejection(exc):
+                actual=api(token,"/branches/preview")["commit"]["sha"]
+                if journal.reject_without_push(number,head,base,merge,actual):
+                    print(f"PR #{number}: definitive push rejection recorded; fresh gates required",flush=True)
+                    return False
+            raise
         actual = api(token, "/branches/preview")["commit"]["sha"]
         if actual != merge:
             print(f"PR #{number}: preview changed after push; reconcile before further release", flush=True)

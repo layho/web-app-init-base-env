@@ -10,7 +10,7 @@ _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _STATES = {"QUEUED", "CLAIMED", "PREPARED", "UNKNOWN", "INTEGRATED", "CANCELLED"}
 _EVENTS = {"QUEUED", "CLAIMED", "PREPARED", "LEASE_EXPIRED", "PREPARATION_RETRY", "RENEWED",
-           "INTEGRATED", "CANCELLED", "PUSH_STARTED"}
+           "INTEGRATED", "CANCELLED", "PUSH_STARTED", "PUSH_REJECTED"}
 
 
 def _safe_id(value):

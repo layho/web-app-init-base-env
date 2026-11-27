@@ -170,6 +170,28 @@ class PreviewJournal:
                 raise ValueError("pending attempt mismatch")
             self._finish_reservation(db,number,head,base)
 
+    def reject_without_push(self,number,head,base,candidate,actual):
+        """Only for a definitive remote rejection, never a timeout/lost reply.
+
+        The caller must hold the coordinator lock, have a completed git push
+        process with explicit remote rejection, and independently read preview.
+        """
+        if _sha(actual)!=_sha(base):
+            return False
+        with self.tx() as db:
+            row=db.execute("SELECT * FROM preview_attempts WHERE state='PENDING'").fetchone()
+            if row is None or (row["pr"],row["head"],row["base"],row["candidate"])!=(number,head,base,candidate):
+                raise ValueError("pending attempt mismatch")
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='integration_jobs'").fetchone():
+                job="pr-"+str(number)
+                reserved=db.execute("SELECT state,head,base FROM integration_jobs WHERE id=?",(job,)).fetchone()
+                if reserved is None or (reserved["state"],reserved["head"],reserved["base"])!=("UNKNOWN",head,base):
+                    raise ValueError("reservation changed during rejection")
+                db.execute("UPDATE integration_jobs SET state='PREPARED' WHERE id=?",(job,))
+                db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,"PUSH_REJECTED",int(time.time())))
+            db.execute("UPDATE preview_attempts SET state='REJECTED',finished=? WHERE seq=?",(int(time.time()),row["seq"]))
+            return True
+
     def reconcile(self,read_preview):
         with self.tx() as db:
             row=db.execute("SELECT * FROM preview_attempts WHERE state='PENDING'").fetchone()

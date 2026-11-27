@@ -30,3 +30,6 @@ Managed mode (`MACCI_MANAGED_QUEUE=1`) uses the same private integration-queue.s
 
 
 The managed coordinator now stages the verified candidate automatically, within a single transaction, from the actual fetched diff after the original authorization gates. It does not overwrite existing reservations or bypass outstanding dependencies, and does not initialize/activate versions from untrusted PR metadata. An operator-provisioned active ledger is still required. Staging has no remote side effect and can be repeated for the identical candidate after a restart.
+
+
+Definitive single-ref porcelain rejection plus a fresh observation of the original preview base can close a pending attempt as REJECTED and restore its reservation to PREPARED. Subsequent attempts must pass all original gates again. Timeouts, lost responses, unexpected refs and ambiguous remote errors remain pending; no blind retry or force push is allowed.

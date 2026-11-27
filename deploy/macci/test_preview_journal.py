@@ -50,3 +50,25 @@ class ManagedStageTests(unittest.TestCase):
             with sqlite3.connect(path) as db:
                 self.assertEqual(db.execute("SELECT state FROM integration_jobs").fetchone()[0],"INTEGRATED")
                 self.assertEqual([r[0] for r in db.execute("SELECT event FROM integration_events ORDER BY seq")],["QUEUED","PREPARED","PUSH_STARTED","INTEGRATED"])
+
+
+class RejectionTests(unittest.TestCase):
+    def test_definitive_rejection_releases_pending_only_at_original_base(self):
+        with tempfile.TemporaryDirectory() as root:
+            journal=PreviewJournal(Path(root)/"journal.sqlite3")
+            journal.prepare(196,H,B,C)
+            self.assertFalse(journal.reject_without_push(196,H,B,C,"d"*40))
+            self.assertFalse(journal.reconcile(lambda:B))
+            self.assertTrue(journal.reject_without_push(196,H,B,C,B))
+            self.assertEqual(journal.history()[0]["state"],"REJECTED")
+            journal.prepare(196,H,B,C)
+
+    def test_porcelain_rejection_is_narrow(self):
+        import subprocess
+        from merge_preview import definitive_push_rejection
+        def error(output):
+            return subprocess.CalledProcessError(1,["git"],output=output)
+        self.assertTrue(definitive_push_rejection(error("!\t"+C+":refs/heads/preview\t[remote rejected] (pre-receive hook declined)")))
+        for output in ("fatal: connection reset","!\t"+C+":refs/heads/main\t[rejected] (fetch first)","!\t"+C+":refs/heads/preview\t[remote failure] (failed to report status)"):
+            self.assertFalse(definitive_push_rejection(error(output)))
+        self.assertFalse(definitive_push_rejection(subprocess.TimeoutExpired(["git"],90)))
