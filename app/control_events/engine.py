@@ -1,8 +1,8 @@
 """Isolated schema 2 event engine.
 
-The store, inbox, outbox, and reducer live here. This process does not mount
-production routes, does not enable the new protocol in production, and does
-not treat legacy records as authorization.
+Authentication and authorization go through ``app.control_authz``. Client
+actor, trusted_source, authorizer, test-proof, and guard strings are not
+authority. This process does not mount production routes.
 """
 
 from datetime import datetime, timezone
@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 
+from app.control_authz import AuthnError, AuthzError, AuthzService, isolated_registry
+from app.control_authz.service import POLICY_REVISION
 from app.feedback_progress import STAGES, STATUSES
 
 from .errors import ControlError
@@ -20,19 +22,22 @@ from .legacy import parse_comments, read_operations
 from .outbox import DEFAULT_CHANNELS, OutboxLimits, ReportOutbox
 from .redact import redact
 from .reducer import check_transition, object_key, prefer_fact, progress_rank
-from .schema import authorize_source, channel_of, split_request
+from .schema import authorize_source, split_request
 from .store import Store
 
 _REVISION_CLASSES = {"task", "candidate", "deployment", "resource", "authorization"}
 _OPERATION = "event_append"
+_PAGE_LIMIT = 50
+TRUSTED_EXECUTORS = frozenset({"macci-isolated"})
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _hash(event: dict) -> str:
-    encoded = json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+def _identity(event: dict) -> str:
+    visible = {key: value for key, value in event.items() if not str(key).startswith("_") and key != "guard"}
+    encoded = json.dumps(visible, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -40,50 +45,99 @@ def _scope_key(scope: dict) -> str:
     return json.dumps(scope, sort_keys=True, separators=(",", ":"))
 
 
+def _tasks(principal) -> set[str]:
+    return {item.removeprefix("task:") for item in principal.scopes if item.startswith("task:")}
+
+
 class Engine:
-    def __init__(self, root: Path, identity: RepositoryIdentity, store: Store, outbox: ReportOutbox, authorizer=None):
+    def __init__(self, root: Path, identity: RepositoryIdentity, store: Store, outbox: ReportOutbox, authorizer=None, *, authz: AuthzService, proven_guards: dict | None = None):
         self.root = root
         self.identity = identity
         self.store = store
         self.outbox = outbox
         self.authorizer = authorizer
+        self.authz = authz
+        self.proven_guards = {key: frozenset(value) for key, value in (proven_guards or {}).items()}
         self.isolated = True
         self.production_protocol_enabled = False
 
     @classmethod
-    def open(cls, root: Path, bound_token: str, *, limits: OutboxLimits | None = None, authorizer=None, production: bool = False) -> "Engine":
+    def open(
+        cls,
+        root: Path,
+        bound_token: str,
+        *,
+        limits: OutboxLimits | None = None,
+        authorizer=None,
+        production: bool = False,
+        authz: AuthzService | None = None,
+        proven_guards: dict | None = None,
+        trusted_executors: set[str] | None = None,
+        abandon_claims: bool = True,
+    ) -> "Engine":
         if production or PRODUCTION_PROTOCOL_ENABLED:
             raise ControlError("NOT_AUTHORIZED", 403, "unverified schema 2 protocol cannot be enabled in production")
         identity = RepositoryIdentity.open(root, bound_token)
+        if authz is None:
+            authz = AuthzService(
+                registry=isolated_registry(identity.repo_id),
+                isolated=True,
+                policy_revision=POLICY_REVISION,
+            )
+        elif not isinstance(authz, AuthzService):
+            raise ControlError("NOT_AUTHORIZED", 403, "authorizer configuration is not server-side")
         store = Store(root / "events.sqlite3")
-        engine = cls(root, identity, store, ReportOutbox(root, store, limits), authorizer)
-        engine.outbox.recover()
+        executors = set(TRUSTED_EXECUTORS if trusted_executors is None else trusted_executors)
+        engine = cls(
+            root,
+            identity,
+            store,
+            ReportOutbox(root, store, limits, trusted_executors=executors),
+            authorizer,
+            authz=authz,
+            proven_guards=proven_guards,
+        )
+        engine.outbox.recover(abandon_claims=abandon_claims)
         return engine
 
     @property
     def repo_id(self) -> str:
         return self.identity.repo_id
 
+    def credential_for(self, producer_id: str) -> str:
+        try:
+            return self.authz.registry.credential_for(producer_id)
+        except AuthnError as exc:
+            raise ControlError("NOT_AUTHORIZED", 403, exc.message) from exc
+
     def enable_production_protocol(self) -> None:
         raise ControlError("NOT_AUTHORIZED", 403, "unverified schema 2 protocol cannot be enabled in production")
 
     def append(self, body: dict, *, crash: str | None = None) -> dict:
-        self._authenticate(body)
+        principal = self._principal(body)
         event = split_request(body)
+        self._authorize_append(principal, event, body)
         self.identity.assert_same(event["repo_id"])
         if event.get("state") == "UNKNOWN":
             raise ControlError("NOT_AUTHORIZED", 403, "a caller cannot write UNKNOWN")
-        event["_authoritative"] = authorize_source(event)
+        server_source = self.authz.trusted_source_for(principal)
+        claimed = body.get("trusted_source", None) if isinstance(body, dict) and "trusted_source" in body else None
+        if "trusted_source" in body and claimed not in (None, "", server_source):
+            raise ControlError("NOT_AUTHORIZED", 403, "trusted source does not match the server principal")
+        event.pop("guard", None)
+        event["trusted_source"] = server_source or None
+        event["_authoritative"] = authorize_source(event, server_source or None)
+        if event["event_class"] == "authorization" and event["event_type"] != "authorization.epoch_closed":
+            if not event["_authoritative"]:
+                raise ControlError("NOT_AUTHORIZED", 403, "authorization events require the server source")
         if self.authorizer is not None and self.authorizer(event) is False:
             raise ControlError("POLICY_DENIED", 403, "policy denied before idempotency")
-        event = redact(event)
-        digest = _hash(event)
-        principal = body["actor"]["id"]
+        digest = _identity(event)
         scope = _scope_key(body["scope"])
         with self.store.transaction() as conn:
             existing = conn.execute(
                 "SELECT payload_hash, result_json FROM idempotency WHERE principal_id=? AND scope=? AND operation=? AND idempotency_key=?",
-                (principal, scope, _OPERATION, event["idempotency_key"]),
+                (principal.principal_id, scope, _OPERATION, event["idempotency_key"]),
             ).fetchone()
             if existing is not None:
                 if existing["payload_hash"] != digest:
@@ -91,7 +145,7 @@ class Engine:
                 else:
                     outcome = _replay(json.loads(existing["result_json"]), self._current_state(conn, event))
             else:
-                outcome = self._attempt(conn, event, digest, principal, scope)
+                outcome = self._attempt(conn, event, digest, principal.principal_id, scope)
             if crash == "before-commit":
                 os._exit(90)
         return redact(_public(outcome))
@@ -102,8 +156,8 @@ class Engine:
         chosen = list(channels or DEFAULT_CHANNELS)
         return self.outbox.submit(report, chosen, remote, crash=crash)
 
-    def deliver_pending(self, remote) -> list[dict]:
-        return self.outbox.deliver_pending(remote)
+    def deliver_pending(self, remote, *, crash: str | None = None) -> list[dict]:
+        return self.outbox.deliver_pending(remote, crash=crash)
 
     def declare_counter_loss(self, stream_id: str) -> dict:
         with self.store.transaction() as conn:
@@ -121,10 +175,17 @@ class Engine:
             next_epoch = (max(sealed) + 1) if sealed else 1
         return {"stream_id": stream_id, "sealed": sealed, "next_epoch": next_epoch, "event_written": False}
 
-    def query(self, *, stream_id: str, stream_epoch: int, after_seq: int = 0) -> dict:
+    def query(self, *, credential: str, stream_id: str, stream_epoch: int, after_seq: int = 0, task_id: str | None = None, limit: int = _PAGE_LIMIT) -> dict:
+        principal = self._principal(credential)
+        allowed = _tasks(principal)
+        selected = task_id or (next(iter(allowed)) if len(allowed) == 1 else None)
+        self._authorize(principal, "event.read", stream_id=stream_id, task_id=selected, scope={"task_id": selected} if selected else {})
+        limit = _page_limit(limit)
         with self.store.transaction() as conn:
             watermark = self._watermark(conn, stream_id, stream_epoch)["seq"]
-            items = self._items(conn, stream_id, stream_epoch, after_seq, event_class=None, subject=None)
+            items, next_after, truncated = self._items(
+                conn, stream_id, stream_epoch, after_seq, event_class=None, subject=None, limit=limit, allowed_tasks=allowed
+            )
             gap = after_seq > watermark or self._has_unapplied(conn, stream_id, stream_epoch)
         return {
             "schema_version": 2,
@@ -135,65 +196,100 @@ class Engine:
             "watermark_seq": watermark,
             "gap": gap,
             "items": items,
+            "next_after_seq": next_after,
+            "truncated": truncated,
             "lease_token": None,
         }
 
-    def poll_diagnostics(self, *, subject: str, stream_id: str, stream_epoch: int, after_seq: int) -> dict:
+    def poll_diagnostics(self, *, credential: str, subject: str, stream_id: str, stream_epoch: int, after_seq: int, task_id: str | None = None, limit: int = _PAGE_LIMIT) -> dict:
+        principal = self._principal(credential)
         if type(after_seq) is not int or after_seq < 0 or type(stream_epoch) is not int:
             raise ControlError("SCHEMA_UNSUPPORTED", 422, "diagnostic cursor is invalid")
+        allowed = _tasks(principal)
+        selected = task_id or (next(iter(allowed)) if len(allowed) == 1 else None)
+        self._authorize(principal, "diagnostic.read", stream_id=stream_id, task_id=selected, scope={"task_id": selected} if selected else {})
+        limit = _page_limit(limit)
         if not isinstance(stream_id, str) or not stream_id.endswith(":diagnostic"):
-            return {
-                "schema_version": 2,
-                "http": 200,
-                "side_effect": False,
-                "business_side_effect": False,
-                "stream_id": stream_id,
-                "stream_epoch": stream_epoch,
-                "watermark_seq": 0,
-                "gap": False,
-                "items": [],
-                "cursor_after_seq": None,
-                "lease_token": None,
-            }
+            raise ControlError("NOT_AUTHORIZED", 403, "diagnostic read is not authorized for this stream")
         with self.store.transaction() as conn:
             watermark = self._watermark(conn, stream_id, stream_epoch)["seq"]
             gap = after_seq > watermark or self._has_unapplied(conn, stream_id, stream_epoch)
-            items = self._items(conn, stream_id, stream_epoch, after_seq, event_class="diagnostic", subject=subject)
-            stored = conn.execute(
-                "SELECT after_seq FROM cursors WHERE stream_id=? AND stream_epoch=?",
-                (stream_id, stream_epoch),
-            ).fetchone()
-            current = 0 if stored is None else stored["after_seq"]
-            if after_seq <= watermark and after_seq >= current:
-                conn.execute(
-                    """
-                    INSERT INTO cursors (stream_id, stream_epoch, after_seq) VALUES (?, ?, ?)
-                    ON CONFLICT(stream_id, stream_epoch) DO UPDATE SET after_seq=excluded.after_seq
-                    """,
-                    (stream_id, stream_epoch, after_seq),
-                )
-                current = after_seq
+            items, next_after, truncated = self._items(
+                conn, stream_id, stream_epoch, after_seq, event_class="diagnostic", subject=subject, limit=limit, allowed_tasks=allowed
+            )
         return {
             "schema_version": 2,
             "http": 200,
             "side_effect": False,
             "business_side_effect": False,
+            "cursor_persisted": False,
             "subject": subject,
             "stream_id": stream_id,
             "stream_epoch": stream_epoch,
             "watermark_seq": watermark,
             "gap": gap,
             "items": items,
-            "cursor_after_seq": current,
+            "next_after_seq": next_after,
+            "truncated": truncated,
+            "cursor_after_seq": after_seq,
             "lease_token": None,
         }
 
-    def cursor(self, stream_id: str, stream_epoch: int) -> int | None:
+    def commit_cursor(self, *, credential: str, subject: str, stream_id: str, stream_epoch: int, after_seq: int, task_id: str | None = None) -> dict:
+        principal = self._principal(credential)
+        if type(after_seq) is not int or after_seq < 0 or type(stream_epoch) is not int:
+            raise ControlError("SCHEMA_UNSUPPORTED", 422, "diagnostic cursor is invalid")
+        allowed = _tasks(principal)
+        selected = task_id or (next(iter(allowed)) if len(allowed) == 1 else None)
+        self._authorize(principal, "diagnostic.cursor", stream_id=stream_id, task_id=selected, scope={"task_id": selected} if selected else {})
+        if not stream_id.endswith(":diagnostic"):
+            raise ControlError("NOT_AUTHORIZED", 403, "diagnostic cursor is not authorized for this stream")
         with self.store.transaction() as conn:
+            watermark = self._watermark(conn, stream_id, stream_epoch)["seq"]
+            if after_seq > watermark:
+                raise ControlError("EVIDENCE_MISSING", 409, "cursor is past the watermark")
             row = conn.execute(
-                "SELECT after_seq FROM cursors WHERE stream_id=? AND stream_epoch=?",
-                (stream_id, stream_epoch),
+                "SELECT after_seq FROM cursors WHERE principal_id=? AND stream_id=? AND stream_epoch=?",
+                (principal.principal_id, stream_id, stream_epoch),
             ).fetchone()
+            current = 0 if row is None else row["after_seq"]
+            stored = current
+            if after_seq >= current:
+                conn.execute(
+                    """
+                    INSERT INTO cursors (principal_id, stream_id, stream_epoch, after_seq)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(principal_id, stream_id, stream_epoch) DO UPDATE SET after_seq=excluded.after_seq
+                    """,
+                    (principal.principal_id, stream_id, stream_epoch, after_seq),
+                )
+                stored = after_seq
+        return {
+            "schema_version": 2,
+            "http": 200,
+            "side_effect": True,
+            "business_side_effect": False,
+            "cursor_persisted": True,
+            "subject": subject,
+            "principal_id": principal.principal_id,
+            "stream_id": stream_id,
+            "stream_epoch": stream_epoch,
+            "cursor_after_seq": stored,
+            "lease_token": None,
+        }
+
+    def cursor(self, stream_id: str, stream_epoch: int, principal_id: str | None = None) -> int | None:
+        with self.store.transaction() as conn:
+            if principal_id is None:
+                row = conn.execute(
+                    "SELECT after_seq FROM cursors WHERE stream_id=? AND stream_epoch=? ORDER BY after_seq DESC LIMIT 1",
+                    (stream_id, stream_epoch),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT after_seq FROM cursors WHERE principal_id=? AND stream_id=? AND stream_epoch=?",
+                    (principal_id, stream_id, stream_epoch),
+                ).fetchone()
         return None if row is None else row["after_seq"]
 
     def dual_read(self, operations_path: Path, comments) -> dict:
@@ -288,19 +384,41 @@ class Engine:
             for row in gaps
         ]
         snapshot["production_protocol_enabled"] = False
+        snapshot["event_delivery_disposition"] = "not_delivered"
+        snapshot["event_outbox_consumer"] = None
         return snapshot
 
-    def _authenticate(self, body: dict) -> None:
-        if not self.isolated or self.production_protocol_enabled:
-            raise ControlError("NOT_AUTHORIZED", 403, "isolated test identity is required")
-        actor = body.get("actor") if isinstance(body, dict) else None
-        if not isinstance(actor, dict) or actor.get("kind") != "test" or not isinstance(actor.get("id"), str):
-            raise ControlError("NOT_AUTHORIZED", 403, "test identity was not accepted")
-        proof = actor.get("proof_ref")
-        if not isinstance(proof, str) or not proof.startswith("test-proof://"):
-            raise ControlError("NOT_AUTHORIZED", 403, "test proof is not accepted on this route")
-        if body.get("production_verification_enabled") is True:
-            raise ControlError("NOT_AUTHORIZED", 403, "production verification is disabled")
+    def _principal(self, material: object):
+        try:
+            return self.authz.authenticate(material)
+        except AuthnError as exc:
+            raise ControlError("NOT_AUTHORIZED", 403, exc.message) from exc
+
+    def _authorize(self, principal, operation: str, *, stream_id: str, task_id: str | None, scope: dict | None = None, business: str | None = None) -> None:
+        binding = {
+            "repo_id": self.repo_id,
+            "app_id": principal.app_id,
+            "producer_id": principal.producer_id,
+            "stream_id": stream_id,
+            "task_id": task_id,
+            "scope": scope or {},
+            "business_operation": business,
+        }
+        try:
+            self.authz.authorize(principal, operation, binding)
+        except AuthzError as exc:
+            raise ControlError("NOT_AUTHORIZED", 403, exc.message) from exc
+
+    def _authorize_append(self, principal, event: dict, body: dict) -> None:
+        scope = body.get("scope") if isinstance(body.get("scope"), dict) else {}
+        task_id = event.get("task_id") or scope.get("task_id")
+        business = None
+        if event["event_class"] == "authorization" and event["event_type"] != "authorization.epoch_closed":
+            business = event.get("operation")
+        self._authorize(principal, "event.append", stream_id=event["stream_id"], task_id=task_id, scope=scope, business=business)
+
+    def _guards(self, event: dict) -> set[str]:
+        return set(self.proven_guards.get(object_key(event) or "", frozenset()))
 
     def _attempt(self, conn, event: dict, digest: str, principal: str, scope: str) -> dict:
         received_at = _now()
@@ -309,12 +427,14 @@ class Engine:
         seals = self._seals(conn, event["stream_id"])
         later = self._has_later(conn, event["stream_id"], event["stream_epoch"], event["producer_seq"])
         action, reason = decide(event, watermarks, seals, later=later)
+        history = False
         if action == "reject":
             return self._save(conn, event, digest, principal, scope, _error(reason or "EVIDENCE_MISSING", 409, "stream proof was rejected"), wrote=False)
         if action == "apply":
             failure = self._precheck(conn, event)
-            if failure is not None:
+            if isinstance(failure, dict):
                 return self._save(conn, event, digest, principal, scope, failure, wrote=False)
+            history = failure in {"history", "stream-only"}
         clash = conn.execute(
             """
             SELECT event_id FROM events
@@ -332,12 +452,13 @@ class Engine:
                 _error("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "event identity or stream sequence already exists"),
                 wrote=False,
             )
+        stored = _stored(event)
         conn.execute(
             """
             INSERT INTO events (
                 event_id, stream_id, stream_epoch, producer_seq, payload_hash, payload_json,
                 received_at, applied, hold_reason, epoch_closed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event["event_id"],
@@ -345,29 +466,39 @@ class Engine:
                 event["stream_epoch"],
                 event["producer_seq"],
                 digest,
-                json.dumps(event, sort_keys=True),
+                json.dumps(stored, sort_keys=True),
                 received_at,
-                reason,
+                1 if history else 0,
+                None if history or action == "apply" else reason,
+                1 if history and event.get("epoch_closed") else 0,
             ),
         )
-        for name in event.get("delivery_channels") or [channel_of(event)]:
-            conn.execute(
-                """
-                INSERT INTO deliveries (event_id, channel, state, detail, updated_at, run_id)
-                VALUES (?, ?, 'DURABLE_LOCAL', NULL, ?, ?)
-                """,
-                (event["event_id"], name, received_at, event.get("run_id")),
-            )
-        self._drain(conn, event["stream_id"])
-        row = conn.execute("SELECT applied, hold_reason FROM events WHERE event_id=?", (event["event_id"],)).fetchone()
-        applied = bool(row["applied"])
+        projected = False
+        if history:
+            applied = True
+            self._drain(conn, event["stream_id"])
+        elif action == "apply":
+            self._drain(conn, event["stream_id"])
+            row = conn.execute("SELECT applied, hold_reason FROM events WHERE event_id=?", (event["event_id"],)).fetchone()
+            applied = bool(row["applied"])
+            reason = row["hold_reason"]
+            projected = applied
+        else:
+            self._drain(conn, event["stream_id"])
+            row = conn.execute("SELECT applied, hold_reason FROM events WHERE event_id=?", (event["event_id"],)).fetchone()
+            applied = bool(row["applied"])
+            reason = row["hold_reason"]
+            projected = applied
         result = {
             "schema_version": 2,
             "http": 200,
             "fact_state": "ACCEPTED" if applied else None,
             "delivery_state": "DURABLE_LOCAL",
+            "delivery_disposition": "not_delivered",
+            "outbox_consumer": None,
             "applied": applied,
-            "hold_reason": row["hold_reason"],
+            "projected": projected,
+            "hold_reason": None if applied else reason,
             "event_id": event["event_id"],
             "received_at": received_at,
             "replayed": False,
@@ -389,16 +520,26 @@ class Engine:
             seals = self._seals(conn, stream_id)
             progressed = False
             for row in rows:
-                event = json.loads(row["payload_json"])
+                event = _rehydrate(json.loads(row["payload_json"]))
                 later = self._has_later(conn, stream_id, event["stream_epoch"], event["producer_seq"])
                 action, reason = decide(event, watermarks, seals, later=later)
                 if action != "apply":
-                    if row["hold_reason"] != reason:
+                    if action == "reject":
+                        conn.execute("UPDATE events SET hold_reason=? WHERE event_id=?", (reason, event["event_id"]))
+                    elif row["hold_reason"] != reason:
                         conn.execute("UPDATE events SET hold_reason=? WHERE event_id=?", (reason, event["event_id"]))
                     continue
-                if self._precheck(conn, event) is not None:
-                    conn.execute("UPDATE events SET hold_reason=? WHERE event_id=?", ("CONFLICT_REVISION", event["event_id"]))
+                verdict = self._precheck(conn, event)
+                if isinstance(verdict, dict):
+                    conn.execute("UPDATE events SET hold_reason=? WHERE event_id=?", (verdict.get("code"), event["event_id"]))
                     continue
+                if verdict in {"history", "stream-only"}:
+                    conn.execute(
+                        "UPDATE events SET applied=1, hold_reason=NULL, epoch_closed=? WHERE event_id=?",
+                        (1 if event.get("epoch_closed") else 0, event["event_id"]),
+                    )
+                    progressed = True
+                    break
                 self._reduce(conn, event)
                 conn.execute(
                     "UPDATE events SET applied=1, hold_reason=NULL, epoch_closed=? WHERE event_id=?",
@@ -409,24 +550,35 @@ class Engine:
             if not progressed:
                 return
 
-    def _precheck(self, conn, event: dict) -> dict | None:
+    def _precheck(self, conn, event: dict):
+        if event["event_type"] == "authorization.epoch_closed":
+            return "stream-only"
         if event["event_class"] not in _REVISION_CLASSES:
             return None
         key = object_key(event)
         current = self._fact(conn, key)
         expected = event.get("expected_revision")
         revision = event.get("revision")
+        authoritative = bool(event.get("_authoritative"))
         try:
             if current is None:
                 if expected not in (0, revision):
                     return _error("CONFLICT_REVISION", 409, "expected_revision does not match the stored revision")
-                check_transition(event["event_class"], None, event.get("state"), event.get("guard"))
-            elif expected != current["revision"] or (revision is not None and revision < current["revision"]):
+                check_transition(event["event_class"], None, event.get("state"), self._guards(event))
+                return None
+            if authoritative and event["producer_id"] != current["producer_id"]:
+                return _error("CONFLICT_REVISION", 409, "cross-stream revision was rejected")
+            if expected != current["revision"]:
                 return _error("CONFLICT_REVISION", 409, "expected_revision does not match the stored revision")
-            elif revision is not None and revision > current["revision"]:
-                check_transition(event["event_class"], current["state"], event.get("state"), event.get("guard"))
+            if revision == current["revision"] and authoritative and current["authoritative"]:
+                return _error("CONFLICT_REVISION", 409, "same revision conflicts with the current fact")
+            if revision <= current["revision"] or not authoritative:
+                return "history"
+            check_transition(event["event_class"], current["state"], event.get("state"), self._guards(event))
         except ControlError as exc:
-            return exc.public()
+            body = exc.public()
+            body["applied"] = False
+            return body
         return None
 
     def _reduce(self, conn, event: dict) -> None:
@@ -436,6 +588,9 @@ class Engine:
             self._write_diagnostic(conn, event)
             return
         if event["event_class"] in _REVISION_CLASSES:
+            current = self._fact(conn, object_key(event))
+            if current is not None and not _wins(current, event):
+                return
             self._write_fact(conn, event)
         if event["event_class"] == "task":
             self._write_round(conn, event)
@@ -476,12 +631,11 @@ class Engine:
                 incoming["producer_id"],
                 incoming["event_id"],
                 incoming["state"],
-                json.dumps(redact(event), sort_keys=True),
+                json.dumps(_stored(event), sort_keys=True),
             ),
         )
 
     def _write_diagnostic(self, conn, event: dict) -> None:
-        # Diagnostic facts use their own key. They never update authorization, deployment, or candidate rows.
         key = object_key(event)
         conn.execute(
             """
@@ -497,7 +651,7 @@ class Engine:
                 1 if event.get("_authoritative") else 0,
                 event["producer_id"],
                 event["event_id"],
-                json.dumps(redact(event), sort_keys=True),
+                json.dumps(_stored(event), sort_keys=True),
             ),
         )
 
@@ -531,6 +685,15 @@ class Engine:
         )
 
     def _write_authorization(self, conn, event: dict, *, revoked: int) -> None:
+        existing = conn.execute(
+            "SELECT revision, revoked FROM authorizations WHERE task_id=? AND candidate_id=? AND operation=?",
+            (event["task_id"], event["candidate_id"], event["operation"]),
+        ).fetchone()
+        if existing is not None:
+            if event["revision"] < existing["revision"]:
+                return
+            if event["revision"] == existing["revision"] and existing["revoked"] and not revoked:
+                return
         conn.execute(
             """
             INSERT INTO authorizations (task_id, candidate_id, operation, revision, event_id, revoked, source)
@@ -619,7 +782,7 @@ class Engine:
         ).fetchone()
         return row is not None
 
-    def _items(self, conn, stream_id: str, epoch: int, after_seq: int, *, event_class: str | None, subject: str | None) -> list[dict]:
+    def _items(self, conn, stream_id: str, epoch: int, after_seq: int, *, event_class: str | None, subject: str | None, limit: int, allowed_tasks: set[str]):
         rows = conn.execute(
             """
             SELECT payload_json FROM events
@@ -629,15 +792,57 @@ class Engine:
             (stream_id, epoch, after_seq),
         ).fetchall()
         items = []
+        truncated = False
         for row in rows:
             payload = redact(json.loads(row["payload_json"]))
             if event_class is not None and payload.get("event_class") != event_class:
                 continue
             if subject is not None and payload.get("subject_id") != subject:
                 continue
+            task_id = payload.get("task_id")
+            if task_id and task_id not in allowed_tasks:
+                continue
+            subject_id = payload.get("subject_id")
+            if isinstance(subject_id, str) and subject_id.startswith("tsk_") and subject_id not in allowed_tasks:
+                continue
             payload.pop("_authoritative", None)
+            if len(items) >= limit:
+                truncated = True
+                break
             items.append(payload)
-        return items
+        next_after = items[-1]["producer_seq"] if truncated and items else None
+        return items, next_after, truncated
+
+
+def _wins(current: dict, event: dict) -> bool:
+    if not event.get("_authoritative"):
+        return False
+    revision = event.get("revision") or 0
+    if revision < current["revision"]:
+        return False
+    if revision == current["revision"]:
+        return not current["authoritative"]
+    if event.get("producer_id") != current["producer_id"]:
+        return False
+    return True
+
+
+def _rehydrate(payload: dict) -> dict:
+    event = dict(payload)
+    source = event.get("trusted_source") or None
+    event["_authoritative"] = authorize_source(event, source)
+    return event
+
+
+def _stored(event: dict) -> dict:
+    visible = {key: value for key, value in event.items() if not str(key).startswith("_") and key != "guard"}
+    return redact(visible)
+
+
+def _page_limit(limit: int) -> int:
+    if type(limit) is not int or limit < 1 or limit > 100:
+        raise ControlError("SCHEMA_UNSUPPORTED", 422, "page limit is invalid")
+    return limit
 
 
 def _public(result: dict) -> dict:
@@ -653,6 +858,7 @@ def _error(code: str, http: int, message: str) -> dict:
         "lease_token": None,
         "replayed": False,
         "applied": False,
+        "projected": False,
         "side_effect": False,
         "production_protocol_enabled": False,
     }

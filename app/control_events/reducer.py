@@ -34,7 +34,22 @@ def machine(name: str) -> dict:
     return entities[name]
 
 
-def check_transition(event_class: str, current: str | None, new: str | None, guard: str | None) -> None:
+def initial_states(event_class: str) -> set[str]:
+    machine_name = MACHINE_OF.get(event_class)
+    if machine_name is None:
+        return set()
+    spec = machine(machine_name)
+    reached = {edge["to"] for edge in spec["transitions"]}
+    starts = set(spec["states"]) - reached
+    if starts:
+        return starts
+    if spec["transitions"]:
+        return {spec["transitions"][0]["from"]}
+    return set()
+
+
+def check_transition(event_class: str, current: str | None, new: str | None, server_guards: set[str] | None = None) -> None:
+    """Client guard strings are not accepted. ``server_guards`` is injected by the server."""
     machine_name = MACHINE_OF.get(event_class)
     if machine_name is None or new is None:
         return
@@ -42,20 +57,20 @@ def check_transition(event_class: str, current: str | None, new: str | None, gua
     if new not in spec["states"]:
         raise _illegal(f"{new} is not a {machine_name} state")
     if current is None:
+        if new not in initial_states(event_class):
+            raise _illegal(f"{new} is not an initial {machine_name} state")
         return
-    if current == new:
-        edges = [edge for edge in spec["transitions"] if edge["from"] == current and edge["to"] == new]
-        if not edges:
-            return
-    else:
-        edges = [edge for edge in spec["transitions"] if edge["from"] == current and edge["to"] == new]
-        if not edges:
-            raise _illegal(f"{current} cannot move to {new}")
+    edges = [edge for edge in spec["transitions"] if edge["from"] == current and edge["to"] == new]
+    if current == new and not edges:
+        return
+    if not edges:
+        raise _illegal(f"{current} cannot move to {new}")
     guards = [edge.get("guard") for edge in edges]
     if any(item is None for item in guards):
         return
-    if guard not in guards:
-        raise ControlError("EVIDENCE_MISSING", 409, "transition guard is missing")
+    proven = server_guards or set()
+    if not any(item in proven for item in guards if item):
+        raise ControlError("EVIDENCE_MISSING", 409, "transition guard is not proven")
 
 
 def object_key(event: dict) -> str | None:

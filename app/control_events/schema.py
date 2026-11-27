@@ -21,8 +21,32 @@ OPTIONAL = (
 )
 
 
+STRUCTURAL_TYPES = {
+    "run.started": "task",
+    "authorization.epoch_closed": "authorization",
+}
+_SHA = set("0123456789abcdef")
+
+
 def _schema(message: str) -> ControlError:
     return ControlError("SCHEMA_UNSUPPORTED", 422, message)
+
+
+def _text(value, field: str) -> None:
+    if type(value) is not str or not value:
+        raise _schema(f"{field} must be a string")
+
+
+def _integer(value, field: str, *, minimum: int | None = None) -> None:
+    if type(value) is not int:
+        raise _schema(f"{field} must be an integer")
+    if minimum is not None and value < minimum:
+        raise _schema(f"{field} is out of range")
+
+
+def _sha(value, field: str) -> None:
+    if type(value) is not str or len(value) != 40 or any(char not in _SHA for char in value):
+        raise _schema(f"{field} must be a sha")
 
 
 def split_request(body: dict) -> dict:
@@ -98,6 +122,8 @@ def validate_event(event: dict) -> None:
     registered = spec["event_types"].get(event["event_type"])
     if registered and registered["class"] != event_class:
         raise _schema("event_type does not match its class")
+    _strict_types(event)
+    _known_event_type(event)
     if event.get("epoch_closed") and type(event.get("closed_through_seq")) is not int:
         raise _schema("epoch close requires closed_through_seq")
     channels = event.get("delivery_channels")
@@ -108,22 +134,87 @@ def validate_event(event: dict) -> None:
             raise _schema("delivery channel name is invalid")
 
 
+def _known_event_type(event: dict) -> None:
+    event_type = event.get("event_type")
+    _text(event_type, "event_type")
+    spec = event_spec()
+    registered = spec["event_types"].get(event_type)
+    if registered is not None:
+        if registered["class"] != event["event_class"]:
+            raise _schema("event_type does not match its class")
+        return
+    expected = STRUCTURAL_TYPES.get(event_type)
+    if expected is None or expected != event["event_class"]:
+        raise _schema("event_type is not registered")
+
+
+def _strict_types(event: dict) -> None:
+    for field in ("event_id", "event_class", "repo_id", "producer_id", "occurred_at", "idempotency_key"):
+        _text(event.get(field), field)
+    _integer(event.get("stream_epoch"), "stream_epoch", minimum=1)
+    _integer(event.get("producer_seq"), "producer_seq", minimum=1)
+    for field in ("revision", "attempt", "policy_revision", "closed_through_seq"):
+        if field in event and event[field] is not None:
+            _integer(event[field], field, minimum=0)
+    if "state" in event and event["state"] is not None:
+        _text(event["state"], "state")
+    if "stage" in event and event["stage"] is not None:
+        _text(event["stage"], "stage")
+    if "host_id" in event and event["host_id"] is not None:
+        _text(event["host_id"], "host_id")
+    if "note" in event and event["note"] is not None:
+        _text(event["note"], "note")
+    if "guard" in event and event["guard"] is not None:
+        _text(event["guard"], "guard")
+    if "progress_status" in event and event["progress_status"] is not None:
+        _text(event["progress_status"], "progress_status")
+    if "classification" in event and event["classification"] is not None:
+        _text(event["classification"], "classification")
+    if "epoch_closed" in event and type(event["epoch_closed"]) is not bool:
+        raise _schema("epoch_closed must be a boolean")
+    if "trusted_source" in event and event["trusted_source"] is not None:
+        _text(event["trusted_source"], "trusted_source")
+    event_class = event["event_class"]
+    sha_fields = {
+        "deployment": ("head", "base", "merge", "tree", "running_sha"),
+        "authorization": ("head", "base", "merge", "tree"),
+        "candidate": ("head", "base", "merge", "tree"),
+    }.get(event_class, ())
+    for field in sha_fields:
+        if event.get(field) is not None:
+            _sha(event[field], field)
+    if event_class == "deployment" and event.get("previous_healthy_sha") is not None:
+        _sha(event["previous_healthy_sha"], "previous_healthy_sha")
+    if event_class == "deployment" and event.get("install_kind") not in {"first_install", "upgrade"}:
+        raise _schema("install_kind is invalid")
+    digest = event.get("artifact_digest")
+    if event_class == "deployment":
+        if type(digest) is not str or not digest.startswith("sha256:") or len(digest) != 7 + 64:
+            raise _schema("artifact_digest is invalid")
+        if any(char not in _SHA for char in digest[7:]):
+            raise _schema("artifact_digest is invalid")
+
+
 def _channel(stream_id: str) -> str:
     if type(stream_id) is not str or stream_id.count(":") != 1:
         raise _schema("stream_id must be producer_id:channel")
     return stream_id.split(":", 1)[1]
 
 
-def authorize_source(event: dict) -> bool:
-    """Trusted-source check. False means the event is a non-authoritative observation."""
+def authorize_source(event: dict, server_source: str | None = None) -> bool:
+    """Server source is the only authority. The client field cannot grant trust."""
     registered = event_spec()["event_types"].get(event["event_type"])
-    source = event.get("trusted_source")
+    claimed = event.get("trusted_source")
+    if claimed not in (None, "", server_source) and server_source is not None:
+        raise ControlError("NOT_AUTHORIZED", 403, "trusted source does not match the server principal")
+    if server_source in (None, ""):
+        if claimed not in (None, ""):
+            raise ControlError("NOT_AUTHORIZED", 403, "client trusted source is not authority")
+        return event.get("event_type") == "run.started"
     if registered is None:
-        if source:
-            raise ControlError("NOT_AUTHORIZED", 403, "unregistered event cannot claim a trusted source")
         return False
-    if source != registered["trusted_source"]:
-        raise ControlError("NOT_AUTHORIZED", 403, "trusted source does not match the event type")
+    if server_source != registered["trusted_source"]:
+        raise ControlError("NOT_AUTHORIZED", 403, "server source does not match the event type")
     return True
 
 

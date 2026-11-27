@@ -5,7 +5,7 @@ isolated engine has been bound in-process. The schema 2 protocol stays off
 in production.
 """
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 
 from app.control_events.errors import ControlError
@@ -55,22 +55,70 @@ async def append_event(request: Request):
 
 
 @router.get("/api/v1/control/events")
-def query_events(stream_id: str, stream_epoch: int, after_seq: int = 0):
+def query_events(
+    stream_id: str,
+    stream_epoch: int,
+    after_seq: int = 0,
+    task_id: str | None = None,
+    limit: int = 50,
+    x_control_credential: str | None = Header(default=None),
+):
     try:
         engine = _engine()
-        result = engine.query(stream_id=stream_id, stream_epoch=stream_epoch, after_seq=after_seq)
+        result = engine.query(
+            credential=x_control_credential or "",
+            stream_id=stream_id,
+            stream_epoch=stream_epoch,
+            after_seq=after_seq,
+            task_id=task_id,
+            limit=limit,
+        )
     except ControlError as exc:
         result = exc.public()
     return _response(result)
 
 
 @router.get("/api/v1/control/diagnostics")
-def poll_diagnostics(subject: str, stream_id: str, stream_epoch: int, after_seq: int = 0):
+def poll_diagnostics(
+    subject: str,
+    stream_id: str,
+    stream_epoch: int,
+    after_seq: int = 0,
+    task_id: str | None = None,
+    limit: int = 50,
+    x_control_credential: str | None = Header(default=None),
+):
     try:
         engine = _engine()
         result = engine.poll_diagnostics(
-            subject=subject, stream_id=stream_id, stream_epoch=stream_epoch, after_seq=after_seq
+            credential=x_control_credential or "",
+            subject=subject,
+            stream_id=stream_id,
+            stream_epoch=stream_epoch,
+            after_seq=after_seq,
+            task_id=task_id,
+            limit=limit,
         )
     except ControlError as exc:
         result = exc.public()
+    return _response(result)
+
+
+@router.post("/api/v1/control/diagnostics/cursor")
+async def commit_cursor(request: Request, x_control_credential: str | None = Header(default=None)):
+    try:
+        engine = _engine()
+        body = await request.json()
+        result = engine.commit_cursor(
+            credential=x_control_credential or body.get("credential") or "",
+            subject=body.get("subject") or "",
+            stream_id=body.get("stream_id") or "",
+            stream_epoch=body.get("stream_epoch"),
+            after_seq=body.get("after_seq"),
+            task_id=body.get("task_id"),
+        )
+    except ControlError as exc:
+        result = exc.public()
+    except TypeError:
+        result = ControlError("SCHEMA_UNSUPPORTED", 422, "diagnostic cursor is invalid").public()
     return _response(result)

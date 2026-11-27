@@ -50,10 +50,11 @@ CREATE TABLE IF NOT EXISTS rounds (
     PRIMARY KEY (task_id, candidate_id, run_id)
 );
 CREATE TABLE IF NOT EXISTS cursors (
+    principal_id TEXT NOT NULL,
     stream_id TEXT NOT NULL,
     stream_epoch INTEGER NOT NULL,
     after_seq INTEGER NOT NULL,
-    PRIMARY KEY (stream_id, stream_epoch)
+    PRIMARY KEY (principal_id, stream_id, stream_epoch)
 );
 CREATE TABLE IF NOT EXISTS seals (
     stream_id TEXT NOT NULL,
@@ -66,8 +67,17 @@ CREATE TABLE IF NOT EXISTS deliveries (
     state TEXT NOT NULL,
     detail TEXT,
     updated_at TEXT NOT NULL,
+    pending_since TEXT NOT NULL,
     run_id TEXT,
+    claim_token TEXT,
     PRIMARY KEY (event_id, channel)
+);
+CREATE TABLE IF NOT EXISTS reports (
+    run_id TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    channels_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS receipts (
     receipt_id TEXT PRIMARY KEY,

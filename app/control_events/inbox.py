@@ -10,17 +10,18 @@ def decide(event: dict, watermarks: dict, sealed: set, *, later: bool = False) -
     seq = event["producer_seq"]
     channel = stream_id.split(":", 1)[1]
     key = (stream_id, epoch)
-    watermark = watermarks.get(key, {"seq": 0, "closed": False})["seq"]
+    info = watermarks.get(key, {"seq": 0, "closed": False})
+    watermark = info["seq"]
     classification = event.get("classification")
     closing = bool(event.get("epoch_closed"))
 
     if classification == "never_existed" and (channel == "authorization" or event.get("event_class") != "diagnostic"):
         return "reject", "EVIDENCE_MISSING"
-    if closing and (event.get("closed_through_seq") != seq or later):
+    if info.get("closed") or key in sealed:
         return "reject", "EVIDENCE_MISSING"
-    if key in sealed:
-        complete_close = closing and event.get("closed_through_seq") == seq and seq == watermark + 1
-        if not complete_close:
+    if closing:
+        through = event.get("closed_through_seq")
+        if type(through) is not int or through != seq or later or watermark != seq - 1:
             return "reject", "EVIDENCE_MISSING"
         return "apply", None
     if channel == "authorization" and epoch > 1:
