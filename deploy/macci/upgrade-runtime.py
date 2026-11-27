@@ -18,7 +18,8 @@ TRUSTED_INSTALLER = INSTALL_ROOT / "libexec/macmini-pr-tests/runtime-installer.p
 TRUSTED_INSTALLER_PIN = INSTALL_ROOT / "etc/macmini-pr-tests/runtime-installer.sha256"
 SOURCE = Path.home() / "web-app-init-base-env-preview"
 ROOT = Path.home() / ".local/share/macmini-pr-tests"
-NAMES = ("runner.py", "merge_preview.py")
+REQUIRED_EXISTING = ("runner.py", "merge_preview.py")
+NAMES = (*REQUIRED_EXISTING, "preview_journal.py")
 LOCKS = ("worker.lock", "preview-merge.lock", "main-publish.lock", "receipt-delivery.lock")
 MAX_MODULE_BYTES = 1024 * 1024
 
@@ -137,8 +138,8 @@ def read_candidate_modules(source, sha):
     return result
 
 
-def verify_reviewed_digests(modules, runner_digest, merge_digest):
-    expected = {"runner.py": runner_digest, "merge_preview.py": merge_digest}
+def verify_reviewed_digests(modules, runner_digest, merge_digest, journal_digest=None):
+    expected = {"runner.py": runner_digest, "merge_preview.py": merge_digest, "preview_journal.py": journal_digest}
     for name in NAMES:
         digest = expected[name]
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -155,6 +156,7 @@ def main():
     parser.add_argument("--sha", required=True, help="exact reviewed source commit")
     parser.add_argument("--runner-sha256", help="independently reviewed runner.py digest")
     parser.add_argument("--merge-sha256", help="independently reviewed merge_preview.py digest")
+    parser.add_argument("--journal-sha256", help="independently reviewed preview_journal.py digest")
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--check", action="store_true")
     modes.add_argument("--apply", action="store_true")
@@ -173,16 +175,19 @@ def main():
         raise SystemExit("MacCI source checkout contains changes; refuse upgrade")
     if not owned_private(ROOT, False):
         raise SystemExit("Existing private MacCI data directory required")
-    for name in (*NAMES, "publish_main.py", "github-token"):
+    for name in (*REQUIRED_EXISTING, "publish_main.py", "github-token"):
         if not owned_private(ROOT / name):
             raise SystemExit("Unsafe or missing existing file: " + name)
+    optional = ROOT / "preview_journal.py"
+    if os.path.lexists(optional) and not owned_private(optional):
+        raise SystemExit("Unsafe existing journal module")
     desired = read_candidate_modules(SOURCE, args.sha)
     if args.check:
         print("Candidate module syntax checked only; no runtime changes or test approval")
         return 0
     # This explicit gate is not a substitute for independent MacCI evidence or authorization.
     # Only a locally trusted installer and independently reviewed digests may be used.
-    verify_reviewed_digests(desired, args.runner_sha256, args.merge_sha256)
+    verify_reviewed_digests(desired, args.runner_sha256, args.merge_sha256, args.journal_sha256)
     if sys.platform != "darwin":
         raise SystemExit("Apply is restricted to existing macOS runtime")
     with ExitStack() as stack:
@@ -196,7 +201,12 @@ def main():
                 fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:
                 raise SystemExit("MacCI job active; no files changed; retry when idle")
-        previous={name:(ROOT/name).read_bytes() for name in NAMES}
+        for name in REQUIRED_EXISTING:
+            if not owned_private(ROOT/name):
+                raise SystemExit("Runtime changed before lock acquisition")
+        if os.path.lexists(optional) and not owned_private(optional):
+            raise SystemExit("Unsafe existing journal module")
+        previous={name:(ROOT/name).read_bytes() for name in NAMES if os.path.lexists(ROOT/name)}
         if previous == desired:
             print("Runtime already matches reviewed source; no changes")
             return 0
@@ -206,11 +216,15 @@ def main():
         for name,content in previous.items():
             replace_file(backup/name, content)
         try:
-            for name,content in desired.items():
-                replace_file(ROOT/name, content)
+            # Install the dependency before its callers; existing services are locked.
+            for name in ("preview_journal.py", *REQUIRED_EXISTING):
+                replace_file(ROOT/name, desired[name])
         except OSError:
-            for name,content in previous.items():
-                replace_file(ROOT/name,content)
+            for name in NAMES:
+                if name in previous:
+                    replace_file(ROOT/name,previous[name])
+                else:
+                    (ROOT/name).unlink(missing_ok=True)
             raise
         print("Runtime updated to reviewed SHA",actual)
         print("Backup:",backup)

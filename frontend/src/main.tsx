@@ -125,6 +125,12 @@ function App() {
   const manualPR = developmentTasks?.pr_tracking?.prs.find(row => row.number === manualPrNumber)
   async function runManualPR(action: 'test' | 'merge') {
     if (!session || !manualPR || !manualPR.base || manualPrBusy) return
+    if (developmentTasks?.pr_tracking?.stale || manualPR.conflict?.blocked ||
+      !/^[0-9a-f]{40}$/.test(manualPR.head) || !/^[0-9a-f]{40}$/.test(manualPR.base) ||
+      (action === 'merge' && (manualPR.merge_state !== 'open' || manualPR.test.state !== 'success'))) {
+      setManualPrResult({type:'error',text:'候选证据已过期、存在冲突或尚未满足合并条件，请刷新任务状态。'})
+      return
+    }
     setManualPrBusy(true)
     setManualPrResult(null)
     try {
@@ -593,7 +599,7 @@ function App() {
           cancel: id => api('/api/hostops/v1/tasks/'+encodeURIComponent(id)+'/cancel',{method:'POST'},session.csrf_token),
         }} />
       ) : page === 'logs' ? (
-        <SystemLogPage data={systemLogs} loading={loadingOperations === 'logs'} onRefresh={() => void loadOperations('logs')} />
+        <SystemLogPage data={systemLogs} loading={loadingOperations === 'logs'} onRefresh={() => void loadOperations('logs')} onOpenTasks={()=>navigate('tasks')} />
       ) : (
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
           <Card title="开发任务 · 需求与反馈记录" extra={<Space wrap>

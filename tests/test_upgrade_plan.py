@@ -167,3 +167,29 @@ def test_manage_script_app_port_is_unchanged_after_safe_upstream_patch():
     result = p.plan({path: old}, {path: new}, {path: old})[0]
     assert result.action == "replace"
     assert p.host_identity(result.result) == p.host_identity(old)
+
+
+def test_application_modules_never_managed():
+    for path in ("app_modules/registry.py", "APP_MODULES/notes.py", "frontend/src/app-modules/notes.tsx", "migrations/modules/notes/001.sql"):
+        assert p.app_owned(path) and not p.managed(path)
+        assert p.plan({path:b"old"}, {path:b"new"}, {path:b"business"}) == []
+
+
+def test_module_seed_first_upgrade_and_preservation(tmp_path):
+    folder=tmp_path/"app_modules"
+    folder.mkdir()
+    (folder/"registry.py").write_text("MODULES = ()")
+    (folder/"__init__.py").write_text("")
+    (folder/"business.py").write_text("private business code")
+    seeds=p.module_seed_snapshot(tmp_path)
+    assert set(seeds)==p.MODULE_SEEDS
+    first=p.module_seed_decisions(seeds,{})
+    assert len(first)==2 and all(d.action=="add" for d in first)
+    assert p.module_seed_decisions(seeds,{"app_modules/registry.py":"100644","app_modules/__init__.py":"100644"})==[]
+    assert [d.path for d in p.module_seed_decisions(seeds,{"app_modules/registry.py":"100644"})]==["app_modules/__init__.py"]
+
+
+@pytest.mark.parametrize("observed",[{"APP_MODULES/REGISTRY.PY":"100644"},{"app_modules":"100644"},{"app_modules/registry.py":"120000"},{"app_modules/registry.py/nested":"100644"}])
+def test_module_seed_collision_fails_closed(observed):
+    with pytest.raises(ValueError):
+        p.module_seed_decisions({"app_modules/registry.py":b"seed"},observed)

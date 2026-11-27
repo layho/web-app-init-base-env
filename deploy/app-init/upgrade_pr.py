@@ -253,6 +253,9 @@ def legacy_check(app, app_sha, old_generated, repository, params):
 def create_commit(app, app_sha, decisions, meta, target):
     if any(d.action not in ("add", "replace", "merge") or d.result is None for d in decisions):
         raise ValueError("Unresolved plan; refusing to create commit")
+    for d in decisions:
+        if planner.app_owned(d.path) and not (d.path in planner.MODULE_SEEDS and d.action == "add" and d.local is None and not git(app, "ls-tree", app_sha, "--", d.path)):
+            raise ValueError("Refusing to overwrite application-owned module: " + d.path)
     # Isolated Git index: no materialization of app code or working tree writes.
     with TemporaryDirectory(prefix="base-upgrade-index-") as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
@@ -419,7 +422,7 @@ def verify_upgrade_inventory(app, app_sha, target_sha, before, after, decisions)
         mode, kind, oid = fields.decode("ascii").split()
         observed.append(path)
         modes[path] = mode
-    template = sorted(set(before) | set(after))
+    template = sorted(set(before) | set(after) | {d.path for d in decisions if d.path in planner.MODULE_SEEDS and d.action == "add" and d.local is None})
     changes = [{"path": d.path, "op": "add" if d.local is None else "modify",
                 "symlink": modes.get(d.path, "100644") not in {"100644", "100755"}}
                for d in decisions if d.action in {"add", "replace", "merge"}]
@@ -430,6 +433,9 @@ def verify_upgrade_inventory(app, app_sha, target_sha, before, after, decisions)
                    "app": [], "protected": sorted(planner.PROTECTED)},
         "template_paths": template, "observed_files": observed, "changes": changes,
     })
+    for d in decisions:
+        if planner.app_owned(d.path) and not (d.path in planner.MODULE_SEEDS and d.action == "add" and d.local is None and d.path not in modes):
+            result["errors"].append("application-owned path cannot be upgraded: " + d.path)
     # Detect file/directory collisions and case-folded parent aliases, not just
     # full filename collisions. Never stage into an existing business tree alias.
     occupied = {}
@@ -502,6 +508,13 @@ def coordinate(repository, legacy_base=None, create_pr=False, *, expected_target
         before, after = preserve_verified_panel_auth_tests(
             source, old_sha, target_sha, repository, before, after, current)
         decisions = planner.plan(before, after, current)
+        seeds = planner.module_seed_snapshot(new_dir)
+        observed_modes = {}
+        for entry in git(app, "ls-tree", "-rz", app_sha).split(b"\0"):
+            if entry:
+                fields, raw = entry.split(b"\t", 1)
+                observed_modes[raw.decode("utf-8", "strict")] = fields.decode("ascii").split()[0]
+        decisions.extend(planner.module_seed_decisions(seeds, observed_modes))
         inventory = verify_upgrade_inventory(app, app_sha, target_sha, before, after, decisions)
         summary = {"schema": 1, "app_sha": actual, "from": old, "target": target,
                    "legacy_verified_root": legacy_root,

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sqlite3
 import subprocess
 from tempfile import TemporaryDirectory
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -207,6 +208,48 @@ def latest_release(token, sha):
     return tuple(map(int, version.split("."))), required
 
 
+def published_preview_equivalent(read, preview, main):
+    """Recognize an exact, officially merged preview-to-main release.
+
+    Equal trees alone are not publication evidence. Only an actual GitHub
+    release merge with the preview as a parent and matching PR is accepted.
+    A missing or inconsistent receipt leaves the candidate frozen.
+    """
+    if not all(isinstance(x, str) and SHA.fullmatch(x) for x in (preview, main)):
+        return False
+    if preview == main:
+        return True
+    published = read("/git/commits/" + main)
+    candidate = read("/git/commits/" + preview)
+    if not isinstance(published, dict) or not isinstance(candidate, dict):
+        return False
+    if published.get("sha") != main or candidate.get("sha") != preview:
+        return False
+    tree = (candidate.get("tree") or {}).get("sha")
+    parents = published.get("parents")
+    if (not isinstance(tree, str) or not SHA.fullmatch(tree)
+            or (published.get("tree") or {}).get("sha") != tree
+            or not isinstance(parents, list) or len(parents) != 2
+            or not all(isinstance(p, dict) for p in parents)
+            or parents[1].get("sha") != preview):
+        return False
+    message = published.get("message")
+    match = re.match(r"Merge pull request #([1-9][0-9]{0,8}) from layho/preview(?:\\n|$)",
+                     message) if isinstance(message, str) else None
+    if not match:
+        return False
+    release = read("/pulls/" + match.group(1))
+    if not isinstance(release, dict):
+        return False
+    source, target = release.get("head") or {}, release.get("base") or {}
+    return (release.get("merged") is True and release.get("state") == "closed"
+            and release.get("merge_commit_sha") == main
+            and source.get("sha") == preview and source.get("ref") == "preview"
+            and target.get("ref") == "main"
+            and (source.get("repo") or {}).get("full_name") == REPO
+            and (target.get("repo") or {}).get("full_name") == REPO)
+
+
 def preview_frozen(token):
     """Freeze when preview's release version is newer than official main.
 
@@ -226,7 +269,14 @@ def preview_frozen(token):
         return True
     # The web gate offers acceptance for the running SHA, including revisions
     # that retain the same release number and release notes.
-    return requires_acceptance and preview != main
+    if not requires_acceptance or preview == main:
+        return False
+    if not published_preview_equivalent(lambda path: api(token, path), preview, main):
+        return True
+    # The caller still verifies the candidate, OWNER review and test receipt.
+    return (api(token, "/branches/preview")["commit"]["sha"] != preview
+            or api(token, "/branches/main")["commit"]["sha"] != main)
+
 
 
 def deployment_replacement_allowed(token, number, base, head, merge, main):
@@ -400,7 +450,24 @@ def verify_candidate(folder, base, head, candidate, required):
         git(folder, "merge-base", "--is-ancestor", required, base)
 
 
-def merge_one(token, number, dry_run=False):
+def definitive_push_rejection(exc):
+    """Only parse a single porcelain status for the exact target ref.
+
+    Never infer rejection from generic stderr, transport failure or timeout.
+    """
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return False
+    output=exc.output
+    if not isinstance(output,str):
+        return False
+    statuses=[line.split("\t") for line in output.splitlines() if len(line)>1 and line[1]=="\t"]
+    return (len(statuses)==1 and len(statuses[0])==3 and statuses[0][0]=="!"
+            and statuses[0][1].endswith(":"+TARGET)
+            and statuses[0][2] in ("[remote rejected] (pre-receive hook declined)",
+                                   "[rejected] (non-fast-forward)", "[rejected] (fetch first)"))
+
+
+def merge_one(token, number, dry_run=False, journal=None, managed_queue=False):
     frozen = preview_frozen(token)
     gate = authorization(token, number)
     if gate is None:
@@ -434,11 +501,36 @@ def merge_one(token, number, dry_run=False):
         # Push the exact tested commit, not PR head or a moving merge ref.
         # Non-force push protects concurrent divergent preview updates; branch rules
         # still apply. A failed push must never be retried with force.
-        git(folder, "push", "--porcelain", REMOTE, merge + ":" + TARGET)
+        if journal is not None:
+            # Persist exact authorized candidate before any remote side effect.
+            changed_files = None
+            if managed_queue:
+                # --no-renames includes both sides of a rename. NUL separation
+                # preserves paths with spaces; invalid paths cannot match a reservation.
+                changed_files=git(folder,"diff","--no-renames","--name-only","-z",base,merge).split("\0")
+                changed_files=[p for p in changed_files if p]
+                from preview_journal import ReservationBlocked
+                try:
+                    journal.stage(number,head,base,changed_files)
+                except ReservationBlocked as exc:
+                    print(f"PR #{number}: reservation deferred: {exc}",flush=True)
+                    return False
+            journal.prepare(number, head, base, merge, changed_files=changed_files)
+        try:
+            git(folder, "push", "--porcelain", REMOTE, merge + ":" + TARGET)
+        except subprocess.CalledProcessError as exc:
+            if journal is not None and definitive_push_rejection(exc):
+                actual=api(token,"/branches/preview")["commit"]["sha"]
+                if journal.reject_without_push(number,head,base,merge,actual):
+                    print(f"PR #{number}: definitive push rejection recorded; fresh gates required",flush=True)
+                    return False
+            raise
         actual = api(token, "/branches/preview")["commit"]["sha"]
         if actual != merge:
             print(f"PR #{number}: preview changed after push; reconcile before further release", flush=True)
             return True
+        if journal is not None:
+            journal.confirm(number, head, base, merge, actual)
         pr = api(token, f"/pulls/{number}")
         print(f"PR #{number}: preview advanced to tested SHA {merge}; GitHub merged={pr.get('merged') is True}", flush=True)
         return True
@@ -486,18 +578,47 @@ def main():
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return 0
+            journal = None
+            managed_queue = os.getenv("MACCI_MANAGED_QUEUE") == "1"
+            active_version = os.getenv("MACCI_ACTIVE_VERSION","")
+            active_pr = os.getenv("MACCI_ACTIVE_PR","")
+            if managed_queue and not re.fullmatch(r"[1-9][0-9]{0,9}",active_pr):
+                raise ValueError("managed mode requires explicit active candidate PR")
+            if (managed_queue or os.getenv("MACCI_INTEGRATION_JOURNAL") == "1") and not args.dry_run:
+                from preview_journal import PreviewJournal
+                journal = PreviewJournal(ROOT / ("integration-queue.sqlite3" if managed_queue else "preview-integration.sqlite3"))
+                # Never dispatch another push while an earlier outcome is unknown.
+                if not journal.reconcile(lambda: api(token, "/branches/preview")["commit"]["sha"]):
+                    print("Preview coordinator blocked: unresolved integration journal", flush=True)
+                    return 1
+            if managed_queue and journal is not None:
+                journal.initialize_version(active_version)
+                prepared=journal.prepared()
+                if prepared is not None:
+                    # Only a closed PR can be automatically cancelled here.
+                    # An amended or Draft PR retains its reservation for review.
+                    match=re.fullmatch(r"pr-([1-9][0-9]*)",prepared["id"])
+                    if match:
+                        current=api(token,"/pulls/"+match.group(1))
+                        if current.get("number")==int(match.group(1)) and current.get("state")=="closed" and current.get("merged") is False:
+                            journal.cancel_prepared(prepared["id"],prepared["head"],prepared["base"])
             prs = all_pages(token, "/pulls?state=open&base=preview&sort=created&direction=asc")
             for pr in prs:
                 number = pr.get("number")
-                if type(number) is not int or number <= 0 or pr.get("draft"):
+                if type(number) is not int or number <= 0 or pr.get("draft") is not False:
+                    continue
+                if managed_queue and number!=int(active_pr):
                     continue
                 try:
-                    if merge_one(token, number, args.dry_run):
+                    if merge_one(token, number, args.dry_run, journal=journal, managed_queue=managed_queue):
                         return 0  # New base requires fresh tests for following PRs.
-                except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError) as exc:
+                except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError, sqlite3.Error) as exc:
                     print(f"PR #{number}: gate/push blocked: {type(exc).__name__}", flush=True)
+                    if journal is not None and journal.pending():
+                        return 1  # A possibly completed push must be reconciled on the next tick.
+                    # Known pre-push failures must not starve later independent candidates.
             return 0
-    except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError) as exc:
+    except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError, sqlite3.Error) as exc:
         print(f"Preview coordinator blocked: {type(exc).__name__}", flush=True)
         return 1
 

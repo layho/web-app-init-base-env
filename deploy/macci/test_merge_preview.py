@@ -55,6 +55,9 @@ class MergeTests(unittest.TestCase):
         def api(token, path):
             if path.startswith("/branches/"):
                 return {"commit": {"sha": refs[path.split("/")[-1]]}}
+            if path.startswith("/git/commits/"):
+                return {"sha": path.rsplit("/", 1)[1], "tree": {"sha": D},
+                        "parents": [], "message": "not a publication merge"}
             note = {B: old, C: amended}[path.split("?ref=")[1]]
             content = base64.b64encode(json.dumps([note]).encode()).decode()
             return {"encoding": "base64", "content": content}
@@ -66,6 +69,39 @@ class MergeTests(unittest.TestCase):
             self.assertTrue(m.preview_frozen("fake"))
             refs["main"] = C
             self.assertFalse(m.preview_frozen("fake"))
+
+    def test_exact_published_preview_merge_unfreezes_only_verified_tree(self):
+        tree = "e"*40
+        released = {"merged": True, "state": "closed", "merge_commit_sha": C,
+                    "head": {"sha": B, "ref": "preview", "repo": {"full_name": m.REPO}},
+                    "base": {"ref": "main", "repo": {"full_name": m.REPO}}}
+        candidate = {"sha": B, "tree": {"sha": tree}}
+        main = {"sha": C, "tree": {"sha": tree},
+                "parents": [{"sha": D}, {"sha": B}],
+                "message": "Merge pull request #194 from layho/preview"}
+        def api(token, path):
+            if path == "/branches/preview":
+                return {"commit": {"sha": B}}
+            if path == "/branches/main":
+                return {"commit": {"sha": C}}
+            if path.startswith("/contents/"):
+                return {"encoding": "base64", "content": base64.b64encode(
+                    b'[{"version":"0.4.0","acceptance_required":true}]').decode()}
+            return {"/git/commits/"+B: candidate, "/git/commits/"+C: main,
+                    "/pulls/194": released}[path]
+        with patch.object(m, "api", side_effect=api):
+            self.assertFalse(m.preview_frozen("fake"))
+            released["merged"] = False
+            self.assertTrue(m.preview_frozen("fake"))
+            released["merged"] = True
+            candidate["tree"]["sha"] = D
+            self.assertTrue(m.preview_frozen("fake"))
+            candidate["tree"]["sha"] = tree
+            released["head"]["sha"] = H
+            self.assertTrue(m.preview_frozen("fake"))
+            released["head"]["sha"] = B
+            main["parents"][1]["sha"] = H
+            self.assertTrue(m.preview_frozen("fake"))
 
     def test_freeze_fails_closed_on_unreachable_release_data(self):
         with patch.object(m, "api", side_effect=OSError("offline")):

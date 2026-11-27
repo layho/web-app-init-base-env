@@ -64,6 +64,16 @@ def eligible(repo, pr):
             and type(pr.get('number')) is int and pr['number'] > 0)
 
 
+def test_requested(pr, *, explicit=False):
+    """Draft is a development hold, not a test or merge authorization.
+
+    A targeted local operator request may test a Draft without changing its
+    state. A broad --force invocation never overrides a Draft hold.
+    Missing/invalid draft metadata is not a ready candidate.
+    """
+    return pr.get("draft") is False or (pr.get("draft") is True and explicit is True)
+
+
 def identity(pr):
     return pr['head']['sha'], pr['base']['sha']
 
@@ -766,6 +776,9 @@ def main():
                     if not eligible(repo, pr):
                         continue
                     pr = api(token, f'/repos/{repo}/pulls/{pr["number"]}')
+                    explicit = bool(args.repo == repo and args.pr == pr.get("number") and args.force)
+                    if not eligible(repo, pr) or not test_requested(pr, explicit=explicit):
+                        continue
                     try:
                         candidate = current_candidate(token, repo, pr)
                     except (OSError, ValueError, KeyError, TypeError):
@@ -779,6 +792,11 @@ def main():
                     statuses = api(token, f'/repos/{repo}/commits/{head}/statuses?per_page=100')
                     if completed(statuses, base, expected_merge) and not args.force:
                         reconcile_progress(token, repo, head, base, expected_merge, statuses)
+                        continue
+                    # Recheck the live state and exact candidate immediately before
+                    # dispatch. A development hold or moving ref invalidates dispatch.
+                    latest = api(token, f'/repos/{repo}/pulls/{pr["number"]}')
+                    if not test_requested(latest, explicit=explicit) or current_candidate(token, repo, latest) != candidate:
                         continue
                     print(f'Testing {repo} PR #{pr["number"]}: {head} against {base}', flush=True)
                     status(token, repo, head, base, None, 'pending')
@@ -795,7 +813,7 @@ def main():
                         diagnostic=failure_summary(stream.read(262144).decode("utf-8",errors="replace"),detail)
                     try:
                         latest = api(token, f'/repos/{repo}/pulls/{pr["number"]}')
-                        unchanged = current_candidate(token, repo, latest) == candidate
+                        unchanged = (test_requested(latest, explicit=explicit) and current_candidate(token, repo, latest) == candidate)
                     except (OSError, ValueError, KeyError, TypeError):
                         unchanged = False
                     if not unchanged or (state == 'success' and merge != expected_merge):
@@ -814,7 +832,7 @@ def main():
                             print("MacCI report unavailable; local test log retained",flush=True)
                     print(f'{state}: {logfile}', flush=True)
                     return 0 if state == 'success' else 1
-            print('No eligible untested PRs (already tested, closed, or outside the trusted project profile)', flush=True)
+            print('No eligible untested PRs (development hold, already tested, closed, or outside the trusted project profile)', flush=True)
     except BlockingIOError:
         print('Another test is running; skip this tick', flush=True)
     return 0

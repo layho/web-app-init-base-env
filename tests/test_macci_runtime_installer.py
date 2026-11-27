@@ -34,11 +34,11 @@ class RuntimeInstallerTests(unittest.TestCase):
             self.assertFalse(sentinel.exists())
             self.assertEqual(modules["runner.py"], data)
             digest = hashlib.sha256(data).hexdigest()
-            installer.verify_reviewed_digests(modules, digest, digest)
+            installer.verify_reviewed_digests(modules, digest, digest, digest)
             with self.assertRaises(ValueError):
-                installer.verify_reviewed_digests(modules, None, digest)
+                installer.verify_reviewed_digests(modules, None, digest, digest)
             with self.assertRaises(ValueError):
-                installer.verify_reviewed_digests(modules, "0"*64, digest)
+                installer.verify_reviewed_digests(modules, "0"*64, digest, digest)
             (source / "runner.py").unlink()
             (source / "runner.py").symlink_to("merge_preview.py")
             git("add", ".")

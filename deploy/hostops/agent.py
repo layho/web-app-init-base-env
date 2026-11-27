@@ -57,14 +57,51 @@ def runtime_digest():
     return hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 
 
+def preview_receipt_snapshot():
+    """Optional fixed local journal evidence; no remote command or path input."""
+    if os.getenv("HOSTOPS_PREVIEW_EVIDENCE")!="true":
+        return None
+    empty={"state":"unavailable","attempts":[],"truncated":False}
+    try:
+        root=Path.home()/".local/share/macmini-pr-tests"
+        path=root/("integration-queue.sqlite3" if os.getenv("MACCI_MANAGED_QUEUE")=="1" else "preview-integration.sqlite3")
+        for p,mode,kind in ((root,0o700,stat.S_ISDIR),(path,0o600,stat.S_ISREG)):
+            info=p.lstat()
+            if not kind(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=mode:
+                return empty
+        if path.resolve(strict=True)!=path:
+            return empty
+        with closing(sqlite3.connect(path.as_uri()+"?mode=ro",uri=True,timeout=1)) as db:
+            db.row_factory=sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            rows=db.execute("SELECT seq,pr,head,base,candidate,state,created,finished FROM preview_attempts ORDER BY seq DESC LIMIT 21").fetchall()
+            records=[]
+            for row in rows[:20]:
+                if (type(row["seq"]) is not int or row["seq"]<=0 or type(row["pr"]) is not int or row["pr"]<=0
+                    or any(not isinstance(row[k],str) or not re.fullmatch(r"[0-9a-f]{40}",row[k]) for k in ("head","base","candidate"))
+                    or row["state"] not in ("PENDING","INTEGRATED","REJECTED")
+                    or type(row["created"]) is not int or not 0<=row["created"]<=253402300799
+                    or (row["state"]=="PENDING" and row["finished"] is not None)
+                    or (row["state"]!="PENDING" and (type(row["finished"]) is not int or not row["created"]<=row["finished"]<=253402300799))):
+                    return empty
+                records.append(dict(row))
+            return {"state":"available","attempts":records,"truncated":len(rows)>20}
+    except (OSError,ValueError,TypeError,sqlite3.Error):
+        return empty
+
+
 def heartbeat_payload(host):
     snap = execute("agent.snapshot", {})["result"]
     health = snap["health"]
-    return {"host_id": host, "system": health["system"],
+    payload={"host_id": host, "system": health["system"],
             "architecture": health["architecture"], "disk": health["disk"],
             "services": snap["services"], "capabilities": snap["capabilities"],
             "runtime_digest":runtime_digest(),
             "dispatch_active":os.getenv("HOSTOPS_AGENT_DISPATCH")=="true"}
+    evidence=preview_receipt_snapshot()
+    if evidence is not None:
+        payload["preview_evidence"]=evidence
+    return payload
 
 
 def send_heartbeat(host, origin, token, opener=None):

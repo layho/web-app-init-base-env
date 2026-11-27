@@ -192,7 +192,10 @@ def enqueue_refresh():
                 write_status({**refresh_status(), "state": "failed", "phase": "rate_limit", "requests": 0,
                               "force_requested": True, "reason": held["reason"] + "；下次重试 " + held["retry_at"]})
                 return refresh_status()
-            write_status({"state": "queued", "requests": 0, "force_requested": True})
+            prior = refresh_status()
+            write_status({"state": "queued", "requests": 0, "force_requested": True,
+                          "token_health": prior.get("token_health", {}),
+                          "token_health_checked_at": prior.get("token_health_checked_at")})
             try:
                 with (folder / "task-sync-worker.log").open("ab") as log:
                     subprocess.Popen([sys.executable, "-m", "scripts.sync_development_tasks", "--force"],
@@ -220,6 +223,7 @@ def token_health(repository, request):
                 if retry_deadline(str(exc), datetime.now(timezone.utc)):
                     raise
         result[label]["elapsed_seconds"] = round(time.monotonic() - started, 2)
+        result[label]["checked_at"] = datetime.now(timezone.utc).isoformat()
     check("identity", lambda: request("GET", "/user"), lambda o: {"login": o["login"]})
     check("rate_limit", lambda: request("GET", "/rate_limit"),
           lambda o: {"remaining": o["resources"]["core"]["remaining"], "limit": o["resources"]["core"]["limit"]})
@@ -329,10 +333,16 @@ def run_refresh(force=False):
                 write_status(state)
             issues = sync(force=True, repository=target[0], request=request,
                           incremental=not force, collect_only=True)
+            stamp = datetime.now(timezone.utc).isoformat()
+            state["token_health"] = {**state["token_health"], "issues": {"state": "ok", "checked_at": stamp}}
+            state["token_health_checked_at"] = stamp
             state["phase"] = "pulls"
             write_status(state)
             cached = {} if force else {p["number"]: p for p in tracking.get("prs", [])}
             prs = pr_tracking.collect(request, *target, cached=cached)
+            stamp = datetime.now(timezone.utc).isoformat()
+            state["token_health"] = {**state["token_health"], "pulls": {"state": "ok", "checked_at": stamp}}
+            state["token_health_checked_at"] = stamp
             state["phase"] = "reconcile"
             write_status(state)
             known = {t["number"] for t in issues["tasks"]}
@@ -386,7 +396,9 @@ def run_refresh(force=False):
             if held:
                 state["reason"] = held["reason"] + "；下次重试 " + held["retry_at"]
             if state["phase"] in {"issues", "pulls"} and isinstance(exc, release_acceptance.AcceptanceError):
-                state["token_health"] = {**state["token_health"], state["phase"]: {"state": "failed", "reason": state["reason"]}}
+                stamp = datetime.now(timezone.utc).isoformat()
+                state["token_health"] = {**state["token_health"], state["phase"]: {"state": "failed", "reason": state["reason"], "checked_at": stamp}}
+                state["token_health_checked_at"] = stamp
         write_status({**state, "elapsed_seconds": round(time.monotonic() - start, 1)})
         return int(state["state"] != "success")
 

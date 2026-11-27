@@ -11,7 +11,73 @@ export type ReleaseHistory = {
   deployments: Operation[]
   acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown' | 'rejected'; attachments?: {id:string;url:string}[]; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string; main_sha?: string; is_published?: boolean }
 }
-export type SystemLogs = { events: Operation[] }
+type QueueJob = { id:string; state:string; head:string|null; base:string|null; created:number|null; expires:number|null }
+type QueueEvent = { seq:number; job:string; event:string; at:number|null }
+type QueueDiagnostics = { state:string; version:string|null; jobs:QueueJob[]; events:QueueEvent[]; truncated:boolean }
+type PreviewAttempt = {seq:number;pr:number;head:string;base:string;candidate:string;state:'PENDING'|'INTEGRATED'|'REJECTED';created:number;finished:number|null}
+type PreviewAttempts = {state:string;attempts:PreviewAttempt[];truncated:boolean;source?:string;age_seconds?:number}
+export type SystemLogs = { events: Operation[]; integration?:QueueDiagnostics; preview_attempts?:PreviewAttempts }
+
+const attemptLabels = {PENDING:'待对账',INTEGRATED:'已确认集成',REJECTED:'明确拒绝'}
+function PreviewAttemptDiagnostics({data,onOpenTasks,onRefresh,loading}:{data?:PreviewAttempts;onOpenTasks:()=>void;onRefresh:()=>void;loading:boolean}) {
+  const [state,setState]=useState<string>('all')
+  const [selected,setSelected]=useState<PreviewAttempt|null>(null)
+  const records=data?.attempts??[]
+  const pending=records.filter(r=>r.state==='PENDING').length
+  return <Card size="small" title="宿主合并执行回执" extra={<Select size="small" value={state} onChange={setState} options={[{value:'all',label:'全部状态'},...Object.entries(attemptLabels).map(([value,label])=>({value,label}))]} />}>
+    {data?.state!=='available'?<Typography.Text type="secondary">{data?.state==='not_configured'?'尚未配置宿主回执来源':data?.state==='stale'?'宿主回执已过期，等待新心跳':'宿主回执暂不可用'}</Typography.Text>:<Space direction="vertical" style={{width:'100%'}}>
+      {pending>0&&<Alert type="warning" showIcon message="存在未确认合并结果，等待宿主对账；不得直接重复推送。" action={<Button size="small" loading={loading} onClick={onRefresh}>刷新回执</Button>} />}
+      <Typography.Text type="secondary">来源：{data.source==='hostops'?'认证宿主心跳':'本机只读记录'}{data.age_seconds!==undefined?` · ${data.age_seconds}秒前`:''}</Typography.Text>
+      {data.truncated&&<Typography.Text type="secondary">仅展示最近有限条执行记录</Typography.Text>}
+      <Table<PreviewAttempt> size="small" rowKey="seq" dataSource={records.filter(r=>state==='all'||r.state===state)} pagination={{pageSize:5}} scroll={{x:650}} columns={[
+        {title:'PR',dataIndex:'pr',render:(v:number)=>'#'+v},
+        {title:'状态',dataIndex:'state',render:(v:PreviewAttempt['state'])=><Tag color={v==='PENDING'?'warning':v==='INTEGRATED'?'success':'error'}>{attemptLabels[v]}</Tag>},
+        {title:'候选 SHA',dataIndex:'candidate',render:(v:string)=><code title={v}>{v.slice(0,8)}</code>},
+        {title:'开始时间',dataIndex:'created',render:queueTime},
+        {title:'结束时间',dataIndex:'finished',render:queueTime},
+        {title:'操作',render:(_:unknown,row:PreviewAttempt)=><Button type="link" onClick={()=>setSelected(row)}>详情</Button>}
+      ]}/>
+      <Typography.Text type="secondary">宿主回执仅证明合并结果，不代表部署、验收或正式发布成功。</Typography.Text>
+    </Space>}
+    <Space wrap style={{marginTop:12}}>
+      <Button loading={loading} onClick={onRefresh}>刷新诊断（只读）</Button>
+      <Button onClick={onOpenTasks}>打开任务看板 / 人工干预</Button>
+    </Space>
+    <Drawer title="宿主执行回执详情" open={selected!==null} onClose={()=>setSelected(null)}>
+      {selected&&<Descriptions column={1} size="small" items={[
+        {key:'pr',label:'PR',children:'#'+selected.pr},
+        {key:'state',label:'状态',children:attemptLabels[selected.state]},
+        ...(['head','base','candidate'] as const).map(k=>({key:k,label:k,children:<Typography.Text code copyable>{selected[k]}</Typography.Text>})),
+        {key:'created',label:'开始',children:queueTime(selected.created)},
+        {key:'finished',label:'结束',children:queueTime(selected.finished)}
+      ]}/>}
+    </Drawer>
+  </Card>
+}
+
+const queueStateLabels:Record<string,string> = { QUEUED:'等待领取', CLAIMED:'已领取', PREPARED:'候选已准备', UNKNOWN:'结果未知 · 等待对账', INTEGRATED:'已集成', CANCELLED:'已取消' }
+const queueTime = (value:number|null) => value===null ? '未记录' : new Date(value*1000).toLocaleString()
+function IntegrationDiagnostics({ data }: {data?:QueueDiagnostics}) {
+  if (!data || data.state !== 'available') return <Card size="small" title="集成队列诊断"><Typography.Text type="secondary">{data?.state==='not_configured'?'尚未配置队列证据源':data?.state==='not_initialized'?'队列尚未初始化':'队列证据暂不可用'}</Typography.Text></Card>
+  return <Card size="small" title={'集成队列诊断 · '+data.version}>
+    <Space direction="vertical" size="middle" style={{width:'100%'}}>
+      {data.truncated && <Alert type="info" message="仅展示最近 100 条任务和事件" />}
+      <Table<QueueJob> size="small" rowKey="id" dataSource={data.jobs} pagination={{pageSize:5}} scroll={{x:650}} columns={[
+        {title:'任务',dataIndex:'id'},
+        {title:'状态',dataIndex:'state',render:(v:string)=><Tag color={v==='UNKNOWN'?'warning':v==='INTEGRATED'?'success':'default'}>{queueStateLabels[v]??v}</Tag>},
+        {title:'Head',dataIndex:'head',render:(v:string|null)=>v?.slice(0,8)??'未记录'},
+        {title:'Base',dataIndex:'base',render:(v:string|null)=>v?.slice(0,8)??'未记录'},
+        {title:'租约截止',dataIndex:'expires',render:queueTime}
+      ]} />
+      <Table<QueueEvent> size="small" rowKey="seq" dataSource={data.events} pagination={{pageSize:5}} scroll={{x:550}} columns={[
+        {title:'事件时间',dataIndex:'at',render:queueTime},
+        {title:'任务',dataIndex:'job'},
+        {title:'执行事件',dataIndex:'event'}
+      ]} />
+      <Typography.Text type="secondary">只读执行证据；候选准备完成不代表测试、合并或部署成功。</Typography.Text>
+    </Space>
+  </Card>
+}
 
 const labels: Record<string, string> = {
   host_test_case_failed: '宿主测试用例失败',
@@ -239,7 +305,7 @@ export function diagnosticSeverity(code: string) {
   return /_ok$/.test(code) ? 'success' : 'info'
 }
 
-export function SystemLogPage({ data, loading, onRefresh }: RefreshProps & { data: SystemLogs | null }) {
+export function SystemLogPage({ data, loading, onRefresh, onOpenTasks }: RefreshProps & { data: SystemLogs | null; onOpenTasks:()=>void }) {
   const [query,setQuery] = useState('')
   const [category,setCategory] = useState('all')
   const [severity,setSeverity] = useState('all')
@@ -262,6 +328,8 @@ export function SystemLogPage({ data, loading, onRefresh }: RefreshProps & { dat
       {counts.map(([title,count]) => <Card key={title} size="small"><Typography.Text type="secondary">{title}</Typography.Text><Typography.Title level={3} style={{margin:'8px 0 0'}}>{data ? count : '未记录'}</Typography.Title></Card>)}
     </div>
     <Alert showIcon type="info" message="统计范围仅为接口返回的最近系统事件，不代表全量故障、实时服务健康或未解决阻塞数量。" />
+    <IntegrationDiagnostics data={data?.integration}/>
+    <PreviewAttemptDiagnostics data={data?.preview_attempts} onOpenTasks={onOpenTasks} onRefresh={onRefresh} loading={loading}/>
     <Card title="系统事件" extra={<Button onClick={onRefresh} loading={loading}>刷新</Button>}>
       <Space wrap style={{marginBottom:12}}>
         <Input.Search allowClear value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索事件、原因、SHA" style={{width:'min(260px,100%)'}} />

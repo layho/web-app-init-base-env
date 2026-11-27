@@ -384,9 +384,11 @@ def manual_merge_pr(req: ManualPRActionIn, request: Request, response: Response,
 
 
 @app.get("/api/v1/system-logs", dependencies=[Depends(authorize)])
-def system_logs(response: Response):
+def system_logs(request: Request, response: Response, db: Session = Depends(get_db)):
+    from . import integration_diagnostics
+    auth.authorize_session(request, db)
     response.headers["Cache-Control"] = "no-store"
-    return {"events": operations.recent_operations(operations.OPERATIONS_LOG)}
+    return {"events": operations.recent_operations(operations.OPERATIONS_LOG), "integration": integration_diagnostics.read_queue(), "preview_attempts": integration_diagnostics.preview_evidence()}
 
 
 @app.get("/api/v1/deploy/status", dependencies=[Depends(authorize)])
@@ -427,6 +429,10 @@ def version(response: Response):
 
 from .hostops import router as hostops_router
 app.include_router(hostops_router)
+
+from .module_sdk import mount_modules
+from app_modules.registry import MODULES
+mount_modules(app, MODULES)
 
 
 # HTML is never reusable across deployments; hashed assets keep normal caching.

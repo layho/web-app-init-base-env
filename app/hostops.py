@@ -40,6 +40,23 @@ class Service(StrictModel):
     last_exit_code: int | None = Field(default=None, ge=-2147483648, le=2147483647)
 
 
+class PreviewReceipt(StrictModel):
+    seq: int = Field(gt=0)
+    pr: int = Field(gt=0)
+    head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    base: str = Field(pattern=r"^[0-9a-f]{40}$")
+    candidate: str = Field(pattern=r"^[0-9a-f]{40}$")
+    state: Literal["PENDING","INTEGRATED","REJECTED"]
+    created: int = Field(ge=0,le=253402300799)
+    finished: int | None = Field(ge=0,le=253402300799)
+
+
+class PreviewEvidence(StrictModel):
+    state: Literal["available","unavailable"]
+    attempts: list[PreviewReceipt] = Field(max_length=20)
+    truncated: bool
+
+
 class Heartbeat(StrictModel):
     host_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$")
     system: Literal["Darwin", "Linux"]
@@ -49,6 +66,7 @@ class Heartbeat(StrictModel):
     capabilities: list[str] = Field(max_length=3)
     runtime_digest: str | None = Field(default=None,pattern=r"^[0-9a-f]{64}$")
     dispatch_active: bool = False
+    preview_evidence: PreviewEvidence | None = None
 
 
 def dispatch_ready():
@@ -79,8 +97,17 @@ def heartbeat(payload: Heartbeat, request: Request, response: Response):
         raise HTTPException(422, "Unsupported capability or service")
     if payload.disk and max(payload.disk.used_bytes, payload.disk.free_bytes) > payload.disk.total_bytes:
         raise HTTPException(422, "Invalid disk capacity")
+    if payload.preview_evidence is not None:
+        evidence=payload.preview_evidence
+        ids=[r.seq for r in evidence.attempts]
+        if (len(ids)!=len(set(ids)) or (evidence.state=="unavailable" and (ids or evidence.truncated))
+                or any((r.state=="PENDING" and r.finished is not None) or
+                       (r.state!="PENDING" and (r.finished is None or r.finished<r.created)) for r in evidence.attempts)):
+            raise HTTPException(422,"Invalid preview evidence")
     response.headers["Cache-Control"] = "no-store"
     data=payload.model_dump()
+    if payload.preview_evidence is None:
+        data.pop("preview_evidence",None)
     if os.getenv("HOSTOPS_STATE_DIR"):
         try:
             task_store().save_snapshot(host,data,now=int(_wall_clock()))
