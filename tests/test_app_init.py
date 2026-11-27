@@ -112,6 +112,9 @@ def test_seeds_an_empty_git_repo_and_reuses_existing_main(tmp_path, monkeypatch)
                 assert (repo / "app" / f"{entry.name}.py").is_file(), entry.name
     assert (repo / "tests/test_hostops_gateway.py").is_file()
     assert (repo / "app/hostops_tasks.py").is_file()
+    assert (repo / "app/module_sdk.py").is_file()
+    assert (repo / "app_modules/registry.py").is_file()
+    assert (repo / "tests/test_module_sdk.py").is_file()
     assert (repo / "tests/test_hostops_tasks.py").is_file()
     generated_test = (repo / "tests/test_auth.py").read_text(encoding="utf-8")
     assert 'assert guide["scope"] == "application"' in generated_test

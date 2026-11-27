@@ -428,6 +428,10 @@ def version(response: Response):
 from .hostops import router as hostops_router
 app.include_router(hostops_router)
 
+from .module_sdk import mount_modules
+from app_modules.registry import MODULES
+mount_modules(app, MODULES)
+
 
 # HTML is never reusable across deployments; hashed assets keep normal caching.
 class FoundationStaticFiles(StaticFiles):
