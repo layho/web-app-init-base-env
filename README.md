@@ -4,7 +4,7 @@
 
 ## 版本与功能
 
-正式基线 V0.4.0；V0.5.0 集成候选见 [PR #196](https://github.com/layho/web-app-init-base-env/pull/196)。本候选文档不代表已发布或已安装宿主 runtime。实际运行版本以网页 SHA、GitHub 分支及独立回执为准。
+正式基线 V0.4.0；本分支版本标识 V0.5.0，集成候选见 [PR #196](https://github.com/layho/web-app-init-base-env/pull/196)。本候选文档不代表已发布或已安装宿主 runtime。实际运行版本以网页 SHA、GitHub 分支及独立回执为准。
 
 | 能力 | 使用方式 |
 |---|---|
