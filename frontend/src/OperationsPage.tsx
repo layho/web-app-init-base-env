@@ -11,7 +11,34 @@ export type ReleaseHistory = {
   deployments: Operation[]
   acceptance?: { enabled: boolean; state: 'unavailable' | 'not_requested' | 'queued' | 'published' | 'blocked' | 'unknown' | 'rejected'; attachments?: {id:string;url:string}[]; issue?: number | null; ready?: boolean; reason?: string; preview_sha?: string; main_sha?: string; is_published?: boolean }
 }
-export type SystemLogs = { events: Operation[] }
+type QueueJob = { id:string; state:string; head:string|null; base:string|null; created:number|null; expires:number|null }
+type QueueEvent = { seq:number; job:string; event:string; at:number|null }
+type QueueDiagnostics = { state:string; version:string|null; jobs:QueueJob[]; events:QueueEvent[]; truncated:boolean }
+export type SystemLogs = { events: Operation[]; integration?:QueueDiagnostics }
+
+const queueStateLabels:Record<string,string> = { QUEUED:'等待领取', CLAIMED:'已领取', PREPARED:'候选已准备', UNKNOWN:'结果未知 · 等待对账', INTEGRATED:'已集成', CANCELLED:'已取消' }
+const queueTime = (value:number|null) => value===null ? '未记录' : new Date(value*1000).toLocaleString()
+function IntegrationDiagnostics({ data }: {data?:QueueDiagnostics}) {
+  if (!data || data.state !== 'available') return <Card size="small" title="集成队列诊断"><Typography.Text type="secondary">{data?.state==='not_configured'?'尚未配置队列证据源':data?.state==='not_initialized'?'队列尚未初始化':'队列证据暂不可用'}</Typography.Text></Card>
+  return <Card size="small" title={'集成队列诊断 · '+data.version}>
+    <Space direction="vertical" size="middle" style={{width:'100%'}}>
+      {data.truncated && <Alert type="info" message="仅展示最近 100 条任务和事件" />}
+      <Table<QueueJob> size="small" rowKey="id" dataSource={data.jobs} pagination={{pageSize:5}} scroll={{x:650}} columns={[
+        {title:'任务',dataIndex:'id'},
+        {title:'状态',dataIndex:'state',render:(v:string)=><Tag color={v==='UNKNOWN'?'warning':v==='INTEGRATED'?'success':'default'}>{queueStateLabels[v]??v}</Tag>},
+        {title:'Head',dataIndex:'head',render:(v:string|null)=>v?.slice(0,8)??'未记录'},
+        {title:'Base',dataIndex:'base',render:(v:string|null)=>v?.slice(0,8)??'未记录'},
+        {title:'租约截止',dataIndex:'expires',render:queueTime}
+      ]} />
+      <Table<QueueEvent> size="small" rowKey="seq" dataSource={data.events} pagination={{pageSize:5}} scroll={{x:550}} columns={[
+        {title:'事件时间',dataIndex:'at',render:queueTime},
+        {title:'任务',dataIndex:'job'},
+        {title:'执行事件',dataIndex:'event'}
+      ]} />
+      <Typography.Text type="secondary">只读执行证据；候选准备完成不代表测试、合并或部署成功。</Typography.Text>
+    </Space>
+  </Card>
+}
 
 const labels: Record<string, string> = {
   host_test_case_failed: '宿主测试用例失败',
@@ -262,6 +289,7 @@ export function SystemLogPage({ data, loading, onRefresh }: RefreshProps & { dat
       {counts.map(([title,count]) => <Card key={title} size="small"><Typography.Text type="secondary">{title}</Typography.Text><Typography.Title level={3} style={{margin:'8px 0 0'}}>{data ? count : '未记录'}</Typography.Title></Card>)}
     </div>
     <Alert showIcon type="info" message="统计范围仅为接口返回的最近系统事件，不代表全量故障、实时服务健康或未解决阻塞数量。" />
+    <IntegrationDiagnostics data={data?.integration}/>
     <Card title="系统事件" extra={<Button onClick={onRefresh} loading={loading}>刷新</Button>}>
       <Space wrap style={{marginBottom:12}}>
         <Input.Search allowClear value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索事件、原因、SHA" style={{width:'min(260px,100%)'}} />

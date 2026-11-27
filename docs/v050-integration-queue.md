@@ -12,3 +12,7 @@ Fallback CI is triggered only when the repository owner explicitly adds the auth
 
 ## Candidate evidence
 The candidate_evidence module distinguishes commit identity, tree identity and verified ancestry. It rejects stale head/base/merge/tree, mismatched merge parents and stale test identity. Matching evidence is not a publication grant. The trusted coordinator still needs to fetch the actual Git metadata and independently authenticate the receipt before using these checks. No production integration or automatic merge is enabled by this module.
+
+
+## Read-only diagnostics
+The existing system-log API now includes bounded integration queue diagnostics for authenticated browser sessions. Configure APP_INTEGRATION_QUEUE_FILE only with an existing private ledger owned by the service user. The reader uses SQLite read-only mode and never creates a database or changes permissions. It returns no lease, file reservations, evidence IDs or arbitrary log content. Missing configuration, unavailable and uninitialized sources are distinct. This does not provision a production queue or grant the web process cross-user access; a separately protected export mechanism is still needed if the coordinator runs under a different UID.

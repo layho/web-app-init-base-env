@@ -384,9 +384,11 @@ def manual_merge_pr(req: ManualPRActionIn, request: Request, response: Response,
 
 
 @app.get("/api/v1/system-logs", dependencies=[Depends(authorize)])
-def system_logs(response: Response):
+def system_logs(request: Request, response: Response, db: Session = Depends(get_db)):
+    from . import integration_diagnostics
+    auth.authorize_session(request, db)
     response.headers["Cache-Control"] = "no-store"
-    return {"events": operations.recent_operations(operations.OPERATIONS_LOG)}
+    return {"events": operations.recent_operations(operations.OPERATIONS_LOG), "integration": integration_diagnostics.read_queue()}
 
 
 @app.get("/api/v1/deploy/status", dependencies=[Depends(authorize)])
