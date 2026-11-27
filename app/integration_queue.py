@@ -9,6 +9,9 @@ import re
 import secrets
 import sqlite3
 import time
+import os
+import stat
+from pathlib import Path
 
 
 class QueueConflict(ValueError):
@@ -41,7 +44,20 @@ def _overlap(a, b):
 
 class IntegrationQueue:
     def __init__(self, db_path):
-        self.db_path = db_path
+        path = Path(db_path)
+        if not path.is_absolute():
+            raise ValueError("absolute queue path required")
+        parent = path.parent.lstat()
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700:
+            raise ValueError("private queue directory required")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise ValueError("private queue file required")
+        finally:
+            os.close(fd)
+        self.db_path = path
         with self.transaction() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS integration_jobs(
                 id TEXT PRIMARY KEY, version TEXT NOT NULL, head TEXT NOT NULL,
@@ -104,6 +120,9 @@ class IntegrationQueue:
                 if tuple(old[k] for k in ("version","head","dependencies","files","priority"))!=spec:
                     raise QueueConflict("job specification changed; use a new job identity")
                 return False
+            for row in db.execute("SELECT id,files FROM integration_jobs WHERE version=? AND state NOT IN ('INTEGRATED','CANCELLED')",(version,)):
+                if any(_overlap(p,r) for p in paths for r in json.loads(row["files"])):
+                    raise QueueConflict("file reservation conflicts with "+row["id"])
             # Dependencies must already exist. This makes cycles impossible.
             for dep in deps:
                 row = db.execute("SELECT version,state FROM integration_jobs WHERE id=?",(dep,)).fetchone()
@@ -124,7 +143,7 @@ class IntegrationQueue:
                 db.execute("UPDATE integration_jobs SET state='UNKNOWN',lease=NULL,expires=NULL WHERE id=?",(row["id"],))
                 self._event(db,row["id"],"LEASE_EXPIRED",now)
             # UNKNOWN blocks the queue until an operator reconciles the real outcome.
-            if db.execute("SELECT 1 FROM integration_jobs WHERE version=? AND state IN ('CLAIMED','UNKNOWN')",(version,)).fetchone():
+            if db.execute("SELECT 1 FROM integration_jobs WHERE version=? AND state IN ('CLAIMED','UNKNOWN','PREPARED')",(version,)).fetchone():
                 return None
             rows = db.execute("SELECT * FROM integration_jobs WHERE version=? AND state='QUEUED' ORDER BY priority DESC,created,id",(version,)).fetchall()
             for row in rows:
@@ -155,6 +174,39 @@ class IntegrationQueue:
                 raise QueueConflict("diff exceeds reservation")
             db.execute("UPDATE integration_jobs SET state='PREPARED',lease=NULL,expires=NULL WHERE id=?",(job,))
             self._event(db,job,"PREPARED",now)
+
+    def retry_preparation(self, job, expected_head, expected_base, *, now=None):
+        """Only a trusted local coordinator may call after reconciling evidence.
+        PREPARED has no publication side effect; UNKNOWN is deliberately excluded.
+        """
+        _sha(expected_head); _sha(expected_base)
+        now=int(time.time()) if now is None else int(now)
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
+            if not row or row["state"]!="PREPARED" or row["head"]!=expected_head or row["base"]!=expected_base:
+                raise QueueConflict("prepared candidate changed")
+            db.execute("UPDATE integration_jobs SET state='QUEUED',base=NULL WHERE id=?",(job,))
+            self._event(db,job,"PREPARATION_RETRY",now)
+
+    def renew(self, job, lease, base, ttl=120, *, now=None):
+        _sha(base)
+        if type(ttl) is not int or not 15<=ttl<=900:
+            raise ValueError("invalid lease duration")
+        now=int(time.time()) if now is None else int(now)
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
+            if not row or row["state"]!="CLAIMED" or row["base"]!=base or not isinstance(lease,str) or not secrets.compare_digest(row["lease"],lease) or now>=row["expires"]:
+                raise QueueConflict("invalid or expired lease")
+            expires=max(row["expires"],now+ttl)
+            db.execute("UPDATE integration_jobs SET expires=? WHERE id=?",(expires,job))
+            self._event(db,job,"RENEWED",now)
+            return expires
+
+    def events(self, version, after=0):
+        if type(after) is not int or not 0<=after<=9223372036854775807:
+            raise ValueError("invalid cursor")
+        with self.transaction() as db:
+            return [dict(r) for r in db.execute("SELECT e.seq,e.job,e.event,e.at FROM integration_events e JOIN integration_jobs j ON j.id=e.job WHERE j.version=? AND e.seq>? ORDER BY e.seq LIMIT 100",(version,after))]
 
     def snapshot(self, version):
         with self.transaction() as db:

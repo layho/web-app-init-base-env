@@ -7,6 +7,7 @@ BASE="b"*40
 
 @pytest.fixture
 def queue(tmp_path):
+    tmp_path.chmod(0o700)
     q=IntegrationQueue(tmp_path/"queue.sqlite3")
     q.activate("0.5.0")
     return q
@@ -50,3 +51,37 @@ def test_reservation_and_exact_base(queue):
 def test_invalid_path(queue,path):
     with pytest.raises(ValueError):
         queue.register("one","0.5.0",HEAD,[],[path])
+
+def test_reservation_enforced_and_prepared_blocks(queue):
+    queue.register("one","0.5.0",HEAD,[],["app/core"])
+    with pytest.raises(QueueConflict):
+        queue.register("overlap","0.5.0",HEAD,[],["APP/core/sub.py"])
+    queue.register("other","0.5.0",HEAD,[],["app/other"])
+    c=queue.claim("0.5.0",BASE,now=100)
+    queue.finish(c["id"],c["lease"],BASE,c["files"],now=101)
+    assert queue.claim("0.5.0",BASE,now=102) is None
+    queue.retry_preparation(c["id"],HEAD,BASE,now=103)
+    assert queue.claim("0.5.0",BASE,now=104) is not None
+
+def test_renewal_and_audit(queue):
+    queue.register("one","0.5.0",HEAD,[],["app/core"])
+    c=queue.claim("0.5.0",BASE,ttl=15,now=100)
+    assert queue.renew("one",c["lease"],BASE,ttl=30,now=110)==140
+    with pytest.raises(QueueConflict):
+        queue.renew("one",c["lease"],BASE,now=140)
+    assert queue.claim("0.5.0",BASE,now=140) is None
+    events=queue.events("0.5.0")
+    assert [x["event"] for x in events]==["QUEUED","CLAIMED","RENEWED","LEASE_EXPIRED"]
+    assert queue.events("0.5.0",events[-1]["seq"])==[]
+
+def test_private_storage(tmp_path):
+    tmp_path.chmod(0o755)
+    with pytest.raises(ValueError):
+        IntegrationQueue(tmp_path/"queue.sqlite3")
+    tmp_path.chmod(0o700)
+    p=tmp_path/"target"
+    p.touch(mode=0o600)
+    link=tmp_path/"link"
+    link.symlink_to(p)
+    with pytest.raises(OSError):
+        IntegrationQueue(link)
