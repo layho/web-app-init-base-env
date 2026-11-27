@@ -6,6 +6,7 @@ the isolated routes. They do not enable production verification.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
@@ -19,12 +20,28 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
 from fastapi.testclient import TestClient
 
+from app.control_authz import AuthzError, AuthzService, Principal, PrincipalRegistry, ResourceBinding, authorize, trusted_source_for
+from app.control_authz.canonical import (
+    DOMAIN,
+    PAYLOAD_DOMAIN,
+    PROOF_DOMAIN,
+    PROOF_FIELDS,
+    UNIT,
+    candidate_id_for,
+    canonical_bytes,
+    canonical_query,
+    idempotency_digest,
+    parse_canonical,
+    proof_message,
+)
+from app.control_authz.service import READ_REPLAY_POLICY, WRITE_REPLAY_POLICY
 from app.control_identity.boundary import response_acceptable
 from app.control_identity.branch_evidence import observe, summarize
-from app.control_identity.canonical import DOMAIN, PROOF_FIELDS, candidate_id_for, canonical_bytes, parse_canonical, proof_message
+from app.control_identity.effects import DurableEffectProxy
 from app.control_identity.errors import ControlError
 from app.control_identity.service import ControlIdentityService
 from app.control_identity.proof import sign_request
+from app.control_authz.routes import route_path_for
 from app.control_routes_w02 import build_app
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,7 +76,7 @@ class World:
         self.private_raw = {}
         self.n = 0
 
-    def register(self, principal_id, kind, *, app_id="", scopes=None):
+    def register(self, principal_id, kind, *, app_id="", scopes=None, admin=False, task_ids=None):
         key = Ed25519PrivateKey.generate()
         public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
         key_id = principal_id + "-key"
@@ -71,6 +88,11 @@ class World:
             test_identity=True,
             app_id=app_id,
             scopes=scopes or [],
+            repo_id=REPO,
+            producer_id=principal_id,
+            stream_id=f"{principal_id}:task",
+            task_ids=task_ids or [TASK],
+            admin=admin,
         )
         self.keys[principal_id] = key
         self.key_ids[principal_id] = key_id
@@ -79,18 +101,61 @@ class World:
 
     def sign(self, principal_id, operation, **fields):
         self.n += 1
+        nonce = fields.pop("nonce", secrets.token_hex(16))
+        declared_id = fields.pop("declared_id", principal_id)
+        declared_kind = fields.pop("declared_kind", "test")
+        repo = fields.pop("repo_id", REPO)
+        task = fields.pop("task_id", TASK)
+        object_id = fields.pop("object_id", task)
+        phase = fields.pop("phase", "")
+        credential_scope = fields.pop("credential_scope", "")
+        app_id = fields.pop("app_id", "")
         body = {
-            "repo_id": REPO,
-            "task_id": TASK,
-            "object_id": fields.pop("object_id", TASK),
+            "operation": operation,
+            "authorizer": fields.pop("authorizer", principal_id),
+            "repo_id": repo,
+            "task_id": task,
+            "app_id": app_id,
+            "target_app_id": fields.pop("target_app_id", ""),
+            "producer_id": fields.pop("producer_id", ""),
+            "stream_id": fields.pop("stream_id", ""),
+            "object_id": object_id,
+            "phase": phase,
+            "action": fields.pop("action", ""),
+            "result": fields.pop("result", ""),
+            "candidate_id": fields.pop("candidate_id", ""),
+            "head": fields.pop("head", ""),
+            "base": fields.pop("base", ""),
+            "merge": fields.pop("merge", ""),
+            "tree": fields.pop("tree", ""),
             "policy_revision": fields.pop("policy_revision", 1),
-            "credential_scope": fields.pop("credential_scope", ""),
+            "credential_scope": credential_scope,
             "credential_generation": fields.pop("credential_generation", 1),
             "idempotency_key": fields.pop("idempotency_key", f"idem-w02-{self.n}"),
+            "expected_revision": fields.pop("expected_revision", 0),
+            "run_id": fields.pop("run_id", ""),
+            "lease_generation": fields.pop("lease_generation", 0),
+            "lease_token": fields.pop("lease_token", ""),
+            "session_id": fields.pop("session_id", ""),
+            "effect_id": fields.pop("effect_id", ""),
+            "requested_operation": fields.pop("requested_operation", ""),
+            "scope_to_rotate": fields.pop("scope_to_rotate", ""),
+            "target_signer": fields.pop("target_signer", ""),
+            "recovery": fields.pop("recovery", ""),
+            "release_version": fields.pop("release_version", "0.6.0" if operation.startswith("release.") else ""),
+            "method": fields.pop("method", "GET" if operation == "branch.read" else "POST"),
+            "query": fields.pop("query", ""),
+            "scope": {
+                "repo": repo,
+                "task_id": task,
+                "app_id": app_id,
+                "credential_scope": credential_scope,
+                "phase": phase,
+                "object_id": object_id,
+            },
         }
+        body["path"] = fields.pop("path", route_path_for(operation, body))
         body.update(fields)
-        declared_id = body.pop("declared_id", principal_id)
-        declared_kind = body.pop("declared_kind", "test")
         return sign_request(
             self.keys[principal_id],
             signer_id=principal_id,
@@ -102,37 +167,24 @@ class World:
             declared_proof_ref=f"test-proof://w02/{principal_id}",
             issued_at=self.clock.t,
             expires_at=self.clock.t + 500,
-            nonce=body.pop("nonce", secrets.token_hex(16)),
+            nonce=nonce,
         )
 
     def path(self, operation, body):
-        task_id = body.get("task_id", TASK)
-        run_id = body.get("run_id", "")
-        return {
-            "policy.evaluate": "/api/v1/control/policy:evaluate",
-            "run.claim": f"/api/v1/control/tasks/{task_id}:claim",
-            "run.renew": f"/api/v1/control/tasks/{task_id}:renew",
-            "run.start": f"/api/v1/control/runs/{run_id}:start",
-            "run.complete": f"/api/v1/control/runs/{run_id}:complete",
-            "run.release": f"/api/v1/control/runs/{run_id}:release",
-            "run.reconcile": f"/api/v1/control/runs/{run_id}:reconcile",
-            "proxy.authorize": "/api/v1/control/identity/proxy:authorize",
-            "proxy.rotate": "/api/v1/control/identity/proxy:rotate",
-            "ci.status.write": "/api/v1/control/ci:status",
-            "release.accept": "/api/v1/control/releases:accept",
-            "release.publish": "/api/v1/control/releases:publish",
-            "feedback.write": "/api/v1/control/feedback:write",
-            "pull.read": "/api/v1/control/pull:read",
-            "preview.merge": "/api/v1/control/preview:merge",
-            "diagnostic.read": "/api/v1/control/diagnostics:read",
-            "session.issue": "/api/v1/control/sessions:issue",
-            "session.revoke": "/api/v1/control/sessions:revoke",
-            "session.check": "/api/v1/control/sessions:check",
-            "limit.consume": "/api/v1/control/limits:consume",
-            "github.effect": "/api/v1/control/github-effects:submit",
-            "host.privilege": "/api/v1/control/host:privilege",
-            "signer.revoke": "/api/v1/control/identity/signers:revoke",
-        }[operation]
+        return route_path_for(operation, body)
+
+    def inject_gates(self, **overrides):
+        evidence = {
+            "macci_passed": True,
+            "same_repo": True,
+            "queue_allowed": True,
+            "no_conflict": True,
+            "frozen": False,
+            "candidate_exact": True,
+            "test_passed": True,
+        }
+        evidence.update(overrides)
+        self.svc.inject_gate_evidence(evidence)
 
     def post(self, operation, principal_id, **fields):
         body = self.sign(principal_id, operation, **fields)
@@ -168,35 +220,65 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         proof = body["proof"]
         self.assertEqual(len(proof["payload_hash"]), 64)
-        message = proof_message({name: proof[name] for name in PROOF_FIELDS})
+        message_fields = {}
+        for name in PROOF_FIELDS:
+            value = proof[name]
+            message_fields[name] = str(value)
+        message = proof_message(message_fields)
         parsed = parse_canonical(message)
-        self.assertEqual(parsed[0], ("domain", DOMAIN))
+        self.assertEqual(parsed[0], ("version", "v1"))
+        self.assertEqual(parsed[1], ("domain", DOMAIN))
+        self.assertEqual(DOMAIN, PROOF_DOMAIN)
         fields = dict(parsed)
         for name in PROOF_FIELDS:
             self.assertIn(name, fields)
         self.assertEqual(fields["payload_hash"], proof["payload_hash"])
+        self.assertIn("target_signer", body)
+        self.assertIn("lease_token", body)
+        self.assertIsInstance(body["scope"], dict)
+        vector = canonical_bytes(
+            [("payload_hash", "ab" * 32), ("signer_id", "signer-w00"), ("key_id", "key-w00"), ("issued_at", "1700000000")],
+            domain=PROOF_DOMAIN,
+        )
+        expected = UNIT.join(["v1", PROOF_DOMAIN, "payload_hash", "ab" * 32, "signer_id", "signer-w00", "key_id", "key-w00", "issued_at", "1700000000"]).encode()
+        self.assertEqual(vector, expected)
         self.assertNotEqual(
             parse_canonical(canonical_bytes([("a", "bc")], domain=DOMAIN)),
             parse_canonical(canonical_bytes([("ab", "c")], domain=DOMAIN)),
         )
-        other = proof_message({name: proof[name] for name in PROOF_FIELDS}, domain="other.domain")
-        swapped = dict(body)
-        swapped["proof"] = dict(proof)
+        self.assertNotEqual(
+            idempotency_digest(principal_id="a|b", kind="agent", repo_id="c", app_id="", producer_id="p", stream_id="s", task_id="t", credential_scope="", phase="", object_id="t", operation="op", idempotency_key="k", target_app_id=""),
+            idempotency_digest(principal_id="a", kind="agent", repo_id="b|c", app_id="", producer_id="p", stream_id="s", task_id="t", credential_scope="", phase="", object_id="t", operation="op", idempotency_key="k", target_app_id=""),
+        )
+        self.assertEqual("|".join(["a|b", "c", "op", "k"]), "|".join(["a", "b|c", "op", "k"]))
+        other = proof_message(message_fields, domain="other.domain")
+        swapped = json.loads(json.dumps(body))
         swapped["proof"]["signature"] = world.keys["agent-1"].sign(other).hex()
         rejected = world.client.post(world.path("feedback.write", swapped), json=swapped)
         self.assertEqual(rejected.status_code, 403)
         self.assertEqual(rejected.json()["reason"], "signature")
+        self.assertNotEqual(PAYLOAD_DOMAIN, PROOF_DOMAIN)
+        from app.control_authz.canonical import payload_values
+        secret_body = world.sign(
+            "agent-1", "run.complete", credential_scope="run", run_id="run_example",
+            lease_token="lease-secret-token-value", lease_generation=1, expected_revision=1, result="SUCCEEDED",
+        )
+        covered = canonical_bytes(payload_values("run.complete", secret_body), domain=PAYLOAD_DOMAIN)
+        self.assertNotIn(b"lease-secret-token-value", covered)
+        self.assertIn(b"lease_token", covered)
 
 
 class ProofTests(unittest.TestCase):
     def test_tamper_expiry_revocation_replay_and_tuple(self):
         world = standard_world()
         response, body = world.post(
-            "run.claim", "agent-1", run_id="run-proof", credential_scope="run", phase="develop"
+            "run.claim", "agent-1", credential_scope="run", phase="develop"
         )
         self.assertEqual(response.status_code, 200, response.text)
         token = response.json()["lease_token"]
+        run_id = response.json()["run_id"]
         self.assertTrue(token)
+        self.assertTrue(run_id.startswith("run_"))
         self.assertNotIn(token, world.svc.store.text())
         self.assertNotIn(world.private_raw["agent-1"], world.svc.store.text())
 
@@ -204,10 +286,10 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(replay.status_code, 403)
         self.assertEqual(replay.json()["reason"], "replay")
         self.assertNotIn(token, replay.text)
-        self.assertEqual(world.run("run-proof")["state"], "LEASED")
+        self.assertEqual(world.run(run_id)["state"], "LEASED")
 
         again, _ = world.post(
-            "run.claim", "agent-1", run_id="run-proof", credential_scope="run",
+            "run.claim", "agent-1", credential_scope="run",
             phase="develop", idempotency_key=body["idempotency_key"],
         )
         self.assertEqual(again.status_code, 200, again.text)
@@ -217,16 +299,17 @@ class ProofTests(unittest.TestCase):
         self.assertNotIn("lease_token", again.json()["original_result"])
 
         mismatched, _ = world.post(
-            "run.claim", "agent-1", run_id="run-proof", credential_scope="run",
-            phase="review", idempotency_key=body["idempotency_key"],
+            "run.claim", "agent-1", credential_scope="run",
+            phase="develop", action="other", idempotency_key=body["idempotency_key"],
         )
         self.assertEqual(mismatched.status_code, 409)
         self.assertEqual(mismatched.json()["code"], "IDEMPOTENCY_PAYLOAD_MISMATCH")
-        self.assertEqual(world.run("run-proof")["generation"], 1)
+        self.assertEqual(world.run(run_id)["generation"], 1)
 
         for name in ("nonce", "payload_hash", "signature", "expires_at", "scope", "operation"):
             forged = json.loads(json.dumps(body))
-            forged["proof"][name] = forged["proof"][name][:-1] + ("0" if forged["proof"][name][-1] != "0" else "1")
+            current = str(forged["proof"][name])
+            forged["proof"][name] = current[:-1] + ("0" if current[-1] != "0" else "1")
             outcome = world.client.post(world.path("run.claim", forged), json=forged)
             self.assertEqual(outcome.status_code, 403, name)
             self.assertIn(outcome.json()["code"], {"PROOF_INVALID", "PROOF_EXPIRED", "SCHEMA_UNSUPPORTED"})
@@ -234,6 +317,7 @@ class ProofTests(unittest.TestCase):
 
         shifted = json.loads(json.dumps(body))
         shifted["phase"] = "review"
+        shifted["scope"]["phase"] = "review"
         outcome = world.client.post(world.path("run.claim", shifted), json=shifted)
         self.assertEqual(outcome.json()["reason"], "payload_hash")
 
@@ -349,14 +433,15 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(crossed.json()["reason"], "cross_scope")
         before = dict(world.svc.store.read()["idempotency"])
         merge, _ = world.post(
-            "preview.merge", "host-1", credential_scope="feedback", credential_generation=1, gates=GATES,
+            "preview.merge", "host-1", credential_scope="feedback", credential_generation=1,
         )
         self.assertEqual(merge.json()["reason"], "cross_scope")
         self.assertEqual(world.svc.store.read()["idempotency"], before)
         self.assertEqual(world.svc.store.read()["merges"], [])
 
+        world.inject_gates()
         good, _ = world.post(
-            "preview.merge", "host-1", credential_scope="merge", credential_generation=1, gates=GATES,
+            "preview.merge", "host-1", credential_scope="merge", credential_generation=1,
         )
         self.assertEqual(good.status_code, 200, good.text)
         self.assertFalse(good.json()["production_enabled"])
@@ -373,7 +458,7 @@ class ProxyTests(unittest.TestCase):
         swapped, _ = world.post("pull.read", "host-1", credential_scope="feedback", credential_generation=2)
         self.assertEqual(swapped.json()["reason"], "cross_scope")
         still_merge, _ = world.post(
-            "preview.merge", "host-1", credential_scope="merge", credential_generation=1, gates=GATES,
+            "preview.merge", "host-1", credential_scope="merge", credential_generation=1,
             idempotency_key="idem-merge-again",
         )
         self.assertEqual(still_merge.status_code, 200, still_merge.text)
@@ -410,127 +495,139 @@ class ProxyTests(unittest.TestCase):
 
 
 class LeaseTests(unittest.TestCase):
-    def _lease(self, world, run_id="run-lease"):
-        response, body = world.post("run.claim", "agent-1", run_id=run_id, credential_scope="run")
+    def _lease(self, world):
+        response, body = world.post("run.claim", "agent-1", credential_scope="run")
         self.assertEqual(response.status_code, 200, response.text)
-        return response.json()["lease_token"], body
+        payload = response.json()
+        self.assertEqual(payload["attempt"], 1)
+        self.assertEqual(payload["revision"], 1)
+        return payload["lease_token"], payload["run_id"], body
 
     def test_stale_generation_does_not_change_the_newer_run(self):
         world = standard_world()
-        token, _ = self._lease(world)
+        token, run_id, _ = self._lease(world)
         renewed, _ = world.post(
-            "run.renew", "agent-1", run_id="run-lease", credential_scope="run",
-            lease_token=token, lease_generation=1,
+            "run.renew", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=token, lease_generation=1, expected_revision=1,
         )
         self.assertEqual(renewed.status_code, 200, renewed.text)
         current = renewed.json()["lease_token"]
         self.assertNotEqual(current, token)
         self.assertEqual(renewed.json()["lease_generation"], 2)
+        self.assertEqual(renewed.json()["revision"], 2)
         started, _ = world.post(
-            "run.start", "agent-1", run_id="run-lease", credential_scope="run",
-            lease_token=current, lease_generation=2,
+            "run.start", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=current, lease_generation=2, expected_revision=2,
         )
         self.assertEqual(started.json()["state"], "RUNNING")
-        before = world.run("run-lease")
+        self.assertEqual(started.json()["revision"], 3)
+        before = world.run(run_id)
         stale, _ = world.post(
-            "run.complete", "agent-1", run_id="run-lease", credential_scope="run",
-            lease_token=token, lease_generation=1, result="SUCCEEDED",
+            "run.complete", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=token, lease_generation=1, result="SUCCEEDED", expected_revision=3,
         )
         self.assertEqual(stale.json()["code"], "LEASE_FENCE_REJECTED")
         self.assertFalse(stale.json()["changed"])
         self.assertEqual(stale.json()["state"], "RUNNING")
-        after = world.run("run-lease")
+        after = world.run(run_id)
         self.assertEqual(after["state"], before["state"])
         self.assertEqual(after["generation"], 2)
+        self.assertEqual(after["revision"], before["revision"])
         self.assertEqual(after["token_hash"], before["token_hash"])
         self.assertNotEqual(after["state"], "UNKNOWN")
         done, _ = world.post(
-            "run.complete", "agent-1", run_id="run-lease", credential_scope="run",
-            lease_token=current, lease_generation=2, result="SUCCEEDED",
+            "run.complete", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=current, lease_generation=2, result="SUCCEEDED", expected_revision=3,
         )
         self.assertEqual(done.status_code, 200, done.text)
-        bare = world.sign(
-            "agent-1", "run.complete", run_id="run-other", credential_scope="run",
-            lease_generation=1, result="SUCCEEDED",
+        self.assertEqual(world.run(run_id)["task_id"], TASK)
+        nxt, _ = world.post("run.claim", "agent-1", credential_scope="run")
+        self.assertEqual(nxt.status_code, 200, nxt.text)
+        bare, _ = world.post(
+            "run.complete", "agent-1", run_id=nxt.json()["run_id"], credential_scope="run",
+            lease_token="1", lease_generation=1, result="SUCCEEDED", expected_revision=1,
         )
-        world.post("run.claim", "agent-1", run_id="run-other", credential_scope="run")
-        bare["lease_token"] = "1"
-        bare["run_id"] = "run-other"
-        rejected = world.client.post(world.path("run.complete", bare), json=bare)
-        self.assertEqual(rejected.json()["code"], "LEASE_FENCE_REJECTED")
+        self.assertEqual(bare.json()["code"], "LEASE_FENCE_REJECTED")
 
     def test_timeout_does_not_reclaim_or_mark_unknown_without_the_proxy(self):
         world = standard_world()
-        token, _ = self._lease(world, "run-timeout")
-        world.post("run.start", "agent-1", run_id="run-timeout", credential_scope="run", lease_token=token, lease_generation=1)
+        token, run_id, _ = self._lease(world)
+        world.post(
+            "run.start", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=token, lease_generation=1, expected_revision=1,
+        )
         world.clock.t += 60
         expired, _ = world.post(
-            "run.complete", "agent-1", run_id="run-timeout", credential_scope="run",
-            lease_token=token, lease_generation=1, result="SUCCEEDED",
+            "run.complete", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=token, lease_generation=1, result="SUCCEEDED", expected_revision=2,
         )
         self.assertEqual(expired.json()["code"], "LEASE_FENCE_REJECTED")
         self.assertEqual(expired.json()["reason"], "expired")
-        self.assertEqual(world.run("run-timeout")["state"], "RUNNING")
-        reclaim, _ = world.post(
-            "run.claim", "agent-1", run_id="run-timeout", credential_scope="run", recovery="timeout",
-        )
+        self.assertEqual(world.run(run_id)["state"], "RUNNING")
+        self.assertEqual(world.run(run_id)["revision"], 2)
+        reclaim, _ = world.post("run.claim", "agent-1", credential_scope="run", recovery="timeout")
         self.assertEqual(reclaim.json()["code"], "RECLAIM_DENIED")
-        self.assertEqual(world.run("run-timeout")["state"], "RUNNING")
-        client, _ = world.post(
-            "run.reconcile", "agent-1", run_id="run-timeout", credential_scope="run", actor_role="trusted_proxy",
-        )
+        self.assertEqual(world.run(run_id)["state"], "RUNNING")
+        client, _ = world.post("run.reconcile", "agent-1", run_id=run_id, credential_scope="run")
         self.assertEqual(client.json()["reason"], "client_cannot_fence")
-        self.assertEqual(world.run("run-timeout")["state"], "RUNNING")
+        self.assertEqual(world.run(run_id)["state"], "RUNNING")
         with self.assertRaises(ControlError):
-            world.svc.trusted_fence("run-timeout", fenced=False, effect_known=False)
+            world.svc.trusted_fence(run_id, fenced=False, effect_known=False)
         with self.assertRaises(ControlError):
-            world.svc.trusted_fence("run-timeout", fenced=True, effect_known=True)
-        self.assertEqual(world.run("run-timeout")["state"], "RUNNING")
-        fenced = world.svc.trusted_fence("run-timeout", fenced=True, effect_known=False)
+            world.svc.trusted_fence(run_id, fenced=True, effect_known=True)
+        self.assertEqual(world.run(run_id)["state"], "RUNNING")
+        fenced = world.svc.trusted_fence(run_id, fenced=True, effect_known=False)
         self.assertEqual(fenced["state"], "UNKNOWN")
-        again, _ = world.post("run.claim", "agent-1", run_id="run-timeout", credential_scope="run", recovery="timeout")
-        self.assertEqual(again.json()["code"], "RECLAIM_DENIED")
-        self.assertEqual(world.run("run-timeout")["state"], "UNKNOWN")
+        self.assertFalse(fenced["github_fencing"])
+        bypass, _ = world.post("run.claim", "agent-1", credential_scope="run")
+        self.assertEqual(bypass.json()["code"], "RECLAIM_DENIED")
+        self.assertEqual(bypass.json()["reason"], "unknown_unreconciled")
+        self.assertEqual(world.run(run_id)["state"], "UNKNOWN")
         with self.assertRaises(ControlError):
-            world.svc.trusted_classify("run-timeout", fenced=False, classification="succeeded")
-        self.assertEqual(world.run("run-timeout")["state"], "UNKNOWN")
-        classified = world.svc.trusted_classify("run-timeout", fenced=True, classification="succeeded")
+            world.svc.trusted_classify(run_id, fenced=False, classification="succeeded")
+        self.assertEqual(world.run(run_id)["state"], "UNKNOWN")
+        classified = world.svc.trusted_classify(run_id, fenced=True, classification="succeeded")
         self.assertEqual(classified["state"], "SUCCEEDED")
-        fresh, _ = world.post("run.claim", "agent-1", run_id="run-timeout-2", credential_scope="run")
+        fresh, _ = world.post("run.claim", "agent-1", credential_scope="run")
         self.assertEqual(fresh.status_code, 200, fresh.text)
+        self.assertNotEqual(fresh.json()["run_id"], run_id)
+        self.assertEqual(fresh.json()["attempt"], 2)
         self.assertTrue(fresh.json()["lease_token"])
 
     def test_github_effects_are_serial_and_a_stale_generation_does_not_apply(self):
         world = standard_world()
-        token, _ = self._lease(world, "run-effect")
+        token, run_id, _ = self._lease(world)
         renewed, _ = world.post(
-            "run.renew", "agent-1", run_id="run-effect", credential_scope="run",
-            lease_token=token, lease_generation=1,
+            "run.renew", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=token, lease_generation=1, expected_revision=1,
         )
         current = renewed.json()["lease_token"]
-        world.post("run.start", "agent-1", run_id="run-effect", credential_scope="run", lease_token=current, lease_generation=2)
+        world.post(
+            "run.start", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=current, lease_generation=2, expected_revision=2,
+        )
         stale, _ = world.post(
-            "github.effect", "agent-1", run_id="run-effect", credential_scope="run",
-            lease_token=token, lease_generation=1, effect_id="effect-old",
+            "github.effect", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=token, lease_generation=1, effect_id="effect-old", expected_revision=3,
         )
         self.assertEqual(stale.json()["code"], "LEASE_FENCE_REJECTED")
         self.assertEqual(world.svc.store.read()["effects"], [])
-        self.assertEqual(world.run("run-effect")["generation"], 2)
+        self.assertEqual(world.run(run_id)["generation"], 2)
         world.svc.effect_hold = lambda: time.sleep(0.05)
         first = world.sign(
-            "agent-1", "github.effect", run_id="run-effect", credential_scope="run",
-            lease_token=current, lease_generation=2, effect_id="effect-a",
+            "agent-1", "github.effect", run_id=run_id, credential_scope="run",
+            lease_token=current, lease_generation=2, effect_id="effect-a", expected_revision=3,
         )
         second = world.sign(
-            "agent-1", "github.effect", run_id="run-effect", credential_scope="run",
-            lease_token=current, lease_generation=2, effect_id="effect-b",
+            "agent-1", "github.effect", run_id=run_id, credential_scope="run",
+            lease_token=current, lease_generation=2, effect_id="effect-b", expected_revision=3,
         )
         errors = []
 
         def submit(body):
             try:
                 world.svc.execute("github.effect", body, route_class="isolated")
-            except Exception as exc:  # pragma: no cover - surfaced below
+            except Exception as exc:
                 errors.append(exc)
 
         threads = [threading.Thread(target=submit, args=(body,)) for body in (first, second)]
@@ -538,11 +635,26 @@ class LeaseTests(unittest.TestCase):
             thread.start()
         for thread in threads:
             thread.join()
-        self.assertEqual(errors, [])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].reason, "revision")
         parallel = sorted((span for span in world.svc.effects.spans if span[0] in {"effect-a", "effect-b"}), key=lambda item: item[1])
         self.assertEqual(len(parallel), 2)
         self.assertLessEqual(parallel[0][2], parallel[1][1] + 0.001)
-        self.assertEqual({item["id"] for item in world.svc.store.read()["effects"]}, {"effect-a", "effect-b"})
+        stored = {item["id"] for item in world.svc.store.read()["effects"]}
+        self.assertEqual(len(stored), 1)
+        follow, _ = world.post(
+            "github.effect", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=current, lease_generation=2, effect_id="effect-c",
+            expected_revision=world.run(run_id)["revision"],
+        )
+        self.assertEqual(follow.status_code, 200, follow.text)
+        self.assertFalse(follow.json()["github_fencing"])
+        self.assertEqual(
+            {item["id"] for item in world.svc.store.read()["effects"]},
+            stored | {"effect-c"},
+        )
+        self.assertFalse(DurableEffectProxy.SIMULATES_GITHUB_FENCING)
+        self.assertIn("GitHub fencing", DurableEffectProxy.FENCING_NOTICE)
 
 
 class PolicyAndAuthzTests(unittest.TestCase):
@@ -577,8 +689,10 @@ class PolicyAndAuthzTests(unittest.TestCase):
         self.assertEqual(privilege.json()["code"], "POLICY_DENIED")
         self.assertEqual(privilege.json()["scope_class"], "high_risk")
         self.assertEqual(world.svc.store.read()["policy"]["high_risk_allow"], [])
-        allowed, _ = world.post("preview.merge", "host-1", credential_scope="merge", credential_generation=1, gates=GATES)
+        world.inject_gates()
+        allowed, _ = world.post("preview.merge", "host-1", credential_scope="merge", credential_generation=1)
         self.assertEqual(allowed.status_code, 200, allowed.text)
+        world.svc.clear_gate_evidence()
         missing, _ = world.post("preview.merge", "host-1", credential_scope="merge", credential_generation=1)
         self.assertEqual(missing.json()["code"], "POLICY_DENIED")
         self.assertEqual(missing.json()["scope_class"], "ordinary")
@@ -607,21 +721,25 @@ class DurableAndBoundaryTests(unittest.TestCase):
     def test_rate_limit_and_session_revocation_survive_restart(self):
         world = standard_world()
         for _ in range(3):
-            response, _ = world.post("limit.consume", "agent-1", limit_key="login")
+            response, _ = world.post("limit.consume", "agent-1")
             self.assertEqual(response.status_code, 200, response.text)
-        limited, _ = world.post("limit.consume", "agent-1", limit_key="login")
+        limited, _ = world.post("limit.consume", "agent-1")
         self.assertEqual(limited.status_code, 429)
         self.assertEqual(limited.json()["code"], "RATE_LIMITED")
         self.assertIn("script-src", limited.headers["content-security-policy"])
         world.reopen()
-        still, _ = world.post("limit.consume", "agent-1", limit_key="login")
+        still, _ = world.post("limit.consume", "agent-1")
         self.assertEqual(still.status_code, 429)
-        self.assertGreaterEqual(world.svc.store.read()["limits"]["login"]["count"], 4)
+        buckets = world.svc.store.read()["limits"]
+        self.assertEqual(len(buckets), 1)
+        self.assertGreaterEqual(next(iter(buckets.values()))["count"], 4)
+        self.assertNotIn("login", buckets)
 
         issued, _ = world.post("session.issue", "agent-1")
         raw = issued.json()["session_id"]
         self.assertNotIn(raw, world.svc.store.text())
-        revoked, _ = world.post("session.revoke", "host-1", session_id=raw)
+        world.register("host-admin", "host", scopes=["pull", "merge", "publish"], admin=True)
+        revoked, _ = world.post("session.revoke", "host-admin", session_id=raw)
         self.assertEqual(revoked.status_code, 200, revoked.text)
         world.reopen()
         checked, _ = world.post("session.check", "agent-1", session_id=raw)
@@ -650,9 +768,24 @@ class DurableAndBoundaryTests(unittest.TestCase):
         self.assertFalse(response_acceptable("script-src 'self'", "github_pat_example", https=False, hsts=""))
 
         https = TestClient(build_app(world.svc, route_class="isolated"), base_url="https://isolated.example")
-        secure = https.get("/api/v1/control/branch-protection?overall=proven")
+        anonymous = https.get("/api/v1/control/branch-protection?overall=proven")
+        self.assertEqual(anonymous.status_code, 401)
+        self.assertEqual(anonymous.json()["reason"], "unauthenticated")
+        self.assertNotIn("overall", anonymous.json())
+        query = "overall=proven"
+        signed = world.sign(
+            "host-1", "branch.read", method="GET", query=canonical_query(query), credential_scope="",
+        )
+        secure = https.get(
+            "/api/v1/control/branch-protection?" + query,
+            headers={"x-control-proof": base64.b64encode(json.dumps(signed).encode()).decode()},
+        )
+        self.assertEqual(secure.status_code, 200, secure.text)
         self.assertEqual(secure.json()["overall"], "unproven")
         self.assertFalse(secure.json()["rules_modified"])
+        self.assertEqual(secure.json()["evidence_source"], "server_readonly_observation")
+        self.assertEqual(secure.json()["permission"], "branch.read")
+        self.assertFalse(secure.json()["client_query_is_evidence"])
         self.assertIn("script-src", secure.headers["content-security-policy"])
         self.assertIn("max-age", secure.headers["strict-transport-security"])
         self.assertTrue(response_acceptable(
@@ -701,9 +834,244 @@ class ProductionBoundaryTests(unittest.TestCase):
         auth = (ROOT / "app" / "auth.py").read_text(encoding="utf-8")
         self.assertNotIn("control_routes_w02", main)
         self.assertNotIn("control_identity", main)
+        self.assertNotIn("control_authz", main)
         self.assertIn("pbkdf2_sha256", auth)
         self.assertIn("csrf", auth.lower())
         self.assertIn("script-src", (ROOT / "app" / "control_identity" / "boundary.py").read_text(encoding="utf-8"))
+
+
+def effect_proxy_worker(root, effect_id, delay):
+    import time as time_module
+
+    from app.control_identity.effects import DurableEffectProxy
+
+    proxy = DurableEffectProxy(root)
+    proxy.check(effect_id, lambda: None, hold=lambda: time_module.sleep(delay))
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    def test_unsigned_fields_and_secret_digest_are_rejected(self):
+        world = standard_world()
+        response, body = world.post(
+            "signer.revoke", "host-1", target_signer="agent-2",
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(response.json()["reason"], "admin")
+        self.assertNotIn("agent-2", world.svc.store.read()["revoked_signers"])
+        world.register("host-admin", "host", admin=True)
+        allowed, signed = world.post("signer.revoke", "host-admin", target_signer="agent-2")
+        self.assertEqual(allowed.status_code, 200, allowed.text)
+        self.assertIn("agent-2", world.svc.store.read()["revoked_signers"])
+        before_nonces = dict(world.svc.store.read()["nonces"])
+        empty, _ = world.post("feedback.write", "agent-1", credential_scope="feedback", credential_generation=1, authorizer="")
+        self.assertEqual(empty.status_code, 403)
+        self.assertEqual(empty.json()["reason"], "empty_authorizer")
+        self.assertEqual(world.svc.store.read()["nonces"], before_nonces)
+        tampered = json.loads(json.dumps(signed))
+        tampered["target_signer"] = "agent-1"
+        rejected = world.client.post(world.path("signer.revoke", tampered), json=tampered)
+        self.assertEqual(rejected.json()["reason"], "payload_hash")
+        self.assertNotIn("agent-1", world.svc.store.read()["revoked_signers"])
+        gated = json.loads(json.dumps(signed))
+        gated["gates"] = {"frozen": False}
+        gated["idempotency_key"] = "idem-gates"
+        unsigned = world.client.post(world.path("signer.revoke", gated), json=gated)
+        self.assertEqual(unsigned.status_code, 422)
+        self.assertEqual(unsigned.json()["reason"], "canonical")
+
+    def test_rejected_requests_do_not_pollute_and_reads_do_not_consume_nonces(self):
+        world = standard_world()
+        before = world.svc.store.text()
+        denied, body = world.post("feedback.write", "host-1", credential_scope="feedback", credential_generation=1)
+        self.assertEqual(denied.json()["reason"], "role")
+        self.assertEqual(world.svc.store.text(), before)
+        self.assertEqual(world.svc.store.read()["nonces"], {})
+        first, signed = world.post("diagnostic.read", "service-a", credential_scope="read", credential_generation=1, target_app_id="app-a")
+        second = world.client.post(world.path("diagnostic.read", signed), json=signed)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(world.svc.store.read()["nonces"], {})
+        self.assertEqual(first.json()["read_replay_policy"], READ_REPLAY_POLICY)
+        cross, _ = world.post(
+            "diagnostic.read", "agent-1", credential_scope="read", credential_generation=1,
+            task_id="task-other", target_app_id="",
+        )
+        self.assertEqual(cross.json()["reason"], "cross_task")
+        self.assertEqual(world.svc.store.read()["nonces"], {})
+        other_repo, _ = world.post(
+            "diagnostic.read", "service-a", credential_scope="read", credential_generation=1,
+            repo_id="other/repo", target_app_id="app-a",
+        )
+        self.assertEqual(other_repo.json()["reason"], "cross_repo")
+
+    def test_recheck_sees_revocation_before_the_side_effect(self):
+        world = standard_world()
+        before = world.svc.store.text()
+
+        def revoke(state):
+            state["revoked_signers"].append("agent-1")
+
+        world.svc.transaction_probe = revoke
+        denied, _ = world.post("feedback.write", "agent-1", credential_scope="feedback", credential_generation=1)
+        self.assertEqual(denied.json()["code"], "PROOF_REVOKED")
+        self.assertEqual(world.svc.store.text(), before)
+        world.svc.transaction_probe = None
+
+    def test_server_rate_limit_and_session_owner(self):
+        world = standard_world()
+        issued, _ = world.post("session.issue", "agent-1")
+        raw = issued.json()["session_id"]
+        foreign, _ = world.post("session.check", "agent-2", session_id=raw)
+        self.assertEqual(foreign.json()["reason"], "session_owner")
+        outsider, _ = world.post("session.revoke", "host-1", session_id=raw)
+        self.assertEqual(outsider.json()["reason"], "session_owner")
+        still, _ = world.post("session.check", "agent-1", session_id=raw)
+        self.assertEqual(still.status_code, 200, still.text)
+        for _ in range(3):
+            self.assertEqual(world.post("limit.consume", "agent-2")[0].status_code, 200)
+        self.assertEqual(world.post("limit.consume", "agent-1")[0].status_code, 200)
+
+    def test_store_fails_closed_and_effects_do_not_overlap_across_processes(self):
+        import multiprocessing
+
+        world = standard_world()
+        world.svc.store.path.write_text("{", encoding="utf-8")
+        with self.assertRaises(ControlError) as raised:
+            world.svc.store.read()
+        self.assertEqual(raised.exception.reason, "store_corrupt")
+        self.assertEqual(world.svc.store.path.read_text(encoding="utf-8"), "{")
+
+        scratch = Path(tempfile.mkdtemp())
+        fresh = ControlIdentityService(scratch / "private-store", isolated=True, clock=world.clock)
+        mode = fresh.store.root.stat().st_mode
+        self.assertEqual(mode & 0o077, 0)
+        os.chmod(fresh.store.root, 0o755)
+        with self.assertRaises(ControlError) as raised:
+            fresh.store.read()
+        self.assertEqual(raised.exception.reason, "store_permissions")
+
+        linked = ControlIdentityService(scratch / "link-store", isolated=True, clock=world.clock)
+        linked.store.path.write_text(linked.store.text() or "{}", encoding="utf-8")
+        target = scratch / "secret-target.json"
+        target.write_text('{"secret":"github_pat_shouldnotfollow"}', encoding="utf-8")
+        linked.store.path.unlink()
+        linked.store.path.symlink_to(target)
+        with self.assertRaises(ControlError) as raised:
+            linked.store.read()
+        self.assertEqual(raised.exception.reason, "store_symlink")
+
+        from app.control_identity.durable import write_all
+
+        kept = ControlIdentityService(scratch / "kept-store", isolated=True, clock=world.clock)
+
+        def mutate(state):
+            state["published"].append("kept")
+            return state, None
+
+        kept.store.update(mutate)
+        original = kept.store.path.read_bytes()
+        real_write = os.write
+
+        def fail_write(fd, data):
+            return 0
+
+        os.write = fail_write
+        try:
+            with self.assertRaises(ControlError) as raised:
+                kept.store.update(mutate)
+            self.assertEqual(raised.exception.reason, "short_write")
+        finally:
+            os.write = real_write
+        self.assertEqual(kept.store.path.read_bytes(), original)
+
+        parts = []
+
+        def partial(buf):
+            if not parts:
+                parts.append(True)
+                return 1
+            return len(buf)
+
+        write_all(partial, b"abcd")
+
+        proxy_root = scratch / "proxy-root"
+        proxy_root.mkdir()
+        ctx = multiprocessing.get_context("spawn")
+        first = ctx.Process(target=effect_proxy_worker, args=(str(proxy_root), "proc-a", 0.2))
+        second = ctx.Process(target=effect_proxy_worker, args=(str(proxy_root), "proc-b", 0.2))
+        first.start()
+        second.start()
+        first.join(5)
+        second.join(5)
+        self.assertEqual(first.exitcode, 0)
+        self.assertEqual(second.exitcode, 0)
+        journal = json.loads((proxy_root / "effect-journal.json").read_text(encoding="utf-8"))
+        finished = [row for row in journal if row["phase"] == "finished"]
+        self.assertEqual(len(finished), 2)
+        finished.sort(key=lambda row: row["start"])
+        self.assertLessEqual(finished[0]["end"], finished[1]["start"])
+        self.assertTrue(all(row["github_fencing"] is False for row in journal))
+
+    def test_heartbeat_and_versioned_release_paths(self):
+        world = standard_world()
+        missing = world.client.post("/api/v1/control/releases:accept", json={"schema_version": 2})
+        self.assertEqual(missing.status_code, 404)
+        claimed, _ = world.post("run.claim", "agent-1", credential_scope="run")
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        claimed_body = claimed.json()
+        started, _ = world.post(
+            "run.start", "agent-1", run_id=claimed_body["run_id"], credential_scope="run",
+            lease_token=claimed_body["lease_token"], lease_generation=1, expected_revision=1,
+        )
+        self.assertEqual(started.json()["state"], "RUNNING")
+        world.clock.t += 10
+        beat, _ = world.post(
+            "run.heartbeat", "agent-1", run_id=claimed_body["run_id"], credential_scope="run",
+            lease_token=claimed_body["lease_token"], lease_generation=1, expected_revision=started.json()["revision"],
+        )
+        self.assertEqual(beat.status_code, 200, beat.text)
+        self.assertEqual(beat.json()["state"], "RUNNING")
+        self.assertEqual(beat.json()["lease_generation"], 1)
+        self.assertGreater(world.run(claimed_body["run_id"])["expires_at"], world.clock.t)
+        self.assertEqual(world.run(claimed_body["run_id"])["run_id"], claimed_body["run_id"])
+        candidate = world.svc.register_candidate(repo=REPO, task=TASK, head=HEAD, base=BASE, merge=MERGE, tree=TREE)
+        rejected, _ = world.post(
+            "release.reject", "accept-1", release_version="0.6.0", credential_scope="accept",
+            candidate_id=candidate, head=HEAD, base=BASE, merge=MERGE, tree=TREE, object_id=candidate,
+        )
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertEqual(world.svc.store.read()["acceptances"][candidate]["outcome"], "rejected")
+
+    def test_shared_authz_api_is_server_configured(self):
+        with self.assertRaises(AuthzError):
+            AuthzService(registry={"actor": "test"}, isolated=True, policy_revision=1)
+        registry = PrincipalRegistry(isolated=True)
+        service = AuthzService(registry=registry, isolated=True, policy_revision=1)
+        self.assertTrue(service.registry.test_identities_enabled)
+        closed = PrincipalRegistry(isolated=False)
+        self.assertFalse(closed.test_identities_enabled)
+        principal = Principal(
+            principal_id="agent-1", kind="agent", repo_id=REPO, app_id="", producer_id="agent-1",
+            stream_id="agent-1:task", scopes=("task:" + TASK, "feedback"), trusted_source="agent",
+        )
+        self.assertEqual(trusted_source_for(principal), "agent")
+        lied = Principal(
+            principal_id="agent-1", kind="agent", repo_id=REPO, app_id="", producer_id="agent-1",
+            stream_id="agent-1:task", scopes=("task:" + TASK,), trusted_source="policy_service",
+        )
+        with self.assertRaises(AuthzError):
+            trusted_source_for(lied)
+        with self.assertRaises(AuthzError):
+            authorize(principal, "shell.exec", ResourceBinding(
+                repo_id=REPO, app_id="", producer_id="agent-1", stream_id="agent-1:task",
+                operation="shell.exec", scope="", task_id=TASK, target_app_id="",
+            ))
+        self.assertIs(READ_REPLAY_POLICY, world_policy())
+        self.assertIn("nonce", WRITE_REPLAY_POLICY)
+
+
+def world_policy():
+    return READ_REPLAY_POLICY
 
 
 if __name__ == "__main__":

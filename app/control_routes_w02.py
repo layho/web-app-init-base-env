@@ -9,8 +9,12 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
+import base64
+import json
+
+from app.control_authz.canonical import canonical_query
+
 from .control_identity.boundary import CSP, HSTS, redact
-from .control_identity.branch_evidence import summarize
 from .control_identity.errors import ControlError
 from .control_identity.service import ControlIdentityService
 
@@ -28,11 +32,14 @@ def _schema(detail: str) -> JSONResponse:
     )
 
 
-async def _invoke(request: Request, operation: str, match: dict | None = None) -> JSONResponse:
-    try:
-        body = await request.json()
-    except Exception:
-        return _schema("invalid json")
+async def _invoke(request: Request, operation: str, match: dict | None = None, document: dict | None = None) -> JSONResponse:
+    if document is None:
+        try:
+            body = await request.json()
+        except Exception:
+            return _schema("invalid json")
+    else:
+        body = document
     if not isinstance(body, dict):
         return _schema("json object required")
     for key, value in (match or {}).items():
@@ -83,10 +90,30 @@ def build_app(service: ControlIdentityService, *, route_class: str = "isolated")
 
 
 @router.get("/api/v1/control/branch-protection")
-def branch_protection():
-    report = summarize([])
-    report.update({"schema_version": 2, "http": 200, "side_effect": False, "overall": "unproven", "rules_modified": False})
-    return report
+async def branch_protection(request: Request):
+    encoded = request.headers.get("x-control-proof")
+    if not encoded:
+        return JSONResponse(
+            {
+                "schema_version": 2,
+                "http": 401,
+                "code": "NOT_AUTHORIZED",
+                "detail": "authentication required",
+                "reason": "unauthenticated",
+                "side_effect": False,
+                "evidence_source": "server_readonly_observation",
+                "permission": "branch.read",
+            },
+            status_code=401,
+        )
+    try:
+        document = json.loads(base64.b64decode(encoded, validate=True))
+        query = canonical_query(request.url.query)
+    except Exception:
+        return _schema("branch protection proof rejected")
+    if not isinstance(document, dict) or document.get("query") != query or document.get("method") != "GET":
+        return _schema("branch protection proof rejected")
+    return await _invoke(request, "branch.read", document=document)
 
 
 @router.post("/api/v1/control/policy:evaluate")
@@ -119,6 +146,11 @@ async def release(run_id: str, request: Request):
     return await _invoke(request, "run.release", {"run_id": run_id})
 
 
+@router.post("/api/v1/control/runs/{run_id}:heartbeat")
+async def heartbeat(run_id: str, request: Request):
+    return await _invoke(request, "run.heartbeat", {"run_id": run_id})
+
+
 @router.post("/api/v1/control/runs/{run_id}:reconcile")
 async def reconcile(run_id: str, request: Request):
     return await _invoke(request, "run.reconcile", {"run_id": run_id})
@@ -139,14 +171,19 @@ async def ci_status(request: Request):
     return await _invoke(request, "ci.status.write")
 
 
-@router.post("/api/v1/control/releases:accept")
-async def accept(request: Request):
-    return await _invoke(request, "release.accept")
+@router.post("/api/v1/control/releases/{version}:accept")
+async def accept(version: str, request: Request):
+    return await _invoke(request, "release.accept", {"release_version": version})
 
 
-@router.post("/api/v1/control/releases:publish")
-async def publish(request: Request):
-    return await _invoke(request, "release.publish")
+@router.post("/api/v1/control/releases/{version}:reject")
+async def reject(version: str, request: Request):
+    return await _invoke(request, "release.reject", {"release_version": version})
+
+
+@router.post("/api/v1/control/releases/{version}:publish")
+async def publish(version: str, request: Request):
+    return await _invoke(request, "release.publish", {"release_version": version})
 
 
 @router.post("/api/v1/control/feedback:write")

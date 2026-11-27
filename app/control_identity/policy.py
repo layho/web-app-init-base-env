@@ -1,4 +1,9 @@
-"""Pre-authorization policy stored outside any candidate checkout."""
+"""Pre-authorization policy stored outside any candidate checkout.
+
+Gate evidence is server-injected. A missing flag denies. ``frozen`` must be
+present and false; a missing freeze flag does not mean the candidate is
+unfrozen. Unknown actions are denied. Production verification stays off.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ HIGH_RISK = frozenset({
     "path.expand",
     "policy.change",
 })
-ORDINARY_GATES = ("macci_passed", "same_repo", "queue_allowed", "no_conflict")
+EVIDENCE_FLAGS = ("macci_passed", "same_repo", "queue_allowed", "no_conflict", "candidate_exact", "test_passed")
 
 
 class Decision:
@@ -25,28 +30,38 @@ class Decision:
         self.scope_class = scope_class
 
 
-def _gates_ok(body: dict) -> bool:
-    gates = body.get("gates")
-    if not isinstance(gates, dict):
+def evidence_allows(policy: dict) -> bool:
+    evidence = policy.get("evidence") if isinstance(policy, dict) else None
+    if not isinstance(evidence, dict):
         return False
-    if gates.get("frozen") is True:
+    if "frozen" not in evidence or "policy_revision" not in evidence:
         return False
-    return all(gates.get(name) is True for name in ORDINARY_GATES)
+    if evidence.get("policy_revision") != policy.get("revision"):
+        return False
+    if evidence.get("frozen") is not False:
+        return False
+    return all(evidence.get(name) is True for name in EVIDENCE_FLAGS)
 
 
-def decide(principal: dict, operation: str, body: dict, policy: dict) -> Decision:
+def decide(principal, operation: str, body: dict, policy: dict) -> Decision:
+    from app.control_authz.authorize import MATRIX
+
     action = body.get("action") if operation == "policy.evaluate" else operation
-    action = str(action or "")
-    if principal["kind"] == "candidate" and action == "release.publish":
+    if not isinstance(action, str) or action == "":
+        return Decision(False, "POLICY_DENIED", "unknown_action")
+    kind = principal.kind
+    if kind == "candidate" and action == "release.publish":
         return Decision(False, "POLICY_DENIED", "denied")
     if action in HIGH_RISK:
         allowed = set(policy.get("high_risk_allow") or [])
         if action not in allowed:
             return Decision(False, "POLICY_DENIED", "high_risk")
         return Decision(True, None, "high_risk")
+    if action not in MATRIX:
+        return Decision(False, "POLICY_DENIED", "unknown_action")
     if action == "preview.merge":
         ordinary = set(policy.get("ordinary_allow") or [])
-        if action not in ordinary or principal["kind"] != "host" or not _gates_ok(body):
+        if action not in ordinary or kind != "host" or not evidence_allows(policy):
             return Decision(False, "POLICY_DENIED", "ordinary")
         return Decision(True, None, "ordinary")
     if action == "release.publish":
