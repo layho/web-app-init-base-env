@@ -10,7 +10,7 @@ HEAD, BASE, MERGE = 'a'*40, 'b'*40, 'c'*40
 REPO = 'layho/web-app-init-base-env'
 
 def pr():
-    return {'state': 'open', 'author_association': 'OWNER', 'number': 14, 'head': {'repo': {'full_name': REPO}, 'sha': HEAD}, 'base': {'ref': 'preview', 'sha': BASE}}
+    return {'state': 'open', 'draft': False, 'author_association': 'OWNER', 'number': 14, 'head': {'repo': {'full_name': REPO}, 'sha': HEAD}, 'base': {'ref': 'preview', 'sha': BASE}}
 
 class RunnerTests(unittest.TestCase):
     def test_allowlist(self):
@@ -22,6 +22,16 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(runner.eligible(REPO, candidate))
         candidate = pr(); candidate['base']['ref'] = 'main'
         self.assertFalse(runner.eligible(REPO, candidate))
+
+    def test_draft_requires_targeted_operator_request(self):
+        ready = pr()
+        self.assertTrue(runner.test_requested(ready))
+        draft = {**ready, "draft": True}
+        self.assertFalse(runner.test_requested(draft))
+        self.assertTrue(runner.test_requested(draft, explicit=True))
+        self.assertFalse(runner.test_requested({**ready, "draft": None}, explicit=True))
+        self.assertFalse(runner.test_requested({**ready, "draft": "false"}))
+        self.assertFalse(runner.test_requested(draft, explicit=1))
 
     def test_merge_identity(self):
         self.assertEqual(MERGE, runner.verify_parents(f'{MERGE} {BASE} {HEAD}', HEAD, BASE))
