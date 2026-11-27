@@ -118,3 +118,24 @@ def read_attempts(config=None):
             return {"state":"available","attempts":attempts,"truncated":len(rows)>100}
     except (OSError,ValueError,TypeError,sqlite3.Error):
         return dict(empty,state="unavailable")
+
+
+def preview_evidence():
+    """Prefer explicitly configured local ledger; otherwise authenticated heartbeat."""
+    if os.getenv("APP_PREVIEW_JOURNAL_FILE"):
+        return dict(read_attempts(),source="local")
+    empty={"state":"not_configured","attempts":[],"truncated":False,"source":"hostops"}
+    from . import hostops
+    from fastapi import HTTPException
+    try:
+        host,_=hostops.settings()
+        age,snapshot=hostops.host_evidence(host)
+    except (HTTPException,OSError,ValueError,sqlite3.Error):
+        return empty
+    if not snapshot or snapshot.get("preview_evidence") is None:
+        return empty
+    if age is None or age>90 or age<0:
+        return dict(empty,state="stale",age_seconds=age)
+    evidence=snapshot["preview_evidence"]
+    # Gateway validated the bounded report on receipt; never use it for authorization.
+    return dict(evidence,source="hostops",age_seconds=age)

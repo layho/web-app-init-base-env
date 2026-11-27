@@ -42,3 +42,6 @@ A stale PREPARED reservation can be re-prepared at a freshly verified base when 
 
 
 The managed coordinator now independently checks a retained PREPARED PR against GitHub. A closed, explicitly unmerged PR can release its exact reservation without touching a remote branch. Any pending push, missing identity, merged PR, Draft or amended candidate remains protected. The cancellation event is visible in the existing diagnostics.
+
+
+Optional cross-process evidence transport reuses the authenticated HostOps heartbeat. After the gateway is updated, a trusted local operator may enable HOSTOPS_PREVIEW_EVIDENCE=true on the reviewed agent; the agent reads only its fixed private MacCI journal, optionally selecting the managed ledger with MACCI_MANAGED_QUEUE=1. Reports are bounded to 20 records, gateway-validated, persisted through existing snapshot storage and suppressed as stale after 90 seconds. No new command, token, file path input or release authority is exposed. Update gateway before enabling the new agent field; older gateways reject extra fields. This path does not grant access across OS users; agent must already own the journal. No live activation is implied.

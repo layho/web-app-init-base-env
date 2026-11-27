@@ -388,7 +388,7 @@ def system_logs(request: Request, response: Response, db: Session = Depends(get_
     from . import integration_diagnostics
     auth.authorize_session(request, db)
     response.headers["Cache-Control"] = "no-store"
-    return {"events": operations.recent_operations(operations.OPERATIONS_LOG), "integration": integration_diagnostics.read_queue(), "preview_attempts": integration_diagnostics.read_attempts()}
+    return {"events": operations.recent_operations(operations.OPERATIONS_LOG), "integration": integration_diagnostics.read_queue(), "preview_attempts": integration_diagnostics.preview_evidence()}
 
 
 @app.get("/api/v1/deploy/status", dependencies=[Depends(authorize)])

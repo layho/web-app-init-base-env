@@ -15,7 +15,7 @@ type QueueJob = { id:string; state:string; head:string|null; base:string|null; c
 type QueueEvent = { seq:number; job:string; event:string; at:number|null }
 type QueueDiagnostics = { state:string; version:string|null; jobs:QueueJob[]; events:QueueEvent[]; truncated:boolean }
 type PreviewAttempt = {seq:number;pr:number;head:string;base:string;candidate:string;state:'PENDING'|'INTEGRATED'|'REJECTED';created:number;finished:number|null}
-type PreviewAttempts = {state:string;attempts:PreviewAttempt[];truncated:boolean}
+type PreviewAttempts = {state:string;attempts:PreviewAttempt[];truncated:boolean;source?:string;age_seconds?:number}
 export type SystemLogs = { events: Operation[]; integration?:QueueDiagnostics; preview_attempts?:PreviewAttempts }
 
 const attemptLabels = {PENDING:'待对账',INTEGRATED:'已确认集成',REJECTED:'明确拒绝'}
@@ -25,9 +25,10 @@ function PreviewAttemptDiagnostics({data}:{data?:PreviewAttempts}) {
   const records=data?.attempts??[]
   const pending=records.filter(r=>r.state==='PENDING').length
   return <Card size="small" title="宿主合并执行回执" extra={<Select size="small" value={state} onChange={setState} options={[{value:'all',label:'全部状态'},...Object.entries(attemptLabels).map(([value,label])=>({value,label}))]} />}>
-    {data?.state!=='available'?<Typography.Text type="secondary">{data?.state==='not_configured'?'尚未配置宿主回执来源':'宿主回执暂不可用'}</Typography.Text>:<Space direction="vertical" style={{width:'100%'}}>
+    {data?.state!=='available'?<Typography.Text type="secondary">{data?.state==='not_configured'?'尚未配置宿主回执来源':data?.state==='stale'?'宿主回执已过期，等待新心跳':'宿主回执暂不可用'}</Typography.Text>:<Space direction="vertical" style={{width:'100%'}}>
       {pending>0&&<Alert type="warning" showIcon message="存在未确认合并结果，等待宿主对账；不得直接重复推送。" />}
-      {data.truncated&&<Typography.Text type="secondary">仅展示最近100次执行</Typography.Text>}
+      <Typography.Text type="secondary">来源：{data.source==='hostops'?'认证宿主心跳':'本机只读记录'}{data.age_seconds!==undefined?` · ${data.age_seconds}秒前`:''}</Typography.Text>
+      {data.truncated&&<Typography.Text type="secondary">仅展示最近有限条执行记录</Typography.Text>}
       <Table<PreviewAttempt> size="small" rowKey="seq" dataSource={records.filter(r=>state==='all'||r.state===state)} pagination={{pageSize:5}} scroll={{x:650}} columns={[
         {title:'PR',dataIndex:'pr',render:(v:number)=>'#'+v},
         {title:'状态',dataIndex:'state',render:(v:PreviewAttempt['state'])=><Tag color={v==='PENDING'?'warning':v==='INTEGRATED'?'success':'error'}>{attemptLabels[v]}</Tag>},

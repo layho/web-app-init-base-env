@@ -71,3 +71,16 @@ def test_invalid_host_receipt_never_reports_success(tmp_path):
     with sqlite3.connect(p) as db:
         db.execute("UPDATE preview_attempts SET state='INTEGRATED'")
     assert read_attempts(str(p))["state"]=="unavailable"
+
+
+def test_authenticated_heartbeat_fallback_is_fresh_only(monkeypatch):
+    from app import integration_diagnostics as diag, hostops
+    monkeypatch.delenv("APP_PREVIEW_JOURNAL_FILE",raising=False)
+    monkeypatch.setattr(hostops,"settings",lambda:("host","secret"))
+    evidence={"state":"available","attempts":[],"truncated":False}
+    monkeypatch.setattr(hostops,"host_evidence",lambda host:(10,{"preview_evidence":evidence}))
+    assert diag.preview_evidence()["source"]=="hostops"
+    assert diag.preview_evidence()["state"]=="available"
+    monkeypatch.setattr(hostops,"host_evidence",lambda host:(91,{"preview_evidence":evidence}))
+    assert diag.preview_evidence()["state"]=="stale"
+    assert diag.preview_evidence()["attempts"]==[]
