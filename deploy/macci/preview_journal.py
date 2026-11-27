@@ -214,6 +214,25 @@ class PreviewJournal:
             self._finish_reservation(db,row["pr"],row["head"],row["base"])
             return True
 
+    def prepared(self):
+        """Read the single prepared reservation, without any credentials."""
+        with self.tx() as db:
+            rows=db.execute("SELECT id,head,base FROM integration_jobs WHERE state='PREPARED'").fetchall()
+            if len(rows)>1:
+                raise ValueError("multiple prepared reservations")
+            return dict(rows[0]) if rows else None
+
+    def cancel_prepared(self,job,head,base):
+        """Cancel only a proven obsolete pre-push reservation under host lock."""
+        _sha(head); _sha(base)
+        with self.tx() as db:
+            if db.execute("SELECT 1 FROM preview_attempts WHERE state='PENDING'").fetchone():
+                return False
+            changed=db.execute("UPDATE integration_jobs SET state='CANCELLED',lease=NULL,expires=NULL WHERE id=? AND head=? AND base=? AND state='PREPARED'",(job,head,base)).rowcount
+            if changed:
+                db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,"CANCELLED",int(time.time())))
+            return changed==1
+
     def pending(self):
         with self.tx() as db:
             return db.execute("SELECT 1 FROM preview_attempts WHERE state='PENDING'").fetchone() is not None

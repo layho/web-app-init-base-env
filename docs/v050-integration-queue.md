@@ -39,3 +39,6 @@ Host preview push receipts are independently readable through the authenticated 
 
 
 A stale PREPARED reservation can be re-prepared at a freshly verified base when no pending push exists. Known pre-push reservation conflicts defer that candidate rather than starving all following PRs; a pending remote push still blocks the entire coordinator. Missing Draft metadata fails closed. Tests cover the stale-base transition and pending distinction.
+
+
+The managed coordinator now independently checks a retained PREPARED PR against GitHub. A closed, explicitly unmerged PR can release its exact reservation without touching a remote branch. Any pending push, missing identity, merged PR, Draft or amended candidate remains protected. The cancellation event is visible in the existing diagnostics.

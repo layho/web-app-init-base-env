@@ -538,6 +538,16 @@ def main():
                 if not journal.reconcile(lambda: api(token, "/branches/preview")["commit"]["sha"]):
                     print("Preview coordinator blocked: unresolved integration journal", flush=True)
                     return 1
+            if managed_queue and journal is not None:
+                prepared=journal.prepared()
+                if prepared is not None:
+                    # Only a closed PR can be automatically cancelled here.
+                    # An amended or Draft PR retains its reservation for review.
+                    match=re.fullmatch(r"pr-([1-9][0-9]*)",prepared["id"])
+                    if match:
+                        current=api(token,"/pulls/"+match.group(1))
+                        if current.get("number")==int(match.group(1)) and current.get("state")=="closed" and current.get("merged") is False:
+                            journal.cancel_prepared(prepared["id"],prepared["head"],prepared["base"])
             prs = all_pages(token, "/pulls?state=open&base=preview&sort=created&direction=asc")
             for pr in prs:
                 number = pr.get("number")

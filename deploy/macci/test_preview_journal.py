@@ -76,3 +76,24 @@ class RejectionTests(unittest.TestCase):
         for output in ("fatal: connection reset","!\t"+C+":refs/heads/main\t[rejected] (fetch first)","!\t"+C+":refs/heads/preview\t[remote failure] (failed to report status)"):
             self.assertFalse(definitive_push_rejection(error(output)))
         self.assertFalse(definitive_push_rejection(subprocess.TimeoutExpired(["git"],90)))
+
+
+class PreparedCancellationTests(unittest.TestCase):
+    def test_closed_candidate_releases_prepared_reservation_only(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as root:
+            path=Path(root)/"ledger.sqlite3"
+            journal=PreviewJournal(path)
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE integration_jobs(id TEXT PRIMARY KEY,head TEXT,base TEXT,state TEXT,lease TEXT,expires INTEGER)")
+                db.execute("CREATE TABLE integration_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,job TEXT,event TEXT,at INTEGER)")
+                db.execute("INSERT INTO integration_jobs VALUES('pr-196',?,?,'PREPARED',NULL,NULL)",(H,B))
+            self.assertEqual(journal.prepared(),{"id":"pr-196","head":H,"base":B})
+            self.assertFalse(journal.cancel_prepared("pr-196",H,C))
+            journal.prepare(197,H,B,C)
+            self.assertFalse(journal.cancel_prepared("pr-196",H,B))
+            self.assertTrue(journal.pending())
+            with sqlite3.connect(path) as db:
+                db.execute("DELETE FROM preview_attempts")
+            self.assertTrue(journal.cancel_prepared("pr-196",H,B))
+            self.assertIsNone(journal.prepared())
