@@ -83,12 +83,18 @@ class IntegrationQueue:
                 raise
 
     @staticmethod
+    def _require_no_pending_push(db):
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='preview_attempts'").fetchone() and db.execute("SELECT 1 FROM preview_attempts WHERE state='PENDING'").fetchone():
+            raise QueueConflict("host push reconciliation owns the pending reservation")
+
+    @staticmethod
     def _event(db, job, event, now):
         db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,event,now))
 
     def activate(self, version):
         _id(version)
         with self.transaction() as db:
+            self._require_no_pending_push(db)
             row = db.execute("SELECT version FROM integration_version WHERE singleton=1").fetchone()
             if row and row["version"] != version:
                 if db.execute("SELECT 1 FROM integration_jobs WHERE version=? AND state NOT IN ('INTEGRATED','CANCELLED') LIMIT 1",(row["version"],)).fetchone():
@@ -182,6 +188,7 @@ class IntegrationQueue:
         _sha(expected_head); _sha(expected_base)
         now=int(time.time()) if now is None else int(now)
         with self.transaction() as db:
+            self._require_no_pending_push(db)
             row=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
             if not row or row["state"]!="PREPARED" or row["head"]!=expected_head or row["base"]!=expected_base:
                 raise QueueConflict("prepared candidate changed")
@@ -218,6 +225,7 @@ class IntegrationQueue:
         _sha(expected_head); _sha(expected_base); _id(evidence_id)
         now=int(time.time()) if now is None else int(now)
         with self.transaction() as db:
+            self._require_no_pending_push(db)
             row=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
             if not row or row["state"]!="UNKNOWN" or row["head"]!=expected_head or row["base"]!=expected_base:
                 raise QueueConflict("unknown candidate changed")
@@ -234,6 +242,7 @@ class IntegrationQueue:
         _sha(expected_head); _sha(expected_base); _sha(candidate)
         now=int(time.time()) if now is None else int(now)
         with self.transaction() as db:
+            self._require_no_pending_push(db)
             row=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
             if not row or row["state"] not in ("PREPARED","UNKNOWN") or row["head"]!=expected_head or row["base"]!=expected_base:
                 raise QueueConflict("candidate state changed")

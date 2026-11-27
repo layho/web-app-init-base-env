@@ -75,9 +75,7 @@ def validate_dependencies(dependencies):
             raise ValueError("module dependency version mismatch")
 
 
-@lru_cache(maxsize=100)
-def _module_session_factory(module_id):
-    """Separate explicit PostgreSQL credentials; never fall back to Core."""
+def _module_database_url(module_id):
     from .db import DATABASE_URL
     table_name(module_id,"items")
     key="APP_MODULE_"+module_id.upper()+"_DATABASE_URL"
@@ -89,11 +87,24 @@ def _module_session_factory(module_id):
         core=make_url(DATABASE_URL)
         if url.get_backend_name()!="postgresql" or not url.username or not url.password or not url.database:
             raise ValueError("invalid module database")
-        # Separate role is mandatory even when using a separate database.
-        # PostgreSQL ACL provisioning is external; URL comparison is not
-        # itself proof of role privilege isolation.
         if url.username==core.username:
             raise ValueError("module database role must differ from Core")
+        # Different registered modules must not reuse an identical role name.
+        # Conservative even across different PostgreSQL servers.
+        for other,value in os.environ.items():
+            if other!=key and re.fullmatch(r"APP_MODULE_[A-Z][A-Z0-9_]{1,39}_DATABASE_URL",other) and value:
+                if make_url(value).username==url.username:
+                    raise ValueError("module database role must be unique")
+        return url
+    except Exception:
+        raise ValueError("invalid module database configuration") from None
+
+
+@lru_cache(maxsize=100)
+def _module_session_factory(module_id):
+    """Separate explicit PostgreSQL credentials; never fall back to Core."""
+    url=_module_database_url(module_id)
+    try:
         engine=create_engine(url,pool_pre_ping=True,hide_parameters=True)
     except Exception:
         raise ValueError("invalid module database configuration") from None

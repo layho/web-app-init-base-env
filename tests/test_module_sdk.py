@@ -86,3 +86,14 @@ def test_module_database_requires_explicit_distinct_role(monkeypatch):
     assert sdk._module_session_factory("notes")=="module-session"
     assert calls[0].username=="notes"
     sdk._module_session_factory.cache_clear()
+
+
+def test_module_database_roles_cannot_be_shared(monkeypatch):
+    from app import module_sdk as sdk, db
+    monkeypatch.setattr(db,"DATABASE_URL","postgresql://core:secret@localhost/core")
+    monkeypatch.setenv("APP_MODULE_NOTES_DATABASE_URL","postgresql://shared:secret@localhost/notes")
+    monkeypatch.setenv("APP_MODULE_ORDERS_DATABASE_URL","postgresql://shared:other@localhost/orders")
+    with pytest.raises(ValueError,match="invalid module database"):
+        sdk._module_database_url("notes")
+    monkeypatch.setenv("APP_MODULE_ORDERS_DATABASE_URL","postgresql://orders:other@localhost/orders")
+    assert sdk._module_database_url("notes").username=="shared"

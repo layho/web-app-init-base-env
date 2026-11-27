@@ -146,3 +146,19 @@ def test_actual_preview_journal_consumes_reservation_atomically(queue):
     assert journal.reconcile(lambda:"c"*40)
     assert queue.snapshot("0.5.0")[0]["state"]=="INTEGRATED"
     assert journal.history()[0]["state"]=="INTEGRATED"
+
+def test_pending_host_push_blocks_generic_queue_mutations(tmp_path):
+    import sqlite3
+    from app.integration_queue import IntegrationQueue, QueueConflict
+    import pytest
+    tmp_path.chmod(0o700)
+    path=tmp_path/"queue.sqlite3"
+    q=IntegrationQueue(path)
+    q.activate("0.5.0")
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE preview_attempts(state TEXT)")
+        db.execute("INSERT INTO preview_attempts VALUES('PENDING')")
+    with pytest.raises(QueueConflict,match="host push"):
+        q.activate("0.6.0")
+    with pytest.raises(QueueConflict,match="host push"):
+        q.record_integrated("pr-196","a"*40,"b"*40,candidate="c"*40,verify=lambda *args:True)
