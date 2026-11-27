@@ -62,3 +62,12 @@ bash deploy/base-preview.sh --verify
 ## 开发与发布规范
 
 遵守 [版本驱动开发规范](docs/VERSION_DEVELOPMENT.md) 与 [当前版本计划](docs/RELEASE_PLAN.md)。
+
+部署配置 `.env` 和基座验收站的 `.base-preview.env` 必须是运行用户拥有的普通文件，权限为 `600` 或 `400`。旧安装使用更宽权限时，更新前用 `chmod 600` 收紧对应的本机配置文件。
+
+Python 依赖以 `requirements-runtime.in` 和 `requirements-dev.in` 声明。`requirements-runtime.txt` 用于只运行服务的环境，`requirements.txt` 另外包含部署前和 MacCI 回归用的测试依赖。两份锁均包含发行包哈希。更新依赖声明后重新生成两份锁：
+
+```bash
+uv pip compile --universal --python-version 3.10 --generate-hashes requirements-runtime.in -o requirements-runtime.txt
+uv pip compile --universal --python-version 3.10 --generate-hashes requirements-dev.in -c requirements-runtime.txt -o requirements.txt
+```
