@@ -238,3 +238,30 @@ def test_github_retry_is_bounded_and_never_replays_writes(monkeypatch, code, dat
     assert len(sleeps) == expected - 1
     if expected == 3:
         assert "已尝试 3 次" in str(exc.value)
+
+
+@pytest.mark.parametrize("failure", ["network", "invalid_json"])
+@pytest.mark.parametrize("data", [None, {"mutation": "example"}])
+def test_transport_retry_is_bounded_and_never_replays_post(monkeypatch, failure, data):
+    from io import BytesIO
+    from urllib.error import URLError
+    calls, sleeps = [], []
+    monkeypatch.setattr(acceptance, "github_token", lambda: "test-only")
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(request)
+            if len(calls) == 1:
+                if failure == "network":
+                    raise URLError("private transport detail")
+                return BytesIO(b"not-json")
+            return BytesIO(b'{"ok":true}')
+    monkeypatch.setattr(acceptance, "build_opener", lambda *a: Opener())
+    monkeypatch.setattr(acceptance.time, "sleep", sleeps.append)
+    if data is None:
+        assert acceptance.github("/repos/owner/repo/issues") == {"ok": True}
+        assert len(calls) == 2 and sleeps == [0.5]
+    else:
+        with pytest.raises(acceptance.AcceptanceError, match="GH-REST-NETWORK") as error:
+            acceptance.github("/repos/owner/repo/issues", data)
+        assert "private transport detail" not in str(error.value)
+        assert len(calls) == 1 and sleeps == []

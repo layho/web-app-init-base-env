@@ -104,7 +104,13 @@ def github(path, data=None):
                 reason += "；已尝试 " + str(attempt + 1) + " 次"
             raise AcceptanceError(reason) from None
         except (URLError, OSError, ValueError):
-            raise AcceptanceError("GH-REST-NETWORK：GitHub 请求失败或回执无效") from None
+            if attempt < len(delays):
+                time.sleep(delays[attempt])
+                continue
+            reason = "GH-REST-NETWORK：GitHub 请求失败或回执无效"
+            if delays:
+                reason += "；已尝试 " + str(attempt + 1) + " 次"
+            raise AcceptanceError(reason) from None
 
 def api(path, data=None):
     return github(f"/repos/{REPO}{path}", data)

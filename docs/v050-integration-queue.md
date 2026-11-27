@@ -16,3 +16,7 @@ The candidate_evidence module distinguishes commit identity, tree identity and v
 
 ## Read-only diagnostics
 The existing system-log API now includes bounded integration queue diagnostics for authenticated browser sessions. Configure APP_INTEGRATION_QUEUE_FILE only with an existing private ledger owned by the service user. The reader uses SQLite read-only mode and never creates a database or changes permissions. It returns no lease, file reservations, evidence IDs or arbitrary log content. Missing configuration, unavailable and uninitialized sources are distinct. This does not provision a production queue or grant the web process cross-user access; a separately protected export mechanism is still needed if the coordinator runs under a different UID.
+
+
+## GitHub transport recovery
+Read-only REST requests retry transient network and invalid-response errors with the same bounded delay as transient HTTP 5xx. POST is never replayed. Successful full Issue/PR collection replaces stale endpoint errors and records the observation time; failed collection retains the prior combined snapshot. Diagnostic probes record individual check times. No credential or raw transport error is exposed.
