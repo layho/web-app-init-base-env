@@ -510,9 +510,9 @@ def coordinate(repository, legacy_base=None, create_pr=False, *, expected_target
         decisions = planner.plan(before, after, current)
         seeds = planner.module_seed_snapshot(new_dir)
         observed_modes = {}
-        for entry in git(app, "ls-tree", "-rz", app_sha).split(b"\\0"):
+        for entry in git(app, "ls-tree", "-rz", app_sha).split(b"\0"):
             if entry:
-                fields, raw = entry.split(b"\\t", 1)
+                fields, raw = entry.split(b"\t", 1)
                 observed_modes[raw.decode("utf-8", "strict")] = fields.decode("ascii").split()[0]
         decisions.extend(planner.module_seed_decisions(seeds, observed_modes))
         inventory = verify_upgrade_inventory(app, app_sha, target_sha, before, after, decisions)
