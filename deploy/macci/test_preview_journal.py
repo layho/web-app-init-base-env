@@ -27,3 +27,26 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(journal.history()[0]["state"],"PENDING")
             journal.confirm(196,H,B,C,C)
             self.assertEqual(journal.history()[0]["state"],"INTEGRATED")
+
+
+class ManagedStageTests(unittest.TestCase):
+    def test_stage_registers_and_prepares_in_one_transaction(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as root:
+            path=Path(root)/"ledger.sqlite3"
+            journal=PreviewJournal(path)
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE integration_version(singleton INTEGER PRIMARY KEY,version TEXT)")
+                db.execute("INSERT INTO integration_version VALUES(1,'0.5.0')")
+                db.execute("CREATE TABLE integration_jobs(id TEXT PRIMARY KEY,version TEXT,head TEXT,dependencies TEXT,files TEXT,priority INTEGER,state TEXT,base TEXT,lease TEXT,expires INTEGER,created INTEGER)")
+                db.execute("CREATE TABLE integration_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,job TEXT,event TEXT,at INTEGER)")
+            self.assertEqual(journal.stage(196,H,B,["app/core.py"]),"pr-196")
+            self.assertEqual(journal.stage(196,H,B,["app/core.py"]),"pr-196")
+            with self.assertRaises(ValueError):
+                journal.stage(197,H,B,["app/other.py"])
+            journal.prepare(196,H,B,C,changed_files=["app/core.py"])
+            self.assertFalse(journal.reconcile(lambda:B))
+            self.assertTrue(journal.reconcile(lambda:C))
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("SELECT state FROM integration_jobs").fetchone()[0],"INTEGRATED")
+                self.assertEqual([r[0] for r in db.execute("SELECT event FROM integration_events ORDER BY seq")],["QUEUED","PREPARED","PUSH_STARTED","INTEGRATED"])

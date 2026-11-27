@@ -53,6 +53,69 @@ class PreviewJournal:
                 db.rollback()
                 raise
 
+    def stage(self,number,head,base,changed_files):
+        """Atomically register and prepare the already verified candidate.
+
+        Called under the host coordinator lock after all original gates.
+        Never alters existing reservations or bypasses outstanding work.
+        """
+        import json
+        if type(number) is not int or number<=0:
+            raise ValueError("invalid PR")
+        _sha(head); _sha(base)
+        if not isinstance(changed_files,list) or not 1<=len(changed_files)<=1000:
+            raise ValueError("invalid changed paths")
+        paths=[]
+        for path in changed_files:
+            if (not isinstance(path,str) or not path or len(path)>512 or chr(92) in path
+                    or any(ord(c)<32 for c in path) or any(p in ("",".","..") for p in path.split("/"))):
+                raise ValueError("invalid changed path")
+            paths.append(path.casefold())
+        if len(set(paths))!=len(paths):
+            raise ValueError("ambiguous changed paths")
+        paths=sorted(paths)
+        job="pr-"+str(number)
+        now=int(time.time())
+        with self.tx() as db:
+            version=db.execute("SELECT version FROM integration_version WHERE singleton=1").fetchone()
+            if version is None:
+                raise ValueError("no active integration version")
+            version=version["version"]
+            if db.execute("SELECT 1 FROM preview_attempts WHERE state='PENDING'").fetchone():
+                raise ValueError("previous push unresolved")
+            old=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
+            if old and (old["version"]!=version or old["head"]!=head):
+                raise ValueError("candidate registration changed")
+            others=db.execute("SELECT id,files,state FROM integration_jobs WHERE version=? AND id!=? AND state NOT IN ('INTEGRATED','CANCELLED')",(version,job)).fetchall()
+            if any(row["state"] in ("CLAIMED","UNKNOWN","PREPARED") for row in others):
+                raise ValueError("another integration is active")
+            if any(p==r or p.startswith(r+"/") or r.startswith(p+"/") for row in others for r in json.loads(row["files"]) for p in paths):
+                raise ValueError("candidate conflicts with reservation")
+            if old is None:
+                # Do not leapfrog previously queued tasks.
+                if others:
+                    raise ValueError("registered work takes precedence")
+                db.execute("INSERT INTO integration_jobs VALUES(?,?,?,?,?,?,'QUEUED',NULL,NULL,NULL,?)",
+                           (job,version,head,"[]",json.dumps(paths),0,now))
+                db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,"QUEUED",now))
+                reserved=paths
+            else:
+                if old["state"] not in ("QUEUED","PREPARED"):
+                    raise ValueError("candidate not eligible for preparation")
+                if old["state"]=="PREPARED" and old["base"]!=base:
+                    raise ValueError("prepared base changed")
+                reserved=json.loads(old["files"])
+                for dep in json.loads(old["dependencies"]):
+                    row=db.execute("SELECT state FROM integration_jobs WHERE id=?",(dep,)).fetchone()
+                    if row is None or row["state"]!="INTEGRATED":
+                        raise ValueError("dependency unfinished")
+            if any(not any(p==r or p.startswith(r+"/") for r in reserved) for p in paths):
+                raise ValueError("candidate exceeds reservation")
+            if old is None or old["state"]=="QUEUED":
+                db.execute("UPDATE integration_jobs SET state='PREPARED',base=?,lease=NULL,expires=NULL WHERE id=?",(base,job))
+                db.execute("INSERT INTO integration_events(job,event,at) VALUES(?,?,?)",(job,"PREPARED",now))
+            return job
+
     def prepare(self,number,head,base,candidate,changed_files=None):
         """In managed mode, consume the exact PREPARED reservation atomically."""
 

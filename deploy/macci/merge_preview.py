@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sqlite3
 import subprocess
 from tempfile import TemporaryDirectory
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -442,6 +443,7 @@ def merge_one(token, number, dry_run=False, journal=None, managed_queue=False):
                 # preserves paths with spaces; invalid paths cannot match a reservation.
                 changed_files=git(folder,"diff","--no-renames","--name-only","-z",base,merge).split("\0")
                 changed_files=[p for p in changed_files if p]
+                journal.stage(number,head,base,changed_files)
             journal.prepare(number, head, base, merge, changed_files=changed_files)
         git(folder, "push", "--porcelain", REMOTE, merge + ":" + TARGET)
         actual = api(token, "/branches/preview")["commit"]["sha"]
@@ -514,12 +516,12 @@ def main():
                 try:
                     if merge_one(token, number, args.dry_run, journal=journal, managed_queue=managed_queue):
                         return 0  # New base requires fresh tests for following PRs.
-                except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError) as exc:
+                except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError, sqlite3.Error) as exc:
                     print(f"PR #{number}: gate/push blocked: {type(exc).__name__}", flush=True)
                     if journal is not None:
                         return 1  # A possibly completed push must be reconciled on the next tick.
             return 0
-    except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError) as exc:
+    except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError, sqlite3.Error) as exc:
         print(f"Preview coordinator blocked: {type(exc).__name__}", flush=True)
         return 1
 

@@ -27,3 +27,6 @@ The installed preview coordinator optionally journals its already-authorized exa
 
 
 Managed mode (`MACCI_MANAGED_QUEUE=1`) uses the same private integration-queue.sqlite3 ledger for planning and preview push receipts. Only a unique PREPARED reservation `pr-N` matching exact head/base and actual fetched changed paths can enter the existing authorized push path. The journal atomically changes it to UNKNOWN before push and INTEGRATED on exact remote observation, including restart reconciliation. Unregistered candidates fail closed. This mode requires trusted host installation and a provisioned active queue; automated registration/claim and ambiguous-outcome operator recovery remain separate follow-up work. No production activation is implied.
+
+
+The managed coordinator now stages the verified candidate automatically, within a single transaction, from the actual fetched diff after the original authorization gates. It does not overwrite existing reservations or bypass outstanding dependencies, and does not initialize/activate versions from untrusted PR metadata. An operator-provisioned active ledger is still required. Staging has no remote side effect and can be repeated for the identical candidate after a restart.
