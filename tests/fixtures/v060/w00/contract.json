@@ -6,8 +6,22 @@
   "baseline_tree": "c126d37771fa66a832497e6b2814d782fafc1dff",
   "package": "W00",
   "issue": 204,
-  "normative": false,
-  "note": "草案第 2 版，评审评论 7216590735 之后仍未冻结。normative 为 false。未经 REVIEW_APPROVED 不得启动 W01/W02。",
+  "normative": true,
+  "normative_scope": "w01_w02_isolated_development",
+  "normative_sha": "b2011968a9c14845b89fe6d15dda4a595699e9ec",
+  "merge_authorized": false,
+  "freeze": {
+    "approved_comment": 7217178629,
+    "approved_sha": "b2011968a9c14845b89fe6d15dda4a595699e9ec",
+    "schema_version": 2,
+    "scope": "w01_w02_isolated_development",
+    "merge_authorized": false,
+    "release_authorized": false,
+    "machine_acceptance": false,
+    "closeout_verified": false,
+    "note": "评论 7217178629 批准的隔离开发基线只有精确提交 b2011968a9c14845b89fe6d15dda4a595699e9ec。这不是合并或发布授权，也不是实机验收。本收口提交尚未被复核。"
+  },
+  "note": "Schema V2 在精确提交 b2011968a9c14845b89fe6d15dda4a595699e9ec 上被批准为 W01/W02 隔离开发基线。normative 只覆盖这个范围。本收口修改尚未复核，不能当作新的已批准 HEAD，也不能当作合并授权。",
   "delivery": "at_least_once_plus_idempotent_reconcile",
   "exactly_once_across_github_and_db": false,
   "clock": "server",
@@ -36,6 +50,11 @@
     ],
     "alg": "ed25519",
     "signed_content": [
+      "signer_id",
+      "key_id",
+      "issued_at",
+      "expires_at",
+      "nonce",
       "operation",
       "object_id",
       "candidate_id",
@@ -45,9 +64,31 @@
       "tree",
       "policy_revision",
       "scope",
-      "nonce",
-      "expires_at"
+      "payload_hash"
     ],
+    "signature_canonical": {
+      "version": "v1",
+      "domain_separator": "\u001f",
+      "record_separator": "\n",
+      "trailing_newline": false,
+      "fields": [
+        "signer_id",
+        "key_id",
+        "issued_at",
+        "expires_at",
+        "nonce",
+        "operation",
+        "object_id",
+        "candidate_id",
+        "head",
+        "base",
+        "merge",
+        "tree",
+        "policy_revision",
+        "scope",
+        "payload_hash"
+      ]
+    },
     "test_identity": {
       "isolated_configuration_only": true,
       "client_supplied_proof_enters_real_routes": false
@@ -64,7 +105,9 @@
       "github_native_fencing": false,
       "fencing_authority": "trusted_proxy",
       "stale_request_changes_newer_run": false,
-      "rejected_request_is_not_unknown": true
+      "rejected_request_is_not_unknown": true,
+      "unknown_alone_allows_reclaim": false,
+      "lost_token_reclaim_requires": ["trusted_reconciliation", "fencing"]
     }
   },
   "diagnostic": {
@@ -82,7 +125,8 @@
       "items",
       "side_effect"
     ],
-    "cursors": "one after_seq per stream_id",
+    "cursors": "one after_seq per stream_id and stream_epoch",
+    "cursor_key": ["stream_id", "stream_epoch"],
     "classifications": [
       "applied",
       "held",

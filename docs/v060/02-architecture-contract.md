@@ -1,6 +1,6 @@
 # V0.6.0 架构契约草案
 
-执行者：Grok。状态：草案，schema_version = 2。对应评审评论 7216272486。`normative` 仍为 false。未经 REVIEW_APPROVED 不得冻结，不得据此启动 W01/W02。
+执行者：Grok。schema_version = 2。评论 7217178629 把精确提交 `b2011968a9c14845b89fe6d15dda4a595699e9ec` 批准为 W01/W02 隔离开发基线。normative 只表示这个范围。它不是合并或发布授权，也不是实机验收。本收口提交还没有被复核，不能把新的 HEAD 写成已经批准。
 
 机器可读副本是 `tests/fixtures/v060/w00/contract.json`。夹具测试会执行其中的转换、幂等、候选身份和流投影，而不是只检查字段是否存在。路径没有挂到 `app/main.py`。
 
@@ -26,7 +26,7 @@ Task、Run、Candidate、Release、Deployment、Resource、Event 分开建模。
 | stream_epoch | 从 1 开始。生产者确认序号不能连续时才能加一，不能把旧序号重新从 1 写回同一 epoch |
 | producer_seq | 在同一个 stream_id 和 stream_epoch 内单调增加，并且先落盘再确认 |
 
-候选规范编码是 UTF-8，没有结尾换行，六行依次为：
+候选规范编码是 UTF-8，没有结尾换行，七行依次为：
 
 ```text
 v1
@@ -99,7 +99,7 @@ close 还要同时满足三条：每条必要链都是 PUBLISHED、每条链都�
 
 外部副作用必须带上 run_id、代次和令牌绑定。旧代次不能提交副作用。若旧代次可能已经发出外部动作，由可信代理把 Run 记成 UNKNOWN，直到对账把它分成成功、失败或未发生。没有证明时不能取消成 CANCELLED。
 
-丢失明文令牌时，同一幂等键的重放不返回明文租约。恢复方法是把该 run 对账到 UNKNOWN 或确认没有副作用，然后用新 run_id 和新的幂等键重新领取。同一幂等键不能签发第二个令牌。
+丢失明文令牌时，同一幂等键的重放不返回明文租约，也不能签发第二个令牌。Run 进入 UNKNOWN 本身不允许重新领取。丢失令牌后的恢复必须先由可信代理完成对账和 fencing，确认副作用已经分类，然后才能使用新的 run_id 和新的幂等键。
 
 ## Candidate、Release、Deployment、Resource
 
@@ -137,7 +137,7 @@ Resource 的 RELEASING 可以到 RELEASED、RELEASE_FAILED、PARTIAL 或 SAFE_FR
 
 每个 stream 有自己的水位。序号正好等于水位加一才应用。缺口只挡住这条 stream。其他生产者的事件照常应用。authorization 流不允许用 never_existed 补洞来跳过未证实的授权事实。诊断流可以用对账事件声明某个序号从未存在，而且只能补本流的洞。
 
-进程重启必须读回已落盘的 epoch 和序号。计数丢失时增加 epoch，旧 epoch 的缺口继续保持，不用新 epoch 的 1 去填旧洞。授权流的新 epoch 在旧 epoch 还没有已应用的 epoch_closed 事件之前不能应用。这是一条反例：旧授权序号缺 1 时，新 epoch 的序号 1 仍然停住。诊断流不使用这道门。诊断读取使用每个 stream_id 自己的 after_seq。只推进一条流的游标，不能跳过另一条流。
+进程重启必须读回已落盘的 epoch 和序号。计数丢失时增加 epoch，旧 epoch 的缺口继续保持，不用新 epoch 的 1 去填旧洞。授权流的新 epoch 在旧 epoch 还没有已应用的 epoch_closed 事件之前不能应用。这是一条反例：旧授权序号缺 1 时，新 epoch 的序号 1 仍然停住。诊断流不使用这道门。诊断游标按 stream_id 加 stream_epoch 分别保存。只推进其中一个游标，不能跳过另一条流或同一个流的另一个 epoch。
 
 ## 幂等与身份顺序
 
@@ -145,7 +145,7 @@ Resource 的 RELEASING 可以到 RELEASED、RELEASE_FAILED、PARTIAL 或 SAFE_FR
 
 幂等键的范围是已认证主体、scope 和操作名。重放返回 original_result 和 current_state 两个字段。前者是当时的公开结果，后者是对象现在的状态。重放不返回明文租约。
 
-证明至少包含 signer_id、key_id、signature、scope、issued_at、expires_at、nonce、payload_hash、alg。草案把 alg 记为 ed25519。被签名的规范内容绑定 operation、object_id、candidate_id、head、base、merge、tree、policy_revision、scope、nonce 和 expires_at。服务端检查过期、nonce 不重复、以及撤销名单。撤销按 signer_id 立即生效。
+证明至少包含 signer_id、key_id、signature、scope、issued_at、expires_at、nonce、payload_hash、alg。草案把 alg 记为 ed25519。规范字节以 `v1` 开头。每个字段写成名字、域分隔符 U+001F、再写值，字段之间用换行分隔，没有结尾换行。字段顺序固定为 signer_id、key_id、issued_at、expires_at、nonce、operation、object_id、candidate_id、head、base、merge、tree、policy_revision、scope、payload_hash。payload_hash 是完整载荷的哈希，因此签名覆盖整个载荷，也覆盖签名者、密钥和签发时间。值和名字里都不能包含换行或 U+001F。服务端检查过期、nonce 不重复、以及撤销名单。撤销按 signer_id 立即生效。
 
 用户验收使用独立的 signer kind `user_acceptance`。agent、MacCI、候选和网页会话都不能充当它。测试身份只能出现在隔离配置里。调用方自己带上 `test-proof://` 字符串，不能进入真实路由。在身份验证实现并被单独授权之前，`production_verification_enabled` 为 false。这时连 `user_acceptance` 也不能把生产发布放行。
 
@@ -157,16 +157,18 @@ Resource 的 RELEASING 可以到 RELEASED、RELEASE_FAILED、PARTIAL 或 SAFE_FR
 
 写接口都在夹具 examples 里有最小请求和响应，并带 http 和 acceptance_owner：
 
-Task.claim、Task.renew、Run.complete、Task.request_action、Event.append、Policy.authorize、Policy.revoke、Candidate.register、Candidate.supersede、CI.test、CI.build、CI.attest、Deploy.plan、Deploy.apply、Deploy.reconcile、Deploy.rollback、Resource.plan、Resource.apply、Release.accept、Release.reject、Release.publish、Upgrade.plan、Upgrade.reconcile。
+Task.claim、Task.renew、Run.start、Run.release、Run.heartbeat、Run.complete、Task.request_action、Event.append、Policy.authorize、Policy.revoke、Candidate.register、Candidate.supersede、CI.test、CI.build、CI.attest、Deploy.plan、Deploy.apply、Deploy.reconcile、Deploy.rollback、Resource.plan、Resource.apply、Release.accept、Release.reject、Release.publish、Upgrade.plan、Upgrade.reconcile。
+
+Run.start、Run.release 和 Run.heartbeat 就是 `POST /api/v1/control/runs/{run_id}:start`、`:release` 和 `:heartbeat`。三者都要带当前租约令牌和绑定。
 
 读接口：Event.query、Candidate.next、Resource.inspect、Policy.evaluate。Policy.evaluate 没有副作用。候选身份请求发布时返回 POLICY_DENIED。
 
-Diagnostic.subscribe 不在本草案提供。替代是游标轮询：GET `/api/v1/control/diagnostics?subject=&after_seq=`。响应含 watermark_seq、gap、items、side_effect=false。没有推送通道，客户端用 after_seq 接着读。
+Diagnostic.subscribe 不在本草案提供。替代是游标轮询：GET `/api/v1/control/diagnostics?subject=&after_seq=`。游标键是 stream_id 加 stream_epoch，不是一条全局序号。响应含 watermark_seq、gap、items、side_effect=false。没有推送通道。
 
 ## 示例
 
 领取的第一次响应可以包含 lease_token。同一幂等键的重放示例 `task_claim_replay` 把 lease_token 设为 null，original_result 仍是 LEASED，current_state 可以已经是 RUNNING。
 
-过期或旧代次完成的示例 `run_finish_stale_lease` 返回 LEASE_FENCE_REJECTED，状态 UNKNOWN。
+过期或旧代次完成的示例 `run_finish_stale_lease` 返回 LEASE_FENCE_REJECTED。响应里的 state 仍是 RUNNING，changed 为 false。这个请求不把 Run 改成 UNKNOWN。
 
 正例和反例都在 contract.json 的 cases 里，包括 LEASED 到期进入 UNKNOWN、没有 fencing 的取消被拒绝、UNKNOWN 在对账证明成功后进入 SUCCEEDED、RETRY_WAIT 不能进入 RUNNING、缺少回执不能从 PUBLISHING 回到 ACCEPTANCE。

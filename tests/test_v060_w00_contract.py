@@ -71,6 +71,30 @@ def allows(contract, machine, src, dst, guards):
     return False if not matched else False
 
 
+APPROVED_SHA = "b2011968a9c14845b89fe6d15dda4a595699e9ec"
+
+
+def canonical_signed(spec, fields):
+    domain = spec["domain_separator"]
+    record = spec["record_separator"]
+    parts = [spec["version"]]
+    for name in spec["fields"]:
+        value = str(fields[name])
+        if domain in value or record in value:
+            raise ValueError("separator in value")
+        parts.append(name + domain + value)
+    text = record.join(parts)
+    if spec["trailing_newline"]:
+        text += record
+    return text
+
+
+def lost_token_may_reclaim(state, reconciled, fenced):
+    if state == "UNKNOWN" and not (reconciled and fenced):
+        return False
+    return bool(reconciled and fenced)
+
+
 def candidate_id(spec, repo, task, head, base, merge, tree):
     if spec["trailing_newline"]:
         raise AssertionError("canonical encoding must not add a trailing newline")
@@ -303,7 +327,16 @@ class ContractFixtureTest(unittest.TestCase):
         contract = self.contract
         self.assertEqual(contract["schema_version"], 2)
         self.assertEqual(contract["status"], "draft")
-        self.assertFalse(contract["normative"])
+        self.assertTrue(contract["normative"])
+        self.assertEqual(contract["normative_scope"], "w01_w02_isolated_development")
+        self.assertEqual(contract["normative_sha"], APPROVED_SHA)
+        self.assertFalse(contract["merge_authorized"])
+        self.assertEqual(contract["freeze"]["approved_sha"], APPROVED_SHA)
+        self.assertEqual(contract["freeze"]["approved_comment"], 7217178629)
+        self.assertFalse(contract["freeze"]["merge_authorized"])
+        self.assertFalse(contract["freeze"]["release_authorized"])
+        self.assertFalse(contract["freeze"]["machine_acceptance"])
+        self.assertFalse(contract["freeze"]["closeout_verified"])
         self.assertFalse(contract["exactly_once_across_github_and_db"])
         self.assertEqual(contract["clock"], "server")
         self.assertEqual(contract["baseline_sha"], BASE)
@@ -314,7 +347,28 @@ class ContractFixtureTest(unittest.TestCase):
         self.assertFalse(contract["identity"]["production_verification_enabled"])
         self.assertFalse(contract["diagnostic"]["subscribe"])
         self.assertEqual(contract["diagnostic"]["mode"], "poll_cursor")
+        self.assertEqual(contract["diagnostic"]["cursor_key"], ["stream_id", "stream_epoch"])
         self.assertIn("after_seq", contract["diagnostic"]["query"])
+        self.assertFalse(contract["identity"]["lease"]["unknown_alone_allows_reclaim"])
+        self.assertEqual(
+            contract["identity"]["lease"]["lost_token_reclaim_requires"],
+            ["trusted_reconciliation", "fencing"],
+        )
+        self.assertFalse(lost_token_may_reclaim("UNKNOWN", False, False))
+        self.assertFalse(lost_token_may_reclaim("UNKNOWN", True, False))
+        self.assertTrue(lost_token_may_reclaim("UNKNOWN", True, True))
+        signed = contract["identity"]["signature_canonical"]
+        self.assertEqual(signed["fields"], contract["identity"]["signed_content"])
+        sample = {name: f"value-{name}" for name in signed["fields"]}
+        encoded = canonical_signed(signed, sample)
+        self.assertTrue(encoded.startswith("v1\n"))
+        self.assertIn("payload_hash\u001fvalue-payload_hash", encoded)
+        self.assertIn("signer_id\u001fvalue-signer_id", encoded)
+        self.assertIn("key_id\u001fvalue-key_id", encoded)
+        self.assertIn("issued_at\u001fvalue-issued_at", encoded)
+        sample["payload_hash"] = "other-hash"
+        self.assertNotEqual(canonical_signed(signed, sample), encoded)
+        self.assertEqual(len(contract["entities"]["candidate"]["id"]["lines"]), 7)
 
     def test_transition_cases_follow_the_machine(self):
         seen = set()
@@ -603,6 +657,15 @@ class ContractFixtureTest(unittest.TestCase):
         self.assertIn("PUBLISH_UNKNOWN", self.architecture)
         self.assertIn("首次安装", self.architecture)
         self.assertIn("不返回明文租约", self.architecture)
+        self.assertIn("七行", self.architecture)
+        self.assertNotIn("六行依次", self.architecture)
+        self.assertIn("stream_id 加 stream_epoch", self.architecture)
+        self.assertIn("Run.start", self.architecture)
+        self.assertIn(":heartbeat", self.architecture)
+        self.assertIn("changed 为 false", self.architecture)
+        self.assertIn(APPROVED_SHA, self.architecture)
+        self.assertIn("不是合并或发布授权", self.architecture)
+        self.assertIn("进入 UNKNOWN 本身不允许重新领取", self.architecture)
         self.assertIn("after_seq", self.architecture)
         self.assertIn("W03 先交付隔离契约", self.ownership)
         self.assertIn("app/control_routes_", self.ownership)
