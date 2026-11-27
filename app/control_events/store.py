@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS reports (
     payload_hash TEXT NOT NULL,
     channels_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    archived INTEGER NOT NULL DEFAULT 0
+    archived INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT
 );
 CREATE TABLE IF NOT EXISTS receipts (
     receipt_id TEXT PRIMARY KEY,
@@ -150,6 +151,9 @@ class Store:
         conn = self._connect()
         try:
             conn.executescript(SCHEMA)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(reports)")}
+            if columns and "payload_json" not in columns:
+                conn.execute("ALTER TABLE reports ADD COLUMN payload_json TEXT")
         finally:
             conn.close()
 

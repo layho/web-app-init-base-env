@@ -1,9 +1,13 @@
 """Report outbox. A channel is DELIVERED only after a trusted remote confirmation.
 
-Claims are conditional updates, so two processes cannot both send the same
-channel. An unknown result is reconciled before another send. Retrying is not
-treated as exactly-once. Event-log rows are not report deliveries; the engine
-marks those as not yet delivered instead of handing them to this consumer.
+The validated report and its channels commit in the same SQLite transaction as
+the delivery rows. The file is an atomic export of that payload, and recovery
+can deliver from the row when the export did not finish. Claims update only
+the state the worker observed, so a stale read cannot take a row that has
+since become unknown. An unknown result is reconciled before another send.
+Retrying is not treated as exactly-once. Event-log rows are not report
+deliveries; the engine marks those as not yet delivered instead of handing
+them to this consumer.
 """
 
 from dataclasses import dataclass
@@ -187,11 +191,25 @@ class ReportOutbox:
         file_bytes = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
         path = self.directory / f"{report['run_id']}.json"
         archived_path = self.archive / f"{report['run_id']}.json"
+        payload_text = file_bytes.decode()
         with self.store.transaction() as conn:
-            row = conn.execute("SELECT payload_hash, channels_json, archived FROM reports WHERE run_id=?", (report["run_id"],)).fetchone()
+            row = conn.execute(
+                "SELECT payload_hash, channels_json, archived, payload_json FROM reports WHERE run_id=?",
+                (report["run_id"],),
+            ).fetchone()
             if row is not None:
-                if row["payload_hash"] != digest or json.loads(row["channels_json"]) != chosen:
+                stored = row["payload_json"]
+                if (
+                    row["payload_hash"] != digest
+                    or json.loads(row["channels_json"]) != chosen
+                    or (stored is not None and stored.encode() != file_bytes)
+                ):
                     raise ControlError("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "report run_id already has a different payload")
+                if stored is None:
+                    conn.execute(
+                        "UPDATE reports SET payload_json=? WHERE run_id=? AND payload_json IS NULL",
+                        (payload_text, report["run_id"]),
+                    )
             else:
                 if replay_only:
                     raise ControlError("PROOF_REPLAY", 403, "nonce already used")
@@ -202,20 +220,18 @@ class ReportOutbox:
                     raise ControlError("CAPACITY_EXHAUSTED", 409, "outbox capacity is exhausted")
                 now = _now()
                 conn.execute(
-                    "INSERT INTO reports (run_id, payload_hash, channels_json, created_at, archived) VALUES (?, ?, ?, ?, 0)",
-                    (report["run_id"], digest, json.dumps(chosen), now),
+                    """
+                    INSERT INTO reports (
+                        run_id, payload_hash, channels_json, created_at, archived, payload_json
+                    ) VALUES (?, ?, ?, ?, 0, ?)
+                    """,
+                    (report["run_id"], digest, json.dumps(chosen), now, payload_text),
                 )
                 for channel in chosen:
                     self._upsert(conn, f"report-{report['run_id']}", channel, "DURABLE_LOCAL", report["run_id"], None, now)
         if crash == "after-commit":
             os._exit(94)
-        if path.exists():
-            if path.read_bytes() != file_bytes:
-                raise ControlError("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "report run_id already has a different payload")
-        elif not archived_path.exists():
-            if not _create_exclusive(path, file_bytes):
-                if path.read_bytes() != file_bytes:
-                    raise ControlError("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "report run_id already has a different payload")
+        self._export_report(path, archived_path, file_bytes)
         if crash == "after-file":
             os._exit(92)
         if crash == "before-remote":
@@ -263,7 +279,8 @@ class ReportOutbox:
         if self.directory.exists():
             for path in sorted(self.directory.glob("*.json")):
                 try:
-                    report = json.loads(path.read_text(encoding="utf-8"))
+                    raw = path.read_bytes()
+                    report = json.loads(raw)
                     validate_report(report, self.trusted_executors)
                     if path.name != f"{report['run_id']}.json":
                         raise ValueError("report name does not match run_id")
@@ -274,8 +291,9 @@ class ReportOutbox:
                 except (OSError, ValueError, ControlError, KeyError):
                     self._isolate_path(path, "report", "corrupt report file")
                     continue
-                self._adopt(report, chosen)
+                self._adopt(report, chosen, raw)
                 pending.append(report["run_id"])
+        self._materialize_stored_reports()
         self._retire_dead_claims(abandon_claims=abandon_claims)
         return pending
 
@@ -343,9 +361,13 @@ class ReportOutbox:
             "quarantine_overflow": 0 if overflow is None else overflow["value"],
         }
 
-    def _dispatch(self, report: dict, channel: str, remote, *, crash: str | None = None) -> dict:
+    def _dispatch(self, report: dict, channel: str, remote, *, crash: str | None = None, _hop: int = 0) -> dict:
         channel = _safe_channel(channel)
         event_id = f"report-{report['run_id']}"
+        if _hop > 2:
+            fresh = self._channel_state(event_id, channel) or "OUTBOX"
+            found = self._latest_receipt(event_id, channel, fresh)
+            return found if found is not None else self._pending_receipt(report, channel, fresh)
         current = self._channel_state(event_id, channel)
         if current in {"DELIVERED", "QUARANTINED"}:
             found = self._latest_receipt(event_id, channel, current)
@@ -353,36 +375,52 @@ class ReportOutbox:
         if remote is None:
             return self._pending_receipt(report, channel, current or "DURABLE_LOCAL")
         if current == "DELIVERY_UNKNOWN":
-            if self._local_receipt_binds(event_id, channel, report):
-                token = self._claim(event_id, channel, report["run_id"])
-                if token and self._set_state(event_id, channel, "DELIVERED", report["run_id"], None, token):
-                    self._maybe_archive(report["run_id"])
-                found = self._latest_receipt(event_id, channel, "DELIVERED")
-                return found if found is not None else self._pending_receipt(report, channel, "DELIVERY_UNKNOWN")
-            token = self._claim(event_id, channel, report["run_id"])
-            if not token:
+            finished = self._finish_unknown(report, channel, remote, crash=crash)
+            if finished is not None:
+                return finished
+            fresh = self._channel_state(event_id, channel) or "OUTBOX"
+            if fresh == "DELIVERY_UNKNOWN":
                 found = self._latest_receipt(event_id, channel, "DELIVERY_UNKNOWN")
                 return found if found is not None else self._pending_receipt(report, channel, "DELIVERY_UNKNOWN")
-            verdict = _reconcile(remote, channel, report)
-            if verdict == "delivered":
-                receipt = self._write_receipt(report, channel, "DELIVERED")
-                if self._set_state(event_id, channel, "DELIVERED", report["run_id"], None, token):
-                    self._maybe_archive(report["run_id"])
-                return receipt
-            if verdict != "absent":
-                self._set_state(event_id, channel, "DELIVERY_UNKNOWN", report["run_id"], "delivery outcome is unknown", token)
-                found = self._latest_receipt(event_id, channel, "DELIVERY_UNKNOWN")
-                return found if found is not None else self._write_receipt(report, channel, "DELIVERY_UNKNOWN")
-            return self._send(report, channel, remote, token, crash=crash)
+            return self._dispatch(report, channel, remote, crash=crash, _hop=_hop + 1)
         if current == "OUTBOX":
             return self._pending_receipt(report, channel, "OUTBOX")
-        if current not in {None, "DURABLE_LOCAL", "DELIVERY_UNKNOWN"}:
-            return self._pending_receipt(report, channel, current or "DURABLE_LOCAL")
-        token = self._claim(event_id, channel, report["run_id"])
+        if current != "DURABLE_LOCAL":
+            return self._pending_receipt(report, channel, current or "OUTBOX")
+        token = self._claim(event_id, channel, report["run_id"], "DURABLE_LOCAL")
         if not token:
-            raced = self._channel_state(event_id, channel) or "OUTBOX"
-            found = self._latest_receipt(event_id, channel, raced)
-            return found if found is not None else self._pending_receipt(report, channel, raced)
+            fresh = self._channel_state(event_id, channel) or "OUTBOX"
+            if fresh == "DURABLE_LOCAL":
+                found = self._latest_receipt(event_id, channel, fresh)
+                return found if found is not None else self._pending_receipt(report, channel, fresh)
+            return self._dispatch(report, channel, remote, crash=crash, _hop=_hop + 1)
+        return self._send(report, channel, remote, token, crash=crash)
+
+    def _finish_unknown(self, report: dict, channel: str, remote, *, crash: str | None) -> dict | None:
+        """Reconcile an unknown row. None means the expected state was no longer current."""
+
+        event_id = f"report-{report['run_id']}"
+        if self._local_receipt_binds(event_id, channel, report):
+            token = self._claim(event_id, channel, report["run_id"], "DELIVERY_UNKNOWN")
+            if not token:
+                return None
+            if self._set_state(event_id, channel, "DELIVERED", report["run_id"], None, token):
+                self._maybe_archive(report["run_id"])
+            found = self._latest_receipt(event_id, channel, "DELIVERED")
+            return found if found is not None else self._pending_receipt(report, channel, "DELIVERY_UNKNOWN")
+        token = self._claim(event_id, channel, report["run_id"], "DELIVERY_UNKNOWN")
+        if not token:
+            return None
+        verdict = _reconcile(remote, channel, report)
+        if verdict == "delivered":
+            receipt = self._write_receipt(report, channel, "DELIVERED")
+            if self._set_state(event_id, channel, "DELIVERED", report["run_id"], None, token):
+                self._maybe_archive(report["run_id"])
+            return receipt
+        if verdict != "absent":
+            self._set_state(event_id, channel, "DELIVERY_UNKNOWN", report["run_id"], "delivery outcome is unknown", token)
+            found = self._latest_receipt(event_id, channel, "DELIVERY_UNKNOWN")
+            return found if found is not None else self._write_receipt(report, channel, "DELIVERY_UNKNOWN")
         return self._send(report, channel, remote, token, crash=crash)
 
     def _send(self, report: dict, channel: str, remote, token: str, *, crash: str | None) -> dict:
@@ -411,7 +449,9 @@ class ReportOutbox:
             self._maybe_archive(report["run_id"])
         return receipt
 
-    def _claim(self, event_id: str, channel: str, run_id: str) -> str | None:
+    def _claim(self, event_id: str, channel: str, run_id: str, expected: str) -> str | None:
+        if expected not in {"DURABLE_LOCAL", "DELIVERY_UNKNOWN"}:
+            return None
         token = uuid.uuid4().hex
         now = int(time.time())
         expires = now + _CLAIM_TTL_SECONDS
@@ -421,9 +461,9 @@ class ReportOutbox:
                 """
                 UPDATE deliveries
                 SET state='OUTBOX', detail=?, updated_at=?, claim_token=?, claim_pid=?, claim_expires_at=?
-                WHERE event_id=? AND channel=? AND state IN ('DURABLE_LOCAL', 'DELIVERY_UNKNOWN')
+                WHERE event_id=? AND channel=? AND state=?
                 """,
-                (token, _now(), token, os.getpid(), expires, event_id, channel),
+                (token, _now(), token, os.getpid(), expires, event_id, channel, expected),
             )
             if conn.total_changes == before:
                 return None
@@ -442,18 +482,31 @@ class ReportOutbox:
                 (_now(), event_id, channel),
             )
 
-    def _adopt(self, report: dict, channels: list[str]) -> None:
+    def _adopt(self, report: dict, channels: list[str], raw: bytes) -> None:
         event_id = f"report-{report['run_id']}"
         digest = report.get("payload_hash")
         if not isinstance(digest, str) or len(digest) != 64:
             digest = hashlib.sha256(json.dumps(redact(report), sort_keys=True).encode()).hexdigest()
+        payload_text = raw.decode()
         with self.store.transaction() as conn:
-            found = conn.execute("SELECT payload_hash FROM reports WHERE run_id=?", (report["run_id"],)).fetchone()
+            found = conn.execute(
+                "SELECT payload_hash, payload_json FROM reports WHERE run_id=?",
+                (report["run_id"],),
+            ).fetchone()
             now = _now()
             if found is None:
                 conn.execute(
-                    "INSERT INTO reports (run_id, payload_hash, channels_json, created_at, archived) VALUES (?, ?, ?, ?, 0)",
-                    (report["run_id"], digest, json.dumps(channels), now),
+                    """
+                    INSERT INTO reports (
+                        run_id, payload_hash, channels_json, created_at, archived, payload_json
+                    ) VALUES (?, ?, ?, ?, 0, ?)
+                    """,
+                    (report["run_id"], digest, json.dumps(channels), now, payload_text),
+                )
+            elif found["payload_json"] is None:
+                conn.execute(
+                    "UPDATE reports SET payload_json=? WHERE run_id=? AND payload_json IS NULL",
+                    (payload_text, report["run_id"]),
                 )
             for channel in channels:
                 existing = conn.execute(
@@ -481,7 +534,41 @@ class ReportOutbox:
             if path.exists():
                 report = json.loads(path.read_text(encoding="utf-8"))
                 return report
-        return None
+        with self.store.transaction() as conn:
+            row = conn.execute(
+                "SELECT payload_json, archived FROM reports WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None or not row["payload_json"]:
+            return None
+        data = row["payload_json"].encode()
+        target = (self.archive if row["archived"] else self.directory) / f"{run_id}.json"
+        self._export_report(target, self.archive / f"{run_id}.json", data)
+        return json.loads(data)
+
+    def _export_report(self, path: Path, archived_path: Path, file_bytes: bytes) -> None:
+        if path.exists():
+            if path.read_bytes() != file_bytes:
+                raise ControlError("IDEMPOTENCY_PAYLOAD_MISMATCH", 409, "report run_id already has a different payload")
+            return
+        if archived_path.exists() and archived_path != path:
+            return
+        atomic_write(path, file_bytes)
+
+    def _materialize_stored_reports(self) -> None:
+        with self.store.transaction() as conn:
+            rows = conn.execute(
+                "SELECT run_id, payload_json, archived FROM reports WHERE payload_json IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            name = f"{row['run_id']}.json"
+            outbox_path = self.directory / name
+            archive_path = self.archive / name
+            if outbox_path.exists() or archive_path.exists():
+                continue
+            data = row["payload_json"].encode()
+            target = archive_path if row["archived"] else outbox_path
+            self._export_report(target, archive_path, data)
 
     def _channel_state(self, event_id: str, channel: str) -> str | None:
         with self.store.transaction() as conn:
@@ -619,21 +706,3 @@ class ReportOutbox:
                 total += path.stat().st_size
         return count, total
 
-
-def _create_exclusive(path: Path, data: bytes) -> bool:
-    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        return False
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-    return True

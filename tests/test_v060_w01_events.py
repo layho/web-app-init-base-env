@@ -21,7 +21,8 @@ from app.control_events.errors import BadRecord, ControlError, DeliveryUnknown
 from app.control_events.identity import bound_token_for_directory
 from app.control_events.legacy import KNOWN_AGENTS
 from app.control_events.event_outbox import confirmation_binds, exact_confirmation
-from app.control_events.outbox import FAILURE_PHASES, OutboxLimits, bound_confirmation
+from app.control_events.outbox import FAILURE_PHASES, OutboxLimits, bound_confirmation, confirmation_binds as report_binds
+from app.control_events.store import Store
 from app.control_routes_w01 import bind_isolated_engine, clear_binding, router, set_isolated
 from app.feedback_progress import STATUSES
 from tests.w01_isolated_principals import ensure_principals, sign_event, sign_read, sign_report
@@ -1156,14 +1157,14 @@ def test_claim_token_is_required_and_a_live_claim_survives_recovery(tmp_path):
     payload = report(eng, "ab" * 16, outcome="success", phase="passed")
     assert eng.submit_report(payload, remote=None)["complete"] is False
     event_id = "report-" + payload["run_id"]
-    token = eng.outbox._claim(event_id, "github_comment", payload["run_id"])
+    token = eng.outbox._claim(event_id, "github_comment", payload["run_id"], "DURABLE_LOCAL")
     assert isinstance(token, str) and len(token) == 32
-    assert eng.outbox._claim(event_id, "github_comment", payload["run_id"]) is None
+    assert eng.outbox._claim(event_id, "github_comment", payload["run_id"], "DURABLE_LOCAL") is None
     assert eng.outbox._set_state(event_id, "github_comment", "DELIVERED", payload["run_id"], None, "forged") is False
     eng.outbox.recover(abandon_claims=True)
     assert eng.outbox._channel_state(event_id, "github_comment") == "OUTBOX"
     assert eng.outbox._set_state(event_id, "github_comment", "DELIVERED", payload["run_id"], None, token) is True
-    other = eng.outbox._claim(event_id, "commit_status", payload["run_id"])
+    other = eng.outbox._claim(event_id, "commit_status", payload["run_id"], "DURABLE_LOCAL")
     with eng.store.transaction() as conn:
         conn.execute(
             "UPDATE deliveries SET claim_pid=? WHERE event_id=? AND channel='commit_status'",
@@ -1312,7 +1313,11 @@ def test_report_and_cursor_writes_commit_the_nonce_with_the_row(tmp_path):
     restored = Engine.open(root, "generation-1")
     assert restored.store.count("reports") == 1
     assert restored.store.count("consumed_nonces") == 1
-    assert not (root / "report-outbox" / f"{'33' * 16}.json").exists()
+    restored_file = json.loads((root / "report-outbox" / f"{'33' * 16}.json").read_text(encoding="utf-8"))
+    assert restored_file["run_id"] == "33" * 16
+    assert restored_file["outcome"] == "failure"
+    assert restored_file["phase"] == "setup-failed"
+    assert restored_file["channels"] == ["github_comment"]
     other = sign_report(
         restored,
         report(restored, "44" * 16, outcome="success", phase="passed"),
@@ -1409,9 +1414,9 @@ def test_generic_event_outbox_claims_exact_receipts_and_backpressure(tmp_path):
     held = engine(tmp_path / "held-claim")
     accepted = held.append(task(held, event_id="evt_claim", idempotency_key="idem-claim"))
     assert accepted["applied"] is True
-    token = held.events._claim("evt_claim", "event_sink")
+    token = held.events._claim("evt_claim", "event_sink", "DURABLE_LOCAL")
     assert isinstance(token, str) and len(token) == 32
-    assert held.events._claim("evt_claim", "event_sink") is None
+    assert held.events._claim("evt_claim", "event_sink", "DURABLE_LOCAL") is None
     held.events.recover(abandon_claims=True)
     assert held.events._state("evt_claim", "event_sink") == "OUTBOX"
     assert held.events._set_state("evt_claim", "event_sink", "DELIVERED", None, "forged") is False
@@ -1423,3 +1428,258 @@ def test_generic_event_outbox_claims_exact_receipts_and_backpressure(tmp_path):
     held.events.recover(abandon_claims=True)
     assert held.events._state("evt_claim", "event_sink") == "DELIVERY_UNKNOWN"
     assert held.store.count("events") == 1
+
+
+def _mark_unknown(store, table: str, event_id: str, channel: str) -> None:
+    if table not in {"deliveries", "event_outbox"}:
+        raise AssertionError(table)
+    with store.transaction() as conn:
+        conn.execute(
+            f"UPDATE {table} SET state='DELIVERY_UNKNOWN', claim_token=NULL, claim_pid=NULL, claim_expires_at=NULL "
+            "WHERE event_id=? AND channel=?",
+            (event_id, channel),
+        )
+
+
+def test_after_commit_crash_reopens_and_delivers_the_report(tmp_path):
+    root = tmp_path / "gap"
+    root.mkdir()
+    opened = Engine.open(root, "generation-1")
+    ensure_principals(opened)
+    run_id = "55" * 16
+    submitted = report(opened, run_id, outcome="failure", phase="dependencies-failed", note=SECRET)
+    request = tmp_path / "gap-request.json"
+    request.write_text(json.dumps({"report": submitted, "channels": ["github_comment", "commit_status"]}), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-m", "app.control_events.crash_probe", "--root", str(root),
+         "--token", "generation-1", "--mode", "after-report-commit", "--request", str(request)],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 94, proc.stderr
+    assert not (root / "report-outbox" / f"{run_id}.json").exists()
+    assert not (root / "report-archive" / f"{run_id}.json").exists()
+    stored = Store(root / "events.sqlite3")
+    with stored.transaction() as conn:
+        row = conn.execute(
+            "SELECT payload_json, channels_json, payload_hash FROM reports WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        deliveries = conn.execute(
+            "SELECT channel, state FROM deliveries WHERE run_id=? ORDER BY channel",
+            (run_id,),
+        ).fetchall()
+    assert row is not None and row["payload_json"]
+    payload = json.loads(row["payload_json"])
+    assert payload["run_id"] == run_id
+    assert payload["outcome"] == "failure"
+    assert payload["phase"] == "dependencies-failed"
+    assert payload["head"] == SHA and payload["base"] == SHA_B
+    assert payload["merge"] == SHA_C and payload["tree"] == SHA_D
+    assert payload["executor_id"] == "macci-isolated"
+    assert json.loads(row["channels_json"]) == ["github_comment", "commit_status"]
+    assert payload["channels"] == ["github_comment", "commit_status"]
+    assert payload["payload_hash"] == row["payload_hash"]
+    assert SECRET not in row["payload_json"]
+    assert [(item["channel"], item["state"]) for item in deliveries] == [
+        ("commit_status", "DURABLE_LOCAL"),
+        ("github_comment", "DURABLE_LOCAL"),
+    ]
+    restored = Engine.open(root, "generation-1")
+    disk = json.loads((root / "report-outbox" / f"{run_id}.json").read_text(encoding="utf-8"))
+    assert disk == payload
+    seen = []
+
+    def remote(channel, body):
+        seen.append((channel, body["run_id"], body["phase"], body["outcome"], body["head"], body["tree"]))
+        return confirm(channel, body)
+
+    receipts = restored.deliver_pending(remote)
+    assert restored.store.count("reports") == 1
+    assert {item[0] for item in seen} == {"commit_status", "github_comment"}
+    assert len(seen) == 2
+    assert all(item[1] == run_id and item[2] == "dependencies-failed" and item[3] == "failure" and item[4] == SHA and item[5] == SHA_D for item in seen)
+    assert {item["state"] for item in receipts} == {"DELIVERED"}
+    for item in receipts:
+        assert report_binds(item, item["channel"], submitted)
+        assert item["complete"] is True and item["persisted"] is True
+        assert item["head"] == SHA and item["base"] == SHA_B and item["merge"] == SHA_C and item["tree"] == SHA_D
+        assert item["executor_id"] == "macci-isolated" and item["run_id"] == run_id
+    archived = json.loads((root / "report-archive" / f"{run_id}.json").read_text(encoding="utf-8"))
+    assert archived["phase"] == "dependencies-failed" and archived["channels"] == ["github_comment", "commit_status"]
+    assert SECRET not in json.dumps(archived)
+
+
+def test_event_workers_cannot_claim_across_a_state_change(tmp_path):
+    cas = engine(tmp_path / "cas")
+    assert cas.append(task(cas, event_id="evt_cas", idempotency_key="idem-cas"))["applied"] is True
+    _mark_unknown(cas.store, "event_outbox", "evt_cas", "event_sink")
+    assert cas.events._claim("evt_cas", "event_sink", "DURABLE_LOCAL") is None
+    assert cas.events._state("evt_cas", "event_sink") == "DELIVERY_UNKNOWN"
+
+    delivered = engine(tmp_path / "delivered")
+    assert delivered.append(task(delivered, event_id="evt_stale", idempotency_key="idem-stale"))["applied"] is True
+    envelope = delivered.events._load("evt_stale", "event_sink")
+    assert envelope["state"] == "DURABLE_LOCAL"
+    _mark_unknown(delivered.store, "event_outbox", "evt_stale", "event_sink")
+    order = []
+
+    class Already:
+        def __call__(self, channel, payload):
+            order.append(("send", channel))
+            return exact_confirmation(channel, payload)
+
+        def reconcile(self, channel, payload):
+            order.append(("reconcile", channel))
+            return exact_confirmation(channel, payload)
+
+    receipt = delivered.events._dispatch(envelope, "event_sink", Already(), crash=None)
+    assert order == [("reconcile", "event_sink")]
+    assert receipt["state"] == "DELIVERED" and receipt["exact"] is True
+    assert confirmation_binds(receipt, "event_sink", envelope)
+    assert delivered.events._state("evt_stale", "event_sink") == "DELIVERED"
+
+    absent = engine(tmp_path / "absent")
+    assert absent.append(task(absent, event_id="evt_absent", idempotency_key="idem-absent"))["applied"] is True
+    missing = absent.events._load("evt_absent", "event_sink")
+    _mark_unknown(absent.store, "event_outbox", "evt_absent", "event_sink")
+    order = []
+
+    class Missing:
+        def __call__(self, channel, payload):
+            order.append(("send", channel))
+            return exact_confirmation(channel, payload)
+
+        def reconcile(self, channel, payload):
+            order.append(("reconcile", channel))
+            return "absent"
+
+    receipt = absent.events._dispatch(missing, "event_sink", Missing(), crash=None)
+    assert order == [("reconcile", "event_sink"), ("send", "event_sink")]
+    assert receipt["state"] == "DELIVERED"
+    assert confirmation_binds(receipt, "event_sink", missing)
+    assert absent.events._state("evt_absent", "event_sink") == "DELIVERED"
+
+    fresh = engine(tmp_path / "fresh")
+    assert fresh.append(task(fresh, event_id="evt_local", idempotency_key="idem-local"))["applied"] is True
+    assert fresh.events._claim("evt_local", "event_sink", "DELIVERY_UNKNOWN") is None
+    assert fresh.events._state("evt_local", "event_sink") == "DURABLE_LOCAL"
+    snapshot = fresh.events._load("evt_local", "event_sink")
+    snapshot["state"] = "DELIVERY_UNKNOWN"
+    order = []
+
+    class StillLocal:
+        def __call__(self, channel, payload):
+            order.append(("send", channel))
+            return exact_confirmation(channel, payload)
+
+        def reconcile(self, channel, payload):
+            order.append(("reconcile", channel))
+            return exact_confirmation(channel, payload)
+
+    receipt = fresh.events._dispatch(snapshot, "event_sink", StillLocal(), crash=None)
+    assert order == [("send", "event_sink")]
+    assert receipt["state"] == "DELIVERED"
+    assert confirmation_binds(receipt, "event_sink", snapshot)
+    assert fresh.events._state("evt_local", "event_sink") == "DELIVERED"
+
+
+def _lie_about_report_state(outbox, event_id: str, stale: str, mutate) -> None:
+    real = outbox._channel_state
+    used = {"n": 0}
+
+    def wrapped(current_event: str, channel: str) -> str | None:
+        current = real(current_event, channel)
+        if used["n"] == 0 and current_event == event_id and current == "DURABLE_LOCAL":
+            used["n"] = 1
+            mutate(current_event, channel)
+            return stale
+        return current
+
+    outbox._channel_state = wrapped
+
+
+def test_report_workers_cannot_claim_across_a_state_change(tmp_path):
+    cas = engine(tmp_path / "cas")
+    payload = report(cas, "71" * 16, outcome="failure", phase="fetch-failed")
+    assert cas.submit_report(payload, channels=["github_comment"], remote=None)["complete"] is False
+    event_id = "report-" + payload["run_id"]
+    _mark_unknown(cas.store, "deliveries", event_id, "github_comment")
+    assert cas.outbox._claim(event_id, "github_comment", payload["run_id"], "DURABLE_LOCAL") is None
+    assert cas.outbox._channel_state(event_id, "github_comment") == "DELIVERY_UNKNOWN"
+
+    delivered = engine(tmp_path / "delivered")
+    body = report(delivered, "72" * 16, outcome="failure", phase="context-failed")
+    assert delivered.submit_report(body, channels=["github_comment"], remote=None)["complete"] is False
+    delivered_id = "report-" + body["run_id"]
+    _lie_about_report_state(
+        delivered.outbox,
+        delivered_id,
+        "DURABLE_LOCAL",
+        lambda current_event, channel: _mark_unknown(delivered.store, "deliveries", current_event, channel),
+    )
+    order = []
+
+    class Already:
+        def __call__(self, channel, payload):
+            order.append(("send", channel, payload["phase"], payload["head"]))
+            return confirm(channel, payload)
+
+        def reconcile(self, channel, payload):
+            order.append(("reconcile", channel, payload["phase"], payload["head"]))
+            return bound_confirmation(channel, payload)
+
+    receipts = delivered.deliver_pending(Already())
+    assert order == [("reconcile", "github_comment", "context-failed", SHA)]
+    assert len(receipts) == 1 and receipts[0]["state"] == "DELIVERED"
+    assert report_binds(receipts[0], "github_comment", body)
+    assert delivered.outbox._channel_state(delivered_id, "github_comment") == "DELIVERED"
+
+    absent = engine(tmp_path / "absent")
+    missing = report(absent, "74" * 16, outcome="success", phase="passed")
+    assert absent.submit_report(missing, channels=["github_comment"], remote=None)["complete"] is False
+    absent_id = "report-" + missing["run_id"]
+    _lie_about_report_state(
+        absent.outbox,
+        absent_id,
+        "DURABLE_LOCAL",
+        lambda current_event, channel: _mark_unknown(absent.store, "deliveries", current_event, channel),
+    )
+    order = []
+
+    class Missing:
+        def __call__(self, channel, payload):
+            order.append(("send", channel))
+            return confirm(channel, payload)
+
+        def reconcile(self, channel, payload):
+            order.append(("reconcile", channel))
+            return "absent"
+
+    receipts = absent.deliver_pending(Missing())
+    assert order == [("reconcile", "github_comment"), ("send", "github_comment")]
+    assert len(receipts) == 1 and receipts[0]["state"] == "DELIVERED"
+    assert report_binds(receipts[0], "github_comment", missing)
+
+    fresh = engine(tmp_path / "fresh")
+    local = report(fresh, "73" * 16, outcome="success", phase="passed")
+    assert fresh.submit_report(local, channels=["github_comment"], remote=None)["complete"] is False
+    local_id = "report-" + local["run_id"]
+    assert fresh.outbox._claim(local_id, "github_comment", local["run_id"], "DELIVERY_UNKNOWN") is None
+    assert fresh.outbox._channel_state(local_id, "github_comment") == "DURABLE_LOCAL"
+    _lie_about_report_state(fresh.outbox, local_id, "DELIVERY_UNKNOWN", lambda _event, _channel: None)
+    order = []
+
+    class StillLocal:
+        def __call__(self, channel, payload):
+            order.append(("send", channel))
+            return confirm(channel, payload)
+
+        def reconcile(self, channel, payload):
+            order.append(("reconcile", channel))
+            return bound_confirmation(channel, payload)
+
+    receipts = fresh.deliver_pending(StillLocal())
+    assert order == [("send", "github_comment")]
+    assert len(receipts) == 1 and receipts[0]["state"] == "DELIVERED"
+    assert report_binds(receipts[0], "github_comment", local)
+    assert fresh.outbox._channel_state(local_id, "github_comment") == "DELIVERED"

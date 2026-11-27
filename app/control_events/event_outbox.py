@@ -2,10 +2,10 @@
 
 A written event is queued in the same SQLite transaction as the event.
 A channel is DELIVERED only after an exact receipt: event, channel, payload
-hash, stream, epoch, and producer sequence. Claims are conditional. An
-unknown result is reconciled before another send. Capacity rejects the
-write instead of growing without a bound. This consumer does not call
-GitHub, the MacCI runner, or a production route.
+hash, stream, epoch, and producer sequence. A claim updates only the state
+the worker observed. An unknown result is reconciled before another send.
+Capacity rejects the write instead of growing without a bound. This consumer
+does not call GitHub, the MacCI runner, or a production route.
 """
 
 from datetime import datetime, timezone
@@ -199,39 +199,64 @@ class EventOutbox:
         }
 
     def _dispatch(self, envelope: dict, channel: str, remote, *, crash: str | None) -> dict:
-        current = envelope["state"]
-        if current in {"DELIVERED", "QUARANTINED"}:
-            found = self._latest_receipt(envelope["event_id"], channel, current)
-            return found if found is not None else self._pending(envelope, channel, current)
-        if remote is None:
-            return self._pending(envelope, channel, current)
-        if current == "OUTBOX":
-            return self._pending(envelope, channel, "OUTBOX")
-        if current == "DELIVERY_UNKNOWN":
-            if self._local_receipt_binds(envelope, channel):
-                token = self._claim(envelope["event_id"], channel)
-                if token and self._set_state(envelope["event_id"], channel, "DELIVERED", None, token):
-                    pass
-                found = self._latest_receipt(envelope["event_id"], channel, "DELIVERED")
-                return found if found is not None else self._pending(envelope, channel, "DELIVERY_UNKNOWN")
-            token = self._claim(envelope["event_id"], channel)
+        observed = envelope["state"]
+        for _ in range(3):
+            current = observed
+            if current in {"DELIVERED", "QUARANTINED"}:
+                found = self._latest_receipt(envelope["event_id"], channel, current)
+                return found if found is not None else self._pending(envelope, channel, current)
+            if remote is None:
+                return self._pending(envelope, channel, current)
+            if current == "OUTBOX":
+                return self._pending(envelope, channel, "OUTBOX")
+            if current == "DELIVERY_UNKNOWN":
+                finished = self._finish_unknown(envelope, channel, remote, crash=crash)
+                if finished is not None:
+                    return finished
+                observed = self._state(envelope["event_id"], channel) or "OUTBOX"
+                if observed == "DELIVERY_UNKNOWN":
+                    return self._pending(envelope, channel, "DELIVERY_UNKNOWN")
+                continue
+            if current != "DURABLE_LOCAL":
+                fresh = self._state(envelope["event_id"], channel) or current
+                if fresh != current:
+                    observed = fresh
+                    continue
+                return self._pending(envelope, channel, current)
+            token = self._claim(envelope["event_id"], channel, "DURABLE_LOCAL")
+            if token:
+                return self._send(envelope, channel, remote, token, crash=crash)
+            observed = self._state(envelope["event_id"], channel) or "OUTBOX"
+            if observed == "DURABLE_LOCAL":
+                found = self._latest_receipt(envelope["event_id"], channel, "DURABLE_LOCAL")
+                return found if found is not None else self._pending(envelope, channel, "DURABLE_LOCAL")
+            continue
+        fresh = self._state(envelope["event_id"], channel) or "OUTBOX"
+        found = self._latest_receipt(envelope["event_id"], channel, fresh)
+        return found if found is not None else self._pending(envelope, channel, fresh)
+
+    def _finish_unknown(self, envelope: dict, channel: str, remote, *, crash: str | None) -> dict | None:
+        """Reconcile an unknown row. None means the expected state was no longer current."""
+
+        if self._local_receipt_binds(envelope, channel):
+            token = self._claim(envelope["event_id"], channel, "DELIVERY_UNKNOWN")
             if not token:
-                return self._pending(envelope, channel, "DELIVERY_UNKNOWN")
-            verdict = _reconcile(remote, channel, envelope)
-            if verdict == "delivered":
-                receipt = self._write_receipt(envelope, channel, "DELIVERED")
-                self._set_state(envelope["event_id"], channel, "DELIVERED", None, token)
-                return receipt
-            if verdict != "absent":
-                self._set_state(envelope["event_id"], channel, "DELIVERY_UNKNOWN", "delivery outcome is unknown", token)
-                found = self._latest_receipt(envelope["event_id"], channel, "DELIVERY_UNKNOWN")
-                return found if found is not None else self._write_receipt(envelope, channel, "DELIVERY_UNKNOWN")
-            return self._send(envelope, channel, remote, token, crash=crash)
-        token = self._claim(envelope["event_id"], channel)
+                return None
+            self._set_state(envelope["event_id"], channel, "DELIVERED", None, token)
+            found = self._latest_receipt(envelope["event_id"], channel, "DELIVERED")
+            return found if found is not None else self._pending(envelope, channel, "DELIVERY_UNKNOWN")
+        token = self._claim(envelope["event_id"], channel, "DELIVERY_UNKNOWN")
         if not token:
-            raced = self._state(envelope["event_id"], channel) or "OUTBOX"
-            found = self._latest_receipt(envelope["event_id"], channel, raced)
-            return found if found is not None else self._pending(envelope, channel, raced)
+            return None
+        verdict = _reconcile(remote, channel, envelope)
+        if verdict == "delivered":
+            receipt = self._write_receipt(envelope, channel, "DELIVERED")
+            self._set_state(envelope["event_id"], channel, "DELIVERED", None, token)
+            return receipt
+        if verdict != "absent":
+            self._set_state(envelope["event_id"], channel, "DELIVERY_UNKNOWN", "delivery outcome is unknown", token)
+            found = self._latest_receipt(envelope["event_id"], channel, "DELIVERY_UNKNOWN")
+            return found if found is not None else self._write_receipt(envelope, channel, "DELIVERY_UNKNOWN")
         return self._send(envelope, channel, remote, token, crash=crash)
 
     def _send(self, envelope: dict, channel: str, remote, token: str, *, crash: str | None) -> dict:
@@ -258,7 +283,9 @@ class EventOutbox:
         self._set_state(envelope["event_id"], channel, state, detail, token)
         return receipt
 
-    def _claim(self, event_id: str, channel: str) -> str | None:
+    def _claim(self, event_id: str, channel: str, expected: str) -> str | None:
+        if expected not in {"DURABLE_LOCAL", "DELIVERY_UNKNOWN"}:
+            return None
         token = uuid.uuid4().hex
         now = int(time.time())
         with self.store.transaction() as conn:
@@ -267,9 +294,9 @@ class EventOutbox:
                 """
                 UPDATE event_outbox
                 SET state='OUTBOX', detail=?, updated_at=?, claim_token=?, claim_pid=?, claim_expires_at=?
-                WHERE event_id=? AND channel=? AND state IN ('DURABLE_LOCAL', 'DELIVERY_UNKNOWN')
+                WHERE event_id=? AND channel=? AND state=?
                 """,
-                (token, _now(), token, os.getpid(), now + _CLAIM_TTL_SECONDS, event_id, channel),
+                (token, _now(), token, os.getpid(), now + _CLAIM_TTL_SECONDS, event_id, channel, expected),
             )
             if conn.total_changes == before:
                 return None
