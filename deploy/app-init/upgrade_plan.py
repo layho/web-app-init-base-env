@@ -17,13 +17,19 @@ MAX_FILE = 8 * 1024 * 1024
 PROTECTED = {".app-init.json", "README.md", "app/project_info.json", "app/release_notes.json"}
 ROOT_FILES = {".gitignore", "requirements.txt", "frontend/index.html", "frontend/package.json",
               "frontend/package-lock.json", "frontend/tsconfig.json", "frontend/vite.config.ts"}
+APP_OWNED_PREFIXES = ("app_modules/", "frontend/src/app-modules/", "migrations/modules/")
+MODULE_SEEDS = {"app_modules/__init__.py", "app_modules/registry.py"}
 PREFIXES = ("app/", "frontend/src/", "scripts/", "deploy/macmini/", "migrations/", "tests/")
+
+
+def app_owned(path):
+    return isinstance(path, str) and path.casefold().startswith(APP_OWNED_PREFIXES)
 
 
 def managed(path):
     p = PurePosixPath(path)
     if (not path or p.is_absolute() or ".." in p.parts or p.as_posix() != path
-            or path in PROTECTED or any(x.startswith(".") for x in p.parts if path != ".gitignore")
+            or app_owned(path) or path in PROTECTED or any(x.startswith(".") for x in p.parts if path != ".gitignore")
             or any(x in {"__pycache__", "node_modules", "dist", "logs", "data", "secrets"} for x in p.parts)
             or p.suffix.lower() in {".db", ".sqlite", ".sqlite3", ".pem", ".key", ".p12"}):
         return False
@@ -148,6 +154,36 @@ def plan(old, new, app):
             else:
                 action, reason = "merge", "non-overlapping three-way merge"
         decisions.append(Decision(path, action, reason, before, after, current, result))
+    return decisions
+
+
+def module_seed_snapshot(root):
+    """Read only exact starter files; never adopt business content as templates."""
+    root = Path(root).resolve(strict=True)
+    result = {}
+    for relative in sorted(MODULE_SEEDS):
+        path = root / relative
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path.parent.is_symlink() or path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_FILE:
+            raise ValueError("Unsafe application module seed: " + relative)
+        result[relative] = path.read_bytes()
+    return result
+
+
+def module_seed_decisions(new_seeds, observed):
+    """Seed missing files once; an existing exact path is always app-owned."""
+    if not set(new_seeds).issubset(MODULE_SEEDS):
+        raise ValueError("Unexpected application module seed")
+    decisions = []
+    for path, content in sorted(new_seeds.items()):
+        if path in observed:
+            if observed[path] not in {"100644", "100755"}:
+                raise ValueError("Non-regular application module seed: " + path)
+            continue
+        if any(other.casefold() == path.casefold() or other.casefold().startswith(path.casefold()+"/") or path.casefold().startswith(other.casefold()+"/") for other in observed):
+            raise ValueError("Application module seed path collision: " + path)
+        decisions.append(Decision(path, "add", "initialize missing app-owned module seed", None, content, None, content))
     return decisions
 
 
