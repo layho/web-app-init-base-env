@@ -297,9 +297,12 @@ class World:
 
 def standard_world():
     world = World()
-    world.register("agent-1", "agent", scopes=["feedback"])
-    world.register("agent-2", "agent", scopes=["feedback"])
-    world.register("host-1", "host", scopes=["pull", "merge", "publish"])
+    world.register("agent-1", "agent", scopes=["feedback", "run", "github.effect", "session", "limit", "read"])
+    world.register("agent-2", "agent", scopes=["feedback", "run", "github.effect", "session", "limit"])
+    world.register("host-1", "host", scopes=[
+        "pull", "merge", "publish", "rotate", "deploy", "session", "branch.read",
+        "host.privilege", "feedback", "signer.revoke", "read",
+    ])
     world.register("macci-1", "macci", scopes=["ci"])
     world.register("publisher-1", "publisher", scopes=["publish"])
     world.register("accept-1", "user_acceptance", scopes=["accept"])
@@ -543,7 +546,7 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(good.status_code, 200, good.text)
         self.assertFalse(good.json()["production_enabled"])
 
-        rotated, _ = world.post("proxy.rotate", "host-1", scope_to_rotate="feedback", credential_scope="merge")
+        rotated, _ = world.post("proxy.rotate", "host-1", scope_to_rotate="feedback", credential_scope="rotate")
         self.assertEqual(rotated.json()["generation"], 2)
         stale, _ = world.post("feedback.write", "agent-1", credential_scope="feedback", credential_generation=1)
         self.assertEqual(stale.json()["reason"], "stale_generation")
@@ -551,7 +554,7 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(current.status_code, 200, current.text)
         pull, _ = world.post("pull.read", "host-1", credential_scope="pull", credential_generation=1)
         self.assertEqual(pull.status_code, 200, pull.text)
-        world.post("proxy.rotate", "host-1", scope_to_rotate="pull", credential_scope="merge")
+        world.post("proxy.rotate", "host-1", scope_to_rotate="pull", credential_scope="rotate")
         swapped, _ = world.post("pull.read", "host-1", credential_scope="feedback", credential_generation=2)
         self.assertEqual(swapped.json()["reason"], "cross_scope")
         still_merge, _ = world.post(
@@ -785,7 +788,7 @@ class PolicyAndAuthzTests(unittest.TestCase):
         self.assertFalse(any(key.endswith("|release.publish|idem-w02-policy-deny") or "|release.publish|" in key
                              for key in world.svc.store.read()["idempotency"]))
 
-        privilege, _ = world.post("host.privilege", "host-1")
+        privilege, _ = world.post("host.privilege", "host-1", credential_scope="host.privilege")
         self.assertEqual(privilege.json()["code"], "POLICY_DENIED")
         self.assertEqual(privilege.json()["scope_class"], "high_risk")
         self.assertEqual(world.svc.store.read()["policy"]["high_risk_allow"], [])
@@ -823,28 +826,28 @@ class DurableAndBoundaryTests(unittest.TestCase):
     def test_rate_limit_and_session_revocation_survive_restart(self):
         world = standard_world()
         for _ in range(3):
-            response, _ = world.post("limit.consume", "agent-1")
+            response, _ = world.post("limit.consume", "agent-1", credential_scope="limit")
             self.assertEqual(response.status_code, 200, response.text)
-        limited, _ = world.post("limit.consume", "agent-1")
+        limited, _ = world.post("limit.consume", "agent-1", credential_scope="limit")
         self.assertEqual(limited.status_code, 429)
         self.assertEqual(limited.json()["code"], "RATE_LIMITED")
         self.assertIn("script-src", limited.headers["content-security-policy"])
         world.reopen()
-        still, _ = world.post("limit.consume", "agent-1")
+        still, _ = world.post("limit.consume", "agent-1", credential_scope="limit")
         self.assertEqual(still.status_code, 429)
         buckets = world.svc.store.read()["limits"]
         self.assertEqual(len(buckets), 1)
         self.assertGreaterEqual(next(iter(buckets.values()))["count"], 4)
         self.assertNotIn("login", buckets)
 
-        issued, _ = world.post("session.issue", "agent-1")
+        issued, _ = world.post("session.issue", "agent-1", credential_scope="session")
         raw = issued.json()["session_id"]
         self.assertNotIn(raw, world.svc.store.text())
-        world.register("host-admin", "host", scopes=["pull", "merge", "publish"], admin=True)
-        revoked, _ = world.post("session.revoke", "host-admin", session_id=raw)
+        world.register("host-admin", "host", scopes=["pull", "merge", "publish", "session"], admin=True)
+        revoked, _ = world.post("session.revoke", "host-admin", session_id=raw, credential_scope="session")
         self.assertEqual(revoked.status_code, 200, revoked.text)
         world.reopen()
-        checked, _ = world.post("session.check", "agent-1", session_id=raw)
+        checked, _ = world.post("session.check", "agent-1", session_id=raw, credential_scope="session")
         self.assertEqual(checked.status_code, 401)
         self.assertEqual(checked.json()["reason"], "session_revoked")
         self.assertIn("script-src", checked.headers["content-security-policy"])
@@ -876,7 +879,7 @@ class DurableAndBoundaryTests(unittest.TestCase):
         self.assertNotIn("overall", anonymous.json())
         query = "overall=proven"
         signed = world.sign(
-            "host-1", "branch.read", method="GET", query=canonical_query(query), credential_scope="",
+            "host-1", "branch.read", method="GET", query=canonical_query(query), credential_scope="branch.read",
         )
         secure = https.get(
             "/api/v1/control/branch-protection?" + query,
@@ -955,13 +958,13 @@ class ReviewRegressionTests(unittest.TestCase):
     def test_unsigned_fields_and_secret_digest_are_rejected(self):
         world = standard_world()
         response, body = world.post(
-            "signer.revoke", "host-1", target_signer="agent-2",
+            "signer.revoke", "host-1", target_signer="agent-2", credential_scope="signer.revoke",
         )
         self.assertEqual(response.status_code, 403, response.text)
         self.assertEqual(response.json()["reason"], "admin")
         self.assertNotIn("agent-2", world.svc.store.read()["revoked_signers"])
-        world.register("host-admin", "host", admin=True)
-        allowed, signed = world.post("signer.revoke", "host-admin", target_signer="agent-2")
+        world.register("host-admin", "host", scopes=["signer.revoke"], admin=True)
+        allowed, signed = world.post("signer.revoke", "host-admin", target_signer="agent-2", credential_scope="signer.revoke")
         self.assertEqual(allowed.status_code, 200, allowed.text)
         self.assertIn("agent-2", world.svc.store.read()["revoked_signers"])
         before_nonces = dict(world.svc.store.read()["nonces"])
@@ -1021,17 +1024,17 @@ class ReviewRegressionTests(unittest.TestCase):
 
     def test_server_rate_limit_and_session_owner(self):
         world = standard_world()
-        issued, _ = world.post("session.issue", "agent-1")
+        issued, _ = world.post("session.issue", "agent-1", credential_scope="session")
         raw = issued.json()["session_id"]
-        foreign, _ = world.post("session.check", "agent-2", session_id=raw)
+        foreign, _ = world.post("session.check", "agent-2", session_id=raw, credential_scope="session")
         self.assertEqual(foreign.json()["reason"], "session_owner")
-        outsider, _ = world.post("session.revoke", "host-1", session_id=raw)
+        outsider, _ = world.post("session.revoke", "host-1", session_id=raw, credential_scope="session")
         self.assertEqual(outsider.json()["reason"], "session_owner")
-        still, _ = world.post("session.check", "agent-1", session_id=raw)
+        still, _ = world.post("session.check", "agent-1", session_id=raw, credential_scope="session")
         self.assertEqual(still.status_code, 200, still.text)
         for _ in range(3):
-            self.assertEqual(world.post("limit.consume", "agent-2")[0].status_code, 200)
-        self.assertEqual(world.post("limit.consume", "agent-1")[0].status_code, 200)
+            self.assertEqual(world.post("limit.consume", "agent-2", credential_scope="limit")[0].status_code, 200)
+        self.assertEqual(world.post("limit.consume", "agent-1", credential_scope="limit")[0].status_code, 200)
 
     def test_store_fails_closed_and_effects_do_not_overlap_across_processes(self):
         import multiprocessing
@@ -1311,7 +1314,7 @@ class ReviewClosureTests(unittest.TestCase):
 
     def test_policy_checks_role_scope_evidence_and_high_risk_binding(self):
         world = standard_world()
-        known, _ = world.post("policy.evaluate", "host-1", action="deploy.apply")
+        known, _ = world.post("policy.evaluate", "host-1", action="deploy.apply", credential_scope="deploy")
         self.assertEqual(known.json()["code"], "POLICY_DENIED")
         self.assertEqual(known.json()["scope_class"], "ordinary")
         self.assertFalse(known.json()["allow"])
@@ -1359,7 +1362,9 @@ class ReviewClosureTests(unittest.TestCase):
             return state, None
 
         world.svc.store.update(keep_name)
-        listed, _ = world.post("policy.evaluate", "host-1", action="host.privilege", object_id="obj-a")
+        listed, _ = world.post(
+            "policy.evaluate", "host-1", action="host.privilege", object_id="obj-a", credential_scope="host.privilege",
+        )
         self.assertEqual(listed.json()["scope_class"], "high_risk")
         candidate = world.evidence_fields()["candidate_id"]
         subject = phase_subject("develop", TASK, candidate)
@@ -1367,16 +1372,19 @@ class ReviewClosureTests(unittest.TestCase):
             principal_id="host-1", operation="host.privilege", object_id="obj-a", subject=subject,
         )
         other_object, _ = world.post(
-            "policy.evaluate", "host-1", action="host.privilege", object_id="obj-b", phase="develop", **world.evidence_fields(),
+            "policy.evaluate", "host-1", action="host.privilege", object_id="obj-b", phase="develop",
+            credential_scope="host.privilege", **world.evidence_fields(),
         )
         self.assertEqual(other_object.json()["scope_class"], "high_risk")
         other_subject, _ = world.post(
-            "policy.evaluate", "host-1", action="host.privilege", object_id="obj-a", phase="test", **world.evidence_fields(),
+            "policy.evaluate", "host-1", action="host.privilege", object_id="obj-a", phase="test",
+            credential_scope="host.privilege", **world.evidence_fields(),
         )
         self.assertEqual(other_subject.json()["scope_class"], "high_risk")
         before = world.svc.store.text()
         granted, _ = world.post(
-            "policy.evaluate", "host-1", action="host.privilege", object_id="obj-a", phase="develop", **world.evidence_fields(),
+            "policy.evaluate", "host-1", action="host.privilege", object_id="obj-a", phase="develop",
+            credential_scope="host.privilege", **world.evidence_fields(),
         )
         self.assertEqual(granted.status_code, 200, granted.text)
         self.assertTrue(granted.json()["allow"])
@@ -1384,7 +1392,8 @@ class ReviewClosureTests(unittest.TestCase):
         self.assertFalse(granted.json()["side_effect"])
         self.assertEqual(world.svc.store.text(), before)
         direct, _ = world.post(
-            "host.privilege", "host-1", object_id="obj-a", phase="develop", **world.evidence_fields(),
+            "host.privilege", "host-1", object_id="obj-a", phase="develop",
+            credential_scope="host.privilege", **world.evidence_fields(),
         )
         self.assertEqual(direct.json()["code"], "NOT_AUTHORIZED")
         self.assertEqual(world.svc.store.read()["policy"]["high_risk_grants"][0]["special_authorization"], True)
@@ -1410,6 +1419,164 @@ class ReviewClosureTests(unittest.TestCase):
         )
         authorize(complete, "diagnostic.cursor", binding)
         self.assertTrue(REQUIRED_SCOPES["diagnostic.cursor"] <= complete.scopes)
+
+    def test_two_executors_cannot_lease_one_subject(self):
+        world = standard_world()
+        first, candidate_a = self._claim(world, HEAD)
+        rival, _ = world.post(
+            "run.claim", "agent-2", credential_scope="run", phase="develop",
+            candidate_id=candidate_a, head=HEAD, base=BASE, merge=MERGE, tree=TREE,
+        )
+        self.assertEqual(rival.json()["code"], "RECLAIM_DENIED")
+        self.assertEqual(rival.json()["reason"], "active_lease")
+        self.assertFalse(rival.json()["changed"])
+        self.assertEqual(world.run(first["run_id"])["state"], "LEASED")
+        self.assertEqual(world.run(first["run_id"])["principal_id"], "agent-1")
+        self.assertEqual(world.run(first["run_id"])["attempt"], 1)
+        holder = world._principal_binding("agent-2")
+        stolen, _ = world.post(
+            "run.renew", "agent-2", run_id=first["run_id"], credential_scope="run",
+            lease_token=first["lease_token"], lease_generation=1, expected_revision=1,
+            **holder,
+        )
+        self.assertEqual(stolen.json()["code"], "LEASE_FENCE_REJECTED")
+        self.assertEqual(world.run(first["run_id"])["principal_id"], "agent-1")
+        self.assertEqual(world.run(first["run_id"])["producer_id"], "agent-1")
+        second, candidate_b = self._claim_as(world, "agent-2", HEAD_B)
+        self.assertEqual(second["attempt"], 1)
+        self.assertEqual(world.run(first["run_id"])["state"], "LEASED")
+        self.assertEqual(world.run(second["run_id"])["state"], "LEASED")
+        self.assertNotEqual(world.run(first["run_id"])["subject"], world.run(second["run_id"])["subject"])
+        self.assertEqual(world.run(second["run_id"])["producer_id"], "agent-2")
+        self.assertNotEqual(candidate_a, candidate_b)
+
+    def test_unknown_cannot_be_closed_or_continued_by_another_executor(self):
+        world = standard_world()
+        first, candidate = self._claim(world, HEAD)
+        run_id = first["run_id"]
+        started, _ = world.post(
+            "run.start", "agent-1", run_id=run_id, credential_scope="run",
+            lease_token=first["lease_token"], lease_generation=1, expected_revision=1,
+        )
+        self.assertEqual(started.json()["state"], "RUNNING")
+        fenced = world.svc.trusted_fence(run_id, fenced=True, effect_known=False)
+        self.assertEqual(fenced["state"], "UNKNOWN")
+        before = world.run(run_id)
+        rival, _ = world.post(
+            "run.claim", "agent-2", credential_scope="run", phase="develop",
+            candidate_id=candidate, head=HEAD, base=BASE, merge=MERGE, tree=TREE,
+        )
+        self.assertEqual(rival.json()["code"], "RECLAIM_DENIED")
+        self.assertEqual(rival.json()["reason"], "unknown_unreconciled")
+        self.assertFalse(rival.json()["changed"])
+        holder = world._principal_binding("agent-2")
+        fields = dict(
+            phase="develop", candidate_id=candidate, head=HEAD, base=BASE, merge=MERGE, tree=TREE,
+            credential_scope="run", lease_token="other-executor", lease_generation=before["generation"],
+            expected_revision=before["revision"], **holder,
+        )
+        closed, _ = world.post("run.complete", "agent-2", run_id=run_id, result="SUCCEEDED", **fields)
+        self.assertEqual(closed.json()["code"], "LEASE_FENCE_REJECTED")
+        self.assertFalse(closed.json()["changed"])
+        released, _ = world.post("run.release", "agent-2", run_id=run_id, **fields)
+        self.assertNotEqual(released.status_code, 200)
+        self.assertEqual(world.run(run_id)["state"], "UNKNOWN")
+        self.assertEqual(world.run(run_id)["revision"], before["revision"])
+        self.assertEqual(world.run(run_id)["principal_id"], "agent-1")
+        client, _ = world.post("run.reconcile", "agent-2", run_id=run_id, credential_scope="run", **holder)
+        self.assertEqual(client.json()["reason"], "client_cannot_fence")
+        self.assertEqual(world.run(run_id)["state"], "UNKNOWN")
+
+    def test_reconciled_subject_continues_for_another_executor(self):
+        world = standard_world()
+        first, candidate = self._claim(world, HEAD)
+        run_id = first["run_id"]
+        world.svc.trusted_fence(run_id, fenced=True, effect_known=False)
+        classified = world.svc.trusted_classify(run_id, fenced=True, classification="succeeded")
+        self.assertEqual(classified["state"], "SUCCEEDED")
+        continued, _ = world.post(
+            "run.claim", "agent-2", credential_scope="run", phase="develop",
+            candidate_id=candidate, head=HEAD, base=BASE, merge=MERGE, tree=TREE,
+        )
+        self.assertEqual(continued.status_code, 200, continued.text)
+        payload = continued.json()
+        self.assertEqual(payload["attempt"], 2)
+        self.assertNotEqual(payload["run_id"], run_id)
+        self.assertEqual(world.run(run_id)["state"], "SUCCEEDED")
+        self.assertEqual(world.run(payload["run_id"])["principal_id"], "agent-2")
+        self.assertEqual(world.run(payload["run_id"])["producer_id"], "agent-2")
+        self.assertEqual(world.run(payload["run_id"])["subject"], world.run(run_id)["subject"])
+        done, _ = world.post(
+            "run.complete", "agent-2", run_id=payload["run_id"], credential_scope="run",
+            lease_token=payload["lease_token"], lease_generation=1, result="SUCCEEDED", expected_revision=1,
+        )
+        self.assertEqual(done.status_code, 200, done.text)
+        again, _ = world.post(
+            "run.claim", "agent-1", credential_scope="run", phase="develop",
+            candidate_id=candidate, head=HEAD, base=BASE, merge=MERGE, tree=TREE,
+        )
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertEqual(again.json()["attempt"], 3)
+
+    def _claim_as(self, world, principal_id, head):
+        candidate = world.svc.register_candidate(repo=REPO, task=TASK, head=head, base=BASE, merge=MERGE, tree=TREE)
+        response, _ = world.post(
+            "run.claim", principal_id, credential_scope="run", phase="develop",
+            candidate_id=candidate, head=head, base=BASE, merge=MERGE, tree=TREE,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json(), candidate
+
+    def test_missing_scope_entry_does_not_authorize(self):
+        self.assertEqual(set(MATRIX), set(REQUIRED_SCOPES))
+        for operation, scopes in REQUIRED_SCOPES.items():
+            self.assertTrue(scopes, operation)
+            self.assertNotIn("", scopes)
+        world = standard_world()
+        arbitrary, _ = world.post("run.claim", "agent-1", credential_scope="publish")
+        self.assertEqual(arbitrary.json()["reason"], "cross_scope")
+        self.assertEqual(world.svc.store.read()["runs"], {})
+        world.register("agent-plain", "agent", scopes=["feedback"])
+        plain, _ = world.post("run.claim", "agent-plain", credential_scope="run")
+        self.assertEqual(plain.json()["reason"], "cross_scope")
+        self.assertEqual(world.svc.store.read()["runs"], {})
+        saved = REQUIRED_SCOPES.pop("limit.consume")
+        try:
+            denied, _ = world.post("limit.consume", "agent-1", credential_scope="limit")
+            self.assertEqual(denied.json()["reason"], "cross_scope")
+        finally:
+            REQUIRED_SCOPES["limit.consume"] = saved
+        restored, _ = world.post("limit.consume", "agent-1", credential_scope="limit")
+        self.assertEqual(restored.status_code, 200, restored.text)
+
+    def test_publish_evaluation_is_not_publish_authorization(self):
+        world = standard_world()
+        candidate = world.svc.register_candidate(repo=REPO, task=TASK, head=HEAD, base=BASE, merge=MERGE, tree=TREE)
+        fields = dict(
+            candidate_id=candidate, head=HEAD, base=BASE, merge=MERGE, tree=TREE,
+            object_id=candidate, credential_scope="publish", credential_generation=1,
+        )
+        before = world.svc.store.text()
+        missing, _ = world.post("policy.evaluate", "publisher-1", action="release.publish", **fields)
+        self.assertEqual(missing.json()["code"], "EVIDENCE_MISSING")
+        self.assertEqual(missing.json()["reason"], "acceptance")
+        self.assertFalse(missing.json()["allow"])
+        self.assertFalse(world.svc.production_verification_enabled)
+        self.assertEqual(world.svc.store.read()["published"], [])
+        self.assertEqual(world.svc.store.text(), before)
+        accepted, _ = world.post("release.accept", "accept-1", **{**fields, "credential_scope": "accept"})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        blocked, _ = world.post("policy.evaluate", "publisher-1", action="release.publish", **fields)
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(blocked.json()["code"], "PRODUCTION_VERIFICATION_DISABLED")
+        self.assertFalse(blocked.json()["allow"])
+        self.assertFalse(blocked.json()["production_verification_enabled"])
+        self.assertFalse(world.svc.production_verification_enabled)
+        self.assertEqual(world.svc.store.read()["published"], [])
+        direct, _ = world.post("release.publish", "publisher-1", **fields)
+        self.assertEqual(direct.json()["code"], "PRODUCTION_VERIFICATION_DISABLED")
+        self.assertFalse(direct.json()["production_verification_enabled"])
+        self.assertEqual(world.svc.store.read()["published"], [])
 
 
 if __name__ == "__main__":

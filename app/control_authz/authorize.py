@@ -1,8 +1,11 @@
 """Default-deny binding of repo, app, producer, stream, operation, and scope.
 
-``MATRIX`` is the role map. ``REQUIRED_SCOPES`` is every scope an operation
-requires. Authorization checks the presented scope and the whole set.
-``app_id`` and ``target_app_id`` are checked separately.
+``MATRIX`` is the role map. ``REQUIRED_SCOPES`` classifies every operation.
+A missing or empty entry does not authorize an arbitrary scope. The presented
+scope must be one of the classified scopes and the caller must hold it.
+Conjunction operations still require the whole set. ``policy.evaluate`` and
+``proxy.authorize`` present one classified scope; the target action or the
+proxy check is separate. ``app_id`` and ``target_app_id`` are checked separately.
 """
 
 from __future__ import annotations
@@ -55,7 +58,17 @@ MATRIX = {
     "signer.revoke": frozenset({"host"}),
 }
 
-REQUIRED_SCOPES = {
+_RUN = frozenset({"run"})
+_CI = frozenset({"ci"})
+_ACCEPT = frozenset({"accept"})
+_DEPLOY = frozenset({"deploy"})
+_SESSION = frozenset({"session"})
+
+# These operations present one member of a classified set. The caller must
+# hold that member. They do not have to hold every other member.
+_ALTERNATIVE_SCOPE_OPERATIONS = frozenset({"proxy.authorize", "policy.evaluate"})
+
+_OPERATION_SCOPES = {
     "feedback.write": frozenset({"feedback"}),
     "pull.read": frozenset({"pull"}),
     "preview.merge": frozenset({"merge"}),
@@ -66,11 +79,56 @@ REQUIRED_SCOPES = {
     "event.read": frozenset({"event.read"}),
     "report.submit": frozenset({"report.submit"}),
     "report.read": frozenset({"report.read"}),
+    "run.claim": _RUN,
+    "run.renew": _RUN,
+    "run.start": _RUN,
+    "run.complete": _RUN,
+    "run.release": _RUN,
+    "run.heartbeat": _RUN,
+    "run.reconcile": _RUN,
+    "ci.status.write": _CI,
+    "deploy.apply": _DEPLOY,
+    "deploy.switch": _DEPLOY,
+    "release.accept": _ACCEPT,
+    "release.reject": _ACCEPT,
+    "proxy.rotate": frozenset({"rotate"}),
+    "proxy.authorize": frozenset({"feedback", "pull", "merge", "publish", "read"}),
+    "session.issue": _SESSION,
+    "session.revoke": _SESSION,
+    "session.check": _SESSION,
+    "limit.consume": frozenset({"limit"}),
+    "github.effect": frozenset({"run", "github.effect"}),
+    "branch.read": frozenset({"branch.read"}),
+    "host.privilege": frozenset({"host.privilege"}),
+    "policy.change": frozenset({"policy.change"}),
+    "db.migrate": frozenset({"db.migrate"}),
+    "signer.revoke": frozenset({"signer.revoke"}),
+}
+
+REQUIRED_SCOPES = {
+    **_OPERATION_SCOPES,
+    "policy.evaluate": frozenset().union(*_OPERATION_SCOPES.values()),
 }
 
 
 def _deny(reason: str, detail: str) -> AuthzError:
     return AuthzError("NOT_AUTHORIZED", 403, detail, reason=reason)
+
+
+def _scopes_hold(operation: str, presented: str, held: set[str]) -> bool:
+    """True only for a classified scope the caller holds.
+
+    A missing entry, an empty entry, or a scope that is not classified for
+    the operation is a denial. Conjunction operations require every member.
+    Alternative operations require the one presented member.
+    """
+
+    required = REQUIRED_SCOPES.get(operation)
+    if not required or presented not in required or presented not in held:
+        return False
+    if operation in _ALTERNATIVE_SCOPE_OPERATIONS:
+        return True
+    return required <= held
 
 
 def binding_for(principal: Principal, operation: str, body: dict) -> ResourceBinding:
@@ -122,8 +180,5 @@ def authorize(principal: Principal, operation: str, resource_binding: ResourceBi
         raise _deny("cross_producer", "producer is outside the server binding")
     if resource_binding.stream_id != principal.stream_id:
         raise _deny("cross_stream", "stream is outside the server binding")
-    required = REQUIRED_SCOPES.get(operation)
-    if required is not None:
-        held = set(principal.scopes)
-        if resource_binding.scope not in required or not required <= held:
-            raise _deny("cross_scope", "operation scope is not interchangeable")
+    if not _scopes_hold(operation, resource_binding.scope, set(principal.scopes)):
+        raise _deny("cross_scope", "operation scope is not interchangeable")

@@ -4,7 +4,9 @@ Gate evidence is injected on the server and is bound to one candidate.
 A missing flag, a missing tuple, or a validity window that does not cover
 the server clock denies. Evidence for candidate A does not authorize
 candidate B. Unknown actions are denied. A known action is not allowed
-merely because its name is in the role matrix.
+merely because its name is in the role matrix. A publisher role and the
+publish scope are not authorization to publish. Acceptance and the
+production gate stay separate, and production stays disabled.
 
 ``production_verification_enabled`` stays false. This module does not
 enable a high-risk operation in production. A high-risk allow exists only
@@ -14,7 +16,7 @@ principal, and marks special authorization.
 
 from __future__ import annotations
 
-from app.control_authz.authorize import MATRIX, REQUIRED_SCOPES
+from app.control_authz.authorize import MATRIX, _scopes_hold
 from app.control_authz.canonical import candidate_id_for
 
 from .errors import ControlError
@@ -32,6 +34,7 @@ HIGH_RISK = frozenset({
 })
 EVIDENCE_FLAGS = ("macci_passed", "same_repo", "queue_allowed", "no_conflict", "candidate_exact", "test_passed")
 EVIDENCE_GATED = frozenset({"preview.merge", "deploy.apply", "draft.undraft"})
+PUBLISH_NOT_AUTHORIZED = "publish_not_authorized"
 TUPLE_FIELDS = ("head", "base", "merge", "tree")
 ROUTINE = frozenset({
     "feedback.write",
@@ -120,13 +123,10 @@ def evidence_allows(policy: dict, body: dict, *, now: int) -> bool:
     return True
 
 
-def _scopes_hold(principal, action: str, body: dict) -> bool:
-    required = REQUIRED_SCOPES.get(action)
-    if not required:
-        return True
-    held = set(principal.scopes)
-    presented = str(body.get("credential_scope") or "")
-    return presented in required and required <= held
+def scopes_hold(principal, action: str, body: dict) -> bool:
+    """Missing and unknown scopes deny. A role entry is not a scope grant."""
+
+    return _scopes_hold(action, str(body.get("credential_scope") or ""), set(principal.scopes))
 
 
 def _request_subject(body: dict) -> str:
@@ -191,7 +191,7 @@ def decide(principal, operation: str, body: dict, policy: dict, *, now: int) -> 
         return _deny("unknown_action")
     if principal.kind not in MATRIX[action]:
         return _deny("role")
-    if not _scopes_hold(principal, action, body):
+    if not scopes_hold(principal, action, body):
         return _deny("scope")
     if action in HIGH_RISK:
         if _high_risk_bound(principal, action, body, policy):
@@ -203,7 +203,7 @@ def decide(principal, operation: str, body: dict, policy: dict, *, now: int) -> 
             return _deny("ordinary")
         return Decision(True, None, "ordinary")
     if action == "release.publish":
-        return Decision(True, None, "publish")
+        return Decision(False, None, PUBLISH_NOT_AUTHORIZED)
     if action in ROUTINE:
         return Decision(True, None, "ordinary")
     return _deny("unknown_action")

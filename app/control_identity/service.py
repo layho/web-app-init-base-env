@@ -34,12 +34,14 @@ from .lease import (
     phase_subject,
     token_hash,
 )
-from .policy import decide, denied
+from .policy import PUBLISH_NOT_AUTHORIZED, decide, denied
 from .proxy import OPERATION_SCOPE, check_proxy, rotate
 
 _ID = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _REPO = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 TERMINAL_RUNS = {"SUCCEEDED", "FAILED", "SUPERSEDED", "CANCELLED"}
+# One active round per business subject. Holder identity is not part of this key.
+_OBJECT_KEYS = ("repo_id", "app_id", "task_id", "phase", "subject")
 IDEMPOTENT = {
     "run.claim",
     "run.renew",
@@ -377,8 +379,14 @@ class ControlIdentityService:
             self._proxy_gate(state, operation, body)
         if operation not in {"proxy.authorize", "session.check", "diagnostic.read", "branch.read", "pull.read"}:
             decision = decide(principal, operation, body, state["policy"], now=self.now())
-            if not decision.allow:
+            publish_gate = decision.scope_class == PUBLISH_NOT_AUTHORIZED and (
+                operation == "release.publish"
+                or (operation == "policy.evaluate" and str(body.get("action") or "") == "release.publish")
+            )
+            if not decision.allow and not publish_gate:
                 raise denied(decision)
+            if publish_gate:
+                self._block_publish(state, body)
         if operation == "release.publish":
             self._block_publish(state, body)
         actor = body.get("actor") if isinstance(body.get("actor"), dict) else {}
@@ -567,14 +575,14 @@ class ControlIdentityService:
         candidate_id = str(body.get("candidate_id") or "")
         subject = phase_subject(phase, task_id, candidate_id)
         self._bind_claim_identity(state, principal, body, phase, task_id, candidate_id)
+        # producer, stream, and principal validate the holder. They are not
+        # part of the object key, so a second executor cannot open another
+        # active round or restart the attempt on this subject.
         scope = {
             "repo_id": principal.repo_id,
+            "app_id": principal.app_id,
             "task_id": task_id,
             "phase": phase,
-            "candidate_id": candidate_id,
-            "app_id": principal.app_id,
-            "producer_id": principal.producer_id,
-            "stream_id": principal.stream_id,
             "subject": subject,
         }
         active = self._active_runs(state, scope)
@@ -659,9 +667,8 @@ class ControlIdentityService:
                                extra={"changed": False})
 
     def _scoped_runs(self, state, scope):
-        keys = ("repo_id", "task_id", "phase", "candidate_id", "app_id", "producer_id", "stream_id", "subject")
         for run in state["runs"].values():
-            if all(run.get(key) == scope[key] for key in keys):
+            if all(run.get(key) == scope[key] for key in _OBJECT_KEYS):
                 yield run
 
     def _active_runs(self, state, scope):

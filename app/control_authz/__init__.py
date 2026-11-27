@@ -52,8 +52,9 @@ and an integer policy revision. The revision matches the frozen contract
 The source comes from ``SOURCE_BY_KIND``, which includes ``policy_service``.
 ``MATRIX`` is the role map and includes ``event.append``, ``event.read``,
 ``diagnostic.cursor``, ``report.submit``, and ``report.read``.
-``REQUIRED_SCOPES`` lists every scope an operation requires. Authorization
-checks the whole set.
+``REQUIRED_SCOPES`` lists every scope an operation requires. A missing entry
+denies. Authorization checks the presented scope and, for a conjunction, the
+whole set.
 
 Joint W01+W02 isolation tests run after W01 adapts its callers to these
 signatures and drops its copy of this package. Point ``PYTHONPATH`` at one

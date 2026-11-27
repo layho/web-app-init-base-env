@@ -1,9 +1,11 @@
 """Opaque lease tokens bound to principal, run, scope, and generation.
 
 Phase subject identity follows the frozen contract: attempt increases on the
-same task, phase, and subject. The phase list is the contract list. Chain
-phases bind the candidate. Task-aggregate phases bind the task. This is the
-lease fence. It is not a scheduler.
+same repo, app, task, phase, and subject. Producer, stream, and principal
+identify the holder of a round. They do not split that subject into another
+active round. The phase list is the contract list. Chain phases bind the
+candidate, so independent candidate chains stay parallel. Task-aggregate
+phases bind the task. This is the lease fence. It is not a scheduler.
 """
 
 from __future__ import annotations
