@@ -44,6 +44,18 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(json.loads(request.data), {"host_id": "macmini-01"})
         self.assertEqual(request.get_header("Authorization"), "Bearer " + "a"*40)
         self.assertEqual(opener.open.call_args.kwargs["timeout"], 10)
+        self.assertEqual(request.get_header("User-agent"), "HostOps-Agent/0.5.0")
+
+    def test_task_transport_client_identity(self):
+        for route in ("claim", "report"):
+            with patch.object(agent, "build_opener") as build:
+                opener = build.return_value
+                opener.open.return_value.__enter__.return_value = io.BytesIO(b'{}')
+                agent.post_json("https://base.example", "a"*40, route, {})
+                request = opener.open.call_args.args[0]
+                self.assertEqual(request.get_header("User-agent"), "HostOps-Agent/0.5.0")
+                self.assertEqual(request.get_header("Authorization"), "Bearer " + "a"*40)
+                self.assertIsInstance(build.call_args.args[0], agent.NoRedirect)
 
     def test_bad_ack_rejected(self):
         for raw in (b'{"accepted":false,"schema":1}', b'x'*4097):
