@@ -57,3 +57,32 @@ def test_table_namespace():
         table_name("notes","../items")
     with pytest.raises(ValueError):
         table_name("a"*39,"b"*39)
+
+
+def test_exact_dependency_contract(monkeypatch):
+    from app import module_sdk as sdk
+    monkeypatch.setattr(sdk,"installed_version",lambda name:"1.2.3")
+    sdk.validate_dependencies((("example-lib","1.2.3"),))
+    for invalid in ((("example-lib","2.0"),), (("example-lib",">=1"),),
+                    (("example-lib","1.2.3"),("example_lib","1.2.3"))):
+        with pytest.raises(ValueError):
+            sdk.validate_dependencies(invalid)
+
+def test_module_database_requires_explicit_distinct_role(monkeypatch):
+    from app import module_sdk as sdk, db
+    sdk._module_session_factory.cache_clear()
+    monkeypatch.setattr(db,"DATABASE_URL","postgresql://core:secret@localhost/core")
+    monkeypatch.delenv("APP_MODULE_NOTES_DATABASE_URL",raising=False)
+    with pytest.raises(ValueError,match="not configured"):
+        sdk._module_session_factory("notes")
+    for url in ("sqlite:///test.db","postgresql://core:other@localhost/notes"):
+        monkeypatch.setenv("APP_MODULE_NOTES_DATABASE_URL",url)
+        with pytest.raises(ValueError,match="invalid module database"):
+            sdk._module_session_factory("notes")
+    calls=[]
+    monkeypatch.setattr(sdk,"create_engine",lambda url,**kwargs:calls.append(url) or object())
+    monkeypatch.setattr(sdk,"sessionmaker",lambda **kwargs:"module-session")
+    monkeypatch.setenv("APP_MODULE_NOTES_DATABASE_URL","postgresql://notes:secret@localhost/notes")
+    assert sdk._module_session_factory("notes")=="module-session"
+    assert calls[0].username=="notes"
+    sdk._module_session_factory.cache_clear()
