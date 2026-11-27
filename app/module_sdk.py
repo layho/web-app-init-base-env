@@ -48,8 +48,8 @@ def table_name(module_id: str, local_name: str) -> str:
     return name
 
 
-_DIST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\\Z")
-_PIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,79}\\Z")
+_DIST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
+_PIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,79}\Z")
 
 
 def validate_dependencies(dependencies):
