@@ -20,3 +20,7 @@ The existing system-log API now includes bounded integration queue diagnostics f
 
 ## GitHub transport recovery
 Read-only REST requests retry transient network and invalid-response errors with the same bounded delay as transient HTTP 5xx. POST is never replayed. Successful full Issue/PR collection replaces stale endpoint errors and records the observation time; failed collection retains the prior combined snapshot. Diagnostic probes record individual check times. No credential or raw transport error is exposed.
+
+
+## Existing MacCI coordinator integration
+The installed preview coordinator optionally journals its already-authorized exact SHA push when MACCI_INTEGRATION_JOURNAL=1 is provisioned locally. The original lock, review, exact test receipt, freeze, candidate verification and non-force push are unchanged. The journal is persisted before push; only an independently observed exact remote preview SHA confirms integration. Lost responses remain pending across process restarts; unchanged or different remote SHA blocks further pushes rather than retrying blindly. The new installer copies the journal module, but existing host installation/activation, independent queue reconciliation adapter, operator resolution for ambiguous outcomes and read-only export are still required. No claim of live host activation is made.

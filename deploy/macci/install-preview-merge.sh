@@ -11,7 +11,7 @@ domain="gui/$(id -u)"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 [[ -f "$root/github-token" ]] || { echo 'Existing MacCI credential required'; exit 1; }
 launchctl print "$domain" >/dev/null || { echo 'No active Mac GUI login session for LaunchAgent'; exit 1; }
-"$python" -m unittest -v test_merge_preview
+"$python" -m unittest -v test_merge_preview test_preview_journal
 "$python" merge_preview.py --dry-run
 git ls-remote git@github.com:layho/web-app-init-base-env.git refs/heads/preview >/dev/null
 if launchctl print "$domain/$label" >/dev/null 2>&1; then
@@ -20,6 +20,7 @@ if launchctl print "$domain/$label" >/dev/null 2>&1; then
 fi
 mkdir -p "$HOME/Library/LaunchAgents"
 install -m 700 merge_preview.py "$root/merge_preview.py"
+install -m 600 preview_journal.py "$root/preview_journal.py"
 "$python" - "$root" "$python" "$plist" <<'PY'
 import plistlib, sys
 from pathlib import Path

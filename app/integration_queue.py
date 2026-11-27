@@ -229,6 +229,19 @@ class IntegrationQueue:
             db.execute("UPDATE integration_jobs SET state='QUEUED',base=NULL,lease=NULL,expires=NULL WHERE id=?",(job,))
             self._event(db,job,"RECONCILED:"+evidence_id,now)
 
+    def record_integrated(self, job, expected_head, expected_base, *, candidate, verify, now=None):
+        """Record a remotely observed integration, never perform or authorize it."""
+        _sha(expected_head); _sha(expected_base); _sha(candidate)
+        now=int(time.time()) if now is None else int(now)
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM integration_jobs WHERE id=?",(job,)).fetchone()
+            if not row or row["state"] not in ("PREPARED","UNKNOWN") or row["head"]!=expected_head or row["base"]!=expected_base:
+                raise QueueConflict("candidate state changed")
+            if verify(job,expected_head,expected_base,candidate) is not True:
+                raise QueueConflict("integration evidence not verified")
+            db.execute("UPDATE integration_jobs SET state='INTEGRATED',lease=NULL,expires=NULL WHERE id=?",(job,))
+            self._event(db,job,"INTEGRATED",now)
+
     def snapshot(self, version):
         with self.transaction() as db:
             rows=db.execute("SELECT id,version,head,dependencies,files,priority,state,base,expires,created FROM integration_jobs WHERE version=? ORDER BY priority DESC,created,id",(version,)).fetchall()

@@ -400,7 +400,7 @@ def verify_candidate(folder, base, head, candidate, required):
         git(folder, "merge-base", "--is-ancestor", required, base)
 
 
-def merge_one(token, number, dry_run=False):
+def merge_one(token, number, dry_run=False, journal=None):
     frozen = preview_frozen(token)
     gate = authorization(token, number)
     if gate is None:
@@ -434,11 +434,16 @@ def merge_one(token, number, dry_run=False):
         # Push the exact tested commit, not PR head or a moving merge ref.
         # Non-force push protects concurrent divergent preview updates; branch rules
         # still apply. A failed push must never be retried with force.
+        if journal is not None:
+            # Persist exact authorized candidate before any remote side effect.
+            journal.prepare(number, head, base, merge)
         git(folder, "push", "--porcelain", REMOTE, merge + ":" + TARGET)
         actual = api(token, "/branches/preview")["commit"]["sha"]
         if actual != merge:
             print(f"PR #{number}: preview changed after push; reconcile before further release", flush=True)
             return True
+        if journal is not None:
+            journal.confirm(number, head, base, merge, actual)
         pr = api(token, f"/pulls/{number}")
         print(f"PR #{number}: preview advanced to tested SHA {merge}; GitHub merged={pr.get('merged') is True}", flush=True)
         return True
@@ -486,16 +491,26 @@ def main():
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return 0
+            journal = None
+            if os.getenv("MACCI_INTEGRATION_JOURNAL") == "1" and not args.dry_run:
+                from preview_journal import PreviewJournal
+                journal = PreviewJournal(ROOT / "preview-integration.sqlite3")
+                # Never dispatch another push while an earlier outcome is unknown.
+                if not journal.reconcile(lambda: api(token, "/branches/preview")["commit"]["sha"]):
+                    print("Preview coordinator blocked: unresolved integration journal", flush=True)
+                    return 1
             prs = all_pages(token, "/pulls?state=open&base=preview&sort=created&direction=asc")
             for pr in prs:
                 number = pr.get("number")
                 if type(number) is not int or number <= 0 or pr.get("draft"):
                     continue
                 try:
-                    if merge_one(token, number, args.dry_run):
+                    if merge_one(token, number, args.dry_run, journal=journal):
                         return 0  # New base requires fresh tests for following PRs.
                 except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError) as exc:
                     print(f"PR #{number}: gate/push blocked: {type(exc).__name__}", flush=True)
+                    if journal is not None:
+                        return 1  # A possibly completed push must be reconciled on the next tick.
             return 0
     except (ValueError, KeyError, TypeError, OSError, URLError, subprocess.SubprocessError) as exc:
         print(f"Preview coordinator blocked: {type(exc).__name__}", flush=True)

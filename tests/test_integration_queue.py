@@ -115,3 +115,14 @@ def test_unknown_reconciliation_rejects_stale_candidate(queue):
     queue.claim("0.5.0",BASE,now=115)
     with pytest.raises(QueueConflict):
         queue.reconcile_unknown("one",BASE,BASE,evidence_id="receipt-2",verify_stopped=lambda *a:True)
+
+def test_integration_requires_independent_observation(queue):
+    queue.register("one","0.5.0",HEAD,[],["app/core"])
+    queue.register("two","0.5.0",HEAD,["one"],["app/other"])
+    c=queue.claim("0.5.0",BASE,now=100)
+    queue.finish("one",c["lease"],BASE,["app/core"],now=101)
+    with pytest.raises(QueueConflict):
+        queue.record_integrated("one",HEAD,BASE,candidate="c"*40,verify=lambda *a:False,now=102)
+    assert queue.claim("0.5.0",BASE,now=103) is None
+    queue.record_integrated("one",HEAD,BASE,candidate="c"*40,verify=lambda *a:True,now=104)
+    assert queue.claim("0.5.0","c"*40,now=105)["id"]=="two"
