@@ -39,3 +39,35 @@ def test_unsafe_file_and_invalid_schema(tmp_path):
     assert read_queue(str(link))["state"]=="unavailable"
     p.chmod(0o644)
     assert read_queue(str(p))["state"]=="unavailable"
+
+
+def test_host_attempts_read_real_journal_without_mutation(tmp_path):
+    from app.integration_diagnostics import read_attempts
+    from deploy.macci.preview_journal import PreviewJournal
+    tmp_path.chmod(0o700)
+    p=tmp_path/"journal.sqlite3"
+    assert read_attempts(str(p))["state"]=="unavailable"
+    assert not p.exists()
+    j=PreviewJournal(p)
+    j.prepare(196,"a"*40,"b"*40,"c"*40)
+    before=p.read_bytes()
+    result=read_attempts(str(p))
+    assert result["state"]=="available"
+    assert result["attempts"][0]["state"]=="PENDING"
+    assert result["attempts"][0]["candidate"]=="c"*40
+    assert p.read_bytes()==before
+    j.confirm(196,"a"*40,"b"*40,"c"*40,"c"*40)
+    assert read_attempts(str(p))["attempts"][0]["state"]=="INTEGRATED"
+    p.chmod(0o644)
+    assert read_attempts(str(p))["state"]=="unavailable"
+
+def test_invalid_host_receipt_never_reports_success(tmp_path):
+    from app.integration_diagnostics import read_attempts
+    from deploy.macci.preview_journal import PreviewJournal
+    tmp_path.chmod(0o700)
+    p=tmp_path/"journal.sqlite3"
+    j=PreviewJournal(p)
+    j.prepare(196,"a"*40,"b"*40,"c"*40)
+    with sqlite3.connect(p) as db:
+        db.execute("UPDATE preview_attempts SET state='INTEGRATED'")
+    assert read_attempts(str(p))["state"]=="unavailable"

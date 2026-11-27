@@ -78,3 +78,43 @@ def read_queue(config=None):
                     "truncated":len(rows)>100 or len(events)>100}
     except (OSError,ValueError,TypeError,sqlite3.Error):
         return dict(empty,state="unavailable")
+
+
+def read_attempts(config=None):
+    """Read actual host push receipts, independently of planning queue state.
+
+    A trusted local administrator may configure a private same-user journal
+    or the shared managed queue ledger. No browser-supplied path is accepted.
+    """
+    config=os.getenv("APP_PREVIEW_JOURNAL_FILE","") if config is None else config
+    empty={"attempts":[],"truncated":False}
+    if not config:
+        return dict(empty,state="not_configured")
+    try:
+        path=Path(config)
+        if not path.is_absolute() or path.resolve(strict=True)!=path:
+            raise ValueError("unsafe path")
+        parent=path.parent.lstat()
+        info=path.lstat()
+        if (not stat.S_ISDIR(parent.st_mode) or stat.S_IMODE(parent.st_mode)!=0o700
+                or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode)!=0o600
+                or parent.st_uid!=info.st_uid or info.st_uid!=os.getuid()):
+            raise ValueError("unsafe storage")
+        with closing(sqlite3.connect(path.as_uri()+"?mode=ro",uri=True,timeout=1)) as db:
+            db.row_factory=sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            rows=db.execute("SELECT seq,pr,head,base,candidate,state,created,finished FROM preview_attempts ORDER BY seq DESC LIMIT 101").fetchall()
+            attempts=[]
+            for row in rows[:100]:
+                if (type(row["seq"]) is not int or row["seq"]<=0 or type(row["pr"]) is not int or row["pr"]<=0
+                        or row["state"] not in {"PENDING","INTEGRATED","REJECTED"}
+                        or any(_safe_sha(row[k]) is None for k in ("head","base","candidate"))
+                        or _timestamp(row["created"]) is None
+                        or (row["state"]=="PENDING" and row["finished"] is not None)
+                        or (row["state"]!="PENDING" and (_timestamp(row["finished"]) is None or row["finished"]<row["created"]))):
+                    raise ValueError("invalid host receipt")
+                attempts.append(dict(row))
+            return {"state":"available","attempts":attempts,"truncated":len(rows)>100}
+    except (OSError,ValueError,TypeError,sqlite3.Error):
+        return dict(empty,state="unavailable")

@@ -33,3 +33,6 @@ The managed coordinator now stages the verified candidate automatically, within 
 
 
 Definitive single-ref porcelain rejection plus a fresh observation of the original preview base can close a pending attempt as REJECTED and restore its reservation to PREPARED. Subsequent attempts must pass all original gates again. Timeouts, lost responses, unexpected refs and ambiguous remote errors remain pending; no blind retry or force push is allowed.
+
+
+Host preview push receipts are independently readable through the authenticated system-log API and UI. Configure APP_PREVIEW_JOURNAL_FILE to the existing private same-user journal (or managed ledger). The UI displays exact head/base/candidate, state, timestamps, filtering and details, with explicit unavailable and pending states. It never treats integration as deployment or release. Cross-UID transport, automatic configuration and host runtime provisioning still require integration work; no production access is granted by this reader.

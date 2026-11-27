@@ -14,7 +14,41 @@ export type ReleaseHistory = {
 type QueueJob = { id:string; state:string; head:string|null; base:string|null; created:number|null; expires:number|null }
 type QueueEvent = { seq:number; job:string; event:string; at:number|null }
 type QueueDiagnostics = { state:string; version:string|null; jobs:QueueJob[]; events:QueueEvent[]; truncated:boolean }
-export type SystemLogs = { events: Operation[]; integration?:QueueDiagnostics }
+type PreviewAttempt = {seq:number;pr:number;head:string;base:string;candidate:string;state:'PENDING'|'INTEGRATED'|'REJECTED';created:number;finished:number|null}
+type PreviewAttempts = {state:string;attempts:PreviewAttempt[];truncated:boolean}
+export type SystemLogs = { events: Operation[]; integration?:QueueDiagnostics; preview_attempts?:PreviewAttempts }
+
+const attemptLabels = {PENDING:'待对账',INTEGRATED:'已确认集成',REJECTED:'明确拒绝'}
+function PreviewAttemptDiagnostics({data}:{data?:PreviewAttempts}) {
+  const [state,setState]=useState<string>('all')
+  const [selected,setSelected]=useState<PreviewAttempt|null>(null)
+  const records=data?.attempts??[]
+  const pending=records.filter(r=>r.state==='PENDING').length
+  return <Card size="small" title="宿主合并执行回执" extra={<Select size="small" value={state} onChange={setState} options={[{value:'all',label:'全部状态'},...Object.entries(attemptLabels).map(([value,label])=>({value,label}))]} />}>
+    {data?.state!=='available'?<Typography.Text type="secondary">{data?.state==='not_configured'?'尚未配置宿主回执来源':'宿主回执暂不可用'}</Typography.Text>:<Space direction="vertical" style={{width:'100%'}}>
+      {pending>0&&<Alert type="warning" showIcon message="存在未确认合并结果，等待宿主对账；不得直接重复推送。" />}
+      {data.truncated&&<Typography.Text type="secondary">仅展示最近100次执行</Typography.Text>}
+      <Table<PreviewAttempt> size="small" rowKey="seq" dataSource={records.filter(r=>state==='all'||r.state===state)} pagination={{pageSize:5}} scroll={{x:650}} columns={[
+        {title:'PR',dataIndex:'pr',render:(v:number)=>'#'+v},
+        {title:'状态',dataIndex:'state',render:(v:PreviewAttempt['state'])=><Tag color={v==='PENDING'?'warning':v==='INTEGRATED'?'success':'error'}>{attemptLabels[v]}</Tag>},
+        {title:'候选 SHA',dataIndex:'candidate',render:(v:string)=><code title={v}>{v.slice(0,8)}</code>},
+        {title:'开始时间',dataIndex:'created',render:queueTime},
+        {title:'结束时间',dataIndex:'finished',render:queueTime},
+        {title:'操作',render:(_:unknown,row:PreviewAttempt)=><Button type="link" onClick={()=>setSelected(row)}>详情</Button>}
+      ]}/>
+      <Typography.Text type="secondary">宿主回执仅证明合并结果，不代表部署、验收或正式发布成功。</Typography.Text>
+    </Space>}
+    <Drawer title="宿主执行回执详情" open={selected!==null} onClose={()=>setSelected(null)}>
+      {selected&&<Descriptions column={1} size="small" items={[
+        {key:'pr',label:'PR',children:'#'+selected.pr},
+        {key:'state',label:'状态',children:attemptLabels[selected.state]},
+        ...(['head','base','candidate'] as const).map(k=>({key:k,label:k,children:<Typography.Text code copyable>{selected[k]}</Typography.Text>})),
+        {key:'created',label:'开始',children:queueTime(selected.created)},
+        {key:'finished',label:'结束',children:queueTime(selected.finished)}
+      ]}/>}
+    </Drawer>
+  </Card>
+}
 
 const queueStateLabels:Record<string,string> = { QUEUED:'等待领取', CLAIMED:'已领取', PREPARED:'候选已准备', UNKNOWN:'结果未知 · 等待对账', INTEGRATED:'已集成', CANCELLED:'已取消' }
 const queueTime = (value:number|null) => value===null ? '未记录' : new Date(value*1000).toLocaleString()
@@ -290,6 +324,7 @@ export function SystemLogPage({ data, loading, onRefresh }: RefreshProps & { dat
     </div>
     <Alert showIcon type="info" message="统计范围仅为接口返回的最近系统事件，不代表全量故障、实时服务健康或未解决阻塞数量。" />
     <IntegrationDiagnostics data={data?.integration}/>
+    <PreviewAttemptDiagnostics data={data?.preview_attempts}/>
     <Card title="系统事件" extra={<Button onClick={onRefresh} loading={loading}>刷新</Button>}>
       <Space wrap style={{marginBottom:12}}>
         <Input.Search allowClear value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索事件、原因、SHA" style={{width:'min(260px,100%)'}} />
