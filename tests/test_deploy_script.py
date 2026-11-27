@@ -9,6 +9,27 @@ def test_macmini_shell_syntax():
     result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
+
+def test_private_env_requires_owner_only_regular_file(tmp_path):
+    source = SCRIPT.read_text()
+    check = source[source.index("check_private_env() {"):source.index("# Dedicated foundation preview")]
+    env_file = tmp_path / ".env"
+    env_file.write_text("TEST=1\n")
+    link = tmp_path / ".base-preview.env"
+    link.symlink_to(env_file)
+
+    def valid(path):
+        return subprocess.run(["bash", "-c", check + '\ncheck_private_env "$1"', "check", str(path)]).returncode == 0
+
+    env_file.chmod(0o600)
+    assert valid(env_file)
+    assert not valid(link)
+    assert not valid(tmp_path)
+    env_file.chmod(0o400)
+    assert valid(env_file)
+    env_file.chmod(0o640)
+    assert not valid(env_file)
+
 def test_dependencies_rebuilds_broken_venv_without_losing_previous(tmp_path):
     script = SCRIPT.read_text()
     function = script[script.index("replace_path_entry() {"):script.index("\ncheck_schema() {")]

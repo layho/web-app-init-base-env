@@ -85,14 +85,21 @@ def test_feedback_worker_retries_and_reuses_existing_issue(client, monkeypatch):
                 return []
             if query["page"] == ["1"]:
                 pull = {"title": f"{marker} acceptance", "number": 41, "pull_request": {}}
-                return [pull] + [{"title": "Unrelated issue"}] * 99
+                untrusted = {"title": f"{marker} acceptance", "number": 43,
+                             "author_association": "NONE", "body": metadata}
+                wrong_link = {**untrusted, "number": 44, "author_association": "OWNER",
+                              "body": metadata.replace(f"ID: {feedback['id']}", "ID: 999")}
+                return [pull, untrusted, wrong_link] + [{"title": "Unrelated issue"}] * 97
             assert query["page"] == ["2"]
-            return [{"title": f"{marker} acceptance", "number": 42, "state": "closed"}]
+            return [{"title": f"{marker} acceptance", "number": 42, "state": "closed",
+                     "author_association": "OWNER", "body": metadata}]
         assert path == f"/repos/{sync_feedback.REPO}/issues"
         assert data["title"] == f"{marker} acceptance"
         assert "Feedback sync regression" in data["body"]
         raise URLError("simulated response lost after issue creation")
 
+    metadata = (f"Source: {sync_feedback.feedback_source()} admin feedback\n"
+                f"Internal feedback ID: {feedback['id']}\nCategory: acceptance")
     monkeypatch.setattr(sync_feedback, "github", github)
     sync_feedback.main()
     assert client.get("/api/v1/feedback").json()[0]["status"] == "pending"
@@ -123,6 +130,11 @@ def test_feedback_developer_reply_refresh_preserves_last_good_state(client, monk
     monkeypatch.setattr(sync_feedback, "TOKEN", "local-test-only")
     def github(method, path, data=None):
         assert method == "GET"
+        if path == f"/repos/{sync_feedback.REPO}/issues/13":
+            return {"number": 13, "title": f"[APP-FEEDBACK #{feedback_id}] bug",
+                    "author_association": "OWNER",
+                    "body": (f"Source: {sync_feedback.feedback_source()} admin feedback\n"
+                             f"Internal feedback ID: {feedback_id}\nCategory: bug")}
         assert path == f"/repos/{sync_feedback.REPO}/issues/13/comments?per_page=100&page=1"
         return [{"id": 1, "author_association": "OWNER",
                  "created_at": "2026-11-22T02:01:00Z", "updated_at": "2026-11-22T02:01:00Z",
@@ -147,6 +159,9 @@ def test_feedback_developer_reply_refresh_preserves_last_good_state(client, monk
     assert after["overall_status"] == "claimed"
     assert after["developer_reply"] == "已领取"
     assert after["progress_stale"]
+    monkeypatch.setattr(sync_feedback, "github", lambda *args: {"number": 13})
+    assert sync_feedback.refresh_progress() == 1
+    assert "13" not in feedback_progress.load_cache()
 
 def test_private_attachment_roundtrip(client,monkeypatch,tmp_path):
     import base64, io
