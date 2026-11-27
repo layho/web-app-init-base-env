@@ -8,3 +8,7 @@ This module is not yet wired to the production coordinator. Its database must be
 UNKNOWN recovery requires a trusted local fencing verifier bound to the exact job/head/base and expiry event sequence. Evidence identifiers are consumed once per job; a stale lease cannot finish a new attempt. The verifier must establish that no integration side effect occurred. No web endpoint or production fencing adapter is enabled yet. If the outcome cannot be established, retain UNKNOWN.
 
 Fallback CI is triggered only when the repository owner explicitly adds the authorized-fallback-test label to a same-repository preview PR. Remove and reapply the label for a separately authorized run after a new candidate; synchronizations do not trigger a run. Results are not MacCI receipts or merge authorization.
+
+
+## Candidate evidence
+The candidate_evidence module distinguishes commit identity, tree identity and verified ancestry. It rejects stale head/base/merge/tree, mismatched merge parents and stale test identity. Matching evidence is not a publication grant. The trusted coordinator still needs to fetch the actual Git metadata and independently authenticate the receipt before using these checks. No production integration or automatic merge is enabled by this module.
