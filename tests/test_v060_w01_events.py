@@ -305,6 +305,26 @@ def test_w05_signed_intent_business_cas_recovers_without_fixture_fallback(tmp_pa
     witness = restarted.store.read("business-commit", pending["event_id"])
     assert witness["intent_mode"] == "signed-isolated-v1"
     assert witness["production_effective"] is False
+    from app.control_joint.receipts import verify_isolated_business_commit, query_operation_receipt
+
+    args = dict(events_root=eng.root, event_id=pending["event_id"],
+                repo_id=eng.repo_id, app_id="base", task_id="tsk_w01",
+                request_digest=witness["request_digest"], expected_revision=0)
+    assert verify_isolated_business_commit(tmp_path.resolve(), **args)["status"] == "verified_isolated"
+    for altered in ({"task_id": "tsk_other"}, {"app_id": "other"},
+                    {"request_digest": "0" * 64}, {"expected_revision": 1}):
+        assert verify_isolated_business_commit(tmp_path.resolve(), **{**args, **altered})["status"] == "unknown"
+    for kind, key, row, changes in (
+        ("business-commit", pending["event_id"], witness, {"result": {"state": "forged"}}),
+        ("outbox", pending["event_id"], outbox, {"receipt": {**outbox["receipt"], "w01_proof": True}}),
+        ("feedback", "fb_signed", restarted.store.read("feedback", "fb_signed"), {"body": "tampered"}),
+    ):
+        restarted.store.write(kind, key, {**row, **changes})
+        assert verify_isolated_business_commit(tmp_path.resolve(), **args)["status"] == "unknown"
+        restarted.store.write(kind, key, row)
+    assert query_operation_receipt(tmp_path, authority="W05", operation_id=pending["event_id"],
+                                   repo_id=eng.repo_id, app_id="base", expected_revision=0,
+                                   candidate_digest=witness["request_digest"])["status"] == "unknown"
     assert restarted.submit_feedback(**request).ok
     assert eng.store.count("events") == 1
     assert not fixture_events.events
