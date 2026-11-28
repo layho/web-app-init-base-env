@@ -427,6 +427,14 @@ class ControlIdentityService:
         if record is None or record.get("signer_kind") != "user_acceptance":
             raise ControlError("EVIDENCE_MISSING", 409, "user acceptance is missing", reason="acceptance",
                                extra={"allow": False, "changed": False})
+        if record.get("outcome") != "accepted":
+            raise ControlError(
+                "ACCEPTANCE_REJECTED",
+                409,
+                "a rejection record is not an acceptance",
+                reason="acceptance_rejected",
+                extra={"allow": False, "changed": False, "outcome": record.get("outcome")},
+            )
         raise ControlError(
             "PRODUCTION_VERIFICATION_DISABLED",
             403,

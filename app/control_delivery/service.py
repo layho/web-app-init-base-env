@@ -22,6 +22,7 @@ from app.control_delivery.flags import (
     PRODUCTION_ENABLEMENT,
     PRODUCTION_VERIFICATION_ENABLED,
 )
+from app.control_delivery.ports import event_identity_digest
 from app.control_delivery.store import Journal
 
 _TERMINAL_PR = {"merged", "closed", "superseded"}
@@ -63,6 +64,40 @@ def operation_id_for(scope, kind, request):
 
 def _fence_key(kind, key):
     return kind + "__" + key
+
+
+def _binding_holds(observed, expected):
+    author = observed.get("author_id")
+    scope = observed.get("scope")
+    if not isinstance(author, str) or not author or author != expected.get("author_id"):
+        return False
+    if observed.get("repo") != expected.get("repo"):
+        return False
+    if not isinstance(observed.get("request_digest"), str) or observed.get("request_digest") != expected.get("request_digest"):
+        return False
+    wanted = expected.get("scope") or {}
+    if not isinstance(scope, dict) or scope.get("repo") != wanted.get("repo") or scope.get("task_id") != wanted.get("task_id"):
+        return False
+    return True
+
+
+def _expected_binding(row, scope, digest, scope_exact):
+    return {
+        "author_id": row.get("author_id"),
+        "repo": scope.get("repo"),
+        "scope": scope_exact,
+        "request_digest": digest,
+    }
+
+
+def _expected_from_operation(existing, row):
+    scope = existing.get("scope") if isinstance(existing.get("scope"), dict) else {}
+    return {
+        "author_id": row.get("author_id") or existing.get("author_id"),
+        "repo": scope.get("repo"),
+        "scope": scope,
+        "request_digest": existing.get("request_digest"),
+    }
 
 
 def _revision(doc):
@@ -1509,22 +1544,29 @@ class DeliveryService:
                 })
         return grant
 
-    def _trusted_reconcile(self, operation_id):
+    def _trusted_reconcile(self, operation_id, expected):
         observed = self.remote.reconcile(operation_id)
         if not isinstance(observed, dict) or observed.get("blocked"):
             return {"classification": "unknown", "blocked": bool(isinstance(observed, dict) and observed.get("blocked"))}
         if observed.get("operation_id") != operation_id:
-            return {"classification": "unknown"}
+            return {"classification": "unknown", "reason": "operation"}
         classification = observed.get("classification")
         if classification not in {"succeeded", "failed", "absent", "unknown"}:
-            return {"classification": "unknown"}
+            return {"classification": "unknown", "reason": "classification"}
+        if classification == "unknown":
+            return {"classification": "unknown", "reason": "remote"}
+        if not _binding_holds(observed, expected):
+            return {"classification": "unknown", "reason": "unbound", "blocked": False}
         return {
             "classification": classification,
             "issue_number": observed.get("issue_number"),
             "feedback_id": observed.get("feedback_id"),
             "author_id": observed.get("author_id"),
+            "repo": observed.get("repo"),
+            "scope": observed.get("scope"),
+            "request_digest": observed.get("request_digest"),
             "github_proof": False,
-            "test_double": True,
+            "test_double": observed.get("test_double", True),
         }
 
     def _push_request(self, scope, row):
@@ -1625,7 +1667,9 @@ class DeliveryService:
                     "operation_id": op_id,
                 }
             if existing is None:
-                observed = self._trusted_reconcile(op_id)
+                observed = self._trusted_reconcile(op_id, _expected_binding(row, scope, digest, scope_exact))
+                if observed.get("reason") == "unbound":
+                    observed = {"classification": "unproven"}
                 if observed.get("classification") == "succeeded" and observed.get("issue_number") is not None:
                     if observed.get("author_id") not in (None, row["author_id"]):
                         return {
@@ -1706,7 +1750,7 @@ class DeliveryService:
                 "scope": scope_exact,
             })
             if not isinstance(created, dict) or created.get("status") == "unknown":
-                observed = self._trusted_reconcile(op_id)
+                observed = self._trusted_reconcile(op_id, _expected_binding(row, scope, digest, scope_exact))
                 return self._apply_push_classification(row, op_doc, observed)
             if created.get("status") == "failed" or not created.get("ok", True):
                 op_doc["state"] = "FAILED"
@@ -1730,7 +1774,7 @@ class DeliveryService:
 
     def _recover_push(self, row, existing):
         feedback_id = row["feedback_id"]
-        observed = self._trusted_reconcile(existing["operation_id"])
+        observed = self._trusted_reconcile(existing["operation_id"], _expected_from_operation(existing, row))
         return self._apply_push_classification(row, dict(existing), observed)
 
     def _apply_push_classification(self, row, op_doc, observed):
@@ -2054,15 +2098,20 @@ class DeliveryService:
             existing = view.read("outbox", event_id)
             if isinstance(existing, dict):
                 return existing
-            current = view.read(kind, key)
-            if _revision(current) != begun["observed_revision"]:
-                view.abort()
-                return "conflict"
-            fence_id = _fence_key(kind, key)
-            fence = view.read("fence", fence_id)
-            if isinstance(fence, dict) and fence.get("state") == "open" and fence.get("event_id") != event_id:
-                view.abort()
-                return "conflict"
+            plan = begun.get("change_plan")
+            if not isinstance(plan, list) or not plan:
+                plan = [{"kind": kind, "key": key, "expected_revision": begun["observed_revision"]}]
+            current = None
+            for entry in plan:
+                current = view.read(entry["kind"], entry["key"])
+                if _revision(current) != entry["expected_revision"]:
+                    view.abort()
+                    return "conflict"
+                fence_id = _fence_key(entry["kind"], entry["key"])
+                fence = view.read("fence", fence_id)
+                if isinstance(fence, dict) and fence.get("state") == "open" and fence.get("event_id") != event_id:
+                    view.abort()
+                    return "conflict"
             counter_key = "w05_task"
             counter = view.read("producer", counter_key) or {"revision": 0, "next_seq": 1, "epoch": 1}
             seq = int(counter.get("next_seq") or 1)
@@ -2081,6 +2130,7 @@ class DeliveryService:
                 "scope": {"repo": begun["scope"]["repo"], "task_id": begun["scope"]["task_id"]},
                 "request_digest": begun["payload_hash"],
                 "operation_id": event_id,
+                "change_plan": plan,
             }
             view.stage("producer", counter_key, {
                 "revision": _revision(counter) + 1,
@@ -2089,12 +2139,14 @@ class DeliveryService:
                 "stream_id": "w05:task",
             })
             view.stage("outbox", event_id, outbox)
-            view.stage("fence", fence_id, {
-                "state": "open",
-                "event_id": event_id,
-                "revision": 1,
-                "object_revision": _revision(current),
-            })
+            for entry in plan:
+                fenced = view.read(entry["kind"], entry["key"])
+                view.stage("fence", _fence_key(entry["kind"], entry["key"]), {
+                    "state": "open",
+                    "event_id": event_id,
+                    "revision": 1,
+                    "object_revision": _revision(fenced),
+                })
             return outbox
 
         return self.store.mutate(mutator)
@@ -2152,11 +2204,17 @@ class DeliveryService:
             after_seq=0,
             limit=10,
             event_id=event["event_id"],
+            producer_seq=event.get("producer_seq"),
+            repo_id=event.get("repo_id"),
+            event_type=event.get("event_type"),
+            idempotency_key=event.get("idempotency_key"),
+            state=event.get("state"),
+            operation=event.get("operation"),
         )
         receipt = self._receipt_from_query(event, queried)
         if receipt is not None:
             return receipt
-        if not isinstance(queried, dict) or queried.get("classification") != "absent":
+        if not _absence_proven(event, queried):
             return None
         appended = self.events.append(event)
         return self._exact_receipt(event, appended)
@@ -2193,7 +2251,12 @@ class DeliveryService:
             "w01_proof": False,
         }
         event.update({key: value for key, value in fields.items() if key != "received_at"})
-        staged = self._stage_outbox(begun, event)
+        planned = dict(begun)
+        planned["change_plan"] = [
+            {"kind": item_kind, "key": item_key, "expected_revision": expected}
+            for item_kind, item_key, _doc, expected in pairs
+        ]
+        staged = self._stage_outbox(planned, event)
         if staged == "conflict":
             return _denied(409, "CONFLICT_REVISION", state, {"reason": "cas"})
         if not isinstance(staged, dict):
@@ -2224,6 +2287,21 @@ class DeliveryService:
         fields["github_proof"] = False
         fields["macci_proof"] = False
         self.store.append_trace(fields)
+
+
+def _absence_proven(event, queried):
+    if not isinstance(queried, dict) or queried.get("classification") != "absent":
+        return False
+    proof = queried.get("absence_proof")
+    if not isinstance(proof, dict) or proof.get("accepted") is not False or proof.get("trusted") is not True:
+        return False
+    if proof.get("authority") != "W01" or not isinstance(proof.get("author"), str) or not proof.get("author"):
+        return False
+    if proof.get("event_id") != event.get("event_id") or proof.get("producer_seq") != event.get("producer_seq"):
+        return False
+    if proof.get("stream_id") != event.get("stream_id") or proof.get("stream_epoch") != event.get("stream_epoch"):
+        return False
+    return proof.get("payload_digest") == event_identity_digest(event)
 
 
 def _tuple_diff(chain, head, base, merge, tree):

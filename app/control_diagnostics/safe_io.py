@@ -14,6 +14,7 @@ live outside the directory.
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 
 
@@ -23,8 +24,28 @@ class UnsafePath(OSError):
         self.kind = kind
 
 
+def proc_fd_path(fd, platform_name=None):
+    """Path of an open descriptor. Darwin and Linux do not share one string."""
+    name = sys.platform if platform_name is None else platform_name
+    if name == "darwin":
+        return f"/dev/fd/{fd}"
+    if isinstance(name, str) and name.startswith("linux"):
+        return f"/proc/self/fd/{fd}"
+    raise UnsafePath("platform file-descriptor path is not available", "blocked")
+
+
+def _assert_real_ancestors(path):
+    current = Path(os.fspath(path))
+    if not current.is_absolute():
+        current = Path(os.path.abspath(current))
+    for parent in (current, *current.parents):
+        if parent.is_symlink():
+            raise UnsafePath("ancestor is a symlink")
+
+
 def open_root(path):
-    """Return a directory fd. The path itself must not be a symlink."""
+    """Return a directory fd. The path and its ancestors must not be symlinks."""
+    _assert_real_ancestors(path)
     fd = os.open(os.fspath(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     info = os.fstat(fd)
     if not stat.S_ISDIR(info.st_mode):
@@ -59,7 +80,7 @@ def read_bounded(dir_fd, name, max_bytes):
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
         raise UnsafePath("invalid bound", "bound")
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
     except FileNotFoundError:
         raise
     except OSError as exc:
@@ -72,8 +93,8 @@ def read_bounded(dir_fd, name, max_bytes):
             raise UnsafePath("hard link")
         if info.st_size > max_bytes:
             raise UnsafePath("bounded read exceeded", "bound")
-        directory = os.path.realpath(f"/proc/self/fd/{dir_fd}")
-        located = os.path.realpath(f"/proc/self/fd/{fd}")
+        directory = os.path.realpath(proc_fd_path(dir_fd))
+        located = os.path.realpath(proc_fd_path(fd))
         prefix = directory.rstrip("/") + "/"
         if not located.startswith(prefix):
             raise UnsafePath("escaped directory")
@@ -182,7 +203,7 @@ class SafeRoot:
         except OSError as exc:
             raise UnsafePath("application log directory is not a real directory") from exc
         try:
-            app_real = os.path.realpath(f"/proc/self/fd/{app_fd}")
+            app_real = os.path.realpath(proc_fd_path(app_fd))
             data = _read_relative(app_fd, parts, max_bytes, app_real)
         finally:
             os.close(app_fd)
@@ -213,7 +234,7 @@ def _read_relative(dir_fd, parts, max_bytes, expected_root):
             nxt = open_directory(current, part)
             owned.append(nxt)
             current = nxt
-        current_real = os.path.realpath(f"/proc/self/fd/{current}")
+        current_real = os.path.realpath(proc_fd_path(current))
         prefix = expected_root.rstrip("/") + "/"
         if current_real != expected_root.rstrip("/") and not current_real.startswith(prefix):
             raise UnsafePath("escaped directory")

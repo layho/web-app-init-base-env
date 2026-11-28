@@ -7,6 +7,28 @@ and they are not MacCI receipts.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
+
+def event_identity_digest(event):
+    material = {
+        key: event.get(key)
+        for key in (
+            "event_id",
+            "event_type",
+            "repo_id",
+            "stream_id",
+            "stream_epoch",
+            "producer_seq",
+            "idempotency_key",
+            "state",
+            "operation",
+        )
+    }
+    raw = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
 
 def _blocked(operation):
     return {
@@ -51,7 +73,7 @@ class BlockedEvents:
     def append(self, event):
         return _blocked("event.append")
 
-    def query(self, *, stream_id, stream_epoch, after_seq=0, limit=100, event_id=None):
+    def query(self, *, stream_id, stream_epoch, after_seq=0, limit=100, event_id=None, **_extra):
         return _blocked("event.query")
 
 
@@ -198,6 +220,22 @@ class FixtureAuth:
         return body
 
 
+def _absence_proof(event):
+    return {
+        "accepted": False,
+        "trusted": True,
+        "authority": "W01",
+        "author": "w01",
+        "event_id": event.get("event_id"),
+        "producer_seq": event.get("producer_seq"),
+        "stream_id": event.get("stream_id"),
+        "stream_epoch": event.get("stream_epoch"),
+        "payload_digest": event_identity_digest(event),
+        "test_double": True,
+        "w01_proof": False,
+    }
+
+
 class FixtureEvents:
     """Records event intents. ``applied`` here is not a W01 receipt."""
 
@@ -250,7 +288,21 @@ class FixtureEvents:
         self.events.append(stored)
         return self._receipt(stored)
 
-    def query(self, *, stream_id, stream_epoch, after_seq=0, limit=100, event_id=None):
+    def query(
+        self,
+        *,
+        stream_id,
+        stream_epoch,
+        after_seq=0,
+        limit=100,
+        event_id=None,
+        producer_seq=None,
+        repo_id=None,
+        event_type=None,
+        idempotency_key=None,
+        state=None,
+        operation=None,
+    ):
         if self.fail:
             return {
                 "ok": False,
@@ -263,6 +315,17 @@ class FixtureEvents:
         if event_id is not None:
             found = self.by_id.get(event_id)
             if found is None or found.get("stream_id") != stream_id or found.get("stream_epoch") != stream_epoch:
+                proof_event = {
+                    "event_id": event_id,
+                    "stream_id": stream_id,
+                    "stream_epoch": stream_epoch,
+                    "producer_seq": producer_seq,
+                    "repo_id": repo_id,
+                    "event_type": event_type,
+                    "idempotency_key": idempotency_key,
+                    "state": state,
+                    "operation": operation,
+                }
                 return {
                     "ok": True,
                     "blocked": False,
@@ -272,6 +335,7 @@ class FixtureEvents:
                     "side_effect": False,
                     "test_double": True,
                     "w01_proof": False,
+                    "absence_proof": _absence_proof(proof_event),
                 }
             return {
                 "ok": True,
@@ -445,6 +509,9 @@ class FixtureRemote:
                 "issue_number": number,
                 "author_id": payload["author_id"],
                 "feedback_id": feedback_id,
+                "repo": (payload.get("scope") or {}).get("repo"),
+                "scope": payload.get("scope"),
+                "request_digest": payload.get("request_digest"),
             }
         body = dict(record)
         body.update({"ok": True, "blocked": False, "status": "created", "test_double": True, "github_proof": False})

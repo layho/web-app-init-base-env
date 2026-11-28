@@ -368,6 +368,9 @@ class Fence:
             except FileExistsError:
                 return {"ok": False, "code": "RESERVATION_CONFLICT", "record": "update_locked"}
             try:
+                info = os.fstat(fd)
+                body["inode"] = info.st_ino
+                body["device"] = info.st_dev
                 self._rewrite(fd, body)
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -397,8 +400,26 @@ class Fence:
             fd = self._lock(path)
             if fd is None:
                 return False
+            if not self._held_identity(fd, path, key, run_id, generation):
+                os.close(fd)
+                return False
             _LIVE[name] = {"engine_id": engine_id, "fd": fd}
             return True
+
+    def _held_identity(self, fd, path, key, run_id, generation):
+        body = self._load_fd(fd)
+        if not self._generation_exact(body, key, generation) or body.get("run_id") != run_id:
+            return False
+        try:
+            info = os.fstat(fd)
+            named = path.stat()
+        except OSError:
+            return False
+        if info.st_ino != named.st_ino or info.st_dev != named.st_dev:
+            return False
+        if body.get("inode") != info.st_ino or body.get("device") != info.st_dev:
+            return False
+        return True
 
     def _load_fd(self, fd):
         try:
@@ -557,15 +578,23 @@ class Fence:
             if current.get("generation") != expected_generation:
                 return {"ok": False, "code": "LEASE_FENCE_REJECTED"}
             previous_dead = live is None
+            acquired = live is None
             fd = live["fd"] if live is not None else self._lock(path)
             if fd is None:
                 return {"ok": False, "code": "RESERVATION_CONFLICT", "record": "owner_alive"}
+            if not self._held_identity(fd, path, key, current.get("run_id"), expected_generation):
+                if acquired:
+                    os.close(fd)
+                return {"ok": False, "code": "LEASE_FENCE_REJECTED", "record": "inode"}
+            info = os.fstat(fd)
             body = {
                 "key": key,
                 "generation": expected_generation + 1,
                 "run_id": run_id,
                 "deployment_id": deployment_id,
                 "holder_pid": os.getpid(),
+                "inode": info.st_ino,
+                "device": info.st_dev,
                 "previous_pid": current.get("holder_pid"),
                 "previous_run_id": current.get("run_id"),
             }

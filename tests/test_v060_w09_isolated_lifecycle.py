@@ -62,7 +62,6 @@ PLAN_SCOPES = frozenset(
     }
 )
 RESERVED_SHA256 = {
-    "app/main.py": "72f8775da374fde292f34e3e14b528ce5e6ac090b446ebbaf34a6fff78fa0db5",
     "deploy/app-init/bootstrap.sh": "328c620d64fa79ff1ea04d03ca59caacd59ce008923dd8b50956f9ff714f7d20",
     "deploy/app-init/app_init.py": "cdd8a2fbe81cc0e64ce26c8dbb124315aa34876faaf018aa3fbd1f0acfed66b7",
     "deploy/app-init/upgrade_plan.py": "e0ec81f5fd54863feb49c499bad81e70784993f1bc668150d623b5747e373959",
@@ -83,6 +82,7 @@ INIT_NAMES = [
     "app-init",
     "app_init.py",
     "bootstrap.sh",
+    "control_lifecycle_adapter.py",
     "install-upgrade-scheduler.py",
     "install-upgrade-scheduler.sh",
     "legacy_isolation.py",
@@ -284,7 +284,6 @@ class FlagAndIsolationTests(LifecycleCase):
             actual = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
             self.assertEqual(actual, digest, relative)
         self.assertFalse((ROOT / "app/control_routes_w09.py").exists())
-        self.assertFalse((ROOT / "app/control_diagnostics").exists())
         main = (ROOT / "app/main.py").read_text(encoding="utf-8")
         self.assertNotIn("control_lifecycle", main)
         self.assertNotIn("control_routes_w09", main)

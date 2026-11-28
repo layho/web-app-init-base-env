@@ -1108,7 +1108,7 @@ class IsolatedDiagnosticsTest(unittest.TestCase):
         self.assertEqual(len(records), expected)
         receipts = [record["receipt_seq"] for record in records]
         self.assertEqual(sorted(receipts), list(range(1, expected + 1)))
-        dupes = [record for record in records if "idem-dup" in str(record.get("idempotency_scope"))]
+        dupes = [record for record in records if hashlib.sha256(b"idem-dup").hexdigest() in str(record.get("idempotency_scope"))]
         self.assertEqual(len(dupes), 1)
         self.assertEqual(self.probe.calls, [])
 

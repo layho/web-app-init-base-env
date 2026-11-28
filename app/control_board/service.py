@@ -700,6 +700,17 @@ class Board:
         denied = self._shape_or_app(principal, app_id)
         if denied:
             return denied
+        server = self._server_principal(principal)
+        if server.get("error"):
+            return _stamp({
+                "http": server.get("http") or 403,
+                "code": server.get("code") or "NOT_AUTHORIZED",
+                "side_effect": False,
+                "evidence_state": "missing",
+                "production_healthy": False,
+                "items": [],
+            })
+        principal = server["principal"]
         decision = self.auth.evaluate(principal, app_id=app_id, action=action)
         if decision.get("side_effect") not in (False, None):
             return _stamp({"http": 409, "code": "SIDE_EFFECT_UNKNOWN", "side_effect": False, "evidence_state": "unknown", "production_healthy": False})

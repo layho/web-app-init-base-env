@@ -259,7 +259,7 @@ def _walk(value, depth):
             if name in _ALLOWED and not _sensitive_key(name):
                 cleaned[name] = _walk(item, depth + 1)
                 continue
-            omitted.append("[REDACTED]" if _embeds_marker(name) else name)
+            omitted.append("[REDACTED]")
         if omitted:
             existing = cleaned.get("omitted_fields", [])
             if not isinstance(existing, list):

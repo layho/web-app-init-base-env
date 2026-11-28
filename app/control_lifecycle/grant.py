@@ -89,7 +89,14 @@ class W02AuthorizationPort:
         self.policy = policy if isinstance(policy, ServerPolicy) else None
         self._secret = secrets.token_bytes(32)
 
+    def server_principal(self):
+        if self.policy is None or not self.policy.bound():
+            return None
+        return self.policy.principal
+
     def issue(self, principal, scopes, object_id):
+        if self.server_principal() != principal:
+            return None
         if self.policy is None or not self.policy.permits(principal, scopes, object_id):
             return None
         scope_set = frozenset(scopes)

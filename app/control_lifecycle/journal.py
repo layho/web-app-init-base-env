@@ -280,6 +280,7 @@ class Journal:
         if not _valid(parsed):
             return {"error": "CORRUPT_JOURNAL", "diagnosis": "journal record is corrupt", "data": self.data}
         parsed.setdefault("intents", {})
+        parsed.setdefault("retired_port_generations", {})
         return {"error": None, "diagnosis": "", "data": parsed}
 
     def _commit(self, data):
@@ -344,6 +345,7 @@ class Journal:
             "deployment_state": "ABSENT",
             "service_generation": 0,
             "receipt": None,
+            "retired_port_generations": {},
         }
 
     def _public(self, data):

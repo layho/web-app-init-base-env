@@ -8,6 +8,7 @@ PYTHONPATH=. python3 -m unittest tests.test_v060_w10_task_board -v
 Test doubles are not GitHub, MacCI, merge, or deploy proof.
 """
 
+import hashlib
 import json
 import threading
 import unittest
@@ -102,6 +103,9 @@ def _with_read_receipt(item, overrides):
         return item
     item["fact_state"] = "ACCEPTED"
     item["evidence"] = "verified"
+    digest = _payload_digest(item)
+    item["payload_digest"] = digest
+    item["server_source"] = server_source
     item["read_receipt"] = {
         "kind": "read",
         "authority": "W01",
@@ -110,8 +114,41 @@ def _with_read_receipt(item, overrides):
         "fact_state": "ACCEPTED",
         "evidence": "verified",
         "event_id": item.get("event_id"),
+        "payload_digest": digest,
+        "stream_id": item.get("stream_id"),
+        "stream_epoch": item.get("stream_epoch"),
+        "producer_seq": item.get("producer_seq"),
     }
     return item
+
+
+def _seal_receipt(item):
+    receipt = dict(item.get("read_receipt") or {})
+    item.pop("payload_digest", None)
+    digest = _payload_digest(item)
+    source = receipt.get("server_source") or item.get("server_source")
+    item["payload_digest"] = digest
+    item["server_source"] = source
+    receipt.update({
+        "event_id": item.get("event_id"),
+        "stream_id": item.get("stream_id"),
+        "stream_epoch": item.get("stream_epoch"),
+        "producer_seq": item.get("producer_seq"),
+        "payload_digest": digest,
+        "server_source": source,
+    })
+    item["read_receipt"] = receipt
+    return item
+
+
+def _payload_digest(item):
+    material = {
+        key: value
+        for key, value in item.items()
+        if key not in {"read_receipt", "submit_receipt", "fact_state", "evidence", "source", "trusted_source", "payload_digest", "server_source"}
+    }
+    raw = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def event(seq, **overrides):
@@ -233,7 +270,9 @@ class TaskBoardTests(unittest.TestCase):
             ["authorization", "deployment", "candidate"],
         )
         self.assertFalse(contract["identity"]["production_verification_enabled"])
-        self.assertFalse(contract["normative"] if "normative" in contract else False)
+        self.assertTrue(contract["normative"])
+        self.assertFalse(contract["merge_authorized"])
+        self.assertFalse(contract["freeze"]["merge_authorized"])
 
     def test_unified_lists_owner_executor_mode_stages_and_many_prs(self):
         events = [
@@ -934,7 +973,7 @@ class TaskBoardTests(unittest.TestCase):
             event(1, task_id="tsk_visible", stream_id="vis:task", event_id="evt-visible"),
             event(1, task_id="tsk_hidden", stream_id="hid:task", event_id="evt-hidden", owner="hidden-owner"),
         ]
-        board = board_with(events, extra_grants=(Grant("fixture-reader-b", "app-a", "board.read"),))
+        board = board_with(events, extra_grants=(Grant("fixture-reader-b", "app-a", "board.read", "reader"),))
         board.auth.object_allow = {("fixture-reader-b", "app-a"): frozenset({"tsk_visible"})}
         wide = principal()
         narrow = principal(pid="fixture-reader-b", role="reader")
@@ -1016,6 +1055,7 @@ class TaskBoardTests(unittest.TestCase):
                 "event_id": "evt-read",
             },
         }
+        _seal_receipt(witnessed)
         contradicted = dict(witnessed)
         contradicted.update({
             "event_id": "evt-clock",
@@ -1025,6 +1065,7 @@ class TaskBoardTests(unittest.TestCase):
             "received_at": "1999-01-01T00:00:00Z",
         })
         contradicted["read_receipt"] = dict(witnessed["read_receipt"], event_id="evt-clock")
+        _seal_receipt(contradicted)
         matched = dict(witnessed)
         matched.update({
             "event_id": "evt-matched",
@@ -1034,6 +1075,7 @@ class TaskBoardTests(unittest.TestCase):
             "received_at": "2026-11-28T01:00:01Z",
         })
         matched["read_receipt"] = dict(witnessed["read_receipt"], event_id="evt-matched")
+        _seal_receipt(matched)
         bare_candidate = candidate(
             1, "cand_bare", pr_number=9, state="SUPERSEDED", task_id="tsk_bare",
             stream_id="bare:candidate", read_receipt=None,

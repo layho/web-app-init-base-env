@@ -18,6 +18,7 @@ import { HostOpsPage } from './HostOpsPage'
 import { WorkspaceShell } from './WorkspaceShell'
 import { ScreenshotPicker } from './ScreenshotPicker'
 import { FeedbackDelivery } from './FeedbackDelivery'
+import { ControlBoardPanel } from './ControlBoardPanel'
 import type { Delivery } from './FeedbackDelivery'
 
 type DeployStatus = { state: string; event: {at: string; code: string; sha: string; detail?: string} | null; last_successful_deployment?: {at:string; sha:string} | null; locked: boolean; age_seconds: number | null; requested_at: string | null; running_sha: string; rollback_failed: boolean }
@@ -565,6 +566,7 @@ function App() {
             </Typography.Paragraph>
             {manualPrResult && <Alert showIcon type={manualPrResult.type} message={manualPrResult.text} />}
           </Card>}
+        <ControlBoardPanel />
         <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'}
           onRefresh={() => void loadOperations('tasks', true)}
           onRequestRepair={async (number, head, base) => {

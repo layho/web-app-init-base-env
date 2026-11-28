@@ -41,7 +41,7 @@ from app.control_delivery.ports import (
     ServerClock,
 )
 from app.control_delivery.projection import project_chain
-from app.control_delivery.service import DeliveryService
+from app.control_delivery.service import DeliveryService, operation_id_for
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -669,7 +669,15 @@ class IsolatedDeliveryTest(unittest.TestCase):
         )
         self.assertEqual(guessed.code, "SIDE_EFFECT_UNKNOWN")
         self.assertEqual(self._feedback("fb_unknown")["state"], "UNKNOWN")
-        self.remote.reconcile_result[operation_id] = {"classification": "absent", "operation_id": operation_id}
+        stored_operation = self.svc.store.read("operation", operation_id)
+        self.remote.reconcile_result[operation_id] = {
+            "classification": "absent",
+            "operation_id": operation_id,
+            "author_id": "fixture",
+            "repo": stored_operation["scope"]["repo"],
+            "scope": stored_operation["scope"],
+            "request_digest": stored_operation["request_digest"],
+        }
         reconciled = self.svc.reconcile_operation(
             actor=self.actor, scope=self.scope, operation_id=operation_id,
             idempotency_key="reconcile-absent", expected_revision=1,
@@ -885,6 +893,11 @@ class IsolatedDeliveryTest(unittest.TestCase):
 
         def reconcile(operation_id):
             adopted["operation_id"] = operation_id
+            _op, digest, scope_exact = operation_id_for(
+                self.scope,
+                "feedback.create_issue",
+                {"feedback_id": "fb_gap", "author_id": "fixture", "body": "body-fb_gap", "attempt": 1},
+            )
             return {
                 "ok": True,
                 "blocked": False,
@@ -893,6 +906,9 @@ class IsolatedDeliveryTest(unittest.TestCase):
                 "issue_number": 77,
                 "author_id": "fixture",
                 "feedback_id": "fb_gap",
+                "repo": self.scope["repo"],
+                "scope": scope_exact,
+                "request_digest": digest,
                 "test_double": True,
                 "github_proof": False,
             }
@@ -923,6 +939,9 @@ class IsolatedDeliveryTest(unittest.TestCase):
                 "issue_number": result["number"],
                 "author_id": payload["author_id"],
                 "feedback_id": payload["feedback_id"],
+                "repo": payload["scope"]["repo"],
+                "scope": payload["scope"],
+                "request_digest": payload["request_digest"],
             }
             raise RuntimeError("crash before local result")
 

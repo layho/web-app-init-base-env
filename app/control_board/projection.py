@@ -66,11 +66,17 @@ def reject_reason(event):
 
 def _read_receipt(event):
     receipt = event.get("read_receipt")
-    if not isinstance(receipt, dict):
+    if not isinstance(receipt, dict) or not isinstance(event, dict):
         return None
     if receipt.get("kind") != "read" or receipt.get("authority") != "W01":
         return None
-    if receipt.get("event_id") not in (None, event.get("event_id")):
+    if not receipt.get("event_id") or receipt.get("event_id") != event.get("event_id"):
+        return None
+    for key in ("payload_digest", "stream_id", "stream_epoch", "producer_seq"):
+        if receipt.get(key) in (None, "") or receipt.get(key) != event.get(key):
+            return None
+    source = receipt.get("server_source")
+    if not isinstance(source, str) or not source:
         return None
     return receipt
 
@@ -108,10 +114,10 @@ def authoritative(event):
     if isinstance(event.get("submit_receipt"), dict) and event["submit_receipt"].get("kind") == "submit":
         if event["submit_receipt"].get("received_at") not in (None, receipt.get("received_at")):
             return False
-    fact_state = receipt.get("fact_state") or event.get("fact_state")
+    fact_state = receipt.get("fact_state")
     if fact_state != "ACCEPTED":
         return False
-    evidence = receipt.get("evidence") if receipt.get("evidence") in {"verified", "accepted"} else event.get("evidence")
+    evidence = receipt.get("evidence")
     if evidence not in {"verified", "accepted"}:
         return False
     server_source = receipt.get("server_source")
@@ -157,17 +163,29 @@ def fold(events):
                 continue
             watermark = 0
             stopped = False
-            seen_seq = {}
+            grouped_seq = {}
+            order = []
             for event in batch:
-                if stopped:
-                    held.append(_held(event, "gap"))
-                    continue
                 seq = event["producer_seq"]
-                prior = seen_seq.get(seq)
-                if prior is not None and prior != event.get("event_id"):
-                    held.append(_held(event, "same_seq"))
+                if seq not in grouped_seq:
+                    order.append(seq)
+                    grouped_seq[seq] = []
+                grouped_seq[seq].append(event)
+            for seq in order:
+                group = grouped_seq[seq]
+                if stopped:
+                    for event in group:
+                        held.append(_held(event, "gap"))
                     continue
-                seen_seq[seq] = event.get("event_id")
+                identities = {event.get("event_id") for event in group}
+                if len(identities) > 1:
+                    for event in group:
+                        held.append(_held(event, "same_seq"))
+                    stopped = True
+                    continue
+                event = group[0]
+                for extra in group[1:]:
+                    held.append(_held(extra, "duplicate"))
                 if seq <= watermark:
                     held.append(_held(event, "duplicate"))
                     continue

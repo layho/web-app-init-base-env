@@ -95,11 +95,14 @@ class Scheduler:
     MACCI_PROOF = False
 
     def __init__(self, root, auth, events, *, clock=None, repo_id: str, producer_id: str = "w04-scheduler",
-                 stream_id: str = "w04-scheduler:task"):
+                 stream_id: str = "w04-scheduler:task", event_authority: str = "agent"):
         self.root = Path(root)
         self.auth = auth
         self.events = events
         self.clock = clock or (lambda: int(time.time()))
+        if not isinstance(event_authority, str) or not event_authority or event_authority == "authoritative":
+            raise ValueError("invalid event authority")
+        self.event_authority = event_authority
         if not isinstance(repo_id, str) or not repo_id or len(repo_id) > 200 or "\n" in repo_id:
             raise ValueError("invalid repo")
         self.repo_id = repo_id
@@ -187,7 +190,14 @@ class Scheduler:
             acceptance_ref = ""
             publish_ref = ""
             for chain in published:
-                acceptance_ref, publish_ref = self._require_publish_binding(chain)
+                materialized = _materialize(chain)
+                if materialized["tree"] != observed_tree:
+                    raise SchedulerError(
+                        "EVIDENCE_INCONSISTENT",
+                        "published chain tree is not the selected version tree",
+                        extra={"changed": False, "state": row["state"]},
+                    )
+                acceptance_ref, publish_ref = self._require_publish_binding(materialized)
             db.execute(
                 """UPDATE versions SET state='PUBLISHED', acceptance_ref=?, publish_ref=?, published_tree=?,
                    main_sha=?, preview_sha=? WHERE version=?""",
@@ -1595,6 +1605,11 @@ class Scheduler:
         test = self._server_fact("test", **binding)
         if test.get("candidate_id") != chain["candidate_id"] or test.get("tree") != chain["tree"] or test.get("signer_kind") != "macci":
             raise SchedulerError("EVIDENCE_INCONSISTENT", "test evidence belongs to a different candidate")
+        if test.get("outcome") not in {"success", "passed"}:
+            raise SchedulerError("EVIDENCE_INCONSISTENT", "test evidence is not a successful outcome", extra={"changed": False})
+        for fact in (server, acceptance, test):
+            if fact.get("head") != chain["head"] or fact.get("base") != chain["base"] or fact.get("merge") != chain["merge_sha"] or fact.get("tree") != chain["tree"]:
+                raise SchedulerError("EVIDENCE_INCONSISTENT", "evidence tuple is not the full selected chain", extra={"changed": False})
         if not isinstance(remote, dict) or remote.get("candidate_id") != chain["candidate_id"] or remote.get("head") != chain["head"]:
             raise SchedulerError("EVIDENCE_INCONSISTENT", "merge observation is not bound to this candidate")
         if remote.get("tree") != chain["tree"]:
@@ -1922,13 +1937,24 @@ class Scheduler:
         return False
 
     def _reconcile_event(self, payload: dict):
+        digest = hashlib.sha256(_json(payload).encode()).hexdigest()
         page = self._query_events(payload["stream_id"], int(payload["stream_epoch"]), int(payload["producer_seq"]) - 1, limit=10)
+        matched = None
         for item in page.get("items") or []:
-            if all(item.get(key) == payload.get(key) for key in ("event_id", "repo_id", "app_id", "stream_id", "stream_epoch", "producer_seq", "idempotency_key")):
-                source = item.get("trusted_source")
-                if isinstance(source, str) and source:
-                    return source
-        return None
+            if item.get("stream_id") == payload.get("stream_id") and item.get("producer_seq") == payload.get("producer_seq") and item.get("event_id") not in (None, payload.get("event_id")):
+                return None
+            if not all(item.get(key) == payload.get(key) for key in ("event_id", "repo_id", "app_id", "stream_id", "stream_epoch", "producer_seq", "idempotency_key")):
+                continue
+            if any(item.get(key) != value for key, value in payload.items()):
+                continue
+            declared = item.get("payload_digest")
+            if declared is not None and declared != digest:
+                continue
+            source = item.get("trusted_source")
+            if source != self.event_authority:
+                continue
+            matched = source
+        return matched
 
     def _query_events(self, stream_id: str, epoch: int, after_seq: int, limit: int = 100) -> dict:
         request = {

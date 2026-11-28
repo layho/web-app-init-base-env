@@ -7,6 +7,7 @@ import re
 import stat
 from pathlib import Path
 
+from app.control_diagnostics.safe_io import UnsafePath, proc_fd_path
 from app.control_lifecycle.errors import LifecycleError
 from app.control_lifecycle.fdpath import containment_holds, fd_namespace, string_map_is_safe_path_resolution
 from app.control_lifecycle.grant import DenyAllAuthorizationPort, W02AuthorizationPort
@@ -88,6 +89,9 @@ class LifecycleService:
         self.journal = Journal(self.workspace / "lifecycle-journal.json", host.faults)
 
     def issue_grant(self, principal, scopes, object_id):
+        server_id = getattr(self.auth, "server_principal", lambda: None)()
+        if not isinstance(server_id, str) or not server_id or server_id != principal:
+            raise LifecycleError("NOT_AUTHORIZED", 403, "grant principal is not the server authentication context")
         grant = self.auth.issue(principal, scopes, object_id)
         if grant is None:
             raise LifecycleError("NOT_AUTHORIZED", 403, "authorization port denied the request")
@@ -96,10 +100,13 @@ class LifecycleService:
     def inspect(self, grant):
         if not self.auth.authenticate(grant):
             raise LifecycleError("NOT_AUTHORIZED", 403, "inspect requires a server grant")
+        if "lifecycle.plan" not in grant.scopes and "lifecycle.read" not in grant.scopes:
+            raise LifecycleError("POLICY_DENIED", 403, "inspect requires an independent read scope")
         policy = getattr(self.auth, "policy", None)
         if policy is None or grant.object_id != policy.app_id or grant.repo != policy.repo or grant.host_id != policy.host_id:
             raise LifecycleError("POLICY_DENIED", 403, "inspect is outside the server grant")
-        return self.journal.inspect()
+        body = self.journal.inspect()
+        return _filter_journal(body, grant)
 
     def call(self, grant, operation, payload, *, idempotency_key, expected_revision):
         try:
@@ -363,6 +370,15 @@ class LifecycleService:
         generation = _reservation_generation(payload)
         if generation is None:
             return _outcome("LEASE_FENCE_REJECTED", 409, False, "reservation generation is not exact", {"port": port, "killed": False, "moved": False, "commands": []})
+        retired = data.setdefault("retired_port_generations", {})
+        if generation <= int(retired.get(str(port), -1)):
+            return _outcome(
+                "PORT_CONFLICT",
+                409,
+                False,
+                "port generation was already released",
+                {"port": port, "killed": False, "moved": False, "commands": []},
+            )
         existing = data["reservations"].get(str(port))
         if existing:
             if not _reservation_matches(existing, grant, generation):
@@ -408,6 +424,8 @@ class LifecycleService:
                 "release requires the exact owner and generation",
                 {"port": port, "occupant": occupant, "killed": False, "moved": False, "commands": []},
             )
+        retired = data.setdefault("retired_port_generations", {})
+        retired[str(port)] = max(int(retired.get(str(port), -1)), generation)
         del data["reservations"][str(port)]
         return _outcome("OK", 200, True, "port reservation released in the journal", {"port": port, "killed": False, "moved": False})
 
@@ -917,13 +935,20 @@ class LifecycleService:
                 return "unsafe"
             if current.st_ino != inode or current.st_dev != device:
                 return "unsafe"
-            base = os.path.realpath(f"/proc/self/fd/{directory}")
-            located = os.path.realpath(f"/proc/self/fd/{fd}")
+            try:
+                base = os.path.realpath(proc_fd_path(directory))
+                located = os.path.realpath(proc_fd_path(fd))
+            except UnsafePath:
+                return "unsafe"
             if not containment_holds(base, located):
                 return "unsafe"
-            os.close(fd)
-            fd = None
+            directory_info = os.fstat(directory)
+            if not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_mode & 0o022:
+                return "unsafe"
             os.unlink(relative, dir_fd=directory)
+            after = os.fstat(fd)
+            if after.st_ino != inode or after.st_dev != device or after.st_nlink != 0:
+                return "unknown"
             return "removed"
         except OSError:
             return "unsafe"
@@ -953,6 +978,28 @@ class LifecycleService:
         if not marker.is_file() or marker.is_symlink():
             return False
         return True
+
+
+def _filter_journal(body, grant):
+    if not isinstance(body, dict):
+        return body
+    filtered = dict(body)
+    reservations = body.get("reservations") or {}
+    filtered["reservations"] = {
+        key: value
+        for key, value in reservations.items()
+        if isinstance(value, dict)
+        and value.get("owner") == grant.object_id
+        and value.get("repo") == grant.repo
+        and value.get("host_id") == grant.host_id
+    }
+    resources = body.get("resources") or {}
+    filtered["resources"] = {
+        key: value
+        for key, value in resources.items()
+        if isinstance(value, dict) and value.get("owner") in (None, grant.object_id)
+    }
+    return filtered
 
 
 def _outcome(code, http, ok, diagnosis, plan=None, simulated=False, count_seq=True, record_run=True):

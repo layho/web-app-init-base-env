@@ -515,7 +515,8 @@ class DiagnosticService:
             record["body"] = redact_value(record.get("body"))
         except ValueError:
             return self._reject("SCHEMA_UNSUPPORTED", "Event body could not be redacted.")
-        scope = "|".join([decision.get("principal_id") or "", app_id, "diagnostic.ingest", key])
+        key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        scope = "|".join([decision.get("principal_id") or "", app_id, "diagnostic.ingest", key_hash])
         basis = _hash_basis(record)
         if record.get("local_seq"):
             basis["producer_seq"] = None

@@ -176,7 +176,7 @@ class UpgradeService:
         for name, component in fresh.items():
             if _usable(component):
                 chosen = dict(component)
-                chosen["stale"] = False
+                self._mark_freshness(chosen)
             else:
                 chosen = self._cached_component(cached, name)
                 if chosen.get("source") != "cache":
@@ -380,6 +380,24 @@ class UpgradeService:
             "stale": False,
             "observed_at": getattr(manifest, "observed_at", None),
         }
+
+    def _mark_freshness(self, chosen):
+        if chosen.get("source") not in {"server_manifest", "port"}:
+            chosen["stale"] = True
+            return
+        observed_at = chosen.get("observed_at")
+        if not isinstance(observed_at, str):
+            chosen["stale"] = True
+            return
+        try:
+            observed = datetime.fromisoformat(observed_at)
+            if observed.tzinfo is None:
+                raise ValueError(observed_at)
+            age = (self.clock.now() - observed).total_seconds()
+        except ValueError:
+            chosen["stale"] = True
+            return
+        chosen["stale"] = cache_is_stale(age)
 
     def _cached_component(self, cached, name):
         unknown = {"sha": None, "state": "unknown", "source": "unknown", "stale": False, "observed_at": None}
