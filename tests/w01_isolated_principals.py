@@ -18,6 +18,7 @@ from app.control_events.auth_state import save_state
 
 _PRODUCERS = (
     ("fixture", "agent", "task", ""),
+    ("w05", "app_service", "task", ""),
     ("fixture_b", "agent", "task", ""),
     ("fixture_c", "agent", "task", ""),
     ("host_deployer", "host", "deployment", "host-test"),
@@ -33,6 +34,7 @@ _PRODUCERS = (
 
 _SCOPES = {
     "agent": ("event.append", "event.read"),
+    "app_service": ("event.append", "event.read", "delivery.intent"),
     "host": ("event.append", "event.read"),
     "policy_service": ("event.append", "event.read", "preview.merge", "preview.observe"),
     "hostops": ("event.append", "event.read", "read", "diagnostic.cursor"),
