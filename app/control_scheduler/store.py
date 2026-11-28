@@ -123,36 +123,59 @@ CREATE TABLE IF NOT EXISTS observations (
     payload_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (chain_id, seq)
 );
+CREATE TABLE IF NOT EXISTS operation_receipts (
+    operation_id TEXT PRIMARY KEY,
+    expected_revision INTEGER NOT NULL,
+    candidate_digest TEXT NOT NULL,
+    repo_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    chain_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    round_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL
+);
 """
 
 
 class Store:
     def __init__(self, root: Path):
-        self.root = root
-        self.path = root / "scheduler.sqlite3"
-        self._prepare()
-        with self.transaction() as db:
-            db.executescript(SCHEMA)
+        self.root = Path(root)
+        self.path = self.root / "scheduler.sqlite3"
+        self._check_directory()
 
-    def _prepare(self) -> None:
+    def _check_directory(self) -> None:
         root = self.root
         if not root.is_absolute():
             raise ValueError("absolute scheduler directory required")
         info = root.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
             raise ValueError("private scheduler directory required")
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+
+    def _ensure(self) -> None:
+        self._check_directory()
+        from app.control_diagnostics.safe_io import open_root
+
+        root_fd = open_root(self.root)
         try:
-            file_info = os.fstat(fd)
-            if not stat.S_ISREG(file_info.st_mode) or file_info.st_uid != os.getuid():
-                raise ValueError("private scheduler file required")
-            if stat.S_IMODE(file_info.st_mode) != 0o600:
-                os.fchmod(fd, 0o600)
+            fd = os.open(self.path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=root_fd)
+            try:
+                file_info = os.fstat(fd)
+                if not stat.S_ISREG(file_info.st_mode) or file_info.st_uid != os.getuid() or file_info.st_nlink != 1:
+                    raise ValueError("private scheduler file required")
+                if stat.S_IMODE(file_info.st_mode) != 0o600:
+                    os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
         finally:
-            os.close(fd)
+            os.close(root_fd)
+        with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as db:
+            db.executescript(SCHEMA)
 
     @contextlib.contextmanager
     def transaction(self):
+        self._ensure()
         with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as db:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA foreign_keys=ON")
@@ -163,3 +186,18 @@ class Store:
             except BaseException:
                 db.rollback()
                 raise
+
+    @contextlib.contextmanager
+    def read_only(self):
+        """Open a private snapshot. This does not create or migrate the ledger."""
+
+        self._check_directory()
+        if not self.path.is_file():
+            raise ValueError("scheduler ledger is not initialized")
+        from app.control_diagnostics.sqlite_fd import verified_sqlite_copy
+
+        with verified_sqlite_copy(self.root, self.path.name) as copied:
+            with contextlib.closing(sqlite3.connect(Path(copied).as_uri() + "?mode=ro", uri=True)) as db:
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA query_only=ON")
+                yield db

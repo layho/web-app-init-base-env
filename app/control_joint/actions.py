@@ -18,6 +18,8 @@ from pathlib import Path
 from app.control_authz.authorize import authorize
 from app.control_authz.errors import AuthzError
 from app.control_authz.principal import Principal, ResourceBinding
+from app.control_joint.receipts import query_operation_receipt
+from app.control_scheduler.digest import candidate_digest
 
 _ACTIONS = {
     "nudge": ("run.reconcile", "run", "催促"),
@@ -31,7 +33,7 @@ _ACTIONS = {
 _CLOSED = frozenset({"merge", "deploy", "request_publish"})
 _SCHEDULER = frozenset({"retry_phase", "unblock", "authorize_repair"})
 _HELD = frozenset({"BLOCKED", "FAILED", "RETRY_WAIT"})
-_DIGEST_FIELDS = ("repo_id", "app_id", "task_id", "chain_id", "candidate_id", "revision", "head", "base", "merge", "tree")
+_FENCE_FIELDS = ("action", "repo_id", "app_id", "task_id", "chain_id", "candidate_id", "round_id", "head", "base", "merge", "tree")
 
 
 def action_specs():
@@ -97,10 +99,10 @@ class ManualActions:
             if named is not None:
                 return named
         intent = _intent(principal, parsed, binding if not custom else None)
+        fence_id = _fence_id(intent)
         payload_hash = _digest_bytes({"action": action, "task_id": task_id, "expected_revision": parsed["revision"], "evidence_ref": parsed["evidence"], "intent": intent})
         key_hash = hashlib.sha256(parsed["key"].encode("utf-8")).hexdigest()
-        operation_id = hashlib.sha256(_dump({"principal_id": principal.principal_id, "intent": intent}).encode()).hexdigest()
-        reserved = self._reserve(principal.principal_id, key_hash, payload_hash, intent, operation_id)
+        reserved = self._reserve(principal.principal_id, key_hash, payload_hash, intent, fence_id)
         if reserved["kind"] == "mismatch":
             return _result(409, "IDEMPOTENCY_PAYLOAD_MISMATCH", "The idempotency key was already used with a different payload.", replayed=False, forwarded=False)
         if reserved["kind"] == "replay":
@@ -116,24 +118,32 @@ class ManualActions:
             named = _named(parsed, binding, revision=True)
             if named is not None:
                 return self._settle(principal.principal_id, key_hash, named)
-        produced = self._execute(principal, intent, parsed)
+        produced = self._execute(principal, intent, parsed, reserved["operation_id"])
         settled = self._settle(principal.principal_id, key_hash, produced)
         return settled
 
-    def _execute(self, principal: Principal, intent: dict, parsed: dict) -> dict:
+    def _execute(self, principal: Principal, intent: dict, parsed: dict, operation_id: str) -> dict:
         payload = dict(intent)
         payload["evidence_ref"] = parsed["evidence"]
         payload["expected_revision"] = parsed["revision"]
+        payload["operation_id"] = operation_id
         try:
             produced = self.executor(self.root, principal, payload)
         except Exception:
             return _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN")
         if not isinstance(produced, dict) or produced.get("side_effect") not in (False, None):
             return _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN")
-        if self.executor is execute_isolated and intent.get("chain_id"):
-            checked = _reconcile_binding(self.root, principal, intent)
-            if checked is None:
-                return _result(409, "SIDE_EFFECT_UNKNOWN", "The authority could not be read after the action.", state="UNKNOWN")
+        if self.executor is execute_isolated and intent.get("chain_id") and int(produced.get("http") or 500) < 400 and not produced.get("code"):
+            receipt = query_operation_receipt(
+                self.root,
+                operation_id=operation_id,
+                expected_revision=intent.get("revision") if type(intent.get("revision")) is int else 0,
+                candidate_digest=intent.get("digest") or "",
+                repo_id=intent.get("repo_id") or "",
+                app_id=intent.get("app_id") or "",
+            )
+            if receipt.get("status") != "applied":
+                return _result(409, "SIDE_EFFECT_UNKNOWN", "The action has no execution receipt.", state="UNKNOWN")
         return _result(
             int(produced.get("http") or 200),
             produced.get("code"),
@@ -156,6 +166,8 @@ class ManualActions:
             """
             CREATE TABLE IF NOT EXISTS manual_actions (
                 operation_id TEXT NOT NULL UNIQUE,
+                fence_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
                 principal_id TEXT NOT NULL,
                 key_hash TEXT NOT NULL,
                 payload_hash TEXT NOT NULL,
@@ -166,9 +178,13 @@ class ManualActions:
             )
             """
         )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(manual_actions)")}
+        if "fence_id" not in columns:
+            conn.execute("ALTER TABLE manual_actions ADD COLUMN fence_id TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE manual_actions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
         return conn
 
-    def _reserve(self, principal_id: str, key_hash: str, payload_hash: str, intent: dict, operation_id: str) -> dict:
+    def _reserve(self, principal_id: str, key_hash: str, payload_hash: str, intent: dict, fence_id: str) -> dict:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -177,35 +193,37 @@ class ManualActions:
                 if row["payload_hash"] != payload_hash:
                     conn.execute("COMMIT")
                     return {"kind": "mismatch"}
-                if row["state"] == "PENDING":
-                    unknown = _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN", replayed=True)
-                    conn.execute(
-                        "UPDATE manual_actions SET state='UNKNOWN', result_json=? WHERE principal_id=? AND key_hash=?",
-                        (_dump(unknown), principal_id, key_hash),
-                    )
-                    conn.execute("COMMIT")
-                    return {"kind": "replay", "result": unknown}
+                recovered = self._recover(conn, row)
                 conn.execute("COMMIT")
-                return {"kind": "replay", "result": json.loads(row["result_json"])}
-            other = conn.execute(
-                "SELECT state, result_json FROM manual_actions WHERE operation_id=?",
-                (operation_id,),
+                return recovered
+            unresolved = conn.execute(
+                "SELECT * FROM manual_actions WHERE fence_id=? AND state IN ('PENDING','UNKNOWN') ORDER BY generation",
+                (fence_id,),
             ).fetchone()
-            if other is not None and other["state"] in {"PENDING", "UNKNOWN"}:
-                conn.execute("COMMIT")
-                return {"kind": "blocked"}
-            if other is not None and other["state"] == "SETTLED":
-                conn.execute("COMMIT")
-                return {"kind": "replay", "result": json.loads(other["result_json"])}
+            if unresolved is not None:
+                self._recover(conn, unresolved)
+                still = conn.execute(
+                    "SELECT 1 FROM manual_actions WHERE fence_id=? AND state IN ('PENDING','UNKNOWN')",
+                    (fence_id,),
+                ).fetchone()
+                if still is not None:
+                    conn.execute("COMMIT")
+                    return {"kind": "blocked"}
+            generation = conn.execute(
+                "SELECT COALESCE(MAX(generation), 0) AS generation FROM manual_actions WHERE fence_id=?",
+                (fence_id,),
+            ).fetchone()["generation"] + 1
+            operation_id = _operation_id(fence_id, generation)
             conn.execute(
                 """
-                INSERT INTO manual_actions(operation_id, principal_id, key_hash, payload_hash, intent_json, state, result_json)
-                VALUES(?,?,?,?,?,'PENDING',NULL)
+                INSERT INTO manual_actions(
+                    operation_id, fence_id, generation, principal_id, key_hash, payload_hash, intent_json, state, result_json
+                ) VALUES(?,?,?,?,?,?,?,'PENDING',NULL)
                 """,
-                (operation_id, principal_id, key_hash, payload_hash, _dump(intent)),
+                (operation_id, fence_id, generation, principal_id, key_hash, payload_hash, _dump(intent)),
             )
             conn.execute("COMMIT")
-            return {"kind": "reserved"}
+            return {"kind": "reserved", "operation_id": operation_id, "generation": generation}
         except sqlite3.IntegrityError:
             conn.execute("ROLLBACK")
             return {"kind": "blocked"}
@@ -215,6 +233,43 @@ class ManualActions:
         finally:
             conn.close()
 
+    def _recover(self, conn, row) -> dict:
+        intent = json.loads(row["intent_json"])
+        revision = intent.get("revision") if type(intent.get("revision")) is int else 0
+        receipt = query_operation_receipt(
+            self.root,
+            operation_id=row["operation_id"],
+            expected_revision=revision,
+            candidate_digest=intent.get("digest") or "",
+            repo_id=intent.get("repo_id") or "",
+            app_id=intent.get("app_id") or "",
+        )
+        if receipt.get("status") == "applied":
+            body = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+            result = _result(
+                int(body.get("http") or 200),
+                body.get("code"),
+                body.get("detail") or body.get("message") or "",
+                state=body.get("state"),
+                replayed=True,
+                forwarded=True,
+            )
+            self._mark(conn, row, "SETTLED", result)
+            return {"kind": "replay", "result": result}
+        if row["state"] == "SETTLED" and row["result_json"]:
+            return {"kind": "replay", "result": json.loads(row["result_json"])}
+        if receipt.get("status") == "absent" and row["state"] in {"PENDING", "UNKNOWN"}:
+            return {"kind": "retry", "operation_id": row["operation_id"], "generation": row["generation"]}
+        if row["result_json"]:
+            return {"kind": "replay", "result": json.loads(row["result_json"])}
+        return {"kind": "replay", "result": _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN", replayed=True)}
+
+    def _mark(self, conn, row, state: str, result: dict) -> None:
+        conn.execute(
+            "UPDATE manual_actions SET state=?, result_json=? WHERE principal_id=? AND key_hash=?",
+            (state, _dump(result), row["principal_id"], row["key_hash"]),
+        )
+
     def _settle(self, principal_id: str, key_hash: str, produced: dict) -> dict:
         state = "UNKNOWN" if produced.get("state") == "UNKNOWN" or produced.get("code") == "SIDE_EFFECT_UNKNOWN" else "SETTLED"
         produced = dict(produced)
@@ -222,10 +277,19 @@ class ManualActions:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE manual_actions SET state=?, result_json=? WHERE principal_id=? AND key_hash=? AND state='PENDING'",
                 (state, _dump(produced), principal_id, key_hash),
             )
+            if cursor.rowcount != 1:
+                current = _key_row(conn, principal_id, key_hash)
+                conn.execute("COMMIT")
+                if current is not None and current["result_json"]:
+                    stored = json.loads(current["result_json"])
+                    stored["replayed"] = True
+                    stored["accepted_as_success"] = False
+                    return stored
+                return _result(409, "SIDE_EFFECT_UNKNOWN", "The action was not settled.", state="UNKNOWN")
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -258,12 +322,16 @@ def execute_isolated(root: Path, principal: Principal, payload: dict) -> dict:
                 action=action,
                 subject_id=subject,
                 evidence_ref=payload.get("evidence_ref") or "",
+                successor_id=payload.get("successor_id") or "",
                 caller={
                     "id": principal.principal_id,
                     "kind": principal.kind,
                     "app_id": principal.app_id,
                     "task_id": payload["task_id"],
                 },
+                operation_id=payload.get("operation_id"),
+                expected_revision=payload.get("expected_revision") if type(payload.get("expected_revision")) is int else None,
+                candidate_digest=payload.get("digest"),
             )
         except SchedulerError as exc:
             return _result(exc.status, exc.code, exc.message, forwarded=True)
@@ -322,8 +390,9 @@ def _parse(body: dict) -> dict:
         return {"error": _result(422, "SCHEMA_UNSUPPORTED", "evidence_ref is invalid.")}
     chain_id = body.get("chain_id")
     candidate_id = body.get("candidate_id")
+    successor_id = body.get("successor_id")
     digest = body.get("digest")
-    for name, value in (("chain_id", chain_id), ("candidate_id", candidate_id)):
+    for name, value in (("chain_id", chain_id), ("candidate_id", candidate_id), ("successor_id", successor_id)):
         if value is not None and (not isinstance(value, str) or not value or len(value) > 200):
             return {"error": _result(422, "SCHEMA_UNSUPPORTED", f"{name} is invalid.")}
     if digest is not None and (not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
@@ -336,6 +405,7 @@ def _parse(body: dict) -> dict:
         "evidence": evidence or "",
         "chain_id": chain_id,
         "candidate_id": candidate_id,
+        "successor_id": successor_id,
         "digest": digest,
     }
 
@@ -407,17 +477,29 @@ def _object(chain: dict, round_id: str) -> dict:
 
 
 def _object_digest(body: dict) -> str:
-    encoded = {key: body.get(key) for key in _DIGEST_FIELDS}
+    return candidate_digest(body)
+
+
+def _fence_id(intent: dict) -> str:
+    encoded = {key: intent.get(key) for key in _FENCE_FIELDS}
     return hashlib.sha256(_dump(encoded).encode()).hexdigest()
 
 
+def _operation_id(fence_id: str, generation: int) -> str:
+    return hashlib.sha256(f"{fence_id}:{generation}".encode()).hexdigest()
+
+
 def _named(parsed: dict, binding: dict, revision: bool = True):
-    if parsed["chain_id"] is not None and parsed["chain_id"] != binding["chain_id"]:
-        return _result(409, "OBJECT_MISMATCH", "The action is not bound to that chain.", forwarded=False)
-    if parsed["candidate_id"] is not None and parsed["candidate_id"] != binding["candidate_id"]:
-        return _result(409, "OBJECT_MISMATCH", "The action is not bound to that candidate.", forwarded=False)
-    if parsed["digest"] is not None and parsed["digest"] != binding["digest"]:
-        return _result(409, "OBJECT_MISMATCH", "The action digest does not match the ledger.", forwarded=False)
+    for field, detail in (
+        ("chain_id", "The action is not bound to that chain."),
+        ("candidate_id", "The action is not bound to that candidate."),
+        ("digest", "The action digest does not match the ledger."),
+    ):
+        value = parsed.get(field)
+        if not isinstance(value, str) or not value or value != binding.get(field):
+            return _result(409, "OBJECT_MISMATCH", detail, forwarded=False)
+    if binding.get("successor_id") and parsed.get("successor_id") != binding.get("successor_id"):
+        return _result(409, "OBJECT_MISMATCH", "The action is not bound to that successor.", forwarded=False)
     if revision and parsed["revision"] != binding["revision"]:
         return _result(409, "CONFLICT_REVISION", "expected_revision does not match the bound object.", forwarded=False)
     return None
@@ -447,22 +529,6 @@ def _intent(principal: Principal, parsed: dict, binding) -> dict:
     return intent
 
 
-def _reconcile_binding(root: Path, principal: Principal, intent: dict):
-    board = _board(root, principal, intent["task_id"])
-    if board.get("blocked"):
-        return None
-    for chain in board.get("chains") or []:
-        if chain.get("chain_id") != intent.get("chain_id"):
-            continue
-        current = _object(chain, intent.get("round_id") or "")
-        if current["candidate_id"] != intent.get("candidate_id"):
-            return None
-        if current["repo_id"] != intent.get("repo_id") or current["app_id"] != intent.get("app_id"):
-            return None
-        return current
-    return None
-
-
 def _button(action, label, task_id, enabled, code, reason, *, connected, binding):
     body = {
         "id": action,
@@ -489,7 +555,7 @@ def _button(action, label, task_id, enabled, code, reason, *, connected, binding
 
 def _key_row(conn, principal_id, key_hash):
     return conn.execute(
-        "SELECT payload_hash, state, result_json FROM manual_actions WHERE principal_id=? AND key_hash=?",
+        "SELECT * FROM manual_actions WHERE principal_id=? AND key_hash=?",
         (principal_id, key_hash),
     ).fetchone()
 

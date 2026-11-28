@@ -154,6 +154,9 @@ class Store:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(reports)")}
             if columns and "payload_json" not in columns:
                 conn.execute("ALTER TABLE reports ADD COLUMN payload_json TEXT")
+            event_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+            if event_columns and "authority_json" not in event_columns:
+                conn.execute("ALTER TABLE events ADD COLUMN authority_json TEXT")
         finally:
             conn.close()
 

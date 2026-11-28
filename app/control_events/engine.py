@@ -22,6 +22,7 @@ import threading
 import time
 
 from app.control_authz import AuthnError, AuthzError, AuthzService, Principal, PrincipalRegistry, ResourceBinding
+from app.control_authz.proof import checked_message
 from app.feedback_progress import STAGES, STATUSES
 
 from .auth_bind import POLICY_REVISION, STREAM_REPAIR, document_for_event, document_for_report, document_for_resource, evidence_key, guard_key, host_text, report_business_digest
@@ -53,6 +54,41 @@ def _identity(event: dict) -> str:
     visible = {key: value for key, value in event.items() if not str(key).startswith("_") and key != "guard"}
     encoded = json.dumps(visible, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _signed_fields(event: dict) -> dict:
+    return {
+        "repo_id": event.get("repo_id") or "",
+        "app_id": event.get("app_id") or "",
+        "task_id": event.get("task_id") or "",
+        "candidate_id": event.get("candidate_id") or "",
+        "head": event.get("head") or "",
+        "base": event.get("base") or "",
+        "merge": event.get("merge") or "",
+        "tree": event.get("tree") or "",
+        "stream_id": event.get("stream_id") or "",
+        "producer_id": event.get("producer_id") or "",
+    }
+
+
+def _authority_record(event, digest, principal, proof, server_source, message, document_fields) -> str:
+    proof = proof if isinstance(proof, dict) else {}
+    return json.dumps(
+        {
+            "signature": proof.get("signature") or "",
+            "message_hex": message.hex(),
+            "principal_id": principal,
+            "signer_id": proof.get("signer_id") or "",
+            "key_id": proof.get("key_id") or "",
+            "server_source": server_source,
+            "authoritative": bool(event.get("_authoritative")),
+            "authorized": True,
+            "event_digest": digest,
+            "signed": document_fields,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _scope_key(scope: dict) -> str:
@@ -157,11 +193,11 @@ class Engine:
             raise ControlError("NOT_AUTHORIZED", 403, "policy revision does not match the server")
         replay_only = False
         try:
-            principal, proof = self._authenticate(body, event=event, operation="event.append", write=True)
+            principal, proof, document = self._authenticate(body, event=event, operation="event.append", write=True)
         except ControlError as exc:
             if exc.code != "PROOF_REPLAY":
                 raise
-            principal, proof = self._authenticate(body, event=event, operation="event.append", write=False)
+            principal, proof, document = self._authenticate(body, event=event, operation="event.append", write=False)
             replay_only = True
         self._authorize_append(principal, event)
         self.identity.assert_same(event["repo_id"])
@@ -179,6 +215,7 @@ class Engine:
         if self.authorizer is not None and self.authorizer(event) is False:
             raise ControlError("POLICY_DENIED", 403, "policy denied before idempotency")
         digest = _identity(event)
+        message = checked_message("event.append", document, proof)
         scope = _scope_key(body["scope"])
         with self.store.transaction() as conn:
             existing = conn.execute(
@@ -194,7 +231,10 @@ class Engine:
                 raise ControlError("PROOF_REPLAY", 403, "nonce already used")
             else:
                 self._commit_nonce(conn, principal, proof, digest, "event.append")
-                outcome = self._attempt(conn, event, digest, principal.principal_id, scope)
+                outcome = self._attempt(
+                    conn, event, digest, principal.principal_id, scope,
+                    proof=proof, server_source=server_source or "", message=message,
+                )
                 if outcome.get("_wrote") and not outcome.get("replayed"):
                     self.events.enqueue(conn, event, digest)
             if crash == "before-commit":
@@ -476,7 +516,8 @@ class Engine:
             document["actor"] = body["actor"]
         if isinstance(body.get("proof"), dict):
             document["proof"] = body["proof"]
-        return self._authenticate_document(document, operation=operation, write=write)
+        principal, proof = self._authenticate_document(document, operation=operation, write=write)
+        return principal, proof, document
 
     def _authenticate_document(self, document: dict, *, operation: str, write: bool):
         try:
@@ -586,7 +627,7 @@ class Engine:
         resource["stream_id"] = stream_id
         if task_id:
             resource["task_id"] = task_id
-        principal, proof = self._authenticate(request, event=None, operation=operation, write=write, resource=resource, method=method)
+        principal, proof, _document = self._authenticate(request, event=None, operation=operation, write=write, resource=resource, method=method)
         self._bind(
             principal,
             operation,
@@ -702,7 +743,7 @@ class Engine:
     def _guards(self, event: dict) -> set[str]:
         return set(self.proven_guards.get(guard_key(event), frozenset()))
 
-    def _attempt(self, conn, event: dict, digest: str, principal: str, scope: str) -> dict:
+    def _attempt(self, conn, event: dict, digest: str, principal: str, scope: str, *, proof: dict, server_source: str, message: bytes) -> dict:
         received_at = _now()
         event["received_at"] = received_at
         watermarks = self._watermarks(conn, event["stream_id"])
@@ -735,12 +776,13 @@ class Engine:
                 wrote=False,
             )
         stored = _stored(event)
+        authority = _authority_record(event, digest, principal, proof, server_source, message, document_fields=_signed_fields(event))
         conn.execute(
             """
             INSERT INTO events (
                 event_id, stream_id, stream_epoch, producer_seq, payload_hash, payload_json,
-                received_at, applied, hold_reason, epoch_closed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                received_at, applied, hold_reason, epoch_closed, authority_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event["event_id"],
@@ -753,6 +795,7 @@ class Engine:
                 1 if history else 0,
                 None if history or action == "apply" else reason,
                 1 if history and event.get("epoch_closed") else 0,
+                authority,
             ),
         )
         projected = False

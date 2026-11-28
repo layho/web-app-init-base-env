@@ -7,7 +7,7 @@ import re
 import stat
 from pathlib import Path
 
-from app.control_diagnostics.safe_io import UnsafePath, proc_fd_path
+from app.control_diagnostics.safe_io import UnsafePath, open_root, proc_fd_path
 from app.control_lifecycle.errors import LifecycleError
 from app.control_lifecycle.fdpath import containment_holds, fd_namespace, string_map_is_safe_path_resolution
 from app.control_lifecycle.grant import DenyAllAuthorizationPort, W02AuthorizationPort
@@ -371,6 +371,7 @@ class LifecycleService:
         if generation is None:
             return _outcome("LEASE_FENCE_REJECTED", 409, False, "reservation generation is not exact", {"port": port, "killed": False, "moved": False, "commands": []})
         retired = data.setdefault("retired_port_generations", {})
+        issued = data.setdefault("issued_port_generations", {})
         if generation <= int(retired.get(str(port), -1)):
             return _outcome(
                 "PORT_CONFLICT",
@@ -379,7 +380,16 @@ class LifecycleService:
                 "port generation was already released",
                 {"port": port, "killed": False, "moved": False, "commands": []},
             )
+        previous = issued.get(str(port))
         existing = data["reservations"].get(str(port))
+        if previous is not None and not existing and generation != int(previous) + 1:
+            return _outcome(
+                "PORT_CONFLICT",
+                409,
+                False,
+                "port generation is not the next fence",
+                {"port": port, "killed": False, "moved": False, "commands": []},
+            )
         if existing:
             if not _reservation_matches(existing, grant, generation):
                 return _outcome(
@@ -407,6 +417,7 @@ class LifecycleService:
             "repo": grant.repo,
             "host_id": grant.host_id,
         }
+        issued[str(port)] = generation
         return _outcome("OK", 200, True, "port reserved in the journal", {"port": port, "killed": False, "moved": False})
 
     def _op_port_release(self, grant, payload, data):
@@ -425,7 +436,9 @@ class LifecycleService:
                 {"port": port, "occupant": occupant, "killed": False, "moved": False, "commands": []},
             )
         retired = data.setdefault("retired_port_generations", {})
+        issued = data.setdefault("issued_port_generations", {})
         retired[str(port)] = max(int(retired.get(str(port), -1)), generation)
+        issued[str(port)] = max(int(issued.get(str(port), generation)), generation)
         del data["reservations"][str(port)]
         return _outcome("OK", 200, True, "port reservation released in the journal", {"port": port, "killed": False, "moved": False})
 
@@ -885,8 +898,8 @@ class LifecycleService:
 
     def _open_inventory(self):
         try:
-            directory = os.open(self.inventory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        except OSError:
+            directory = open_root(self.inventory)
+        except (OSError, UnsafePath):
             return None
         info = os.fstat(directory)
         if not stat.S_ISDIR(info.st_mode):
@@ -905,7 +918,7 @@ class LifecycleService:
                 return "missing"
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 return None
-            fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
             try:
                 current = os.fstat(fd)
             finally:
@@ -929,7 +942,7 @@ class LifecycleService:
             return "unknown"
         fd = None
         try:
-            fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
             current = os.fstat(fd)
             if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
                 return "unsafe"
@@ -949,6 +962,7 @@ class LifecycleService:
             after = os.fstat(fd)
             if after.st_ino != inode or after.st_dev != device or after.st_nlink != 0:
                 return "unknown"
+            os.fsync(directory)
             return "removed"
         except OSError:
             return "unsafe"
@@ -1197,7 +1211,7 @@ def _inside(root, path):
 def _linux_fd_contains(directory, relative):
     dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        file_fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        file_fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
         try:
             directory_real = os.path.realpath(f"/proc/self/fd/{dir_fd}")
             located_real = os.path.realpath(f"/proc/self/fd/{file_fd}")

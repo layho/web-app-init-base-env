@@ -8,6 +8,7 @@ evidence is allowed to move a chain or a version.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import secrets
@@ -15,6 +16,7 @@ import time
 from pathlib import Path
 
 from .candidate import candidate_id, normalize_path, paths_overlap, require_id, require_sha
+from .digest import candidate_digest
 from .errors import SchedulerError
 from .store import Store
 
@@ -109,7 +111,6 @@ class Scheduler:
         self.producer_id = producer_id
         self.stream_id = stream_id
         self.store = Store(self.root)
-        self._bind_repo()
 
     @classmethod
     def open(cls, root, auth, events, **kwargs) -> "Scheduler":
@@ -118,7 +119,7 @@ class Scheduler:
     def open_version(self, version: str, *, baseline: str) -> dict:
         version = require_id(version, "version")
         baseline = require_sha(baseline, "baseline")
-        with self.store.transaction() as db:
+        with self._write() as db:
             if db.execute("SELECT 1 FROM versions").fetchone():
                 raise SchedulerError("VERSION_NOT_RELEASED", "a version already exists; activate only after publish or abandon")
             db.execute(
@@ -131,7 +132,7 @@ class Scheduler:
         self._evidence(evidence_ref)
         if not isinstance(reason, str) or not reason:
             raise SchedulerError("EVIDENCE_MISSING", "freeze reason is required", status=422)
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._version(db, version)
             if row["state"] != "ACTIVE":
                 raise SchedulerError("FREEZE_ACTIVE", "only an active version can be frozen", extra={"state": row["state"]})
@@ -147,7 +148,7 @@ class Scheduler:
     def record_publish_observation(self, version: str, *, main_sha: str, preview_sha: str, observed_tree: str,
                                    candidate_tree: str) -> dict:
         report = self._ancestry(main_sha, preview_sha, observed_tree, candidate_tree)
-        with self.store.transaction() as db:
+        with self._write() as db:
             self._version(db, version)
             db.execute("UPDATE versions SET ancestry_json=? WHERE version=?", (_json(report), version))
         return self._public({"version": version, "ancestry_recorded": True, "is_ancestor": report["is_ancestor"]})
@@ -159,7 +160,7 @@ class Scheduler:
         main_sha = require_sha(main_sha, "main")
         preview_sha = require_sha(preview_sha, "preview")
         live = self._ancestry(main_sha, preview_sha, observed_tree, candidate_tree)
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._version(db, version)
             if row["state"] not in {"ACTIVE", "FROZEN"}:
                 raise SchedulerError("VERSION_NOT_RELEASED", "version cannot be published from this state",
@@ -212,7 +213,7 @@ class Scheduler:
     def activate_version(self, version: str, *, baseline: str) -> dict:
         version = require_id(version, "version")
         baseline = require_sha(baseline, "baseline")
-        with self.store.transaction() as db:
+        with self._write() as db:
             if db.execute("SELECT 1 FROM versions WHERE version=?", (version,)).fetchone():
                 raise SchedulerError("CONFLICT_REVISION", "version already exists")
             rows = db.execute("SELECT state FROM versions").fetchall()
@@ -234,7 +235,7 @@ class Scheduler:
         task_id = require_id(task_id, "task")
         app_id = require_id(app_id, "app")
         worktree = normalize_path(worktree)
-        with self.store.transaction() as db:
+        with self._write() as db:
             self._require_active(db, version)
             if db.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
                 raise SchedulerError("CONFLICT_REVISION", "task already exists; close has no outgoing edge")
@@ -252,7 +253,7 @@ class Scheduler:
                                  extra={"changed": False})
         if fact.get("subject") != task_id or fact.get("ref") != evidence_ref:
             raise SchedulerError("EVIDENCE_INCONSISTENT", "task acceptance is not bound to this task", extra={"changed": False})
-        with self.store.transaction() as db:
+        with self._write() as db:
             task = self._task(db, task_id)
             if task["closed"]:
                 raise SchedulerError("CONFLICT_REVISION", "closed task cannot accept a new record")
@@ -263,7 +264,7 @@ class Scheduler:
         return self._public({"task_id": task_id, "acceptance_recorded": True, "closed": False, "signer_kind": fact["signer_kind"]})
 
     def close_task(self, task_id: str) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             task = self._task(db, task_id)
             if task["closed"]:
                 raise SchedulerError("CONFLICT_REVISION", "close has no outgoing edge", extra={"changed": False, "state": "CLOSED"})
@@ -299,7 +300,7 @@ class Scheduler:
             "files": paths, "dependencies": deps, "priority": priority, "worktree": worktree,
             "pr_line": pr_line, "head": shas[0], "base": shas[1], "merge": shas[2], "tree": shas[3],
         }
-        with self.store.transaction() as db:
+        with self._write() as db:
             task = self._task(db, task_id)
             self._require_active(db, task["version"])
             if task["worktree"] != worktree:
@@ -334,7 +335,7 @@ class Scheduler:
         shas = self._tuple(head, base, merge, tree)
         if not shas[0]:
             raise SchedulerError("SCHEMA_UNSUPPORTED", "candidate tuple is incomplete", status=422)
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             self._require_active(db, chain["version"])
             if chain["head"] and (chain["head"], chain["base"], chain["merge_sha"], chain["tree"]) != shas:
@@ -345,7 +346,7 @@ class Scheduler:
         issued = self.auth.register_candidate(repo=self.repo_id, task=chain["task_id"], head=shas[0], base=shas[1], merge=shas[2], tree=shas[3])
         if issued != candidate:
             raise SchedulerError("EVIDENCE_INCONSISTENT", "auth candidate id does not match the tuple", extra={"changed": False})
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             self._require_active(db, chain["version"])
             if chain["head"] and chain["candidate_id"] != candidate:
@@ -369,14 +370,14 @@ class Scheduler:
             raise SchedulerError("SCHEMA_UNSUPPORTED", "replacement tuple is incomplete", status=422)
         new_chain_id = require_id(new_chain_id, "chain")
         pr_line = require_id(pr_line, "pr")
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             self._require_active(db, chain["version"])
             if chain["state"] not in SUPERSEDE_FROM:
                 raise SchedulerError("CONFLICT_REVISION", "this chain cannot be superseded from its current state",
                                      extra={"state": chain["state"], "changed": False})
         candidate = self._register_remote_candidate(chain["task_id"], *shas)
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             if chain["state"] not in SUPERSEDE_FROM:
                 raise SchedulerError("CONFLICT_REVISION", "this chain cannot be superseded from its current state",
@@ -418,7 +419,7 @@ class Scheduler:
             return self._claim_task(version=version, phase=phase, caller=caller, fault=fault)
         if phase not in CHAIN_PHASES:
             raise SchedulerError("SCHEMA_UNSUPPORTED", "phase is not in the contract", status=422)
-        with self.store.transaction() as db:
+        with self._write() as db:
             self._require_active(db, version)
             if self._version_blocked(db, version):
                 return self._public({"claimed": False, "reason": "version_blocked", "pinned_pr_ignored": pinned_pr is not None})
@@ -439,7 +440,7 @@ class Scheduler:
         return self._bound_call(round_id, caller, operation="run.renew")
 
     def start(self, *, round_id: str, caller: dict) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._round(db, round_id)
             if row["auth_state"] != "LEASED" or row["dispatch"] != "CONFIRMED":
                 raise SchedulerError("CONFLICT_REVISION", "start requires the current leased round",
@@ -448,7 +449,7 @@ class Scheduler:
             if chain and chain["state"] == "SUPERSEDED":
                 raise SchedulerError("CANDIDATE_STALE", "superseded chain cannot start", extra={"changed": False})
         result = self._bound_call(round_id, caller, operation="run.start")
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._round(db, round_id)
             if row["chain_id"] and row["phase"] == "test":
                 chain = self._chain(db, row["chain_id"])
@@ -466,7 +467,7 @@ class Scheduler:
         if result == "UNKNOWN":
             raise SchedulerError("NOT_AUTHORIZED", "a caller cannot write UNKNOWN", status=403)
         fact = None
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._round(db, round_id)
             if row["auth_state"] not in {"LEASED", "RUNNING"} or row["dispatch"] != "CONFIRMED":
                 raise SchedulerError("CONFLICT_REVISION", "complete requires the current round",
@@ -485,7 +486,7 @@ class Scheduler:
                 elif result == "FAILED" and row["phase"] == "accept":
                     fact = self._reject_acceptance(chain, evidence_ref)
         response = self._bound_call(round_id, caller, operation="run.complete", extra_overlay={"result": result})
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._round(db, round_id)
             if row["chain_id"]:
                 self._apply_complete(db, row, result, evidence_ref, fact)
@@ -493,7 +494,7 @@ class Scheduler:
         return response
 
     def report_caller_timeout(self, *, round_id: str) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._round(db, round_id)
             state = row["auth_state"]
         return self._public({
@@ -507,7 +508,7 @@ class Scheduler:
         except Exception as exc:
             self._reraise(exc)
         state = outcome.get("state")
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = db.execute("SELECT * FROM rounds WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 raise SchedulerError("EVIDENCE_MISSING", "run is not a scheduler round")
@@ -532,7 +533,7 @@ class Scheduler:
         mapped = {"succeeded": "SUCCEEDED", "failed": "FAILED", "not_occurred": "RETRY_WAIT"}[classification]
         if outcome.get("state") != mapped:
             raise SchedulerError("EVIDENCE_INCONSISTENT", "auth classification was not applied", extra={"changed": False})
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = db.execute("SELECT * FROM rounds WHERE run_id=?", (run_id,)).fetchone()
             if row is None or row["auth_state"] != "UNKNOWN":
                 raise SchedulerError("EVIDENCE_MISSING", "classification needs an unknown scheduler round", extra={"changed": False})
@@ -549,7 +550,7 @@ class Scheduler:
         return self._public({"run_id": run_id, "state": mapped, "resumed": False, "evidence_ref": evidence_ref})
 
     def advance_serial(self, version: str, *, pinned_pr: str | None = None) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             self._require_active(db, version)
             if self._version_blocked(db, version):
                 return self._public({"advanced": False, "reason": "version_blocked", "pinned_pr_ignored": pinned_pr is not None})
@@ -586,7 +587,7 @@ class Scheduler:
         payload = {
             "kind": kind, "remote_sha": remote_sha, "merged": merged, "closed": closed, "evidence_ref": evidence_ref,
         }
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             if db.execute("SELECT 1 FROM observations WHERE chain_id=? AND seq=?", (chain_id, observation_seq)).fetchone():
                 return self._public({"applied": False, "reason": "duplicate", "state": chain["state"], "remote_status": chain["remote_status"]})
@@ -613,7 +614,7 @@ class Scheduler:
         })
 
     def retry_remote(self, chain_id: str) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             if chain["remote_status"] in REMOTE_HOLD or chain["remote_status"] == "NONE":
                 raise SchedulerError("BLIND_RETRY_DENIED", "a lost or pending remote result cannot be retried",
@@ -621,7 +622,8 @@ class Scheduler:
         raise SchedulerError("BLIND_RETRY_DENIED", "remote retry is not a scheduler action", extra={"changed": False})
 
     def intervene(self, *, action: str, subject_id: str, evidence_ref: str, successor_id: str = "", caller: dict | None = None,
-                  note: str = "") -> dict:
+                  note: str = "", operation_id: str | None = None, expected_revision: int | None = None,
+                  candidate_digest: str | None = None) -> dict:
         if action == "hostops_execute":
             raise SchedulerError("NOT_AN_EXECUTOR", "HostOps diagnostics are not an executor", status=403, extra={"changed": False})
         self._evidence(evidence_ref)
@@ -630,13 +632,19 @@ class Scheduler:
         if action == "supersede_failed":
             return self._supersede_failed(subject_id, evidence_ref)
         if action == "authorize_repair":
-            return self._authorize_repair(subject_id, successor_id, evidence_ref)
+            return self._authorize_repair(
+                subject_id, successor_id, evidence_ref,
+                operation_id=operation_id, expected_revision=expected_revision, digest=candidate_digest,
+            )
         if action == "retarget_dependency":
             return self._retarget(subject_id, successor_id, evidence_ref)
         if action in {"retry_phase", "unblock"}:
             if caller is None:
                 raise SchedulerError("SCHEMA_UNSUPPORTED", "retry requires the holder caller", status=422)
-            return self._retry_phase(subject_id, evidence_ref, caller, action)
+            return self._retry_phase(
+                subject_id, evidence_ref, caller, action,
+                operation_id=operation_id, expected_revision=expected_revision, digest=candidate_digest,
+            )
         raise SchedulerError("SCHEMA_UNSUPPORTED", "intervention is not recognized", status=422)
 
     def ingest(self, *, stream_id: str, stream_epoch: int = 1, request: dict | None = None) -> dict:
@@ -650,7 +658,7 @@ class Scheduler:
         stopped_at = None
         watermark = 0
         while True:
-            with self.store.transaction() as db:
+            with self._write() as db:
                 row = db.execute(
                     "SELECT seq FROM watermarks WHERE stream_id=? AND stream_epoch=?",
                     (stream_id, stream_epoch),
@@ -680,7 +688,7 @@ class Scheduler:
                     stopped_at = seq
                     stop = True
                     break
-                with self.store.transaction() as db:
+                with self._write() as db:
                     if self._event_seen(db, identity):
                         cursor = seq
                         self._save_watermark(db, stream_id, stream_epoch, cursor)
@@ -723,7 +731,7 @@ class Scheduler:
 
     def recover(self) -> dict:
         flushed = self._flush_events()
-        with self.store.transaction() as db:
+        with self._write() as db:
             pending = db.execute(
                 "SELECT * FROM rounds WHERE dispatch IN ('INTENT','DISPATCH_UNKNOWN') ORDER BY created, round_id"
             ).fetchall()
@@ -753,7 +761,7 @@ class Scheduler:
                 self._hold_unknown(row["round_id"])
                 unknown.append({"round_id": row["round_id"], "code": "DISPATCH_UNKNOWN"})
                 continue
-            with self.store.transaction() as db:
+            with self._write() as db:
                 self._confirm(db, row["round_id"], view)
                 self._intend_event(
                     db, event_type="run.claimed", event_class="task", task_id=intent["task_id"], run_id=view["run_id"],
@@ -774,7 +782,7 @@ class Scheduler:
 
     def audit(self) -> list:
         found = []
-        with self.store.transaction() as db:
+        with self._write() as db:
             for chain in db.execute("SELECT * FROM chains WHERE state!='SUPERSEDED'"):
                 evidence = _load(chain["evidence_json"])
                 for phase, record in evidence.items():
@@ -788,19 +796,88 @@ class Scheduler:
                         found.append({"chain_id": chain["chain_id"], "phase": phase, "reason": "tuple"})
         return found
 
-    def _bind_repo(self) -> None:
+    @contextlib.contextmanager
+    def _write(self):
         with self.store.transaction() as db:
-            db.execute("CREATE TABLE IF NOT EXISTS repo_binding (repo_id TEXT PRIMARY KEY)")
-            rows = db.execute("SELECT repo_id FROM repo_binding").fetchall()
-            if not rows:
-                db.execute("INSERT INTO repo_binding(repo_id) VALUES(?)", (self.repo_id,))
-                return
-            bound = {row["repo_id"] for row in rows}
-            if bound != {self.repo_id}:
-                raise ValueError("scheduler repo binding does not match this repository")
+            self._bind_repo_in(db)
+            yield db
+
+    def _compare_fence(self, db, chain, *, operation_id, expected_revision, digest) -> None:
+        if operation_id is None and expected_revision is None and digest is None:
+            return
+        if not isinstance(operation_id, str) or not operation_id or type(expected_revision) is not int or isinstance(expected_revision, bool):
+            raise SchedulerError("SCHEMA_UNSUPPORTED", "operation_id and expected_revision are required", status=422)
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise SchedulerError("SCHEMA_UNSUPPORTED", "candidate digest is required", status=422)
+        if chain is None:
+            raise SchedulerError("NOT_CONNECTED", "the action is not bound to a chain", extra={"changed": False})
+        current = self._digest_of(db, chain)
+        revision = chain["revision"] if type(chain["revision"]) is int else 0
+        if revision != expected_revision or current != digest:
+            raise SchedulerError("CONFLICT_REVISION", "the candidate or revision changed", extra={"changed": False})
+        existing = db.execute("SELECT * FROM operation_receipts WHERE operation_id=?", (operation_id,)).fetchone()
+        if existing is None:
+            return
+        if existing["status"] != "applied" or existing["candidate_digest"] != digest or int(existing["expected_revision"]) != expected_revision:
+            raise SchedulerError("CONFLICT_REVISION", "operation receipt does not match", extra={"changed": False})
+
+    def _store_receipt(self, db, chain, *, operation_id, expected_revision, digest, round_id, result) -> None:
+        if operation_id is None:
+            return
+        existing = db.execute("SELECT operation_id FROM operation_receipts WHERE operation_id=?", (operation_id,)).fetchone()
+        if existing is not None:
+            stored = db.execute("SELECT * FROM operation_receipts WHERE operation_id=?", (operation_id,)).fetchone()
+        else:
+            app_id = self._app_of(db, chain["task_id"])
+            db.execute(
+                """
+                INSERT INTO operation_receipts(
+                    operation_id, expected_revision, candidate_digest, repo_id, app_id, chain_id, candidate_id,
+                    round_id, generation, status, result_json
+                ) VALUES(?,?,?,?,?,?,?,?,0,'applied',?)
+                """,
+                (
+                    operation_id, expected_revision, digest, self.repo_id, app_id, chain["chain_id"],
+                    chain["candidate_id"] or "", round_id or "", _json(result),
+                ),
+            )
+            stored = db.execute("SELECT * FROM operation_receipts WHERE operation_id=?", (operation_id,)).fetchone()
+        if (
+            stored is None
+            or stored["status"] != "applied"
+            or stored["candidate_digest"] != digest
+            or int(stored["expected_revision"]) != expected_revision
+            or stored["operation_id"] != operation_id
+            or stored["repo_id"] != self.repo_id
+        ):
+            raise SchedulerError("SIDE_EFFECT_UNKNOWN", "the operation receipt was not stored", extra={"changed": False})
+
+    def _digest_of(self, db, chain) -> str:
+        return candidate_digest({
+            "repo_id": self.repo_id,
+            "app_id": self._app_of(db, chain["task_id"]),
+            "task_id": chain["task_id"],
+            "chain_id": chain["chain_id"],
+            "candidate_id": chain["candidate_id"] or "",
+            "revision": chain["revision"] if type(chain["revision"]) is int else 0,
+            "head": chain["head"] or "",
+            "base": chain["base"] or "",
+            "merge": chain["merge_sha"] or "",
+            "tree": chain["tree"] or "",
+        })
+
+    def _bind_repo_in(self, db) -> None:
+        db.execute("CREATE TABLE IF NOT EXISTS repo_binding (repo_id TEXT PRIMARY KEY)")
+        rows = db.execute("SELECT repo_id FROM repo_binding").fetchall()
+        if not rows:
+            db.execute("INSERT INTO repo_binding(repo_id) VALUES(?)", (self.repo_id,))
+            return
+        bound = {row["repo_id"] for row in rows}
+        if bound != {self.repo_id}:
+            raise ValueError("scheduler repo binding does not match this repository")
 
     def query_board(self, *, app_id: str, task_ids: set[str], limit: int = 50, after: str | None = None) -> dict:
-        """Read this repository's tasks and chains. SQL errors propagate."""
+        """Read this repository's tasks and chains. The ledger is not migrated."""
 
         if not isinstance(app_id, str) or not app_id:
             raise SchedulerError("SCHEMA_UNSUPPORTED", "app_id is required", status=422)
@@ -808,7 +885,12 @@ class Scheduler:
             raise SchedulerError("SCHEMA_UNSUPPORTED", "page limit is invalid", status=422)
         if after is not None and not isinstance(after, str):
             raise SchedulerError("SCHEMA_UNSUPPORTED", "page cursor is invalid", status=422)
-        with self.store.transaction() as db:
+        with self.store.read_only() as db:
+            rows = db.execute("SELECT repo_id FROM repo_binding").fetchall()
+            bound = {row["repo_id"] for row in rows}
+            if bound != {self.repo_id}:
+                raise ValueError("scheduler repo binding does not match this repository")
+            repo_id = next(iter(bound))
             task_rows = db.execute(
                 """
                 SELECT task_id, app_id, version, closed
@@ -844,8 +926,10 @@ class Scheduler:
                 """
                 SELECT round_id, task_id, chain_id, candidate_id, auth_state, revision, phase
                 FROM rounds
+                WHERE task_id IN (SELECT task_id FROM tasks WHERE app_id=?)
                 ORDER BY round_id
-                """
+                """,
+                (app_id,),
             ).fetchall()
         chains = []
         for row in chain_rows:
@@ -857,7 +941,7 @@ class Scheduler:
                 "chain_id": row["chain_id"],
                 "task_id": row["task_id"],
                 "app_id": app_id,
-                "repo_id": self.repo_id,
+                "repo_id": repo_id,
                 "candidate_id": row["candidate_id"],
                 "state": row["state"],
                 "queue": row["queue"],
@@ -882,7 +966,7 @@ class Scheduler:
                 "auth_state": row["auth_state"],
                 "revision": row["revision"],
                 "phase": row["phase"],
-                "repo_id": self.repo_id,
+                "repo_id": repo_id,
                 "app_id": app_id,
             })
         return {
@@ -893,12 +977,12 @@ class Scheduler:
             "test_double": False,
             "truncated": truncated,
             "next_cursor": page[-1]["chain_id"] if truncated and page else None,
-            "repo_id": self.repo_id,
+            "repo_id": repo_id,
             "app_id": app_id,
         }
 
     def snapshot(self, version: str) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             version_row = self._version(db, version)
             tasks = [self._task_view(row) for row in db.execute("SELECT * FROM tasks WHERE version=? ORDER BY task_id", (version,))]
             chains = [self._chain_view(row) for row in db.execute("SELECT * FROM chains WHERE version=? ORDER BY priority DESC, created, chain_id", (version,))]
@@ -906,7 +990,7 @@ class Scheduler:
         return self._public({"version": self._version_view(version_row), "tasks": tasks, "chains": chains, "rounds": rounds})
 
     def _claim_task(self, *, version: str, phase: str, caller: dict, fault: str | None) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             self._require_active(db, version)
             if self._version_blocked(db, version):
                 return self._public({"claimed": False, "reason": "version_blocked"})
@@ -939,7 +1023,7 @@ class Scheduler:
         if view["auth_state"] in (None, "", "UNKNOWN"):
             self._hold_unknown(round_id)
             raise SchedulerError("SIDE_EFFECT_UNKNOWN", "claim result did not name a usable state", extra={"changed": False})
-        with self.store.transaction() as db:
+        with self._write() as db:
             self._confirm(db, round_id, view)
             row = self._round(db, round_id)
             task = self._task(db, row["task_id"])
@@ -958,7 +1042,7 @@ class Scheduler:
         })
 
     def _bound_call(self, round_id: str, caller: dict, *, operation: str, extra_overlay: dict | None = None) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._round(db, round_id)
             if row["dispatch"] != "CONFIRMED" or not row["run_id"]:
                 raise SchedulerError("CONFLICT_REVISION", "round is not confirmed", extra={"changed": False, "state": row["auth_state"]})
@@ -986,7 +1070,7 @@ class Scheduler:
         except SchedulerError as exc:
             raise SchedulerError(exc.code, exc.message, status=exc.status, extra={**exc.extra, "changed": False, "state": before}) from exc
         view = self._auth_view(result.body, replay_required=False)
-        with self.store.transaction() as db:
+        with self._write() as db:
             db.execute(
                 "UPDATE rounds SET auth_state=?, generation=?, revision=?, attempt=? WHERE round_id=?",
                 (view["auth_state"], view["generation"], view["revision"], view["attempt"], round_id),
@@ -1126,8 +1210,8 @@ class Scheduler:
             return False
         return False
 
-    def _retry_phase(self, round_id: str, evidence_ref: str, caller: dict, action: str) -> dict:
-        with self.store.transaction() as db:
+    def _retry_phase(self, round_id: str, evidence_ref: str, caller: dict, action: str, *, operation_id=None, expected_revision=None, digest=None) -> dict:
+        with self._write() as db:
             row = self._round(db, round_id)
             if action == "unblock" and row["auth_state"] not in {"BLOCKED", "FAILED", "RETRY_WAIT"}:
                 chain = self._chain(db, row["chain_id"]) if row["chain_id"] else None
@@ -1156,14 +1240,28 @@ class Scheduler:
             action, round_id, evidence_ref, version_state=version_state, candidate_id=candidate_id, tree=tree,
             task_id=task_id, head=head, base=base, merge=merge,
         )
-        with self.store.transaction() as db:
-            if held and chain_id:
-                db.execute("UPDATE chains SET queue='READY' WHERE chain_id=? AND queue='HUMAN_HOLD'", (chain_id,))
+        with self._write() as db:
+            row = self._round(db, round_id)
+            chain = self._chain(db, row["chain_id"]) if row["chain_id"] else None
+            if action == "unblock" and row["auth_state"] not in {"BLOCKED", "FAILED", "RETRY_WAIT"}:
+                if not chain or chain["queue"] != "HUMAN_HOLD":
+                    raise SchedulerError("CONFLICT_REVISION", "unblock requires a held failure", extra={"changed": False, "state": row["auth_state"]})
+            if row["auth_state"] not in HUMAN_AUTH and action == "retry_phase":
+                raise SchedulerError("CONFLICT_REVISION", "retry requires a finished non-running round", extra={"changed": False, "state": row["auth_state"]})
+            if chain and chain["state"] in {"FAILED", "REJECTED", "SUPERSEDED"}:
+                raise SchedulerError("CONFLICT_REVISION", "a failed chain needs a new chain", extra={"changed": False, "state": chain["state"]})
+            self._compare_fence(db, chain, operation_id=operation_id, expected_revision=expected_revision, digest=digest)
+            if chain and chain["queue"] == "HUMAN_HOLD":
+                db.execute("UPDATE chains SET queue='READY' WHERE chain_id=? AND queue='HUMAN_HOLD'", (chain["chain_id"],))
             self._intend_event(
                 db, event_type="intervention.recorded", event_class="authorization" if all((head, base, merge, tree)) else "task",
                 task_id=task_id, run_id=previous_run_id or "", stage=action, state="AUTHORIZED", revision=1,
                 evidence_ref=evidence_ref, app_id=self._app_of(db, task_id), candidate_id=candidate_id,
                 head=head, base=base, merge=merge, tree=tree, operation=action,
+            )
+            self._store_receipt(
+                db, chain, operation_id=operation_id, expected_revision=expected_revision, digest=digest,
+                round_id=round_id, result={"action": action, "state": "AUTHORIZED", "http": 200},
             )
         self._flush_events()
         claimed = self.claim_next(
@@ -1175,7 +1273,7 @@ class Scheduler:
         return claimed
 
     def _supersede_failed(self, chain_id: str, evidence_ref: str) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             if chain["state"] != "FAILED":
                 raise SchedulerError("CONFLICT_REVISION", "only a failed chain can be superseded this way",
@@ -1185,7 +1283,7 @@ class Scheduler:
             "supersede_failed", chain_id, evidence_ref, version_state=version["state"], candidate_id=chain["candidate_id"],
             tree=chain["tree"], task_id=chain["task_id"], head=chain["head"], base=chain["base"], merge=chain["merge_sha"],
         )
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             if chain["state"] != "FAILED":
                 raise SchedulerError("CONFLICT_REVISION", "only a failed chain can be superseded this way",
@@ -1201,10 +1299,10 @@ class Scheduler:
         self._flush_events()
         return self._public({"chain_id": chain_id, "state": "SUPERSEDED", "evidence_ref": evidence_ref, "evidence_copied": False})
 
-    def _authorize_repair(self, chain_id: str, successor_id: str, evidence_ref: str) -> dict:
+    def _authorize_repair(self, chain_id: str, successor_id: str, evidence_ref: str, *, operation_id=None, expected_revision=None, digest=None) -> dict:
         if not successor_id:
             raise SchedulerError("EVIDENCE_MISSING", "repair requires a new chain", extra={"changed": False})
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             successor = self._chain(db, successor_id)
             version = self._version(db, chain["version"])
@@ -1219,13 +1317,14 @@ class Scheduler:
             tree=successor["tree"], task_id=chain["task_id"], head=successor["head"], base=successor["base"],
             merge=successor["merge_sha"],
         )
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             successor = self._chain(db, successor_id)
             if chain["state"] != "REJECTED":
                 raise SchedulerError("CONFLICT_REVISION", "repair starts from a rejected chain", extra={"state": chain["state"], "changed": False})
             if _load(successor["evidence_json"]):
                 raise SchedulerError("EVIDENCE_INCONSISTENT", "old evidence cannot move to the repair chain", extra={"changed": False})
+            self._compare_fence(db, chain, operation_id=operation_id, expected_revision=expected_revision, digest=digest)
             db.execute("UPDATE chains SET state='SUPERSEDED', queue='RELEASED', superseded_by=? WHERE chain_id=?", (successor_id, chain_id))
             self._recompute(db, chain["version"])
             self._intend_event(
@@ -1234,11 +1333,15 @@ class Scheduler:
                 app_id=self._app_of(db, chain["task_id"]), candidate_id=successor["candidate_id"], head=successor["head"],
                 base=successor["base"], merge=successor["merge_sha"], tree=successor["tree"], operation="authorize_repair",
             )
+            self._store_receipt(
+                db, chain, operation_id=operation_id, expected_revision=expected_revision, digest=digest,
+                round_id="", result={"action": "authorize_repair", "state": "SUPERSEDED", "http": 200, "successor": successor_id},
+            )
         self._flush_events()
         return self._public({"chain_id": chain_id, "state": "SUPERSEDED", "successor": successor_id, "evidence_copied": False, "evidence_ref": evidence_ref})
 
     def _retarget(self, chain_id: str, successor_id: str, evidence_ref: str) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             successor = self._chain(db, successor_id)
             version = self._version(db, chain["version"])
@@ -1246,7 +1349,7 @@ class Scheduler:
             "retarget_dependency", chain_id, evidence_ref, version_state=version["state"], candidate_id=chain["candidate_id"],
             tree=chain["tree"], task_id=chain["task_id"], head=chain["head"], base=chain["base"], merge=chain["merge_sha"],
         )
-        with self.store.transaction() as db:
+        with self._write() as db:
             chain = self._chain(db, chain_id)
             successor = self._chain(db, successor_id)
             if successor["state"] not in DEPENDENCY_OK:
@@ -1268,7 +1371,7 @@ class Scheduler:
         return self._public({"chain_id": chain_id, "queue": stored["queue"], "dependencies": _load(stored["dependencies_json"]), "evidence_ref": evidence_ref})
 
     def _abandon(self, version: str, evidence_ref: str) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._version(db, version)
             if self._version_blocked(db, version) or self._serial_held(db, version):
                 raise SchedulerError("SIDE_EFFECT_UNKNOWN", "version has an unknown or open remote effect", extra={"changed": False})
@@ -1276,7 +1379,7 @@ class Scheduler:
                 raise SchedulerError("SIDE_EFFECT_UNKNOWN", "remote outcome is unknown", extra={"changed": False})
             state = row["state"]
         self._authorize_manual("abandon_version", version, evidence_ref, version_state=state, task_id="version")
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._version(db, version)
             if self._version_blocked(db, version) or self._serial_held(db, version):
                 raise SchedulerError("SIDE_EFFECT_UNKNOWN", "version has an unknown or open remote effect", extra={"changed": False})
@@ -1375,7 +1478,7 @@ class Scheduler:
         )
 
     def _abort_intent(self, round_id: str) -> None:
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._round(db, round_id)
             if row["dispatch"] != "INTENT":
                 return
@@ -1563,7 +1666,7 @@ class Scheduler:
         self._hold_unknown(round_id)
 
     def _hold_unknown(self, round_id: str) -> None:
-        with self.store.transaction() as db:
+        with self._write() as db:
             row = self._round(db, round_id)
             if row["dispatch"] not in {"INTENT", "DISPATCH_UNKNOWN"}:
                 return
@@ -1755,7 +1858,7 @@ class Scheduler:
 
     def _audit_intervention(self, action, subject_id, evidence_ref, *, state, task_id, candidate_id, head, base, merge, tree) -> None:
         event_class = "authorization" if all((head, base, merge, tree)) else "task"
-        with self.store.transaction() as db:
+        with self._write() as db:
             self._intend_event(
                 db, event_type="intervention.recorded", event_class=event_class, task_id=task_id or subject_id,
                 run_id="", stage=action, state=state, revision=1, evidence_ref=evidence_ref, app_id="scheduler",
@@ -1976,7 +2079,7 @@ class Scheduler:
         return value
 
     def _flush_events(self) -> dict:
-        with self.store.transaction() as db:
+        with self._write() as db:
             rows = db.execute(
                 "SELECT * FROM event_intents WHERE status='PENDING' ORDER BY stream_id, producer_seq, event_id"
             ).fetchall()
@@ -1995,7 +2098,7 @@ class Scheduler:
                 waiting.append(intent["event_id"])
                 break
             if self._event_rejected(result):
-                with self.store.transaction() as db:
+                with self._write() as db:
                     db.execute("UPDATE event_intents SET status='REJECTED' WHERE event_id=?", (intent["event_id"],))
                 rejected.append(intent["event_id"])
                 break
@@ -2003,7 +2106,7 @@ class Scheduler:
             if observed is None:
                 waiting.append(intent["event_id"])
                 break
-            with self.store.transaction() as db:
+            with self._write() as db:
                 db.execute(
                     "UPDATE event_intents SET status='DELIVERED', trusted_source=? WHERE event_id=?",
                     (observed, intent["event_id"]),

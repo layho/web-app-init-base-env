@@ -281,6 +281,7 @@ class Journal:
             return {"error": "CORRUPT_JOURNAL", "diagnosis": "journal record is corrupt", "data": self.data}
         parsed.setdefault("intents", {})
         parsed.setdefault("retired_port_generations", {})
+        parsed.setdefault("issued_port_generations", {})
         return {"error": None, "diagnosis": "", "data": parsed}
 
     def _commit(self, data):
@@ -346,6 +347,7 @@ class Journal:
             "service_generation": 0,
             "receipt": None,
             "retired_port_generations": {},
+            "issued_port_generations": {},
         }
 
     def _public(self, data):

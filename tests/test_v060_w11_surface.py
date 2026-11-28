@@ -151,16 +151,33 @@ class SurfaceTests(unittest.TestCase):
                 self.assertFalse(blocked.json()["accepted_as_success"])
                 self.assertFalse(blocked.json()["side_effect"])
 
+                unblock = next(item for item in payload["actions"] if item["id"] == "unblock")
                 first = client.post(
                     "/api/v1/control/board/actions",
-                    json={"action": "unblock", "task_id": "tsk_w01", "idempotency_key": "route-secret-key", "expected_revision": 0},
+                    json={
+                        "action": "unblock",
+                        "task_id": "tsk_w01",
+                        "idempotency_key": "route-secret-key",
+                        "expected_revision": unblock["revision"],
+                        "chain_id": unblock["chain_id"],
+                        "candidate_id": unblock["candidate_id"],
+                        "digest": unblock["digest"],
+                    },
                     headers={"Origin": "https://webapp.example", "X-CSRF-Token": csrf},
                 )
                 self.assertNotEqual(first.json().get("code"), "IDEMPOTENCY_PAYLOAD_MISMATCH")
                 self.assertFalse(first.json()["accepted_as_success"])
                 second = client.post(
                     "/api/v1/control/board/actions",
-                    json={"action": "unblock", "task_id": "tsk_w01", "idempotency_key": "route-secret-key", "expected_revision": 4},
+                    json={
+                        "action": "unblock",
+                        "task_id": "tsk_w01",
+                        "idempotency_key": "route-secret-key",
+                        "expected_revision": unblock["revision"] + 4,
+                        "chain_id": unblock["chain_id"],
+                        "candidate_id": unblock["candidate_id"],
+                        "digest": unblock["digest"],
+                    },
                     headers={"Origin": "https://webapp.example", "X-CSRF-Token": csrf},
                 )
                 self.assertEqual(second.status_code, 409, second.text)

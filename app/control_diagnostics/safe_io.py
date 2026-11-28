@@ -13,6 +13,7 @@ live outside the directory.
 
 import os
 import re
+import secrets
 import stat
 import sys
 from pathlib import Path
@@ -34,24 +35,35 @@ def proc_fd_path(fd, platform_name=None):
     raise UnsafePath("platform file-descriptor path is not available", "blocked")
 
 
-def _assert_real_ancestors(path):
-    current = Path(os.fspath(path))
-    if not current.is_absolute():
-        current = Path(os.path.abspath(current))
-    for parent in (current, *current.parents):
-        if parent.is_symlink():
-            raise UnsafePath("ancestor is a symlink")
-
-
 def open_root(path):
-    """Return a directory fd. The path and its ancestors must not be symlinks."""
-    _assert_real_ancestors(path)
-    fd = os.open(os.fspath(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    info = os.fstat(fd)
-    if not stat.S_ISDIR(info.st_mode):
-        os.close(fd)
-        raise UnsafePath("not a directory")
-    return fd
+    """Return a directory fd by walking each component with O_NOFOLLOW.
+
+    The check and the open are the same walk. A symlink swapped into an
+    ancestor after a separate lstat cannot redirect this descriptor. Callers
+    keep the fd and do not open the path again.
+    """
+    raw = os.fspath(path)
+    if not os.path.isabs(raw):
+        raw = os.path.abspath(raw)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    held = fd
+    try:
+        for part in (item for item in raw.split("/") if item):
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=held)
+            except OSError as exc:
+                raise UnsafePath("ancestor is a symlink") from exc
+            os.close(held)
+            held = nxt
+            info = os.fstat(held)
+            if not stat.S_ISDIR(info.st_mode):
+                raise UnsafePath("not a directory")
+        fd = held
+        held = None
+        return fd
+    finally:
+        if held is not None:
+            os.close(held)
 
 
 def open_directory(dir_fd, name):
@@ -138,38 +150,46 @@ def append_bytes(dir_fd, name, payload):
 def replace_bytes(dir_fd, name, payload):
     """Replace name with a new regular file.
 
-    A temporary name that is a symlink is unlinked. It is not opened, so the
-    symlink target is not truncated.
+    The temporary name is unique, so two writers do not unlink each other.
+    The file is fsynced before rename, and the directory is fsynced after.
+    The check of the replaced file uses O_NONBLOCK.
     """
-    temporary = name + ".tmp"
+    temporary = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    fd = None
     try:
-        info = os.lstat(temporary, dir_fd=dir_fd)
-    except FileNotFoundError:
-        info = None
-    if info is not None:
-        os.unlink(temporary, dir_fd=dir_fd)
-    try:
-        fd = os.open(
-            temporary,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=dir_fd,
-        )
-    except OSError as exc:
-        raise UnsafePath("replace refused") from exc
-    try:
+        try:
+            fd = os.open(
+                temporary,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=dir_fd,
+            )
+        except OSError as exc:
+            raise UnsafePath("replace refused") from exc
         _write_all(fd, payload)
         os.fchmod(fd, 0o600)
-    finally:
+        os.fsync(fd)
         os.close(fd)
-    os.rename(temporary, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        fd = None
+        os.rename(temporary, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        temporary = None
+        os.fsync(dir_fd)
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=dir_fd)
+            except OSError:
+                pass
+        raise
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
     except OSError as exc:
         raise UnsafePath("replaced file is not regular") from exc
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
             raise UnsafePath("replaced file is not a private regular file")
         os.fchmod(fd, 0o600)
     finally:
