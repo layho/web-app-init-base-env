@@ -70,6 +70,14 @@ def split_request(body: dict) -> dict:
         raise _schema("expected_revision must be an integer")
     if type(body["idempotency_key"]) is not str:
         raise _schema("idempotency_key must be a string")
+    if body.get("event_type") == "delivery.intent.recorded":
+        allowed = set(event_spec()["always_required"]) | {"evidence_ref", "run_id", "app_id", "task_id",
+                                                         "note", "actor", "proof", "authorizer", "scope",
+                                                         "expected_revision"}
+        if (set(body) - allowed or body["expected_revision"] != 0
+                or body["scope"] != {"repo": body.get("repo_id"), "task_id": body.get("task_id")}
+                or body.get("authorizer") != "w05"):
+            raise _schema("invalid isolated W05 request envelope")
     event = _extract(body)
     validate_event(event)
     event["expected_revision"] = body["expected_revision"]
@@ -132,7 +140,11 @@ def validate_event(event: dict) -> None:
     if event["event_type"] == "delivery.intent.recorded":
         note = event.get("note")
         prefix = "w05-intent-v1:"
-        if (not isinstance(note, str) or not note.startswith(prefix)
+        allowed = set(spec["always_required"]) | {"evidence_ref", "run_id", "app_id", "task_id", "note"}
+        if (set(event) - allowed
+                or len(event["idempotency_key"]) != 64
+                or any(c not in _SHA for c in event["idempotency_key"])
+                or not isinstance(note, str) or not note.startswith(prefix)
                 or len(note) != len(prefix) + 64 or any(c not in _SHA for c in note[len(prefix):])
                 or event.get("evidence_ref") != note
                 or channel != "task" or event.get("producer_id") != "w05"
