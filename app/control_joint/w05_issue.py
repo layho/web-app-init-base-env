@@ -64,15 +64,31 @@ def verify_feedback_submit(engine, *, signed, scope, payload, idempotency_key, e
     own journal transaction with the matching outbox. Only the identical
     authorized intent can recover that reservation.
     """
-    import time
-    from app.control_authz import AuthnError, AuthzError
     from app.control_events.auth_state import load_state
     from app.control_events.errors import ControlError
 
-    if not isinstance(signed, dict) or scope.get("repo") != engine.repo_id:
-        return None
     try:
         state = load_state(engine.auth_path)
+    except ControlError:
+        return None
+    return verify_feedback_submit_proof(
+        engine.authz, state, repo_id=engine.repo_id, signed=signed, scope=scope,
+        payload=payload, idempotency_key=idempotency_key, expected_revision=expected_revision)
+
+
+def verify_feedback_submit_proof(authz, state, *, repo_id, signed, scope, payload,
+                                 idempotency_key, expected_revision):
+    """Verify the exact signed document against an isolated server registry.
+
+    Rechecking uses the current policy, keys, revocations and validity
+    window. An expired or revoked proof is unknown, not historical denial.
+    """
+    import time
+    from app.control_authz import AuthnError, AuthzError
+
+    if not isinstance(signed, dict) or scope.get("repo") != repo_id:
+        return None
+    try:
         actor, proof = signed["actor"], signed["proof"]
         principal_id = actor["id"]
         record = state["principals"].get(principal_id)
@@ -86,19 +102,19 @@ def verify_feedback_submit(engine, *, signed, scope, payload, idempotency_key, e
         )
         if {k: v for k, v in signed.items() if k not in {"actor", "proof"}} != expected:
             return None
-        principal = engine.authz.authenticate(
+        principal = authz.authenticate(
             operation="feedback.write", body=signed, route_class="isolated",
             now=int(time.time()), state=state, write=False,
         )
-        engine.authz.authorize(principal, "feedback.write",
-                               engine.authz.binding_for(principal, "feedback.write", expected))
+        authz.authorize(principal, "feedback.write",
+                        authz.binding_for(principal, "feedback.write", expected))
         if principal.principal_id != payload["author_id"]:
             return None
         nonce_key = hashlib.sha256(json.dumps([principal.principal_id, proof["nonce"]],
                                               separators=(",", ":")).encode()).hexdigest()
         return {"principal_id": principal.principal_id, "nonce_key": nonce_key,
                 "authorization_digest": proof["payload_hash"]}
-    except (AuthnError, AuthzError, ControlError, KeyError, TypeError, ValueError, AttributeError):
+    except (AuthnError, AuthzError, KeyError, TypeError, ValueError, AttributeError):
         return None
 
 
