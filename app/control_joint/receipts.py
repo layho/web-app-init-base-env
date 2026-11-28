@@ -100,69 +100,13 @@ def _applied_row(row, operation_id, expected_revision, candidate_digest, repo_id
 
 
 def _w05(root: Path, operation_id: str, expected_revision: int, candidate_digest: str, repo_id: str, app_id: str) -> dict:
-    """A receipt is applied only when the journal issuance head names it.
+    """Fail closed until a real W05 business receipt authority is connected."""
 
-    ``issued``, ``persisted``, and a SHA computed from the receipt file are
-    not an issuance. A missing transaction, a missing head entry, or a
-    digest that does not match the committed transaction is unknown. This
-    read does not write, so it cannot change a W04 result.
-    """
-
-    if not _safe_name(operation_id):
-        return {"status": "unknown"}
-    transaction = _delivery_json(root, "transaction", operation_id)
-    receipt = _delivery_json(root, "receipt", operation_id)
-    head = _delivery_json(root, "issuance-head", "w05")
-    if transaction is None or receipt is None or head is None:
-        return {"status": "unknown"}
-    if not isinstance(transaction, dict) or not isinstance(receipt, dict) or not isinstance(head, dict):
-        return {"status": "unknown"}
-    result = transaction.get("result")
-    parent = transaction.get("parent") if isinstance(transaction.get("parent"), str) else None
-    commit_seq = transaction.get("commit_seq")
-    if not isinstance(result, dict) or parent is None or isinstance(commit_seq, bool) or type(commit_seq) is not int:
-        return {"status": "unknown"}
-    from app.control_joint.w05_issue import issuance_digest
-
-    digest = issuance_digest(
-        operation_id=operation_id,
-        expected_revision=expected_revision,
-        candidate_digest=candidate_digest,
-        repo_id=repo_id,
-        app_id=app_id,
-        result=result,
-        commit_seq=commit_seq,
-        parent=parent,
-    )
-    commits = head.get("commits")
-    if transaction.get("issuance_digest") != digest or not isinstance(commits, dict) or commits.get(operation_id) != digest:
-        return {"status": "unknown"}
-    if transaction.get("status") != "applied" or transaction.get("authority") != "W05":
-        return {"status": "unknown"}
-    if (
-        transaction.get("operation_id") != operation_id
-        or transaction.get("expected_revision") != expected_revision
-        or transaction.get("candidate_digest") != candidate_digest
-        or transaction.get("repo_id") != repo_id
-        or transaction.get("app_id") != app_id
-    ):
-        return {"status": "unknown"}
-    receipt_id = transaction.get("receipt_id")
-    if not isinstance(receipt_id, str) or not receipt_id.startswith("rcpt_"):
-        return {"status": "unknown"}
-    for field in ("operation_id", "expected_revision", "candidate_digest", "repo_id", "app_id", "result", "receipt_id", "status"):
-        if receipt.get(field) != transaction.get(field):
-            return {"status": "unknown"}
-    return {
-        "status": "applied",
-        "operation_id": operation_id,
-        "expected_revision": expected_revision,
-        "candidate_digest": candidate_digest,
-        "repo_id": repo_id,
-        "app_id": app_id,
-        "result": result,
-        "receipt_id": receipt_id,
-    }
+    # Earlier standalone journal records were not tied to an authorized
+    # delivery transaction. They cannot be grandfathered in as proof.
+    # Enable this port only once the actual business CAS and trusted W01
+    # acknowledgement are committed together and independently verified.
+    return {"status": "unknown", "reason": "BUSINESS_TRANSACTION_REQUIRED"}
 
 
 def _delivery_json(root: Path, kind: str, key: str):
