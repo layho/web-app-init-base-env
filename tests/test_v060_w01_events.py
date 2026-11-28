@@ -348,6 +348,30 @@ def test_w05_signed_business_actor_is_independent_of_event_signer(tmp_path):
     assert verify()["status"] == "unknown"
     svc.store.write("business-nonce", auth["nonce_key"], reservation)
     assert verify()["status"] == "verified_isolated"
+
+    # A valid fresh caller must not repair a corrupt persisted proof by
+    # silently proceeding with the already accepted event.
+    original_commit = svc._commit_local
+    def crash(*args, **kwargs):
+        raise RuntimeError("interrupt before local CAS")
+    svc._commit_local = crash
+    with pytest.raises(RuntimeError, match="interrupt before local CAS"):
+        submit("fb_pending_proof", "pending-proof", nonce="pending-nonce")
+    svc._commit_local = original_commit
+    pending, = [row for row in svc.store.list("outbox") if row["delivery_state"] == "PENDING"]
+    proof_id = pending["event_id"]
+    saved = svc.store.read("business-proof", proof_id)
+    corrupted = {**saved, "signed": {**saved["signed"],
+                 "proof": {**saved["signed"]["proof"], "signature": "00" * 64}}}
+    svc.store.write("business-proof", proof_id, corrupted)
+    denied = submit("fb_pending_proof", "pending-proof", nonce="pending-nonce")
+    assert not denied.ok
+    assert svc.store.read("feedback", "fb_pending_proof") is None
+    assert svc.store.read("business-proof", proof_id) == corrupted
+    svc.store.write("business-proof", proof_id, saved)
+    restored = submit("fb_pending_proof", "pending-proof", nonce="pending-nonce")
+    assert restored.ok, restored.as_dict()
+    assert eng.store.count("events") == 2
     with pytest.raises(ValueError, match="dedicated journal"):
         DeliveryService(root, **{**options, "require_business_signature": False})
     registry = load_state(eng.auth_path)
@@ -355,7 +379,7 @@ def test_w05_signed_business_actor_is_independent_of_event_signer(tmp_path):
     save_state(eng.auth_path, registry)
     assert not submit("fb_business", "business").ok
     assert verify()["status"] == "unknown"
-    assert eng.store.count("events") == 1
+    assert eng.store.count("events") == 2
 
 
 def test_w05_signed_intent_business_cas_recovers_without_fixture_fallback(tmp_path):
