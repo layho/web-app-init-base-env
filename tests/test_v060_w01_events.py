@@ -211,6 +211,37 @@ def report(eng, run_id, *, outcome, phase, note=None, **fields):
     return sign_report(eng, payload)
 
 
+def test_w05_intent_bridge_uses_signed_w01_evidence_without_business_commit(tmp_path):
+    from app.control_joint.w05_issue import record_isolated_intent
+
+    eng = engine(tmp_path)
+    event = {
+        "event_id": "evt_w05_intent", "repo_id": eng.repo_id, "app_id": "base",
+        "task_id": "tsk_w01", "run_id": "run_w05_intent",
+        "producer_id": "w05", "stream_id": "w05:task", "stream_epoch": 1,
+        "producer_seq": 1, "occurred_at": 1700000000,
+        "note": "w05-intent-v1:" + "a" * 64,
+    }
+    signer = lambda body: sign_event(eng, body, signer="w05")
+    verified = record_isolated_intent(eng, event=event, sign_request=signer)
+    assert verified["status"] == "intent_verified", verified
+    assert verified["business_committed"] is False
+    assert verified["production_effective"] is False
+    assert verified["w01_receipt"]["evidence"] == "verified"
+    assert eng.fact("task:run_w05_intent") is None
+    assert eng.store.count("events") == 1
+    changed = {**event, "note": "w05-intent-v1:" + "b" * 64}
+    assert record_isolated_intent(eng, event=changed, sign_request=signer)["status"] == "unknown"
+    assert record_isolated_intent(eng, event={**event, "event_id": "evt_foreign",
+                                            "task_id": "tsk_foreign", "producer_seq": 2},
+                                  sign_request=signer)["status"] == "unknown"
+    assert eng.store.count("events") == 1
+    assert record_isolated_intent(eng, event={**event, "event_id": "evt_wrong_role",
+                                            "producer_seq": 2},
+                                  sign_request=lambda body: sign_event(eng, body, signer="fixture"))["status"] == "unknown"
+    assert eng.store.count("events") == 1
+
+
 def test_repo_identity_is_stable_and_not_reusable_after_rebuild(tmp_path):
     first = engine(tmp_path, "generation-1")
     again = Engine.open(tmp_path / "store", "generation-1")
