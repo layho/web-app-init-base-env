@@ -398,8 +398,6 @@ def _failure_text(record: dict) -> str:
 
 
 def _delivery(root: Path, principal: Principal, tasks: set[str]):
-    if not (root / "delivery").exists():
-        return {}, "missing"
     try:
         found = {}
         cursor = None
@@ -414,6 +412,8 @@ def _delivery(root: Path, principal: Principal, tasks: set[str]):
                 task_ids=tasks,
                 after=cursor,
             )
+            if page["missing"]:
+                return ({}, "partial") if cursor is not None else ({}, "missing")
             found.update(page["items"])
             bad += page["bad"]
             unscoped += page["unscoped"]
