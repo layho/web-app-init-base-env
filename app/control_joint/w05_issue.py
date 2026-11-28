@@ -84,8 +84,11 @@ def record_isolated_intent(engine, *, event: dict, sign_request) -> dict:
         if event_business_digest(split_request(signed)) != expected_digest:
             return unknown
         response = engine.append(signed)
-        if response.get("http") != 200 or response.get("applied") is not True:
+        if response.get("http") != 200:
             return unknown
+        # A replay may return the original held response even after a gap
+        # was drained. The verified applied row, not the cached response,
+        # is the final authority for this isolated intent.
         stored = query_exact_event(engine.root, event_id=body["event_id"],
                                    repo_id=body["repo_id"], app_id=body["app_id"],
                                    task_id=body["task_id"])
