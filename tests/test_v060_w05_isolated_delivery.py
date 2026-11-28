@@ -437,6 +437,39 @@ class IsolatedDeliveryTest(unittest.TestCase):
             ["fb_a", "fb_b", "fb_c"],
         )
 
+    def test_base_task_write_is_visible_to_scoped_board_reader(self):
+        from app.control_joint.delivery_read import query_tasks
+
+        root = Path(self.tmp.name).resolve()
+        self.svc = DeliveryService(root / "delivery", auth=self.auth, events=self.events,
+                                   schedule=self.schedule, deploy=self.deploy, remote=self.remote,
+                                   clock=self.clock)
+        self._submit("fb_base")
+        self._claim_task(feedback_ids=["fb_base"])
+        task = self.svc.store.read("task", "tsk_w05")
+        self.assertEqual(task["app_id"], "base")
+        self.assertEqual(self._read_chain("tsk_w05", "ch_a")["app_id"], "base")
+        self.assertEqual(self._feedback("fb_base")["app_id"], "base")
+        args = dict(repo_id=self.scope["repo"], task_ids={"tsk_w05"})
+        visible = query_tasks(root, app_id="base", **args)
+        self.assertEqual(set(visible["items"]), {"tsk_w05"})
+        self.assertFalse(visible["items"]["tsk_w05"]["authoritative"])
+        self.assertEqual(query_tasks(root, app_id="other", **args)["items"], {})
+        foreign_scope = {**self.scope, "app_id": "other"}
+        self.assertFalse(self.svc.project(actor=self.actor, task_id="tsk_w05", scope=foreign_scope).ok)
+        denied = self.svc.submit_feedback(actor=self.actor, scope=foreign_scope,
+                                          author_id=self.actor["id"], feedback_id="fb_foreign_app",
+                                          category="bug", body="foreign", idempotency_key="foreign-app")
+        self.assertEqual(denied.code, "NOT_AUTHORIZED")
+        self.assertIsNone(self.svc.store.read("feedback", "fb_foreign_app"))
+        del task["app_id"]
+        self.svc.store.write("task", "tsk_w05", task)
+        legacy = query_tasks(root, app_id="base", **args)
+        self.assertEqual(legacy["items"], {})
+        self.assertEqual(legacy["unscoped"], 1)
+        self.assertFalse(self.svc.project(actor=self.actor, task_id="tsk_w05", scope=self.scope).ok)
+        self.assertNotIn("app_id", self.svc.store.read("task", "tsk_w05"))
+
     def test_task_claim_rejects_foreign_or_missing_feedback_atomically(self):
         self._submit("fb_local")
         for reason, changes, expected in (
