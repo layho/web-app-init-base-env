@@ -8,6 +8,14 @@ these interfaces. Nothing here copies those packages.
 from typing import Protocol
 
 
+class EventRejected(Exception):
+    """W01 refused a deployment fact. The fact must not be rewritten into a new event."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
 class Effect:
     """Result of one synthetic external call.
 
@@ -80,7 +88,13 @@ class AuthzPort(Protocol):
 
 class EventPort(Protocol):
     def append_deployment(self, fact):
-        """Accept one deployment fact. The caller must not set received_at."""
+        """Accept one deployment fact into the W01 stream.
+
+        The caller must not set received_at. A repeat of the same event_id
+        and payload returns the original receipt. A different payload, a
+        sequence gap, or a sequence conflict is rejected. This port is the
+        only authority for accepted facts.
+        """
 
 
 class ArtifactPort(Protocol):
@@ -118,4 +132,11 @@ class ServicePort(Protocol):
         ...
 
     def observe(self, spec):
-        ...
+        """Read-only probe. Must not repeat stage, switch, rollback, or commit."""
+
+    def operation_result(self, operation_id):
+        """Read-only lookup for one stable operation id.
+
+        Return the Effect already produced for that id, or None when this
+        service never started it. Must not call the operation again.
+        """

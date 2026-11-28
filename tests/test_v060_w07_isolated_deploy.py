@@ -6,8 +6,12 @@ MacCI, not a host deploy, and not production acceptance.
 
 import ast
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +31,8 @@ from app.control_deploy.contract_machine import (
     load_contract,
 )
 from app.control_deploy.engine import Request
-from app.control_deploy.ports import Effect
+from app.control_deploy.journal import JournalCorrupt
+from app.control_deploy.ports import Effect, EventRejected
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,15 +123,46 @@ class MemoryLease:
         self.principal = "fixture"
         self.scope = "deploy"
         self.expires_at = 10_000
+        self.now = 100
         self.force_allow = False
+        self.checks = []
 
     def allow(self, run_id, token=TOKEN, generation=1):
         self.bindings.add((run_id, token, generation))
 
-    def check(self, *, token, principal_id, run_id, scope, generation, server_now):
+    def server_now(self):
+        return self.now
+
+    def check(
+        self,
+        *,
+        token,
+        principal_id,
+        run_id,
+        scope,
+        generation,
+        server_now,
+        candidate_id=None,
+        service_id=None,
+        artifact_digest=None,
+        operation_id=None,
+    ):
+        self.checks.append(
+            {
+                "principal_id": principal_id,
+                "scope": scope,
+                "server_now": server_now,
+                "run_id": run_id,
+                "candidate_id": candidate_id,
+                "service_id": service_id,
+                "artifact_digest": artifact_digest,
+                "operation_id": operation_id,
+            }
+        )
         if self.force_allow:
             return True
-        if server_now >= self.expires_at or principal_id != self.principal or scope != self.scope:
+        scope_ok = scope == self.scope or (isinstance(scope, str) and scope.startswith(self.scope + ":"))
+        if server_now >= self.expires_at or principal_id != self.principal or not scope_ok:
             return False
         return (run_id, token, generation) in self.bindings
 
@@ -138,10 +174,16 @@ class MemoryAuth:
         self.allow = True
         self.high_risk = False
         self.recovery = True
+        self.server_principal = "fixture"
 
     def authenticate(self, actor):
         self.calls.append("authenticate")
         return self.authenticated
+
+    def principal(self, actor):
+        if not self.authenticated:
+            return None
+        return self.server_principal
 
     def authorize(self, actor, scope, operation, candidate_id):
         self.calls.append("authorize")
@@ -157,18 +199,71 @@ class MemoryAuth:
 
 
 class MemoryEvents:
+    """In-test W01 port. Accepted facts live only here; the journal is the outbox."""
+
     def __init__(self):
         self.facts = []
         self.fail = False
+        self.reject_reason = None
+        self.watermark = {}
+        self._bodies = {}
+        self._receipts = {}
+
+    def _body(self, fact):
+        body = {key: value for key, value in fact.items() if key != "received_at"}
+        return json.dumps(body, sort_keys=True, default=str)
+
+    def _receipt(self, fact):
+        return {
+            "event_id": fact["event_id"],
+            "stream_id": fact["stream_id"],
+            "stream_epoch": fact["stream_epoch"],
+            "producer_seq": fact["producer_seq"],
+            "received_at": "server",
+            "fact_state": "ACCEPTED",
+        }
 
     def append_deployment(self, fact):
         if "received_at" in fact:
             raise ValueError("caller supplied received_at")
+        required = (
+            "event_id",
+            "schema_version",
+            "event_type",
+            "event_class",
+            "repo_id",
+            "producer_id",
+            "stream_id",
+            "stream_epoch",
+            "producer_seq",
+            "occurred_at",
+            "idempotency_key",
+        )
+        missing = [name for name in required if fact.get(name) in (None, "")]
+        if missing:
+            raise EventRejected("missing:" + ",".join(missing))
+        if self.reject_reason:
+            raise EventRejected(self.reject_reason)
         if self.fail:
             raise RuntimeError("delivery down")
+        prior = self._bodies.get(fact["event_id"]) or self._bodies.get(fact["idempotency_key"])
+        if prior is not None:
+            if self._body(prior) != self._body(fact):
+                raise EventRejected("payload_mismatch")
+            return dict(self._receipts[prior["event_id"]])
+        key = (fact["stream_id"], fact["stream_epoch"])
+        expected = self.watermark.get(key, 0) + 1
+        if fact["producer_seq"] != expected:
+            raise EventRejected("sequence")
         stored = dict(fact)
         stored["received_at"] = "server"
         self.facts.append(stored)
+        self._bodies[fact["event_id"]] = dict(fact)
+        self._bodies[fact["idempotency_key"]] = dict(fact)
+        receipt = self._receipt(fact)
+        self._receipts[fact["event_id"]] = receipt
+        self.watermark[key] = fact["producer_seq"]
+        return dict(receipt)
 
 
 class ScriptedService:
@@ -177,12 +272,22 @@ class ScriptedService:
     def __init__(self):
         self.calls = []
         self.queue = {}
+        self.operations = {}
         self.running = {
             "ok": True,
             "running_sha": OLD,
             "service_id": "web",
             "artifact_digest": digest_of(OLD_BYTES),
         }
+
+    def _remember(self, spec, effect):
+        operation_id = spec.get("operation_id") if isinstance(spec, dict) else None
+        if operation_id:
+            self.operations.setdefault(operation_id, effect)
+        return effect
+
+    def operation_result(self, operation_id):
+        return self.operations.get(operation_id)
 
     def _next(self, name, default):
         self.calls.append(name)
@@ -192,13 +297,18 @@ class ScriptedService:
         return default()
 
     def stage(self, spec):
-        return self._next("stage", lambda: Effect("ok"))
+        effect = self._next("stage", lambda: Effect("ok"))
+        self._remember(spec, effect)
+        return effect
 
     def verify(self, spec):
-        return self._next("verify", lambda: Effect("ok"))
+        effect = self._next("verify", lambda: Effect("ok"))
+        self._remember(spec, effect)
+        return effect
 
     def switch(self, spec):
         effect = self._next("switch", lambda: Effect("ok"))
+        self._remember(spec, effect)
         if effect.status == "ok":
             self.running = {
                 "ok": True,
@@ -214,13 +324,18 @@ class ScriptedService:
             local.setdefault("ok", True)
             return Effect("ok", local=local, public={"ok": False, "running_sha": None})
 
-        return self._next("health", default)
+        effect = self._next("health", default)
+        self._remember(spec, effect)
+        return effect
 
     def commit(self, spec):
-        return self._next("commit", lambda: Effect("ok"))
+        effect = self._next("commit", lambda: Effect("ok"))
+        self._remember(spec, effect)
+        return effect
 
     def rollback(self, spec):
         effect = self._next("rollback", lambda: Effect("ok", resources_removed=False))
+        self._remember(spec, effect)
         if effect.status == "ok" and spec.get("install_kind") != "first_install":
             self.running = {
                 "ok": True,
@@ -733,6 +848,18 @@ class IsolatedDeployTransactionTest(unittest.TestCase):
         self.assertEqual(lost.state, "RECONCILE")
         self.assertEqual(lost.details["record"], "commit_ack_lost")
         self.assertNotEqual(lost.state, "COMMIT")
+        session.service.queue["observe"] = [
+            Effect(
+                "ok",
+                local={
+                    "ok": True,
+                    "running_sha": OLD,
+                    "service_id": "web",
+                    "artifact_digest": digest_of(OLD_BYTES),
+                },
+                public={"ok": True, "running_sha": HEAD},
+            )
+        ]
         denied = session.call(
             "reconcile",
             "idem-w07-backfill-denied",
@@ -740,6 +867,18 @@ class IsolatedDeployTransactionTest(unittest.TestCase):
         )
         self.assertEqual(denied.code, "EVIDENCE_MISSING")
         self.assertEqual(denied.state, "RECONCILE")
+        session.service.queue["observe"] = [
+            Effect(
+                "ok",
+                local={
+                    "ok": True,
+                    "running_sha": HEAD,
+                    "service_id": "web",
+                    "artifact_digest": digest_of(NEW_BYTES),
+                },
+                public={"ok": False},
+            )
+        ]
         confirmed = session.call(
             "reconcile",
             "idem-w07-backfill",
@@ -797,7 +936,8 @@ class IsolatedDeployTransactionTest(unittest.TestCase):
         self.assertEqual(forged.code, "LEASE_FENCE_REJECTED")
         self.assertEqual(forged.details["record"], "generation_is_not_a_token")
         session.lease.force_allow = False
-        expired = session.call("start", "idem-w07-expired", server_now=10_000)
+        session.lease.now = 10_000
+        expired = session.call("start", "idem-w07-expired", server_now=1)
         self.assertEqual(expired.code, "LEASE_FENCE_REJECTED")
         self.assertEqual(session.engine.deployment(session.deployment_id)["state"], "PLAN")
         self.assertEqual(session.engine.deployment(session.deployment_id)["revision"], started.revision)
@@ -1091,6 +1231,429 @@ class IsolatedDeployTransactionTest(unittest.TestCase):
         self.assertEqual(session.call("apply", "idem-w07-leave").state, "SAFE_FROZEN")
         self.assertEqual(session.call("rollback", "idem-w07-leave-rb").state, "SAFE_FROZEN")
         self.assertFalse(any(edge["from"] == "SAFE_FROZEN" for edge in EDGES))
+
+    def _drive(self, session, *steps):
+        for key in steps:
+            method = "plan" if key == "plan" else "apply"
+            result = session.call(method, f"idem-w07-{key}")
+            self.assertNotEqual(result.state, "SAFE_FROZEN", key)
+        return result
+
+    def test_p0_unfinished_external_intent_is_not_repeated(self):
+        switched = open_session(self)
+        self._drive(switched, "plan", "stage", "verify")
+        switched.engine.halt_at = "before_result:switch"
+        with self.assertRaises(Interrupted):
+            switched.call("apply", "idem-w07-switch")
+        self.assertEqual(switched.service.calls.count("switch"), 1)
+        self.assertEqual(switched.service.running["running_sha"], HEAD)
+        pending = switched.engine.deployment(switched.deployment_id)["pending"]
+        self.assertEqual(pending["phase"], "intent")
+        operation_id = pending["operation_id"]
+        self.assertTrue(operation_id)
+        switched.reopen()
+        resumed = switched.call("apply", "idem-w07-switch-resume")
+        self.assertEqual(switched.service.calls.count("switch"), 1)
+        self.assertEqual(resumed.state, "SWITCH")
+        self.assertIn(operation_id, switched.service.operations)
+
+        rolled = open_session(self)
+        rolled.service.queue["switch"] = [Effect("failed", "deterministic", "switch rejected")]
+        self._drive(rolled, "plan", "stage", "verify", "switch")
+        self.assertEqual(rolled.engine.deployment(rolled.deployment_id)["state"], "RECONCILE")
+        rolled.engine.halt_at = "before_result:rollback"
+        with self.assertRaises(Interrupted):
+            rolled.call("rollback", "idem-w07-rollback")
+        self.assertEqual(rolled.service.calls.count("rollback"), 1)
+        self.assertEqual(rolled.service.running["running_sha"], OLD)
+        crashed = rolled.engine.deployment(rolled.deployment_id)
+        self.assertEqual(crashed["pending"]["phase"], "intent")
+        rolled.revision = crashed["revision"]
+        rolled.fence = crashed["fence_generation"]
+        rolled.reopen()
+        restored = rolled.call("rollback", "idem-w07-rollback-resume")
+        self.assertEqual(rolled.service.calls.count("rollback"), 1)
+        self.assertEqual(restored.details["record"], "restore_recorded")
+        self.assertTrue(rolled.engine.deployment(rolled.deployment_id)["restore_ok"])
+
+        committed = open_session(self)
+        self._drive(committed, "plan", "stage", "verify", "switch", "health", "pending")
+        self.assertEqual(committed.engine.deployment(committed.deployment_id)["state"], "COMMIT_PENDING")
+        committed.engine.halt_at = "before_result:commit"
+        with self.assertRaises(Interrupted):
+            committed.call("apply", "idem-w07-commit")
+        self.assertEqual(committed.service.calls.count("commit"), 1)
+        self.assertEqual(committed.engine.deployment(committed.deployment_id)["pending"]["phase"], "intent")
+        committed.reopen()
+        done = committed.call("apply", "idem-w07-commit-resume")
+        self.assertEqual(committed.service.calls.count("commit"), 1)
+        self.assertEqual(done.state, "COMMIT")
+
+    def test_p0_terminal_finalize_and_w01_stream_recover(self):
+        session = open_session(self)
+        self._drive(session, "plan", "stage", "verify", "switch", "health", "pending")
+        self.assertEqual([fact["producer_seq"] for fact in session.events.facts], [1])
+        self.assertEqual(session.events.facts[0]["event_type"], "deployment.health")
+        session.engine.halt_at = "after_terminal_intent:COMMIT"
+        with self.assertRaises(Interrupted):
+            session.call("apply", "idem-w07-commit")
+        stored = session.engine.deployment(session.deployment_id)
+        self.assertEqual(stored["state"], "COMMIT")
+        self.assertFalse(stored["finalize"]["inventory_done"])
+        self.assertFalse(stored["finalize"]["release_done"])
+        fact = stored["finalize"]["delivery_fact"]
+        self.assertEqual(fact["event_type"], "deployment.commit")
+        self.assertEqual(fact["producer_seq"], 2)
+        self.assertNotEqual(fact["producer_seq"], stored["revision"])
+        self.assertNotIn("received_at", fact)
+        self.assertEqual(fact["stream_id"], "host_deployer:deployment")
+        self.assertEqual(fact["stream_epoch"], 1)
+        fence = session.root / "fence" / "base__host-test__web.json"
+        self.assertTrue(fence.is_file())
+        saved = [
+            record
+            for record in session.engine.journal.replay()["deliveries"].values()
+            if record["event_type"] == "deployment.commit"
+        ]
+        self.assertEqual(saved[0]["status"], "DURABLE_LOCAL")
+        self.assertEqual(saved[0]["fact"]["event_id"], fact["event_id"])
+        self.assertEqual([item["event_type"] for item in session.events.facts], ["deployment.health"])
+        session.reopen()
+        recovered = session.call("recover_boot", "idem-w07-finalize", hostops_pass_count=4)
+        done = session.engine.deployment(session.deployment_id)
+        self.assertTrue(done["finalize"]["inventory_done"])
+        self.assertTrue(done["finalize"]["delivery_done"])
+        self.assertTrue(done["finalize"]["release_done"])
+        self.assertFalse(fence.exists())
+        self.assertTrue(recovered.details["boot_recovery_proved"])
+        commits = [item for item in session.events.facts if item["event_type"] == "deployment.commit"]
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(commits[0]["producer_seq"], 2)
+        self.assertEqual(commits[0]["received_at"], "server")
+        before = len(session.events.facts)
+        replay = session.events.append_deployment({key: value for key, value in commits[0].items() if key != "received_at"})
+        self.assertEqual(replay["event_id"], commits[0]["event_id"])
+        self.assertEqual(replay["producer_seq"], 2)
+        self.assertEqual(replay["fact_state"], "ACCEPTED")
+        self.assertEqual(len(session.events.facts), before)
+        session.call("recover_boot", "idem-w07-finalize-again")
+        self.assertEqual(len([item for item in session.events.facts if item["event_type"] == "deployment.commit"]), 1)
+        gap = dict(commits[0])
+        gap.pop("received_at")
+        gap["event_id"] = "evt_gap"
+        gap["idempotency_key"] = "idem-gap"
+        gap["producer_seq"] = 9
+        with self.assertRaises(EventRejected) as rejected:
+            session.events.append_deployment(gap)
+        self.assertEqual(str(rejected.exception), "sequence")
+
+        shared = open_session(self)
+        for key in ("plan", "stage", "verify", "switch", "health", "pending", "commit"):
+            method = "plan" if key == "plan" else "apply"
+            self.assertEqual(shared.call(method, f"idem-w07-{key}").http, 200)
+        second = shared.call("plan", "idem-w07-second", deployment_id="dep_second")
+        self.assertEqual(second.state, "PLAN")
+        for key in ("stage", "verify", "switch", "health"):
+            self.assertEqual(shared.call("apply", f"idem-w07-second-{key}").http, 200)
+        sequences = [(fact["event_type"], fact["producer_seq"], fact["stream_epoch"]) for fact in shared.events.facts]
+        self.assertEqual(
+            sequences,
+            [
+                ("deployment.health", 1, 1),
+                ("deployment.commit", 2, 1),
+                ("deployment.health", 3, 1),
+            ],
+        )
+        self.assertTrue(all(fact["stream_id"] == "host_deployer:deployment" for fact in shared.events.facts))
+
+        unknown = open_session(self)
+        unknown.events.fail = True
+        for key in ("plan", "stage", "verify", "switch", "health", "pending", "commit"):
+            method = "plan" if key == "plan" else "apply"
+            unknown.call(method, f"idem-w07-{key}")
+        self.assertEqual(unknown.engine.deployment(unknown.deployment_id)["state"], "COMMIT")
+        notes = [note for note in unknown.engine.journal.replay()["notes"] if note["name"] == "delivery"]
+        self.assertTrue(notes)
+        self.assertTrue(all(note["status"] == "DELIVERY_UNKNOWN" for note in notes))
+        self.assertTrue(all(note["fact"]["event_id"] and "received_at" not in note["fact"] for note in notes))
+        unknown.events.fail = False
+        unknown.reopen()
+        unknown.call("recover_boot", "idem-w07-deliver")
+        delivered = [(fact["event_type"], fact["producer_seq"]) for fact in unknown.events.facts]
+        self.assertEqual(delivered, [("deployment.health", 1), ("deployment.commit", 2)])
+        unknown.call("recover_boot", "idem-w07-deliver-again")
+        self.assertEqual(len(unknown.events.facts), 2)
+
+        rejected_port = open_session(self)
+        rejected_port.events.reject_reason = "schema_rejected"
+        for key in ("plan", "stage", "verify", "switch", "health", "pending", "commit"):
+            method = "plan" if key == "plan" else "apply"
+            rejected_port.call(method, f"idem-w07-{key}")
+        self.assertEqual(rejected_port.engine.deployment(rejected_port.deployment_id)["state"], "COMMIT")
+        self.assertEqual(rejected_port.events.facts, [])
+        quarantined = [
+            record
+            for record in rejected_port.engine.journal.replay()["deliveries"].values()
+            if record["status"] == "QUARANTINED"
+        ]
+        self.assertTrue(quarantined)
+        self.assertTrue(all(record["fact"]["event_id"] and record["rejection"] == "schema_rejected" for record in quarantined))
+        rejected_port.events.reject_reason = None
+        rejected_port.reopen()
+        rejected_port.call("recover_boot", "idem-w07-quarantine")
+        self.assertEqual(rejected_port.events.facts, [])
+
+    def test_p0_server_authority_not_caller_observation_clock_or_principal(self):
+        session = open_session(self)
+        self._drive(session, "plan", "stage", "verify", "switch", "health", "pending")
+        session.service.queue["commit"] = [Effect("unknown", detail="lost")]
+        lost = session.call("apply", "idem-w07-commit")
+        self.assertEqual(lost.state, "RECONCILE")
+        session.service.queue["observe"] = [
+            Effect(
+                "ok",
+                local={
+                    "ok": True,
+                    "running_sha": OLD,
+                    "service_id": "web",
+                    "artifact_digest": digest_of(OLD_BYTES),
+                },
+                public={"ok": True, "running_sha": HEAD},
+            )
+        ]
+        denied = session.call(
+            "reconcile",
+            "idem-w07-lie",
+            server_now=1,
+            observation={
+                "status": "healthy",
+                "local": {
+                    "ok": True,
+                    "running_sha": HEAD,
+                    "service_id": "web",
+                    "artifact_digest": digest_of(NEW_BYTES),
+                },
+            },
+        )
+        self.assertEqual(denied.code, "EVIDENCE_MISSING")
+        self.assertEqual(denied.state, "RECONCILE")
+        self.assertNotEqual(denied.state, "COMMIT")
+        checked = [item for item in session.lease.checks if item["candidate_id"]]
+        self.assertTrue(checked)
+        self.assertEqual(checked[-1]["principal_id"], "fixture")
+        self.assertEqual(checked[-1]["server_now"], 100)
+        self.assertIn(session.request.candidate_id, checked[-1]["scope"])
+        self.assertEqual(checked[-1]["service_id"], "web")
+        self.assertEqual(checked[-1]["artifact_digest"], digest_of(NEW_BYTES))
+        session.service.queue["observe"] = [
+            Effect(
+                "ok",
+                local={
+                    "ok": True,
+                    "running_sha": HEAD,
+                    "service_id": "web",
+                    "artifact_digest": digest_of(NEW_BYTES),
+                },
+                public={"ok": False},
+            )
+        ]
+        proved = session.call("reconcile", "idem-w07-server-health", server_now=1)
+        self.assertEqual(proved.state, "COMMIT")
+
+        expired = open_session(self)
+        expired.lease.now = 10_000
+        blocked = expired.call("plan", "idem-w07-caller-clock", server_now=1)
+        self.assertEqual(blocked.code, "LEASE_FENCE_REJECTED")
+        self.assertEqual(expired.engine.journal.replay()["deployments"], {})
+        self.assertTrue(all(item["server_now"] == 10_000 for item in expired.lease.checks))
+
+        spoofed = open_session(self)
+        spoofed.auth.server_principal = "intruder"
+        spoofed.lease.principal = "fixture"
+        rejected = spoofed.call("plan", "idem-w07-caller-principal", principal_id="fixture")
+        self.assertEqual(rejected.code, "LEASE_FENCE_REJECTED")
+        self.assertEqual(spoofed.lease.checks[-1]["principal_id"], "intruder")
+        self.assertEqual(spoofed.engine.journal.replay()["deployments"], {})
+
+    def test_p0_reconcile_boot_and_takeover_bind_exact_ids(self):
+        session = open_session(self)
+        self._drive(session, "plan", "stage", "verify")
+        session.service.queue["switch"] = [Effect("unknown")]
+        unknown = session.call("apply", "idem-w07-switch")
+        self.assertEqual(unknown.state, "RECONCILE")
+        operation_id = session.engine.deployment(session.deployment_id)["pending"]["operation_id"]
+        mismatched = session.call("reconcile", "idem-w07-wrong-op", operation_id="op_other", server_now=1)
+        self.assertEqual(mismatched.details["record"], "operation_binding")
+        self.assertEqual(session.engine.deployment(session.deployment_id)["state"], "RECONCILE")
+        other = candidate(task="tsk_other")
+        stale = session.call(
+            "reconcile",
+            "idem-w07-wrong-candidate",
+            candidate=other,
+            candidate_id=cid(other),
+        )
+        self.assertEqual(stale.details["record"], "candidate_binding")
+        frozen = session.call("reconcile", "idem-w07-exact", operation_id=operation_id, server_now=1)
+        self.assertEqual(frozen.state, "SAFE_FROZEN")
+        binding = [item for item in session.lease.checks if item["operation_id"] == operation_id]
+        self.assertTrue(binding)
+        self.assertEqual(binding[-1]["principal_id"], "fixture")
+        self.assertIn(operation_id, binding[-1]["scope"])
+        self.assertEqual(binding[-1]["artifact_digest"], digest_of(NEW_BYTES))
+
+        booting = open_session(self)
+        for key in ("plan", "stage", "verify", "switch", "health", "pending", "commit"):
+            method = "plan" if key == "plan" else "apply"
+            self.assertEqual(booting.call(method, f"idem-w07-{key}").http, 200)
+        booting.service.queue["observe"] = [
+            Effect(
+                "ok",
+                local={
+                    "ok": True,
+                    "running_sha": HEAD,
+                    "service_id": "web",
+                    "artifact_digest": digest_of(NEW_BYTES),
+                },
+            )
+        ]
+        lied = booting.call(
+            "recover_boot",
+            "idem-w07-boot-lie",
+            artifact_digest=digest_of(b"not-the-artifact"),
+            artifact_bytes=b"not-the-artifact",
+            observation={"status": "healthy", "local": {"ok": True, "running_sha": HEAD}},
+            hostops_pass_count=9,
+        )
+        self.assertEqual(lied.details["record"], "artifact_binding")
+        self.assertFalse(lied.details.get("boot_recovery_proved", False))
+        self.assertEqual(booting.engine.deployment(booting.deployment_id)["state"], "COMMIT")
+
+        held = open_session(self)
+        held.call("plan", "idem-w07-plan")
+        generation = held.engine.deployment(held.deployment_id)["fence_generation"]
+        held.lease.allow("run-2")
+        refused = held.call("start", "idem-w07-bad-takeover", takeover=True, run_id="run-2", service_id="other")
+        self.assertEqual(refused.details["record"], "service_binding")
+        self.assertEqual(held.engine.deployment(held.deployment_id)["fence_generation"], generation)
+        self.assertEqual(held.engine.deployment(held.deployment_id)["owner_run_id"], "run-1")
+
+    def test_p0_cross_process_fence_and_torn_journal_fail_closed(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        ready = root / "ready"
+        script = (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from app.control_deploy import DeployEngine\n"
+            "from tests.test_v060_w07_isolated_deploy import MemoryAuth, MemoryLease, ScriptedService, make_request\n"
+            "root, ready_path = sys.argv[1], sys.argv[2]\n"
+            "engine = DeployEngine(root, service=ScriptedService(), lease=MemoryLease(), auth=MemoryAuth())\n"
+            "result = engine.plan(make_request())\n"
+            "Path(ready_path).write_text((result.state or '') + '\\n' + str(result.code or ''), encoding='utf-8')\n"
+            "time.sleep(30)\n"
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(ROOT)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(root), str(ready)],
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        parent = None
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline and not ready.exists():
+                if proc.poll() is not None:
+                    self.fail(proc.stderr.read().decode("utf-8", errors="replace"))
+                time.sleep(0.05)
+            self.assertTrue(ready.exists())
+            self.assertTrue(ready.read_text(encoding="utf-8").startswith("PLAN"))
+            lease = MemoryLease()
+            lease.allow("run-2")
+            parent = DeployEngine(
+                root,
+                service=ScriptedService(),
+                lease=lease,
+                auth=MemoryAuth(),
+                contract_path=CONTRACT_PATH,
+            )
+            self.addCleanup(parent.close)
+            stored = parent.deployment("dep_w07")
+            generation = stored["fence_generation"]
+            blocked = parent.start(
+                replace(
+                    make_request(),
+                    takeover=True,
+                    run_id="run-2",
+                    deployment_id="dep_w07",
+                    expected_revision=stored["revision"],
+                    fence_generation=generation,
+                    idempotency_key="idem-alive",
+                )
+            )
+            self.assertEqual(blocked.code, "RESERVATION_CONFLICT")
+            self.assertEqual(blocked.details["record"], "owner_alive")
+            self.assertEqual(parent.deployment("dep_w07")["fence_generation"], generation)
+            self.assertEqual(parent.fence.read("base__host-test__web")["holder_pid"], proc.pid)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+        self.assertIsNotNone(parent)
+        current = parent.deployment("dep_w07")
+        adopted = parent.start(
+            replace(
+                make_request(),
+                takeover=True,
+                run_id="run-2",
+                deployment_id="dep_w07",
+                expected_revision=current["revision"],
+                fence_generation=current["fence_generation"],
+                idempotency_key="idem-dead",
+            )
+        )
+        self.assertEqual(adopted.http, 200, adopted.details)
+        self.assertGreater(adopted.fence_generation, current["fence_generation"])
+        deaths = [note for note in parent.journal.replay()["notes"] if note.get("name") == "fence_death_reconciled"]
+        self.assertTrue(deaths)
+        self.assertEqual(deaths[-1]["previous_pid"], proc.pid)
+
+        session = open_session(self)
+        session.call("plan", "idem-w07-plan")
+        session.call("apply", "idem-w07-stage")
+        with session.engine.journal.log_path.open("a", encoding="utf-8") as handle:
+            handle.write('{"type":"deployment","deployment":{"deployment_id":"dep_w07","state":"COMMIT"')
+        with self.assertRaises(JournalCorrupt) as raised:
+            session.engine.deployment(session.deployment_id)
+        self.assertTrue(raised.exception.torn)
+        self.assertTrue(raised.exception.recoverable)
+        self.assertIsNotNone(raised.exception.line)
+        diagnosis = session.engine.journal.diagnose()
+        self.assertFalse(diagnosis["ok"])
+        self.assertTrue(diagnosis["recoverable"])
+        self.assertGreaterEqual(diagnosis["offset"], 0)
+        recovered = session.engine.journal.recover_torn_tail()
+        self.assertTrue(recovered["recovered"])
+        self.assertTrue(recovered["quarantined"])
+        self.assertEqual(session.engine.deployment(session.deployment_id)["state"], "STAGE")
+        quarantine = Path(recovered["quarantine_path"]).read_text(encoding="utf-8")
+        self.assertIn("COMMIT", quarantine)
+        self.assertIn(str(recovered["line"]), quarantine)
+        with session.engine.journal.log_path.open("a", encoding="utf-8") as handle:
+            handle.write('{"type":"nope"}\n{"type":"note","name":"after"}\n')
+        with self.assertRaises(JournalCorrupt) as middle:
+            session.engine.deployment(session.deployment_id)
+        self.assertFalse(middle.exception.recoverable)
+        refused = session.engine.journal.recover_torn_tail()
+        self.assertFalse(refused["recovered"])
+        self.assertEqual(refused["reason"], middle.exception.reason)
+        self.assertGreaterEqual(refused["line"], 1)
 
 
 if __name__ == "__main__":

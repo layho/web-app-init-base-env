@@ -42,7 +42,7 @@ from app.control_deploy.health import (
 )
 from app.control_deploy.journal import Fence, Journal
 from app.control_deploy.migrations import check_migrations
-from app.control_deploy.ports import Effect
+from app.control_deploy.ports import Effect, EventRejected
 
 
 SKIP_IDEMPOTENCY = {
@@ -110,6 +110,7 @@ class Request:
     high_risk: bool = False
     recovers_deployment_id: str | None = None
     observation: dict | None = None
+    operation_id: str | None = None
     hostops_pass_count: int | None = None
     takeover: bool = False
     fence_generation: int | None = None
@@ -151,9 +152,16 @@ class DeployEngine:
     def deployment(self, deployment_id):
         return self._dep(deployment_id)
 
+    def _open(self, request, operation):
+        denied = self._gate(request, operation)
+        if denied:
+            return denied
+        self._resume_incomplete()
+        return None
+
     def plan(self, request):
         with self.journal.exclusive():
-            denied = self._gate(request, "plan")
+            denied = self._open(request, "plan")
             if denied:
                 return denied
             replay = self._replay(request, "plan")
@@ -163,7 +171,7 @@ class DeployEngine:
 
     def apply(self, request):
         with self.journal.exclusive():
-            denied = self._gate(request, "apply")
+            denied = self._open(request, "apply")
             if denied:
                 return denied
             replay = self._replay(request, "apply")
@@ -173,7 +181,7 @@ class DeployEngine:
 
     def reconcile(self, request):
         with self.journal.exclusive():
-            denied = self._gate(request, "reconcile")
+            denied = self._open(request, "reconcile")
             if denied:
                 return denied
             replay = self._replay(request, "reconcile")
@@ -183,7 +191,7 @@ class DeployEngine:
 
     def rollback(self, request):
         with self.journal.exclusive():
-            denied = self._gate(request, "rollback")
+            denied = self._open(request, "rollback")
             if denied:
                 return denied
             replay = self._replay(request, "rollback")
@@ -193,7 +201,7 @@ class DeployEngine:
 
     def verify_old(self, request):
         with self.journal.exclusive():
-            denied = self._gate(request, "verify_old")
+            denied = self._open(request, "verify_old")
             if denied:
                 return denied
             replay = self._replay(request, "verify_old")
@@ -203,7 +211,7 @@ class DeployEngine:
 
     def start(self, request):
         with self.journal.exclusive():
-            denied = self._gate(request, "start")
+            denied = self._open(request, "start")
             if denied:
                 return denied
             replay = self._replay(request, "start")
@@ -214,7 +222,7 @@ class DeployEngine:
 
     def recover_boot(self, request):
         with self.journal.exclusive():
-            denied = self._gate(request, "recover_boot")
+            denied = self._open(request, "recover_boot")
             if denied:
                 return denied
             replay = self._replay(request, "recover_boot")
@@ -307,6 +315,7 @@ class DeployEngine:
             if not taken["ok"]:
                 return self._result(taken.get("http", 409), taken["code"], details={"record": taken.get("record")})
             lock = taken["lock"]
+            self._note_death(taken, deployment_id)
         else:
             taken = self.fence.acquire(key, request.run_id, deployment_id, self._engine_id)
             if not taken["ok"]:
@@ -460,7 +469,7 @@ class DeployEngine:
             deployment = self._put(deployment)
         if request.artifact_bytes is None:
             return self._result(409, "EVIDENCE_MISSING", deployment, record="artifact_missing")
-        effect = self._external(deployment, "stage", lambda: self.service.stage(self._spec(deployment)))
+        effect = self._external(deployment, "stage")
         deployment = self._dep(deployment["deployment_id"])
         if effect is None or effect.status == "unknown":
             return self._result(409, "SIDE_EFFECT_UNKNOWN", deployment, record="stage_unknown")
@@ -486,7 +495,7 @@ class DeployEngine:
     def _apply_verify(self, deployment):
         if not self._bytes_match(deployment["artifact_digest"]):
             return self._fail_closed(deployment, Effect("failed", "deterministic", "artifact_mismatch"), "artifact_mismatch", hold=True)
-        effect = self._external(deployment, "verify", lambda: self.service.verify(self._spec(deployment)))
+        effect = self._external(deployment, "verify")
         deployment = self._dep(deployment["deployment_id"])
         if effect is None or effect.status == "unknown":
             deployment = self._transition(deployment, "STAGE", "RECONCILE", None, keep_pending=True)
@@ -504,7 +513,7 @@ class DeployEngine:
         return self._result(200, None, deployment)
 
     def _apply_switch(self, deployment):
-        effect = self._external(deployment, "switch", lambda: self.service.switch(self._spec(deployment)))
+        effect = self._external(deployment, "switch")
         deployment = self._dep(deployment["deployment_id"])
         if effect is None or effect.status == "unknown":
             deployment = self._transition(deployment, "VERIFY", "RECONCILE", None, keep_pending=True)
@@ -523,7 +532,7 @@ class DeployEngine:
         return self._result(200, None, deployment)
 
     def _apply_health(self, deployment):
-        effect = self._external(deployment, "health", lambda: self.service.health(self._spec(deployment)))
+        effect = self._external(deployment, "health")
         deployment = self._dep(deployment["deployment_id"])
         if effect is None or effect.status == "unknown":
             deployment = self._transition(deployment, "SWITCH", "RECONCILE", None, keep_pending=True)
@@ -578,7 +587,7 @@ class DeployEngine:
         if deployment.get("commit_ack") and deployment["commit_ack"].get("durable"):
             deployment = self._transition(deployment, "COMMIT_PENDING", "COMMIT", "commit_ack_durable")
             return self._result(200, None, deployment, record="commit_ack_durable")
-        effect = self._external(deployment, "commit", lambda: self.service.commit(self._spec(deployment)))
+        effect = self._external(deployment, "commit")
         deployment = self._dep(deployment["deployment_id"])
         if effect is None or effect.status == "unknown":
             deployment["failure_reason"] = "commit_ack_lost"
@@ -608,16 +617,24 @@ class DeployEngine:
         deployment = self._dep(request.deployment_id) if request.deployment_id else None
         if deployment is None:
             return self._result(409, "EVIDENCE_MISSING", details={"record": "deployment_missing"})
+        bound = self._bind_exact(request, deployment)
+        if isinstance(bound, DeployResult):
+            return bound
         owned = self._owned(deployment, request)
         if isinstance(owned, DeployResult):
             return owned
+        if not self._lease_bound(request, deployment):
+            return self._result(409, "LEASE_FENCE_REJECTED", deployment, record="server_binding")
         if deployment["state"] in TERMINAL:
             return self._result(409, "EVIDENCE_MISSING", deployment, record="terminal")
         pending = deployment.get("pending") or {}
         if deployment["state"] == "PLAN" and pending.get("phase") == "unknown":
-            return self._reconcile_plan(deployment, request)
-        observation_status = (request.observation or {}).get("status")
-        enter = pending.get("phase") == "unknown" or observation_status in {"unknown", "failed"}
+            return self._reconcile_plan(deployment)
+        recorded = self._recorded_operation(deployment)
+        observed = self._server_observe(deployment)
+        enter = pending.get("phase") == "unknown" or (
+            recorded is not None and recorded.status == "unknown"
+        ) or observed.status in {"unknown", "failed"}
         if deployment["state"] in RECONCILE_SOURCES and enter:
             guard = "commit_ack_lost" if deployment["state"] == "COMMIT_PENDING" else None
             if deployment["state"] == "COMMIT_PENDING" and guard is None:
@@ -626,43 +643,40 @@ class DeployEngine:
                 raise ContractError("missing reconcile edge")
             if deployment["state"] != "RECONCILE":
                 deployment = self._transition(deployment, deployment["state"], "RECONCILE", guard, keep_pending=True)
-            if request.observation is None:
-                return self._result(200, "SIDE_EFFECT_UNKNOWN", deployment, record="reconcile_required")
         if deployment["state"] != "RECONCILE":
             deployment = self._dep(deployment["deployment_id"])
         if deployment["state"] != "RECONCILE":
             return self._result(409, "EVIDENCE_MISSING", deployment, record="not_reconciling")
-        observation = request.observation
-        if observation is None:
-            return self._result(200, "SIDE_EFFECT_UNKNOWN", deployment, record="reconcile_required")
-        status = observation.get("status")
-        if status == "unknown":
+        return self._classify_observation(deployment, recorded, observed)
+
+    def _classify_observation(self, deployment, recorded, observed):
+        action = (deployment.get("pending") or {}).get("action")
+        if self._candidate_healthy(deployment, observed):
+            return self._backfill(deployment, observed)
+        if action == "commit" and observed.status != "unknown":
+            return self._result(409, "EVIDENCE_MISSING", deployment, record="reconcile_without_health")
+        unknown_effect = recorded is not None and recorded.status == "unknown" and action != "commit"
+        if unknown_effect or observed.status == "unknown":
             deployment["failure_reason"] = "outcome_unknown"
             deployment["failure_class"] = "unknown"
             deployment["pending"] = None
             deployment = self._put(deployment)
             deployment = self._transition(deployment, "RECONCILE", "SAFE_FROZEN", "outcome_unknown")
             return self._frozen(deployment, "outcome_unknown")
-        if status == "healthy":
-            return self._backfill(deployment, observation)
-        if status == "failed":
-            deployment["failure_class"] = observation.get("classification") or "deterministic"
-            deployment["failure_reason"] = observation.get("reason") or "reconcile_failed"
+        if observed.status == "failed" or (recorded is not None and recorded.status == "failed"):
+            source = recorded if recorded is not None and recorded.status == "failed" else observed
+            deployment["failure_class"] = self._classification(source)
+            deployment["failure_reason"] = source.detail or "reconcile_failed"
             deployment["pending"] = None
             deployment = self._put(deployment)
             return self._result(200, None, deployment, record="reconcile_classified")
-        return self._result(409, "SIDE_EFFECT_UNKNOWN", deployment, record="observation_unclassified")
+        return self._result(409, "EVIDENCE_MISSING", deployment, record="reconcile_without_health")
 
-    def _reconcile_plan(self, deployment, request):
-        observation = request.observation or {}
-        status = observation.get("status")
+    def _reconcile_plan(self, deployment):
         body = self.artifacts.read(deployment["artifact_digest"])
-        present = body is not None and digest_of(body) == deployment["artifact_digest"]
-        if status == "absent" and not present:
-            deployment["pending"] = None
-            deployment = self._put(deployment)
-            return self._result(200, None, deployment, record="effect_absent")
-        if status == "present" and present:
+        present = isinstance(body, bytes) and digest_of(body) == deployment["artifact_digest"]
+        recorded = self._recorded_operation(deployment)
+        if present and (recorded is None or recorded.status == "ok"):
             try:
                 self.artifacts.bind(
                     deployment["artifact_digest"],
@@ -675,19 +689,18 @@ class DeployEngine:
             deployment = self._put(deployment)
             deployment = self._transition(deployment, "PLAN", "STAGE", None)
             return self._result(200, None, deployment, record="stage_observed")
+        if not present and (recorded is None or recorded.status == "failed"):
+            deployment["pending"] = None
+            deployment = self._put(deployment)
+            return self._result(200, None, deployment, record="effect_absent")
         return self._result(409, "SIDE_EFFECT_UNKNOWN", deployment, record="stage_unknown")
 
-    def _backfill(self, deployment, observation):
-        local = observation.get("local")
-        if local is None or local.get("ok") is not True or not identity_matches(
-            local,
-            deployment["candidate"]["head"],
-            deployment["service_id"],
-            deployment["artifact_digest"],
-        ):
+    def _backfill(self, deployment, effect):
+        local = effect.local if isinstance(effect, Effect) else None
+        if not self._candidate_healthy(deployment, effect):
             return self._result(409, "EVIDENCE_MISSING", deployment, record="reconcile_without_health")
         deployment["local_health"] = local
-        deployment["public_observation"] = observation.get("public")
+        deployment["public_observation"] = effect.public
         if not health_ok(deployment):
             return self._result(409, "EVIDENCE_MISSING", deployment, record="reconcile_without_health")
         deployment["commit_ack"] = self._ack(deployment, backfill=True)
@@ -726,11 +739,7 @@ class DeployEngine:
         if deployment.get("previous_healthy_sha") is not None:
             deployment["previous_healthy_sha"] = None
             deployment = self._put(deployment)
-        effect = self._external(
-            deployment,
-            "rollback",
-            lambda: self.service.rollback(self._spec(deployment)),
-        )
+        effect = self._external(deployment, "rollback")
         deployment = self._dep(deployment["deployment_id"])
         if effect is None or effect.status == "unknown":
             return self._result(409, "SIDE_EFFECT_UNKNOWN", deployment, record="rollback_unknown")
@@ -762,11 +771,7 @@ class DeployEngine:
             deployment = self._put(deployment)
             deployment = self._transition(deployment, "ROLLBACK", "SAFE_FROZEN", "rollback_failed")
             return self._frozen(deployment, "old_artifact_corrupt")
-        effect = self._external(
-            deployment,
-            "rollback",
-            lambda: self.service.rollback(self._spec(deployment)),
-        )
+        effect = self._external(deployment, "rollback")
         deployment = self._dep(deployment["deployment_id"])
         if effect is None or effect.status == "unknown":
             return self._result(409, "SIDE_EFFECT_UNKNOWN", deployment, record="rollback_unknown")
@@ -835,11 +840,16 @@ class DeployEngine:
         deployment = self._dep(request.deployment_id) if request.deployment_id else None
         if deployment is None:
             return self._result(409, "EVIDENCE_MISSING")
+        bound = self._bind_exact(request, deployment)
+        if isinstance(bound, DeployResult):
+            return bound
+        if not self._lease_bound(request, deployment):
+            return self._result(409, "LEASE_FENCE_REJECTED", deployment, record="server_binding")
         if deployment["state"] in TERMINAL:
             return self._result(409, "EVIDENCE_MISSING", deployment, record="terminal")
         key = self._fence_key(deployment["app_id"], deployment["host_id"], deployment["service_id"])
         current = self.fence.read(key)
-        if not isinstance(current, dict) or current.get("legacy_directory") or "generation" not in current:
+        if not isinstance(current, dict) or current.get("legacy_directory") or current.get("corrupt") or "generation" not in current:
             return self._result(409, "EVIDENCE_MISSING", deployment, record="lock_unproven")
         taken = self.fence.takeover(
             key,
@@ -851,6 +861,7 @@ class DeployEngine:
         if not taken["ok"]:
             return self._result(409, taken["code"], deployment, record=taken.get("record"))
         self.journal.commit({"type": "lock", "lock": taken["lock"]})
+        self._note_death(taken, deployment["deployment_id"])
         deployment["fence_generation"] = taken["lock"]["generation"]
         deployment["owner_run_id"] = request.run_id
         deployment = self._put(deployment)
@@ -862,17 +873,22 @@ class DeployEngine:
         deployment = self._dep(request.deployment_id) if request.deployment_id else None
         if deployment is None:
             return self._result(409, "EVIDENCE_MISSING", details={"record": "deployment_missing", "boot_recovery_proved": False})
+        bound = self._bind_exact(request, deployment)
+        if isinstance(bound, DeployResult):
+            return bound
+        if not self._lease_bound(request, deployment):
+            return self._result(409, "LEASE_FENCE_REJECTED", deployment, record="server_binding", boot_recovery_proved=False)
         before = (deployment["state"], deployment["revision"])
         store = self.journal.replay()
         key = self._fence_key(deployment["app_id"], deployment["host_id"], deployment["service_id"])
         lock = self.fence.read(key)
-        if isinstance(lock, dict) and lock.get("legacy_directory"):
+        if isinstance(lock, dict) and (lock.get("legacy_directory") or lock.get("corrupt")):
             lock = None
         if deployment["state"] == "COMMIT":
             observed_lock = None
         else:
             observed_lock = lock
-        effect = self.service.observe(self._spec(deployment))
+        effect = self._server_observe(deployment)
         report = evaluate_boot(
             deployment=deployment,
             journal_seq=store["seq"],
@@ -962,31 +978,76 @@ class DeployEngine:
             backup_preserved=backup,
         )
 
-    def _external(self, deployment, action, call):
+    def _external(self, deployment, action):
         pending = deployment.get("pending") or {}
         if pending.get("action") == action and pending.get("phase") == "unknown":
             return None
         if pending.get("action") == action and pending.get("phase") == "result":
-            return Effect(
-                pending["status"],
-                classification=pending.get("classification") or "none",
-                detail=pending.get("detail") or "",
-                local=pending.get("local"),
-                public=pending.get("public"),
-                resources_removed=pending.get("resources_removed"),
-            )
-        if not (pending.get("action") == action and pending.get("phase") == "intent"):
-            deployment["pending"] = {"action": action, "phase": "intent"}
+            return self._effect_from_pending(pending)
+        operation_id = None
+        if pending.get("action") == action and pending.get("phase") == "intent":
+            operation_id = pending.get("operation_id")
+            observed = self._recorded_operation(deployment)
+            if isinstance(observed, Effect):
+                phase = "unknown" if observed.status == "unknown" else "result"
+                deployment["pending"] = observed.as_pending(action)
+                deployment["pending"]["operation_id"] = operation_id
+                deployment["pending"]["phase"] = phase
+                self._put(deployment)
+                self._halt(f"after_result:{action}")
+                if observed.status == "unknown":
+                    return None
+                return observed
+        if operation_id is None:
+            operation_id = self._operation_id(deployment, action)
+            deployment["pending"] = {
+                "action": action,
+                "phase": "intent",
+                "operation_id": operation_id,
+            }
             deployment = self._put(deployment)
             self._halt(f"after_intent:{action}")
-        effect = call()
+        deployment = self._dep(deployment["deployment_id"])
+        spec = self._spec(deployment)
+        spec["operation_id"] = operation_id
+        effect = getattr(self.service, action)(spec)
         if not isinstance(effect, Effect):
             raise ContractError("service port did not return an effect")
+        self._halt(f"before_result:{action}")
         deployment = self._dep(deployment["deployment_id"])
         deployment["pending"] = effect.as_pending(action)
+        deployment["pending"]["operation_id"] = operation_id
         self._put(deployment)
         self._halt(f"after_result:{action}")
         return effect
+
+    def _effect_from_pending(self, pending):
+        return Effect(
+            pending["status"],
+            classification=pending.get("classification") or "none",
+            detail=pending.get("detail") or "",
+            local=pending.get("local"),
+            public=pending.get("public"),
+            resources_removed=pending.get("resources_removed"),
+        )
+
+    def _operation_id(self, deployment, action):
+        material = f"{deployment['deployment_id']}:{action}:{deployment['revision']}"
+        return "op_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _recorded_operation(self, deployment):
+        operation_id = (deployment.get("pending") or {}).get("operation_id")
+        if not operation_id:
+            return None
+        lookup = getattr(self.service, "operation_result", None)
+        if not callable(lookup):
+            return Effect("unknown", detail="operation_unprovable")
+        found = lookup(operation_id)
+        if found is None:
+            return None
+        if not isinstance(found, Effect):
+            return Effect("unknown", detail="operation_unprovable")
+        return found
 
     def _locate(self, request):
         deployment = self._dep(request.deployment_id) if request.deployment_id else None
@@ -1026,6 +1087,8 @@ class DeployEngine:
         authenticated = bool(self.auth.authenticate(actor)) if well_formed else False
         if not well_formed or not authenticated:
             return self._result(403, "NOT_AUTHORIZED", details={"production_enablement": False})
+        if self._server_principal(actor) is None:
+            return self._result(403, "NOT_AUTHORIZED", details={"record": "server_principal", "production_enablement": False})
         if not self.auth.authorize(actor, request.scope, operation, request.candidate_id):
             return self._result(403, "POLICY_DENIED", details={"production_enablement": False})
         if request.apply_migrations:
@@ -1044,13 +1107,17 @@ class DeployEngine:
             )
         if not request.lease_token or request.lease_token == str(request.lease_generation):
             return self._result(409, "LEASE_FENCE_REJECTED", details={"record": "generation_is_not_a_token"})
+        now = self._server_now()
+        principal = self._server_principal(actor)
+        if now is None or principal is None:
+            return self._result(409, "LEASE_FENCE_REJECTED", details={"record": "server_authority_missing"})
         allowed = self.lease.check(
             token=request.lease_token,
-            principal_id=request.principal_id,
+            principal_id=principal,
             run_id=request.run_id,
             scope=request.scope,
             generation=request.lease_generation,
-            server_now=request.server_now,
+            server_now=now,
         )
         if not allowed:
             return self._result(409, "LEASE_FENCE_REJECTED")
@@ -1156,7 +1223,11 @@ class DeployEngine:
         deployment["pending"] = pending if keep_pending else None
         if dst == "COMMIT":
             deployment["running_sha"] = deployment["candidate"]["head"]
+        if dst in ("COMMIT", "ROLLED_BACK"):
+            deployment["finalize"] = self._finalize_intent(deployment, dst)
         stored = self._put(deployment)
+        if dst == "COMMIT" and stored["finalize"].get("delivery_fact"):
+            self._save_delivery(stored["finalize"]["delivery_fact"], "DURABLE_LOCAL")
         self._note(
             name="transition",
             deployment_id=stored["deployment_id"],
@@ -1164,59 +1235,127 @@ class DeployEngine:
             to_state=dst,
             guard=guard,
         )
-        if dst == "COMMIT":
-            self._emit("deployment.commit", stored)
-            self._install_inventory(stored)
-            self._release_fence(stored)
-        elif dst == "ROLLED_BACK":
-            self._restore_inventory(stored)
-            self._release_fence(stored)
+        if dst in ("COMMIT", "ROLLED_BACK"):
+            self._halt(f"after_terminal_intent:{dst}")
+            return self._complete_finalize(self._dep(stored["deployment_id"]))
         return self._dep(stored["deployment_id"])
-
-    def _install_inventory(self, deployment):
-        self.journal.commit(
-            {
-                "type": "inventory",
-                "items": [
-                    {
-                        "service_id": deployment["service_id"],
-                        "running_sha": deployment["candidate"]["head"],
-                        "artifact_digest": deployment["artifact_digest"],
-                        "app_id": deployment["app_id"],
-                        "host_id": deployment["host_id"],
-                    }
-                ],
-            }
-        )
-
-    def _restore_inventory(self, deployment):
-        self.journal.commit({"type": "inventory", "items": deployment.get("inventory") or []})
-
-    def _release_fence(self, deployment):
-        key = self._fence_key(deployment["app_id"], deployment["host_id"], deployment["service_id"])
-        self.fence.release(key, deployment["fence_generation"], self._engine_id)
-        self.journal.commit(
-            {"type": "lock_release", "key": key, "generation": deployment["fence_generation"]}
-        )
 
     def _hold(self, candidate_identifier, reason):
         self.journal.commit({"type": "hold", "candidate_id": candidate_identifier, "reason": reason})
 
     def _emit(self, event_type, deployment):
         if self.events is None:
-            return
-        fact = {
-            "event_id": f"evt-{deployment['deployment_id']}-{deployment['revision']}-{event_type}",
+            return None
+        existing = self._existing_delivery(deployment["deployment_id"], event_type)
+        if existing is None:
+            fact = self._build_fact(deployment, event_type)
+            existing = self._save_delivery(fact, "DURABLE_LOCAL")
+            self._halt(f"after_delivery_intent:{event_type}")
+        return self._submit_delivery(existing)
+
+    STREAM_ID = "host_deployer:deployment"
+    PRODUCER_ID = "host_deployer"
+    STREAM_EPOCH = 1
+
+    def _resume_incomplete(self):
+        self._retry_deliveries()
+        store = self.journal.replay()
+        for deployment_id in list(store["deployments"]):
+            deployment = store["deployments"][deployment_id]
+            final = deployment.get("finalize") or {}
+            if deployment.get("state") in ("COMMIT", "ROLLED_BACK") and final:
+                if not (final.get("inventory_done") and final.get("release_done") and final.get("delivery_done", True)):
+                    self._complete_finalize(self._dep(deployment_id))
+
+    def _retry_deliveries(self):
+        store = self.journal.replay()
+        pending = [
+            record
+            for record in store["deliveries"].values()
+            if record.get("status") in {"DURABLE_LOCAL", "OUTBOX", "DELIVERY_UNKNOWN"}
+        ]
+        pending.sort(
+            key=lambda record: (
+                (record.get("fact") or {}).get("stream_epoch", 1),
+                (record.get("fact") or {}).get("producer_seq", 0),
+            )
+        )
+        for record in pending:
+            self._submit_delivery(record)
+
+    def _finalize_intent(self, deployment, dst):
+        key = self._fence_key(deployment["app_id"], deployment["host_id"], deployment["service_id"])
+        if dst == "COMMIT":
+            items = [
+                {
+                    "service_id": deployment["service_id"],
+                    "running_sha": deployment["candidate"]["head"],
+                    "artifact_digest": deployment["artifact_digest"],
+                    "app_id": deployment["app_id"],
+                    "host_id": deployment["host_id"],
+                }
+            ]
+        else:
+            items = list(deployment.get("inventory") or [])
+        intent = {
+            "target": dst,
+            "inventory_items": items,
+            "release_key": key,
+            "release_generation": deployment.get("fence_generation"),
+            "inventory_done": False,
+            "release_done": False,
+            "delivery_done": dst != "COMMIT",
+            "delivery_fact": None,
+        }
+        if dst == "COMMIT":
+            intent["delivery_fact"] = self._build_fact(deployment, "deployment.commit")
+        return intent
+
+    def _complete_finalize(self, deployment):
+        final = deployment.get("finalize")
+        if not isinstance(final, dict) or deployment.get("state") != final.get("target"):
+            return deployment
+        if not final.get("inventory_done"):
+            self.journal.commit({"type": "inventory", "items": final.get("inventory_items") or []})
+            deployment = self._dep(deployment["deployment_id"])
+            deployment["finalize"]["inventory_done"] = True
+            deployment = self._put(deployment)
+            self._halt("after_finalize_inventory")
+        final = deployment["finalize"]
+        if final.get("target") == "COMMIT" and not final.get("delivery_done"):
+            fact = final.get("delivery_fact")
+            saved = self._submit_saved(fact) if fact else None
+            done = saved is None or saved.get("status") in {"DELIVERED", "QUARANTINED"}
+            deployment = self._dep(deployment["deployment_id"])
+            deployment["finalize"]["delivery_done"] = bool(done)
+            deployment = self._put(deployment)
+        final = self._dep(deployment["deployment_id"])["finalize"]
+        if not final.get("release_done"):
+            key = final.get("release_key")
+            generation = final.get("release_generation")
+            if key is not None and generation is not None:
+                self.fence.release(key, generation, self._engine_id)
+                self.journal.commit({"type": "lock_release", "key": key, "generation": generation})
+            deployment = self._dep(deployment["deployment_id"])
+            deployment["finalize"]["release_done"] = True
+            deployment = self._put(deployment)
+        return self._dep(deployment["deployment_id"])
+
+    def _build_fact(self, deployment, event_type):
+        seq = self._next_producer_seq(self.STREAM_ID, self.STREAM_EPOCH)
+        idem = f"idem-event-{deployment['deployment_id']}-{event_type}-{seq}"
+        return {
+            "event_id": "evt_" + hashlib.sha256(idem.encode("utf-8")).hexdigest(),
             "schema_version": 2,
             "event_type": event_type,
             "event_class": "deployment",
             "repo_id": deployment["candidate"]["repo_id"],
-            "producer_id": "host_deployer",
-            "stream_id": "host_deployer:deployment",
-            "stream_epoch": 1,
-            "producer_seq": deployment["revision"],
+            "producer_id": self.PRODUCER_ID,
+            "stream_id": self.STREAM_ID,
+            "stream_epoch": self.STREAM_EPOCH,
+            "producer_seq": seq,
             "occurred_at": "server",
-            "idempotency_key": f"idem-event-{deployment['deployment_id']}-{event_type}-{deployment['revision']}",
+            "idempotency_key": idem,
             "deployment_id": deployment["deployment_id"],
             "app_id": deployment["app_id"],
             "host_id": deployment["host_id"],
@@ -1232,21 +1371,237 @@ class DeployEngine:
             "stage": "deploy",
             "state": deployment["state"],
         }
+
+    def _next_producer_seq(self, stream_id, epoch):
+        high = 0
+        for fact in self._known_facts():
+            if fact.get("stream_id") == stream_id and fact.get("stream_epoch") == epoch:
+                seq = fact.get("producer_seq") or 0
+                if seq > high:
+                    high = seq
+        return high + 1
+
+    def _known_facts(self):
+        store = self.journal.replay()
+        facts = []
+        for record in store["deliveries"].values():
+            if record.get("fact"):
+                facts.append(record["fact"])
+        for deployment in store["deployments"].values():
+            fact = (deployment.get("finalize") or {}).get("delivery_fact")
+            if fact:
+                facts.append(fact)
+        return facts
+
+    def _existing_delivery(self, deployment_id, event_type):
+        store = self.journal.replay()
+        found = [
+            record
+            for record in store["deliveries"].values()
+            if record.get("deployment_id") == deployment_id and record.get("event_type") == event_type
+        ]
+        if found:
+            return found[-1]
+        deployment = store["deployments"].get(deployment_id) or {}
+        fact = (deployment.get("finalize") or {}).get("delivery_fact")
+        if fact and fact.get("event_type") == event_type:
+            return {
+                "event_id": fact["event_id"],
+                "deployment_id": deployment_id,
+                "event_type": event_type,
+                "status": "DURABLE_LOCAL",
+                "fact": fact,
+                "receipt": None,
+                "rejection": None,
+            }
+        return None
+
+    def _save_delivery(self, fact, status, rejection=None, receipt=None):
+        record = {
+            "event_id": fact["event_id"],
+            "deployment_id": fact["deployment_id"],
+            "event_type": fact["event_type"],
+            "status": status,
+            "fact": copy.deepcopy(fact),
+            "receipt": copy.deepcopy(receipt) if receipt else None,
+            "rejection": rejection,
+        }
+        self.journal.commit({"type": "delivery", "record": record})
+        return record
+
+    def _submit_saved(self, fact):
+        existing = None
+        store = self.journal.replay()
+        current = store["deliveries"].get(fact["event_id"])
+        if current is not None:
+            existing = current
+        else:
+            existing = self._save_delivery(fact, "DURABLE_LOCAL")
+        if existing.get("status") in {"DELIVERED", "QUARANTINED"}:
+            return existing
+        return self._submit_delivery(existing)
+
+    def _submit_delivery(self, record):
+        if self.events is None:
+            return record
+        fact = copy.deepcopy(record["fact"])
+        fact.pop("received_at", None)
+        if record.get("status") in {"DELIVERED", "QUARANTINED"}:
+            return record
+        record = self._save_delivery(fact, "OUTBOX", rejection=record.get("rejection"), receipt=record.get("receipt"))
         try:
-            self.events.append_deployment(fact)
+            receipt = self.events.append_deployment(copy.deepcopy(fact))
+        except EventRejected as exc:
+            saved = self._save_delivery(fact, "QUARANTINED", rejection=exc.reason)
             self._note(
                 name="delivery",
-                deployment_id=deployment["deployment_id"],
-                status="DURABLE_LOCAL",
-                event_type=event_type,
+                deployment_id=fact["deployment_id"],
+                status="QUARANTINED",
+                event_type=fact["event_type"],
+                fact=fact,
+                rejection=exc.reason,
             )
+            return saved
         except Exception:
+            saved = self._save_delivery(fact, "DELIVERY_UNKNOWN")
             self._note(
                 name="delivery",
-                deployment_id=deployment["deployment_id"],
+                deployment_id=fact["deployment_id"],
                 status="DELIVERY_UNKNOWN",
-                event_type=event_type,
+                event_type=fact["event_type"],
+                fact=fact,
             )
+            return saved
+        if not self._receipt_exact(receipt, fact):
+            saved = self._save_delivery(fact, "QUARANTINED", rejection="receipt_mismatch", receipt=receipt if isinstance(receipt, dict) else None)
+            self._note(
+                name="delivery",
+                deployment_id=fact["deployment_id"],
+                status="QUARANTINED",
+                event_type=fact["event_type"],
+                fact=fact,
+                rejection="receipt_mismatch",
+            )
+            return saved
+        saved = self._save_delivery(fact, "DELIVERED", receipt=receipt)
+        self._note(
+            name="delivery",
+            deployment_id=fact["deployment_id"],
+            status="DURABLE_LOCAL",
+            event_type=fact["event_type"],
+            fact=fact,
+            receipt=receipt,
+        )
+        return saved
+
+    def _receipt_exact(self, receipt, fact):
+        if not isinstance(receipt, dict):
+            return False
+        return (
+            receipt.get("event_id") == fact["event_id"]
+            and receipt.get("stream_id") == fact["stream_id"]
+            and receipt.get("stream_epoch") == fact["stream_epoch"]
+            and receipt.get("producer_seq") == fact["producer_seq"]
+            and receipt.get("fact_state") == "ACCEPTED"
+            and bool(receipt.get("received_at"))
+            and "received_at" not in fact
+        )
+
+    def _server_principal(self, actor):
+        fn = getattr(self.auth, "principal", None)
+        if not callable(fn):
+            return None
+        found = fn(actor)
+        if not isinstance(found, str) or not found:
+            return None
+        return found
+
+    def _server_now(self):
+        fn = getattr(self.lease, "server_now", None)
+        if not callable(fn):
+            return None
+        try:
+            return int(fn())
+        except (TypeError, ValueError):
+            return None
+
+    def _server_scope(self, deployment):
+        parts = [
+            "deploy",
+            deployment["app_id"],
+            deployment["host_id"],
+            deployment["service_id"],
+            deployment["candidate_id"],
+            deployment["artifact_digest"],
+        ]
+        operation_id = (deployment.get("pending") or {}).get("operation_id")
+        if operation_id:
+            parts.append(operation_id)
+        return ":".join(parts)
+
+    def _bind_exact(self, request, deployment):
+        if request.candidate_id != deployment["candidate_id"]:
+            return self._result(409, "CANDIDATE_STALE", deployment, record="candidate_binding")
+        if request.service_id != deployment["service_id"]:
+            return self._result(409, "CANDIDATE_STALE", deployment, record="service_binding")
+        if request.artifact_digest != deployment["artifact_digest"]:
+            return self._result(409, "CANDIDATE_STALE", deployment, record="artifact_binding")
+        server_op = (deployment.get("pending") or {}).get("operation_id")
+        if request.operation_id and request.operation_id != server_op:
+            return self._result(409, "EVIDENCE_MISSING", deployment, record="operation_binding")
+        full = self._server_scope(deployment)
+        if request.scope not in {"deploy", full}:
+            return self._result(403, "POLICY_DENIED", deployment, record="scope_binding")
+        return None
+
+    def _lease_bound(self, request, deployment):
+        principal = self._server_principal(request.actor)
+        now = self._server_now()
+        if principal is None or now is None:
+            return False
+        return bool(
+            self.lease.check(
+                token=request.lease_token,
+                principal_id=principal,
+                run_id=request.run_id,
+                scope=self._server_scope(deployment),
+                generation=request.lease_generation,
+                server_now=now,
+                candidate_id=deployment["candidate_id"],
+                service_id=deployment["service_id"],
+                artifact_digest=deployment["artifact_digest"],
+                operation_id=(deployment.get("pending") or {}).get("operation_id"),
+            )
+        )
+
+    def _server_observe(self, deployment):
+        spec = self._spec(deployment)
+        spec["operation_id"] = (deployment.get("pending") or {}).get("operation_id")
+        effect = self.service.observe(spec)
+        if not isinstance(effect, Effect):
+            raise ContractError("observe port did not return an effect")
+        return effect
+
+    def _candidate_healthy(self, deployment, effect):
+        if not isinstance(effect, Effect) or effect.status != "ok":
+            return False
+        return identity_matches(
+            effect.local,
+            deployment["candidate"]["head"],
+            deployment["service_id"],
+            deployment["artifact_digest"],
+        )
+
+    def _note_death(self, taken, deployment_id):
+        if not taken.get("previous_dead"):
+            return
+        self._note(
+            name="fence_death_reconciled",
+            deployment_id=deployment_id,
+            previous_run_id=taken.get("previous_run_id"),
+            previous_pid=taken.get("previous_pid"),
+            generation=taken["lock"]["generation"],
+        )
 
     def _ack(self, deployment, no_change=False, backfill=False):
         return {
@@ -1343,8 +1698,9 @@ class DeployEngine:
         }
 
     def _idem_key(self, request, operation):
+        principal = self._server_principal(request.actor) or ""
         raw = "\n".join(
-            [request.principal_id, request.scope, operation, request.idempotency_key]
+            [principal, request.scope, operation, request.idempotency_key]
         ).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
