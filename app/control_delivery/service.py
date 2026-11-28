@@ -2069,6 +2069,9 @@ class DeliveryService:
                 view.stage("idem", begun["idem_key"], idem_body)
             if begun.get("event_id") and begun.get("receipt"):
                 outbox = view.read("outbox", begun["event_id"])
+                if not isinstance(outbox, dict) or outbox.get("event_id") != owner or outbox.get("request_digest") != begun["payload_hash"]:
+                    view.abort()
+                    return "conflict"
                 if isinstance(outbox, dict):
                     outbox = dict(outbox)
                     outbox["receipt"] = begun["receipt"]
@@ -2076,6 +2079,28 @@ class DeliveryService:
                     outbox["authority"] = "W01"
                     outbox["local_is_authority"] = False
                     view.stage("outbox", begun["event_id"], outbox)
+                    # This is a local business commit witness, not a W01 or
+                    # production receipt. The recovery reader must independently
+                    # validate the actual W01 acknowledgement before promotion.
+                    view.stage("business-commit", owner, {
+                        "event_id": owner,
+                        "principal_id": begun["principal"],
+                        "scope": begun["scope"],
+                        "operation": begun["operation"],
+                        "request_digest": begun["payload_hash"],
+                        "idem_key": begun["idem_key"],
+                        "state": state,
+                        "changes": [
+                            {"kind": kind, "key": key, "expected_revision": expected,
+                             "revision": _revision(doc), "digest": _hash(doc)}
+                            for kind, key, doc, expected in pairs
+                        ],
+                        "event_digest": _hash(outbox["event"]),
+                        "receipt_digest": _hash(begun["receipt"]),
+                        "result": idem_body["public"],
+                        "authority": "W05_LOCAL",
+                        "production_effective": False,
+                    })
                 for kind, key, doc, expected in pairs:
                     view.stage("fence", _fence_key(kind, key), {
                         "state": "closed",
