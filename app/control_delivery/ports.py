@@ -30,6 +30,12 @@ def event_identity_digest(event):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def event_payload_digest(event):
+    """Hash the complete staged event, including scope and business intent."""
+    raw = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _blocked(operation):
     return {
         "ok": False,
@@ -231,6 +237,7 @@ def _absence_proof(event):
         "stream_id": event.get("stream_id"),
         "stream_epoch": event.get("stream_epoch"),
         "payload_digest": event_identity_digest(event),
+        "event_digest": event_payload_digest(event),
         "test_double": True,
         "w01_proof": False,
     }
@@ -263,6 +270,7 @@ class FixtureEvents:
                 "stream_epoch": event["stream_epoch"],
                 "producer_seq": event["producer_seq"],
                 "fact_state": "ACCEPTED",
+                "event_digest": event_payload_digest(event),
                 "test_double": True,
                 "w01_proof": False,
             },
@@ -282,7 +290,10 @@ class FixtureEvents:
             }
         event_id = event.get("event_id")
         if event_id in self.by_id:
-            return self._receipt(self.by_id[event_id])
+            stored = self.by_id[event_id]
+            if event_payload_digest(stored) != event_payload_digest(event):
+                return {"ok": False, "applied": False, "blocked": False, "code": "IDEMPOTENCY_PAYLOAD_MISMATCH"}
+            return self._receipt(stored)
         stored = dict(event)
         self.by_id[event_id] = stored
         self.events.append(stored)
@@ -302,6 +313,7 @@ class FixtureEvents:
         idempotency_key=None,
         state=None,
         operation=None,
+        expected_event=None,
     ):
         if self.fail:
             return {
@@ -314,7 +326,9 @@ class FixtureEvents:
             }
         if event_id is not None:
             found = self.by_id.get(event_id)
-            if found is None or found.get("stream_id") != stream_id or found.get("stream_epoch") != stream_epoch:
+            if found is not None and (found.get("stream_id") != stream_id or found.get("stream_epoch") != stream_epoch):
+                return {"ok": False, "blocked": False, "classification": "unknown", "items": []}
+            if found is None:
                 proof_event = {
                     "event_id": event_id,
                     "stream_id": stream_id,
@@ -335,7 +349,9 @@ class FixtureEvents:
                     "side_effect": False,
                     "test_double": True,
                     "w01_proof": False,
-                    "absence_proof": _absence_proof(proof_event),
+                    "absence_proof": _absence_proof(expected_event if isinstance(expected_event, dict)
+                                                      and event_identity_digest(expected_event) == event_identity_digest(proof_event)
+                                                      else proof_event),
                 }
             return {
                 "ok": True,
