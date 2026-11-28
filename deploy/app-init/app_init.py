@@ -98,11 +98,20 @@ def copy_foundation(source, target, repository, title, domain, port, label):
         "migrations/002_admin_sessions.sql", "migrations/003_feedback.sql",
         "scripts/apply_migrations.py", "scripts/hash_admin_password.py", "scripts/sync_feedback.py",
         "scripts/sync_development_tasks.py", "deploy/macmini/manage.sh", "deploy/macmini/acceptance.py",
-        "deploy/macmini/acceptance.sh", "deploy/macmini/release.py", "tests/test_auth.py",
+        "deploy/macmini/acceptance.sh", "deploy/macmini/release.py", "app/control_routes_w11.py", "tests/test_auth.py",
         "tests/test_deploy_script.py", "tests/test_development_tasks.py", "tests/test_feedback.py",
         "tests/test_feedback_issue_body.py", "tests/test_foundation_version.py", "tests/test_upgrade_status.py", "tests/test_feedback_progress.py", "tests/test_release_acceptance.py",
         "tests/test_uvicorn_shutdown.py", "tests/test_request_limits.py", "tests/test_hostops_gateway.py", "tests/test_hostops_tasks.py", "tests/test_module_sdk.py", "tests/test_integration_queue.py", "tests/test_integration_diagnostics.py",
     ]
+    for package in (
+        "app/control_joint", "app/control_authz", "app/control_board",
+        "app/control_diagnostics", "app/control_scheduler", "app/control_delivery",
+    ):
+        paths += [
+            path.relative_to(source).as_posix()
+            for path in sorted((source / package).rglob("*.py"))
+            if path.is_file()
+        ]
     paths += [path.relative_to(source).as_posix() for path in sorted((source / "frontend/src").rglob("*")) if path.is_file()]
     paths += [f"frontend/{path}" for path in ("index.html", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts")]
     for name in paths:
@@ -666,12 +675,35 @@ def application_directory(home: Path, repo_name: str) -> Path:
     return preferred
 
 
+def _control_adapter(command: str) -> int:
+    """Hand a safe command to the lifecycle adapter and return before any install prompt."""
+    import importlib.util
+    path = Path(__file__).resolve().parent / "control_lifecycle_adapter.py"
+    spec = importlib.util.spec_from_file_location("control_lifecycle_adapter", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.main([command])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed-only", action="store_true", help="仅在 GitHub 初始化仓库")
     parser.add_argument("--install-deps", action="store_true", help="用 Homebrew 安装缺失的部署依赖")
     parser.add_argument("--github-https", action="store_true", help="通过 GitHub 浏览器登录初始化仓库")
+    parser.add_argument("--host-preflight", action="store_true", help="只读检查当前宿主的平台、依赖及可用磁盘")
+    parser.add_argument("--control-adapter", choices=["status", "plan", "record"], help="只运行隔离生命周期适配器")
     args = parser.parse_args()
+    if args.host_preflight:
+        if args.install_deps or args.seed_only or args.github_https or args.control_adapter:
+            parser.error("--host-preflight must run alone")
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(SOURCE))
+        from app.control_lifecycle.platform import host_preflight
+        report = host_preflight()
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report["checks_passed"] else 2
+    if args.control_adapter:
+        return _control_adapter(args.control_adapter)
     os.umask(0o077)
     try:
         print("app-init | 修复版 R3（支持单独补验公网）", flush=True)

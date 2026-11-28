@@ -1,0 +1,2612 @@
+{
+  "schema_version": 2,
+  "status": "draft",
+  "revision_comment": 7216590735,
+  "baseline_sha": "db19bff19307fa763fd50e94b4cedfda7181a141",
+  "baseline_tree": "c126d37771fa66a832497e6b2814d782fafc1dff",
+  "package": "W00",
+  "issue": 204,
+  "normative": true,
+  "normative_scope": "w01_w02_isolated_development",
+  "normative_sha": "b2011968a9c14845b89fe6d15dda4a595699e9ec",
+  "merge_authorized": false,
+  "freeze": {
+    "approved_comment": 7217178629,
+    "approved_sha": "b2011968a9c14845b89fe6d15dda4a595699e9ec",
+    "schema_version": 2,
+    "scope": "w01_w02_isolated_development",
+    "merge_authorized": false,
+    "release_authorized": false,
+    "machine_acceptance": false,
+    "closeout_verified": true,
+    "note": "评论 7217178629 批准的隔离开发基线只有精确提交 b2011968a9c14845b89fe6d15dda4a595699e9ec。这不是合并或发布授权，也不是实机验收。本收口提交尚未被复核。"
+  },
+  "note": "Schema V2 在精确提交 b2011968a9c14845b89fe6d15dda4a595699e9ec 上被批准为 W01/W02 隔离开发基线。normative 只覆盖这个范围。本收口修改尚未复核，不能当作新的已批准 HEAD，也不能当作合并授权。",
+  "delivery": "at_least_once_plus_idempotent_reconcile",
+  "exactly_once_across_github_and_db": false,
+  "clock": "server",
+  "identity": {
+    "production_verification_enabled": false,
+    "allowed_kind_until_enabled": "test",
+    "proof_prefix": "test-proof://",
+    "acceptance_kind": "user_acceptance",
+    "order": [
+      "authenticate",
+      "authorize",
+      "idempotency"
+    ],
+    "replay_returns_lease_token": false,
+    "same_key_mints_second_token": false,
+    "proof_fields": [
+      "signer_id",
+      "key_id",
+      "scope",
+      "issued_at",
+      "expires_at",
+      "nonce",
+      "payload_hash",
+      "alg",
+      "signature"
+    ],
+    "alg": "ed25519",
+    "signed_content": [
+      "signer_id",
+      "key_id",
+      "issued_at",
+      "expires_at",
+      "nonce",
+      "operation",
+      "object_id",
+      "candidate_id",
+      "head",
+      "base",
+      "merge",
+      "tree",
+      "policy_revision",
+      "scope",
+      "payload_hash"
+    ],
+    "signature_canonical": {
+      "version": "v1",
+      "domain_separator": "\u001f",
+      "record_separator": "\n",
+      "trailing_newline": false,
+      "fields": [
+        "signer_id",
+        "key_id",
+        "issued_at",
+        "expires_at",
+        "nonce",
+        "operation",
+        "object_id",
+        "candidate_id",
+        "head",
+        "base",
+        "merge",
+        "tree",
+        "policy_revision",
+        "scope",
+        "payload_hash"
+      ]
+    },
+    "test_identity": {
+      "isolated_configuration_only": true,
+      "client_supplied_proof_enters_real_routes": false
+    },
+    "lease": {
+      "token_is_opaque": true,
+      "generation_alone_is_not_a_token": true,
+      "binding": [
+        "principal_id",
+        "run_id",
+        "scope",
+        "lease_generation"
+      ],
+      "github_native_fencing": false,
+      "fencing_authority": "trusted_proxy",
+      "stale_request_changes_newer_run": false,
+      "rejected_request_is_not_unknown": true,
+      "unknown_alone_allows_reclaim": false,
+      "lost_token_reclaim_requires": ["trusted_reconciliation", "fencing"]
+    }
+  },
+  "diagnostic": {
+    "subscribe": false,
+    "mode": "poll_cursor",
+    "method": "GET",
+    "path": "/api/v1/control/diagnostics",
+    "query": [
+      "subject",
+      "after_seq"
+    ],
+    "response": [
+      "watermark_seq",
+      "gap",
+      "items",
+      "side_effect"
+    ],
+    "cursors": "one after_seq per stream_id and stream_epoch",
+    "cursor_key": ["stream_id", "stream_epoch"],
+    "classifications": [
+      "applied",
+      "held",
+      "gap",
+      "quarantined"
+    ]
+  },
+  "acceptance_owners": {
+    "technical_review": "ChatGPT",
+    "functional_acceptance": "user",
+    "implementation_evidence": "Grok",
+    "execution_receipt": "MacCI"
+  },
+  "entities": {
+    "task": {
+      "description": "任务是聚合。SATISFIED 只表示该链已验收，不等于已正式发布。全部必要链 PUBLISHED 且任务级验收已记录才能 close。REJECTED 不是终态。",
+      "phases": [
+        "feedback_sync",
+        "claim",
+        "develop",
+        "review",
+        "test",
+        "integrate",
+        "preview_merge",
+        "deploy",
+        "accept",
+        "publish",
+        "close"
+      ],
+      "terminal_phases": [
+        "close"
+      ],
+      "reopen": false,
+      "transitions": [
+        {
+          "from": "feedback_sync",
+          "to": "claim"
+        },
+        {
+          "from": "claim",
+          "to": "develop"
+        },
+        {
+          "from": "develop",
+          "to": "review"
+        },
+        {
+          "from": "review",
+          "to": "test",
+          "guard": "all_required_chains_ready"
+        },
+        {
+          "from": "test",
+          "to": "integrate",
+          "guard": "all_required_chains_tests_satisfied"
+        },
+        {
+          "from": "integrate",
+          "to": "preview_merge",
+          "guard": "all_required_chains_integrated"
+        },
+        {
+          "from": "preview_merge",
+          "to": "deploy",
+          "guard": "all_required_chains_merged"
+        },
+        {
+          "from": "deploy",
+          "to": "accept",
+          "guard": "all_required_chains_deployed"
+        },
+        {
+          "from": "accept",
+          "to": "publish",
+          "guard": "all_required_chains_accepted"
+        },
+        {
+          "from": "publish",
+          "to": "close",
+          "guard": "all_required_chains_published"
+        },
+        {
+          "from": "accept",
+          "to": "develop",
+          "guard": "repair_authorized"
+        }
+      ],
+      "chains": {
+        "states": [
+          "OPEN",
+          "TESTING",
+          "INTEGRATING",
+          "DEPLOYING",
+          "ACCEPTING",
+          "SATISFIED",
+          "REJECTED",
+          "FAILED",
+          "SUPERSEDED",
+          "PUBLISHED"
+        ],
+        "terminal": [
+          "PUBLISHED",
+          "SUPERSEDED"
+        ],
+        "transitions": [
+          {
+            "from": "OPEN",
+            "to": "TESTING"
+          },
+          {
+            "from": "TESTING",
+            "to": "INTEGRATING",
+            "guard": "test_succeeded"
+          },
+          {
+            "from": "TESTING",
+            "to": "FAILED",
+            "guard": "test_failed"
+          },
+          {
+            "from": "FAILED",
+            "to": "SUPERSEDED",
+            "guard": "new_attempt_new_run"
+          },
+          {
+            "from": "INTEGRATING",
+            "to": "DEPLOYING",
+            "guard": "exact_remote_observation"
+          },
+          {
+            "from": "DEPLOYING",
+            "to": "ACCEPTING",
+            "guard": "deployment_committed"
+          },
+          {
+            "from": "ACCEPTING",
+            "to": "SATISFIED",
+            "guard": "user_acceptance"
+          },
+          {
+            "from": "ACCEPTING",
+            "to": "REJECTED",
+            "guard": "user_rejection"
+          },
+          {
+            "from": "TESTING",
+            "to": "SUPERSEDED",
+            "guard": "candidate_updated"
+          },
+          {
+            "from": "INTEGRATING",
+            "to": "SUPERSEDED",
+            "guard": "candidate_updated"
+          },
+          {
+            "from": "OPEN",
+            "to": "SUPERSEDED",
+            "guard": "candidate_updated"
+          },
+          {
+            "from": "REJECTED",
+            "to": "SUPERSEDED",
+            "guard": "repair_authorized_new_candidate"
+          },
+          {
+            "from": "SATISFIED",
+            "to": "PUBLISHED",
+            "guard": "formal_publish_evidence"
+          },
+          {
+            "from": "DEPLOYING",
+            "to": "SUPERSEDED",
+            "guard": "deployment_failed_replacement"
+          }
+        ]
+      },
+      "after_close": "new task_id with optional follows_task_id; the closed task has no outgoing phase",
+      "close_requires": [
+        "every required chain is PUBLISHED",
+        "each chain has publish_evidence",
+        "task_acceptance recorded"
+      ]
+    },
+    "run": {
+      "description": "一次 attempt 一个 run_id。lease_generation 在领取和续租时加一。过期和取消以服务端时钟为准。续租不是新 run。重试是新 run。",
+      "states": [
+        "PENDING",
+        "LEASED",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "RETRY_WAIT",
+        "BLOCKED",
+        "UNKNOWN",
+        "SUPERSEDED",
+        "CANCELLED"
+      ],
+      "terminal": [
+        "SUCCEEDED",
+        "FAILED",
+        "SUPERSEDED",
+        "CANCELLED"
+      ],
+      "fields": [
+        "run_id",
+        "attempt",
+        "lease_generation",
+        "lease_expires_at"
+      ],
+      "transitions": [
+        {
+          "from": "PENDING",
+          "to": "LEASED",
+          "guard": "claim"
+        },
+        {
+          "from": "LEASED",
+          "to": "RUNNING",
+          "guard": "start_same_generation"
+        },
+        {
+          "from": "LEASED",
+          "to": "LEASED",
+          "guard": "renew"
+        },
+        {
+          "from": "RUNNING",
+          "to": "RUNNING",
+          "guard": "renew"
+        },
+        {
+          "from": "LEASED",
+          "to": "PENDING",
+          "guard": "release_before_side_effect"
+        },
+        {
+          "from": "LEASED",
+          "to": "UNKNOWN",
+          "guard": "lease_expired_or_effect_unproven"
+        },
+        {
+          "from": "LEASED",
+          "to": "CANCELLED",
+          "guard": "fence_stopped_and_no_side_effect"
+        },
+        {
+          "from": "LEASED",
+          "to": "SUPERSEDED",
+          "guard": "fence_stopped_and_no_side_effect"
+        },
+        {
+          "from": "RUNNING",
+          "to": "SUCCEEDED",
+          "guard": "current_token_effect_classified_success"
+        },
+        {
+          "from": "RUNNING",
+          "to": "FAILED",
+          "guard": "current_token_effect_classified_failure"
+        },
+        {
+          "from": "RUNNING",
+          "to": "RETRY_WAIT",
+          "guard": "current_token_retryable_failure"
+        },
+        {
+          "from": "RUNNING",
+          "to": "BLOCKED",
+          "guard": "current_token_needs_human"
+        },
+        {
+          "from": "RUNNING",
+          "to": "UNKNOWN",
+          "guard": "lease_expired_or_effect_unproven"
+        },
+        {
+          "from": "RUNNING",
+          "to": "CANCELLED",
+          "guard": "fence_stopped_and_side_effect_none_or_compensated"
+        },
+        {
+          "from": "RUNNING",
+          "to": "SUPERSEDED",
+          "guard": "fence_stopped_and_side_effect_classified_not_success"
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "SUPERSEDED",
+          "guard": "new_attempt_run_created"
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "FAILED",
+          "guard": "policy_gives_up"
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "CANCELLED",
+          "guard": "no_external_effect_or_compensated"
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "BLOCKED",
+          "guard": "needs_human"
+        },
+        {
+          "from": "BLOCKED",
+          "to": "SUPERSEDED",
+          "guard": "reauthorized_and_new_run_created"
+        },
+        {
+          "from": "BLOCKED",
+          "to": "CANCELLED",
+          "guard": "fence_and_no_unknown_side_effect"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "SUCCEEDED",
+          "guard": "trusted_reconcile_side_effect_succeeded"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "FAILED",
+          "guard": "trusted_reconcile_side_effect_failed"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "RETRY_WAIT",
+          "guard": "trusted_reconcile_no_side_effect"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "CANCELLED",
+          "guard": "operator_after_fence_review_no_side_effect"
+        },
+        {
+          "from": "PENDING",
+          "to": "CANCELLED",
+          "guard": "not_yet_leased"
+        },
+        {
+          "from": "PENDING",
+          "to": "SUPERSEDED",
+          "guard": "not_yet_leased"
+        }
+      ]
+    },
+    "candidate": {
+      "description": "身份是仓库、任务和 head/base/merge/tree 的规范编码哈希。",
+      "states": [
+        "REGISTERED",
+        "SUPERSEDED",
+        "INVALID",
+        "INTEGRATED"
+      ],
+      "terminal": [
+        "SUPERSEDED",
+        "INVALID",
+        "INTEGRATED"
+      ],
+      "required_identity": [
+        "repo_id",
+        "task_id",
+        "head",
+        "base",
+        "merge",
+        "tree"
+      ],
+      "id": {
+        "prefix": "cand_",
+        "algorithm": "sha256",
+        "encoding": "utf-8",
+        "lines": [
+          "v1",
+          "repo_id",
+          "task_id",
+          "head",
+          "base",
+          "merge",
+          "tree"
+        ],
+        "trailing_newline": false,
+        "vector": {
+          "repo_id": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00",
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "merge": "cccccccccccccccccccccccccccccccccccccccc",
+          "tree": "dddddddddddddddddddddddddddddddddddddddd",
+          "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08"
+        }
+      },
+      "transitions": [
+        {
+          "from": "REGISTERED",
+          "to": "SUPERSEDED",
+          "guard": "new_tuple"
+        },
+        {
+          "from": "REGISTERED",
+          "to": "INVALID",
+          "guard": "ancestry_or_tree_failed"
+        },
+        {
+          "from": "REGISTERED",
+          "to": "INTEGRATED",
+          "guard": "exact_remote_observation"
+        }
+      ]
+    },
+    "release": {
+      "description": "发布推送结果未知时进入 PUBLISH_UNKNOWN，不对着缺失回执退回 ACCEPTANCE。",
+      "states": [
+        "PLANNED",
+        "ACTIVE",
+        "INTEGRATING",
+        "ACCEPTANCE",
+        "PUBLISHING",
+        "PUBLISH_UNKNOWN",
+        "PUBLISHED",
+        "ARCHIVED"
+      ],
+      "terminal": [
+        "ARCHIVED"
+      ],
+      "transitions": [
+        {
+          "from": "PLANNED",
+          "to": "ACTIVE"
+        },
+        {
+          "from": "ACTIVE",
+          "to": "INTEGRATING"
+        },
+        {
+          "from": "INTEGRATING",
+          "to": "ACCEPTANCE"
+        },
+        {
+          "from": "ACCEPTANCE",
+          "to": "PUBLISHING",
+          "guard": "user_acceptance_recorded"
+        },
+        {
+          "from": "PUBLISHING",
+          "to": "PUBLISHED",
+          "guard": "main_publish_receipt"
+        },
+        {
+          "from": "PUBLISHING",
+          "to": "PUBLISH_UNKNOWN",
+          "guard": "push_result_unknown"
+        },
+        {
+          "from": "PUBLISH_UNKNOWN",
+          "to": "PUBLISHED",
+          "guard": "exact_remote_main_observation"
+        },
+        {
+          "from": "PUBLISH_UNKNOWN",
+          "to": "ACCEPTANCE",
+          "guard": "reconcile_proves_push_did_not_happen"
+        },
+        {
+          "from": "PUBLISHED",
+          "to": "ARCHIVED"
+        },
+        {
+          "from": "ACCEPTANCE",
+          "to": "INTEGRATING",
+          "guard": "repair_replacement"
+        }
+      ]
+    },
+    "deployment": {
+      "description": "COMMIT 可以来自已落盘的回执，或来自对账确认健康后的回执补记。SAFE_FROZEN 没有出边。首次安装在资源已经清除时才能 ROLLED_BACK。",
+      "states": [
+        "PLAN",
+        "STAGE",
+        "VERIFY",
+        "SWITCH",
+        "HEALTH",
+        "COMMIT_PENDING",
+        "COMMIT",
+        "RECONCILE",
+        "ROLLBACK",
+        "VERIFY_OLD",
+        "ROLLED_BACK",
+        "SAFE_FROZEN"
+      ],
+      "terminal": [
+        "COMMIT",
+        "ROLLED_BACK",
+        "SAFE_FROZEN"
+      ],
+      "first_install": {
+        "previous_healthy_sha": null,
+        "no_change_commit": false,
+        "rollback_without_removal_proof": "SAFE_FROZEN",
+        "rolled_back_requires": "first_install_resources_removed"
+      },
+      "recovery": "new deployment_id with recovers_deployment_id and explicit_authorization",
+      "transitions": [
+        {
+          "from": "PLAN",
+          "to": "STAGE"
+        },
+        {
+          "from": "PLAN",
+          "to": "COMMIT",
+          "guard": "no_change_and_healthy_and_previous_sha"
+        },
+        {
+          "from": "STAGE",
+          "to": "VERIFY"
+        },
+        {
+          "from": "VERIFY",
+          "to": "SWITCH"
+        },
+        {
+          "from": "SWITCH",
+          "to": "HEALTH"
+        },
+        {
+          "from": "HEALTH",
+          "to": "COMMIT_PENDING",
+          "guard": "health_ok"
+        },
+        {
+          "from": "COMMIT_PENDING",
+          "to": "COMMIT",
+          "guard": "commit_ack_durable"
+        },
+        {
+          "from": "COMMIT_PENDING",
+          "to": "RECONCILE",
+          "guard": "commit_ack_lost"
+        },
+        {
+          "from": "STAGE",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "VERIFY",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "SWITCH",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "HEALTH",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "ROLLBACK"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "SAFE_FROZEN",
+          "guard": "outcome_unknown"
+        },
+        {
+          "from": "ROLLBACK",
+          "to": "VERIFY_OLD"
+        },
+        {
+          "from": "ROLLBACK",
+          "to": "SAFE_FROZEN",
+          "guard": "rollback_failed"
+        },
+        {
+          "from": "VERIFY_OLD",
+          "to": "ROLLED_BACK",
+          "guard": "old_health_proved"
+        },
+        {
+          "from": "VERIFY_OLD",
+          "to": "SAFE_FROZEN",
+          "guard": "old_health_unproven"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "COMMIT",
+          "guard": "reconcile_confirms_healthy_and_backfill_commit"
+        },
+        {
+          "from": "ROLLBACK",
+          "to": "ROLLED_BACK",
+          "guard": "first_install_resources_removed"
+        }
+      ]
+    },
+    "resource": {
+      "description": "破坏性释放仍要单独授权。已经预授权的普通恢复不需要每次再请用户批准。",
+      "states": [
+        "PLANNED",
+        "RESERVED",
+        "APPLYING",
+        "APPLIED",
+        "UNKNOWN",
+        "RECONCILE",
+        "RELEASING",
+        "PARTIAL",
+        "RELEASE_FAILED",
+        "RELEASED",
+        "ROLLED_BACK",
+        "SAFE_FROZEN"
+      ],
+      "terminal": [
+        "RELEASED",
+        "ROLLED_BACK",
+        "SAFE_FROZEN"
+      ],
+      "transitions": [
+        {
+          "from": "PLANNED",
+          "to": "RESERVED"
+        },
+        {
+          "from": "RESERVED",
+          "to": "APPLYING"
+        },
+        {
+          "from": "RESERVED",
+          "to": "RELEASED",
+          "guard": "reservation_released"
+        },
+        {
+          "from": "APPLYING",
+          "to": "APPLIED"
+        },
+        {
+          "from": "APPLYING",
+          "to": "UNKNOWN"
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "RECONCILE"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "APPLIED",
+          "guard": "observed_applied"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "ROLLED_BACK",
+          "guard": "observed_absent"
+        },
+        {
+          "from": "RECONCILE",
+          "to": "SAFE_FROZEN",
+          "guard": "outcome_unknown"
+        },
+        {
+          "from": "APPLIED",
+          "to": "RELEASING",
+          "guard": "explicit_authorization"
+        },
+        {
+          "from": "RELEASING",
+          "to": "RELEASED",
+          "guard": "all_observed_released"
+        },
+        {
+          "from": "RELEASING",
+          "to": "RELEASE_FAILED",
+          "guard": "observed_release_failed"
+        },
+        {
+          "from": "RELEASING",
+          "to": "PARTIAL",
+          "guard": "subset_released"
+        },
+        {
+          "from": "RELEASING",
+          "to": "SAFE_FROZEN",
+          "guard": "release_unproven"
+        },
+        {
+          "from": "PARTIAL",
+          "to": "RELEASING",
+          "guard": "preauthorized_recovery"
+        },
+        {
+          "from": "PARTIAL",
+          "to": "SAFE_FROZEN",
+          "guard": "stop_unproven"
+        },
+        {
+          "from": "RELEASE_FAILED",
+          "to": "RELEASING",
+          "guard": "preauthorized_recovery"
+        }
+      ]
+    },
+    "event": {
+      "description": "事实一旦 ACCEPTED 就不可变，没有投递边。投递按 event_id 加通道单独记账。",
+      "states": [
+        "ACCEPTED"
+      ],
+      "terminal": [
+        "ACCEPTED"
+      ],
+      "transitions": [],
+      "always_required": [
+        "event_id",
+        "schema_version",
+        "event_type",
+        "event_class",
+        "repo_id",
+        "producer_id",
+        "stream_id",
+        "stream_epoch",
+        "producer_seq",
+        "occurred_at",
+        "idempotency_key"
+      ],
+      "server_filled": [
+        "received_at"
+      ],
+      "classes": {
+        "task": [
+          "app_id",
+          "host_id",
+          "task_id",
+          "run_id",
+          "attempt",
+          "revision",
+          "stage",
+          "state"
+        ],
+        "candidate": [
+          "task_id",
+          "candidate_id",
+          "head",
+          "base",
+          "merge",
+          "tree",
+          "revision"
+        ],
+        "deployment": [
+          "deployment_id",
+          "app_id",
+          "host_id",
+          "candidate_id",
+          "head",
+          "base",
+          "merge",
+          "tree",
+          "running_sha",
+          "artifact_digest",
+          "previous_healthy_sha",
+          "install_kind",
+          "stage",
+          "state"
+        ],
+        "resource": [
+          "resource_id",
+          "app_id",
+          "host_id",
+          "stage",
+          "state"
+        ],
+        "evidence": [
+          "evidence_ref",
+          "run_id"
+        ],
+        "authorization": [
+          "task_id",
+          "candidate_id",
+          "head",
+          "base",
+          "merge",
+          "tree",
+          "operation",
+          "policy_revision",
+          "revision",
+          "stage",
+          "state",
+          "evidence_ref"
+        ],
+        "diagnostic": [
+          "diagnostic_class",
+          "subject_id",
+          "severity"
+        ]
+      },
+      "nullable": {
+        "task": [
+          "host_id"
+        ],
+        "deployment": [
+          "previous_healthy_sha"
+        ]
+      },
+      "stream": {
+        "channels": [
+          "task",
+          "candidate",
+          "deployment",
+          "resource",
+          "diagnostic",
+          "authorization"
+        ],
+        "epoch_start": 1,
+        "authorization_never_existed": false,
+        "authorization_epoch_gate": "epoch N>1 cannot apply until epoch N-1 has an applied epoch_closed event"
+      },
+      "delivery": {
+        "scope": [
+          "event_id",
+          "channel"
+        ],
+        "states": [
+          "DURABLE_LOCAL",
+          "OUTBOX",
+          "DELIVERED",
+          "DELIVERY_UNKNOWN",
+          "QUARANTINED"
+        ],
+        "terminal": [
+          "DELIVERED",
+          "QUARANTINED"
+        ],
+        "transitions": [
+          {
+            "from": "DURABLE_LOCAL",
+            "to": "OUTBOX"
+          },
+          {
+            "from": "OUTBOX",
+            "to": "DELIVERED"
+          },
+          {
+            "from": "OUTBOX",
+            "to": "DELIVERY_UNKNOWN"
+          },
+          {
+            "from": "OUTBOX",
+            "to": "QUARANTINED"
+          },
+          {
+            "from": "DELIVERY_UNKNOWN",
+            "to": "OUTBOX",
+            "guard": "retry_same_event_id"
+          },
+          {
+            "from": "DELIVERY_UNKNOWN",
+            "to": "QUARANTINED"
+          }
+        ]
+      },
+      "event_types": {
+        "authorization.granted": {
+          "class": "authorization",
+          "trusted_source": "policy_service"
+        },
+        "authorization.revoked": {
+          "class": "authorization",
+          "trusted_source": "policy_service"
+        },
+        "deployment.health": {
+          "class": "deployment",
+          "trusted_source": "host_deployer"
+        },
+        "deployment.commit": {
+          "class": "deployment",
+          "trusted_source": "host_deployer"
+        },
+        "ci.test.finished": {
+          "class": "evidence",
+          "trusted_source": "macci"
+        },
+        "diagnostic.observation": {
+          "class": "diagnostic",
+          "trusted_source": "hostops_readonly"
+        }
+      }
+    }
+  },
+  "error_codes": [
+    {
+      "code": "CONFLICT_REVISION",
+      "http": 409,
+      "meaning": "expected_revision 与当前修订不一致"
+    },
+    {
+      "code": "LEASE_FENCE_REJECTED",
+      "http": 409,
+      "meaning": "租约代次不匹配或服务端时钟已过期"
+    },
+    {
+      "code": "IDEMPOTENCY_REPLAY",
+      "http": 200,
+      "meaning": "同一主体、范围、操作和幂等键返回原结果摘要，不返回令牌"
+    },
+    {
+      "code": "IDEMPOTENCY_PAYLOAD_MISMATCH",
+      "http": 409,
+      "meaning": "同一幂等键对应了不同载荷"
+    },
+    {
+      "code": "CANDIDATE_STALE",
+      "http": 409,
+      "meaning": "仓库、任务或四元组已变化"
+    },
+    {
+      "code": "EVIDENCE_MISSING",
+      "http": 409,
+      "meaning": "缺少该转换要求的证据"
+    },
+    {
+      "code": "POLICY_DENIED",
+      "http": 403,
+      "meaning": "策略拒绝。此时还不查询幂等记录"
+    },
+    {
+      "code": "NOT_AUTHORIZED",
+      "http": 403,
+      "meaning": "身份无效。此时还不查询幂等记录"
+    },
+    {
+      "code": "UNKNOWN_EXECUTOR",
+      "http": 409,
+      "meaning": "没有可验证的执行器"
+    },
+    {
+      "code": "SIDE_EFFECT_UNKNOWN",
+      "http": 409,
+      "meaning": "外部副作用无法分类"
+    },
+    {
+      "code": "SCHEMA_UNSUPPORTED",
+      "http": 422,
+      "meaning": "schema 或调用方填写了服务端字段"
+    },
+    {
+      "code": "RATE_LIMITED",
+      "http": 429,
+      "meaning": "超过限额"
+    },
+    {
+      "code": "DEPENDENCY_UNSATISFIED",
+      "http": 409,
+      "meaning": "必要候选链尚未满足"
+    },
+    {
+      "code": "RESERVATION_CONFLICT",
+      "http": 409,
+      "meaning": "路径预约重叠"
+    },
+    {
+      "code": "FREEZE_ACTIVE",
+      "http": 409,
+      "meaning": "验收冻结拒绝该候选"
+    },
+    {
+      "code": "PRODUCTION_DB_FORBIDDEN",
+      "http": 403,
+      "meaning": "生产数据库自动迁移或回滚被拒绝"
+    },
+    {
+      "code": "PLATFORM_UNSUPPORTED",
+      "http": 422,
+      "meaning": "平台不被支持，且不执行后续命令"
+    }
+  ],
+  "write_required": [
+    "actor",
+    "scope",
+    "expected_revision",
+    "idempotency_key"
+  ],
+  "write_operations": [
+    {
+      "name": "task_claim",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:claim"
+    },
+    {
+      "name": "task_renew",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:renew"
+    },
+    {
+      "name": "run_complete",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:complete"
+    },
+    {
+      "name": "task_request_action",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:request-action"
+    },
+    {
+      "name": "event_append",
+      "method": "POST",
+      "path": "/api/v1/control/events"
+    },
+    {
+      "name": "policy_authorize",
+      "method": "POST",
+      "path": "/api/v1/control/policy:authorize"
+    },
+    {
+      "name": "policy_revoke",
+      "method": "POST",
+      "path": "/api/v1/control/policy:revoke"
+    },
+    {
+      "name": "candidate_register",
+      "method": "POST",
+      "path": "/api/v1/control/candidates"
+    },
+    {
+      "name": "candidate_supersede",
+      "method": "POST",
+      "path": "/api/v1/control/candidates/cand_example:supersede"
+    },
+    {
+      "name": "ci_test",
+      "method": "POST",
+      "path": "/api/v1/control/ci:test"
+    },
+    {
+      "name": "ci_build",
+      "method": "POST",
+      "path": "/api/v1/control/ci:build"
+    },
+    {
+      "name": "ci_attest",
+      "method": "POST",
+      "path": "/api/v1/control/ci:attest"
+    },
+    {
+      "name": "deployment_plan",
+      "method": "POST",
+      "path": "/api/v1/control/deployments:plan"
+    },
+    {
+      "name": "deployment_apply",
+      "method": "POST",
+      "path": "/api/v1/control/deployments/dep_1:apply"
+    },
+    {
+      "name": "deployment_reconcile",
+      "method": "POST",
+      "path": "/api/v1/control/deployments/dep_1:reconcile"
+    },
+    {
+      "name": "deployment_rollback",
+      "method": "POST",
+      "path": "/api/v1/control/deployments/dep_1:rollback"
+    },
+    {
+      "name": "resource_plan",
+      "method": "POST",
+      "path": "/api/v1/control/resources:plan"
+    },
+    {
+      "name": "resource_apply",
+      "method": "POST",
+      "path": "/api/v1/control/resources/res_1:apply"
+    },
+    {
+      "name": "release_accept",
+      "method": "POST",
+      "path": "/api/v1/control/releases/0.6.0:accept"
+    },
+    {
+      "name": "release_reject",
+      "method": "POST",
+      "path": "/api/v1/control/releases/0.6.0:reject"
+    },
+    {
+      "name": "release_publish",
+      "method": "POST",
+      "path": "/api/v1/control/releases/0.6.0:publish"
+    },
+    {
+      "name": "upgrade_plan",
+      "method": "POST",
+      "path": "/api/v1/control/upgrades:plan"
+    },
+    {
+      "name": "upgrade_reconcile",
+      "method": "POST",
+      "path": "/api/v1/control/upgrades:reconcile"
+    },
+    {
+      "name": "run_start",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:start"
+    },
+    {
+      "name": "run_release",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:release"
+    },
+    {
+      "name": "run_heartbeat",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:heartbeat"
+    }
+  ],
+  "examples": [
+    {
+      "name": "task_claim",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:claim",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-task_claim",
+        "phase": "develop"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_claim",
+        "run_id": "run_1",
+        "attempt": 1,
+        "lease_generation": 1,
+        "state": "LEASED",
+        "lease_token": "opaque-lease-claim-7f3a",
+        "replayed": false,
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 1
+        }
+      }
+    },
+    {
+      "name": "task_renew",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:renew",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-task_renew",
+        "run_id": "run_1",
+        "lease_generation": 1,
+        "lease_token": "opaque-lease-claim-7f3a",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 1
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_renew",
+        "lease_generation": 2,
+        "state": "LEASED",
+        "lease_token": "opaque-lease-renew-91c2",
+        "replayed": false,
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
+      }
+    },
+    {
+      "name": "run_complete",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:complete",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-run_complete",
+        "run_id": "run_1",
+        "lease_generation": 2,
+        "result": "SUCCEEDED",
+        "lease_token": "opaque-lease-renew-91c2",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_complete",
+        "state": "SUCCEEDED",
+        "replayed": false,
+        "lease_token": null
+      }
+    },
+    {
+      "name": "task_request_action",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:request-action",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-task_request_action",
+        "action": "nudge"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 409,
+        "request_id": "req_nudge",
+        "state": "READY",
+        "running": false,
+        "code": "UNKNOWN_EXECUTOR"
+      }
+    },
+    {
+      "name": "event_append",
+      "method": "POST",
+      "path": "/api/v1/control/events",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "MacCI",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-event_append",
+        "event_id": "evt_1",
+        "event_class": "task",
+        "event_type": "run.started",
+        "repo_id": "layho/web-app-init-base-env",
+        "producer_id": "fixture",
+        "stream_id": "fixture:task",
+        "stream_epoch": 1,
+        "producer_seq": 1,
+        "occurred_at": "2026-11-27T10:00:00Z",
+        "run_id": "run_1",
+        "attempt": 1,
+        "revision": 1,
+        "stage": "develop",
+        "state": "RUNNING",
+        "app_id": "base",
+        "host_id": null
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_evt",
+        "fact_state": "ACCEPTED",
+        "delivery_state": "DURABLE_LOCAL",
+        "applied": true
+      }
+    },
+    {
+      "name": "policy_authorize",
+      "method": "POST",
+      "path": "/api/v1/control/policy:authorize",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-policy_authorize",
+        "action": "preview.merge",
+        "policy_revision": 1
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_authz",
+        "allow": true,
+        "state": "RECORDED"
+      }
+    },
+    {
+      "name": "policy_revoke",
+      "method": "POST",
+      "path": "/api/v1/control/policy:revoke",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-policy_revoke",
+        "grant_id": "grant_example",
+        "policy_revision": 1
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_revoke",
+        "state": "REVOKED"
+      }
+    },
+    {
+      "name": "candidate_register",
+      "method": "POST",
+      "path": "/api/v1/control/candidates",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-candidate_register",
+        "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "merge": "cccccccccccccccccccccccccccccccccccccccc",
+        "tree": "dddddddddddddddddddddddddddddddddddddddd"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_cand",
+        "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08",
+        "state": "REGISTERED"
+      }
+    },
+    {
+      "name": "candidate_supersede",
+      "method": "POST",
+      "path": "/api/v1/control/candidates/cand_example:supersede",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-candidate_supersede",
+        "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_sup",
+        "state": "SUPERSEDED"
+      }
+    },
+    {
+      "name": "ci_test",
+      "method": "POST",
+      "path": "/api/v1/control/ci:test",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "MacCI",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-ci_test",
+        "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_test",
+        "state": "LEASED"
+      }
+    },
+    {
+      "name": "ci_build",
+      "method": "POST",
+      "path": "/api/v1/control/ci:build",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "MacCI",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-ci_build",
+        "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_build",
+        "state": "LEASED"
+      }
+    },
+    {
+      "name": "ci_attest",
+      "method": "POST",
+      "path": "/api/v1/control/ci:attest",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "MacCI",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-ci_attest",
+        "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08",
+        "evidence_ref": "status://example"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_attest",
+        "state": "ACCEPTED"
+      }
+    },
+    {
+      "name": "deployment_plan",
+      "method": "POST",
+      "path": "/api/v1/control/deployments:plan",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-deployment_plan",
+        "install_kind": "upgrade",
+        "previous_healthy_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "artifact_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "app_id": "base",
+        "host_id": "host-test"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_plan",
+        "deployment_id": "dep_1",
+        "state": "PLAN"
+      }
+    },
+    {
+      "name": "deployment_apply",
+      "method": "POST",
+      "path": "/api/v1/control/deployments/dep_1:apply",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-deployment_apply",
+        "deployment_id": "dep_1"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_apply",
+        "state": "STAGE"
+      }
+    },
+    {
+      "name": "deployment_reconcile",
+      "method": "POST",
+      "path": "/api/v1/control/deployments/dep_1:reconcile",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-deployment_reconcile",
+        "deployment_id": "dep_1"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_rec",
+        "state": "RECONCILE"
+      }
+    },
+    {
+      "name": "deployment_rollback",
+      "method": "POST",
+      "path": "/api/v1/control/deployments/dep_1:rollback",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-deployment_rollback",
+        "deployment_id": "dep_1"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_rb",
+        "state": "ROLLBACK"
+      }
+    },
+    {
+      "name": "resource_plan",
+      "method": "POST",
+      "path": "/api/v1/control/resources:plan",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-resource_plan",
+        "app_id": "base",
+        "host_id": "host-test",
+        "dry_run": true
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_rplan",
+        "resource_id": "res_1",
+        "state": "PLANNED"
+      }
+    },
+    {
+      "name": "resource_apply",
+      "method": "POST",
+      "path": "/api/v1/control/resources/res_1:apply",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-resource_apply",
+        "resource_id": "res_1"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_rapply",
+        "state": "APPLYING"
+      }
+    },
+    {
+      "name": "release_accept",
+      "method": "POST",
+      "path": "/api/v1/control/releases/0.6.0:accept",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-release_accept",
+        "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_accept",
+        "state": "ACCEPTANCE"
+      }
+    },
+    {
+      "name": "release_reject",
+      "method": "POST",
+      "path": "/api/v1/control/releases/0.6.0:reject",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-release_reject",
+        "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08",
+        "reason": "fixture"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_reject",
+        "state": "ACCEPTANCE"
+      }
+    },
+    {
+      "name": "release_publish",
+      "method": "POST",
+      "path": "/api/v1/control/releases/0.6.0:publish",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "publisher",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-release_publish",
+        "candidate_id": "cand_839071261f5ac4e98fd497f62f26c7be47d3221b6938eab31efeef0d6f031f08"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_pub",
+        "state": "PUBLISHING"
+      }
+    },
+    {
+      "name": "upgrade_plan",
+      "method": "POST",
+      "path": "/api/v1/control/upgrades:plan",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-upgrade_plan",
+        "app_id": "panel",
+        "target_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_up",
+        "state": "PLANNED"
+      }
+    },
+    {
+      "name": "upgrade_reconcile",
+      "method": "POST",
+      "path": "/api/v1/control/upgrades:reconcile",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-upgrade_reconcile",
+        "app_id": "panel"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_ur",
+        "state": "RECONCILE"
+      }
+    },
+    {
+      "name": "task_claim_replay",
+      "method": "POST",
+      "path": "/api/v1/control/tasks/tsk_example_w00:claim",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-task_claim",
+        "phase": "develop"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "code": "IDEMPOTENCY_REPLAY",
+        "request_id": "req_claim",
+        "original_result": {
+          "state": "LEASED",
+          "run_id": "run_1"
+        },
+        "current_state": "RUNNING",
+        "lease_token": null,
+        "replayed": true
+      }
+    },
+    {
+      "name": "event_query",
+      "method": "GET",
+      "path": "/api/v1/control/events?producer_id=fixture&after_seq=0",
+      "side_effect": false,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": null,
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "side_effect": false,
+        "gap": false,
+        "items": []
+      }
+    },
+    {
+      "name": "policy_evaluate_deny",
+      "method": "POST",
+      "path": "/api/v1/control/policy:evaluate",
+      "side_effect": false,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-policy-deny",
+        "action": "release.publish"
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 403,
+        "code": "POLICY_DENIED",
+        "allow": false,
+        "side_effect": false
+      }
+    },
+    {
+      "name": "candidate_next",
+      "method": "GET",
+      "path": "/api/v1/control/candidates:next",
+      "side_effect": false,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": null,
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "side_effect": false,
+        "candidate_id": null
+      }
+    },
+    {
+      "name": "diagnostic_poll",
+      "method": "GET",
+      "path": "/api/v1/control/diagnostics?subject=tsk_example_w00&after_seq=0",
+      "side_effect": false,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": null,
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "side_effect": false,
+        "watermark_seq": 0,
+        "gap": false,
+        "items": []
+      }
+    },
+    {
+      "name": "resource_inspect",
+      "method": "GET",
+      "path": "/api/v1/control/resources/res_1",
+      "side_effect": false,
+      "implemented": false,
+      "acceptance_owner": "host",
+      "request": null,
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "side_effect": false,
+        "state": "PLANNED"
+      }
+    },
+    {
+      "name": "run_finish_stale_lease",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:complete",
+      "side_effect": false,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 4,
+        "idempotency_key": "idem-w00-stale-lease",
+        "run_id": "run_1",
+        "lease_generation": 1,
+        "result": "SUCCEEDED",
+        "lease_token": "opaque-lease-old",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 1
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 409,
+        "code": "LEASE_FENCE_REJECTED",
+        "state": "RUNNING",
+        "changed": false
+      }
+    },
+    {
+      "name": "run_start",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:start",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-run_start",
+        "run_id": "run_1",
+        "lease_generation": 2,
+        "lease_token": "opaque-lease-renew-91c2",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_start",
+        "state": "RUNNING",
+        "replayed": false
+      }
+    },
+    {
+      "name": "run_release",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:release",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-run_release",
+        "run_id": "run_1",
+        "lease_generation": 2,
+        "lease_token": "opaque-lease-renew-91c2",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_release",
+        "state": "PENDING",
+        "replayed": false
+      }
+    },
+    {
+      "name": "run_heartbeat",
+      "method": "POST",
+      "path": "/api/v1/control/runs/run_1:heartbeat",
+      "side_effect": true,
+      "implemented": false,
+      "acceptance_owner": "user",
+      "request": {
+        "schema_version": 2,
+        "actor": {
+          "kind": "test",
+          "id": "fixture",
+          "proof_ref": "test-proof://w00/fixture"
+        },
+        "scope": {
+          "repo": "layho/web-app-init-base-env",
+          "task_id": "tsk_example_w00"
+        },
+        "expected_revision": 1,
+        "idempotency_key": "idem-w00-run_heartbeat",
+        "run_id": "run_1",
+        "lease_generation": 2,
+        "lease_token": "opaque-lease-renew-91c2",
+        "lease_binding": {
+          "principal_id": "fixture",
+          "run_id": "run_1",
+          "scope": "layho/web-app-init-base-env",
+          "lease_generation": 2
+        }
+      },
+      "response": {
+        "schema_version": 2,
+        "http": 200,
+        "request_id": "req_beat",
+        "state": "RUNNING",
+        "replayed": false
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "leased_expiry",
+      "kind": "transition",
+      "machine": "run",
+      "from": "LEASED",
+      "to": "UNKNOWN",
+      "guards": [
+        "lease_expired_or_effect_unproven"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "leased_cancel_without_fence",
+      "kind": "transition",
+      "machine": "run",
+      "from": "LEASED",
+      "to": "CANCELLED",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "leased_cancel_with_fence",
+      "kind": "transition",
+      "machine": "run",
+      "from": "LEASED",
+      "to": "CANCELLED",
+      "guards": [
+        "fence_stopped_and_no_side_effect"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "running_cancel_without_fence",
+      "kind": "transition",
+      "machine": "run",
+      "from": "RUNNING",
+      "to": "CANCELLED",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "running_supersede_without_fence",
+      "kind": "transition",
+      "machine": "run",
+      "from": "RUNNING",
+      "to": "SUPERSEDED",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "retry_wait_does_not_resume",
+      "kind": "transition",
+      "machine": "run",
+      "from": "RETRY_WAIT",
+      "to": "RUNNING",
+      "guards": [
+        "new_attempt_run_created"
+      ],
+      "expect": "deny"
+    },
+    {
+      "id": "retry_wait_new_run",
+      "kind": "transition",
+      "machine": "run",
+      "from": "RETRY_WAIT",
+      "to": "SUPERSEDED",
+      "guards": [
+        "new_attempt_run_created"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "unknown_succeeded",
+      "kind": "transition",
+      "machine": "run",
+      "from": "UNKNOWN",
+      "to": "SUCCEEDED",
+      "guards": [
+        "trusted_reconcile_side_effect_succeeded"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "unknown_succeeded_without_proof",
+      "kind": "transition",
+      "machine": "run",
+      "from": "UNKNOWN",
+      "to": "SUCCEEDED",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "renew_same_state",
+      "kind": "transition",
+      "machine": "run",
+      "from": "RUNNING",
+      "to": "RUNNING",
+      "guards": [
+        "renew"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "publishing_missing_receipt_not_acceptance",
+      "kind": "transition",
+      "machine": "release",
+      "from": "PUBLISHING",
+      "to": "ACCEPTANCE",
+      "guards": [
+        "missing_receipt"
+      ],
+      "expect": "deny"
+    },
+    {
+      "id": "publishing_unknown",
+      "kind": "transition",
+      "machine": "release",
+      "from": "PUBLISHING",
+      "to": "PUBLISH_UNKNOWN",
+      "guards": [
+        "push_result_unknown"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "publish_unknown_proved_absent",
+      "kind": "transition",
+      "machine": "release",
+      "from": "PUBLISH_UNKNOWN",
+      "to": "ACCEPTANCE",
+      "guards": [
+        "reconcile_proves_push_did_not_happen"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "safe_frozen_stays",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "SAFE_FROZEN",
+      "to": "PLAN",
+      "guards": [
+        "explicit_authorization"
+      ],
+      "expect": "deny"
+    },
+    {
+      "id": "commit_ack_lost",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "COMMIT_PENDING",
+      "to": "RECONCILE",
+      "guards": [
+        "commit_ack_lost"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "rollback_failed",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "ROLLBACK",
+      "to": "SAFE_FROZEN",
+      "guards": [
+        "rollback_failed"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "release_partial",
+      "kind": "transition",
+      "machine": "resource",
+      "from": "RELEASING",
+      "to": "PARTIAL",
+      "guards": [
+        "subset_released"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "release_failed_edge",
+      "kind": "transition",
+      "machine": "resource",
+      "from": "RELEASING",
+      "to": "RELEASE_FAILED",
+      "guards": [
+        "observed_release_failed"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "partial_resume",
+      "kind": "transition",
+      "machine": "resource",
+      "from": "PARTIAL",
+      "to": "RELEASING",
+      "guards": [
+        "preauthorized_recovery"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "chain_test_failed",
+      "kind": "transition",
+      "machine": "task_chain",
+      "from": "TESTING",
+      "to": "FAILED",
+      "guards": [
+        "test_failed"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "chain_reopen_same_id",
+      "kind": "transition",
+      "machine": "task_chain",
+      "from": "REJECTED",
+      "to": "TESTING",
+      "guards": [
+        "repair_authorized_new_candidate"
+      ],
+      "expect": "deny"
+    },
+    {
+      "id": "task_reopen",
+      "kind": "transition",
+      "machine": "task",
+      "from": "close",
+      "to": "claim",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "reconcile_backfill_commit",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "RECONCILE",
+      "to": "COMMIT",
+      "guards": [
+        "reconcile_confirms_healthy_and_backfill_commit"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "reconcile_commit_without_health",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "RECONCILE",
+      "to": "COMMIT",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "first_install_resources_removed",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "ROLLBACK",
+      "to": "ROLLED_BACK",
+      "guards": [
+        "first_install_resources_removed"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "first_install_rollback_without_proof",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "ROLLBACK",
+      "to": "ROLLED_BACK",
+      "guards": [],
+      "expect": "deny"
+    },
+    {
+      "id": "first_install_old_health_is_not_enough",
+      "kind": "transition",
+      "machine": "deployment",
+      "from": "ROLLBACK",
+      "to": "ROLLED_BACK",
+      "guards": [
+        "old_health_proved"
+      ],
+      "expect": "deny"
+    },
+    {
+      "id": "chain_formal_publish",
+      "kind": "transition",
+      "machine": "task_chain",
+      "from": "SATISFIED",
+      "to": "PUBLISHED",
+      "guards": [
+        "formal_publish_evidence"
+      ],
+      "expect": "allow"
+    },
+    {
+      "id": "failed_deployment_chain_replaceable",
+      "kind": "transition",
+      "machine": "task_chain",
+      "from": "DEPLOYING",
+      "to": "SUPERSEDED",
+      "guards": [
+        "deployment_failed_replacement"
+      ],
+      "expect": "allow"
+    }
+  ],
+  "model_tests": {
+    "guard_matching": "string equality only",
+    "not_production_verification": true,
+    "note": "这些夹具只检验契约模型。字符串守卫不是生产环境里的真实校验。"
+  },
+  "guard_authority": {
+    "lease_expired_or_effect_unproven": "trusted_proxy",
+    "note": "调用方的过期或旧代次请求只被拒绝，不把仍有效的新 Run 改成 UNKNOWN。UNKNOWN 只能由可信代理完成对账后写入。"
+  },
+  "object_projection": {
+    "priority": [
+      "authoritative_source",
+      "revision",
+      "received_at",
+      "producer_id"
+    ],
+    "diagnostic_cannot_override": [
+      "authorization",
+      "deployment",
+      "candidate"
+    ],
+    "same_revision": "authoritative source beats advisory"
+  },
+  "recovery_authorization": {
+    "ordinary_preauthorized_recovery": "no per-action user approval",
+    "high_risk_enablement": "dedicated authorization"
+  },
+  "dependencies": {
+    "same_base_required": false,
+    "rule": "依赖 PR 集成之后，下游可以按当时的基线测试，不必先在依赖的旧 base 上重测。",
+    "failed_deployment_replaceable": true
+  },
+  "isolation_acceptance": {
+    "A01": "隔离代理在轮换后拒绝旧代次，并且操作范围不能互换。",
+    "I07": "同一入口下的拉取与反馈范围在轮换后仍然分开。",
+    "A08": "限流计数和会话撤销在进程重启后仍然有效。",
+    "A09": "响应必须带 script-src，错误正文不得含秘密。",
+    "production_enablement_required": false
+  }
+}

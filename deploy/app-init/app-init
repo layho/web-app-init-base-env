@@ -21,6 +21,12 @@ find_python() {
   return 1
 }
 
+for argument in "$@"; do
+  if [[ "$argument" == --host-preflight && "$#" -ne 1 ]]; then
+    echo '--host-preflight must run alone' >&2
+    exit 2
+  fi
+done
 if ! python="$(find_python)"; then
   for argument in "$@"; do
     if [[ "$argument" == --install-deps && "$(uname -s)" == Darwin && "$EUID" != 0 ]]; then

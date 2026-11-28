@@ -430,6 +430,9 @@ def version(response: Response):
 from .hostops import router as hostops_router
 app.include_router(hostops_router)
 
+from .control_routes_w11 import router as control_w11_router
+app.include_router(control_w11_router)
+
 from .module_sdk import mount_modules
 from app_modules.registry import MODULES
 mount_modules(app, MODULES)

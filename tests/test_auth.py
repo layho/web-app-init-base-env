@@ -5,14 +5,19 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-from app.db import Base, get_db
+from sqlalchemy.pool import NullPool, StaticPool
+from app.db import Base, get_db, serialize_sqlite
 from app.main import app
 from app.auth import COOKIE_NAME, hash_password
 
 @pytest.fixture
-def client(monkeypatch):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+def client(monkeypatch, tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'auth.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
+    )
+    serialize_sqlite(engine)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     def db_override():
@@ -40,8 +45,15 @@ def test_login_and_csrf(client):
     assert client.get("/api/v1/feedback").status_code==200
     assert client.post("/api/v1/feedback",json={"category":"bug","message":"Auth regression feedback"},headers={"Origin":"https://webapp.example"}).status_code==403
     token = client.cookies[COOKIE_NAME]
+    # Starlette's TestClient keeps one cookie jar and one portal. Sharing that
+    # client across threads can send a request with no session cookie, and the
+    # server correctly answers 401. Two tabs are two clients with the same cookie.
+    def session_from(copy):
+        with TestClient(app, base_url="https://webapp.example") as tab:
+            tab.cookies.set(COOKIE_NAME, token, path="/api")
+            return tab.get("/api/session")
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first_tab, refreshed = pool.map(client.get, ["/api/session", "/api/session"])
+        first_tab, refreshed = pool.map(session_from, (1, 2))
     assert first_tab.status_code == 200
     assert first_tab.json()["csrf_token"] == response.json()["csrf_token"]
     assert refreshed.status_code == 200
@@ -438,6 +450,77 @@ def test_private_settings_rejects_symlink(monkeypatch, tmp_path):
     import pytest
     with pytest.raises(ValueError):
         admin_settings.read()
+
+
+def test_shared_connection_login_is_visible_before_commit():
+    """One SQLite connection has one transaction.
+
+    A session lookup on that connection sees the login row before commit and
+    loses it if the login rolls back. That is the 401 race. Independent
+    connections must not observe the uncommitted row, and a new connection
+    must observe it after commit.
+    """
+    from datetime import timedelta
+    from sqlalchemy import select
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool, StaticPool
+    from app.models import AdminSession, utcnow
+
+    shared = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(shared)
+    Shared = sessionmaker(bind=shared, expire_on_commit=False)
+    reader = Shared()
+    writer = Shared()
+    assert reader.connection().connection.dbapi_connection is writer.connection().connection.dbapi_connection
+    now = utcnow()
+    writer.add(AdminSession(token_hash="a" * 64, csrf_hash="b" * 64, username="admin", expires_at=now + timedelta(hours=1)))
+    writer.flush()
+    leaked = reader.scalar(select(AdminSession).where(AdminSession.token_hash == "a" * 64))
+    assert leaked is not None and leaked.username == "admin"
+    writer.rollback()
+    assert reader.scalar(select(AdminSession).where(AdminSession.token_hash == "a" * 64)) is None
+    reader.close()
+    writer.close()
+    shared.dispose()
+
+
+def test_independent_connection_login_is_hidden_until_commit(tmp_path):
+    from datetime import timedelta
+    from sqlalchemy import select
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool
+    from app.models import AdminSession, utcnow
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'auth.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
+    )
+    from sqlalchemy import event
+    @event.listens_for(engine, "connect")
+    def _wal(dbapi, _record):
+        cursor = dbapi.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    writer = Session()
+    reader = Session()
+    assert writer.connection().connection.dbapi_connection is not reader.connection().connection.dbapi_connection
+    now = utcnow()
+    writer.add(AdminSession(token_hash="c" * 64, csrf_hash="d" * 64, username="admin", expires_at=now + timedelta(hours=1)))
+    writer.flush()
+    assert reader.scalar(select(AdminSession).where(AdminSession.token_hash == "c" * 64)) is None
+    writer.commit()
+    reader.close()
+    fresh = Session()
+    found = fresh.scalar(select(AdminSession).where(AdminSession.token_hash == "c" * 64))
+    assert found is not None and found.username == "admin"
+    fresh.close()
+    writer.close()
+    engine.dispose()
 
 
 def test_branding_default_and_control_characters(monkeypatch, tmp_path):

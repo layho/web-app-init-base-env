@@ -4,7 +4,9 @@
 
 ## 版本与功能
 
-正式基线 V0.4.0；本分支版本标识 V0.5.0，集成候选见 [PR #196](https://github.com/layho/web-app-init-base-env/pull/196)。本候选文档不代表已发布或已安装宿主 runtime。实际运行版本以网页 SHA、GitHub 分支及独立回执为准。
+已发布基线仍以 GitHub `main` / `preview` 和 [版本计划](docs/RELEASE_PLAN.md) 为准。V0.4.0 与 V0.5.0 的发布记录留在版本计划里。本文描述仓库里已经能运行和阅读的能力。
+
+V0.6.0 联合集成候选在独立分支上，还没有合并到 preview 或 main，也没有生产启用授权。候选说明见 [集成候选](docs/v060/11-w11-integration.md)。MacCI 回执、macOS/Linux 实机能力和公网运行 SHA 缺环境时记为 BLOCKED，不用本机测试代替。
 
 | 能力 | 使用方式 |
 |---|---|
@@ -102,6 +104,23 @@ V0.5.0 的 Draft 暂停自动送测规则须在新版可信 Runner 安装后才�
 更新失败时保留数据库与本机配置，核对日志、端口、运行 SHA 和回退证据。不要删除锁、清空 journal、复用旧测试或强推绕过保护。部署 .env 及 .base-preview.env 必须是运行用户拥有的普通文件，权限 600 或 400。不要将凭据提交至仓库。
 
 参见 [HostOps 安装](deploy/hostops/README.md)、[反馈交付](docs/FEEDBACK-DELIVERY.md)、[回执交付](deploy/macci/RECEIPT-DELIVERY.md)。
+
+## V0.6.0 集成候选
+
+候选把 W00–W10 的隔离模块放在同一棵树上，并用 W02 作为唯一认证实现、W01 作为事件存储。生产开关保持关闭。只读控制面路由 `/api/v1/control/board` 在没有配置控制根时返回空列表和明确原因，不写入、不展示演示任务。
+
+迁移、回滚和验收清单见 [检查清单](docs/v060/12-w11-checklists.md)。74 项追踪见 [追踪表](docs/v060/11-w11-integration.md)。共享文件改动清单见 [共享文件](docs/v060/13-w11-shared-files.md)。
+
+## 文档导航
+
+- [协作规范](docs/AGENT_COLLABORATION.md)
+- [版本开发规范](docs/VERSION_DEVELOPMENT.md)
+- [版本计划](docs/RELEASE_PLAN.md)
+- [V0.6.0 契约](docs/v060/README.md)
+- [集成队列](docs/v050-integration-queue.md)
+- [后端模块 SDK](docs/BACKEND_MODULE_SDK.md)
+- [前端模块 SDK](docs/FRONTEND_MODULE_SDK.md)
+- [升级所有权预检](docs/APP_UPGRADE_PREFLIGHT.md)
 
 ## 依赖及回归
 

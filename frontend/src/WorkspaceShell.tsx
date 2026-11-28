@@ -47,7 +47,7 @@ export function WorkspaceShell<Key extends string>({
       <Layout className="workspace-frame">
       <Sider
         className="workspace-sider"
-        theme="light"
+        theme="dark"
         width={228}
         collapsedWidth={76}
         breakpoint="md"
