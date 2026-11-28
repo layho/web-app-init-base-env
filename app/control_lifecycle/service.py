@@ -950,6 +950,8 @@ class LifecycleService:
 
         if REAL_UNINSTALL or REAL_INSTALL or HOST_MUTATION:
             return "unsafe"
+        if not _synthetic_cleanup_host(self.host):
+            return "unsafe"
         directory = self._open_exclusive_inventory()
         if directory is None:
             return "unsafe"
@@ -1005,19 +1007,9 @@ class LifecycleService:
         if directory is None:
             return None
         info = os.fstat(directory)
-        if info.st_uid != os.getuid() or not stat.S_ISDIR(info.st_mode):
+        if info.st_uid != os.getuid() or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
             os.close(directory)
             return None
-        if stat.S_IMODE(info.st_mode) != 0o700:
-            try:
-                os.fchmod(directory, 0o700)
-            except OSError:
-                os.close(directory)
-                return None
-            info = os.fstat(directory)
-            if stat.S_IMODE(info.st_mode) != 0o700:
-                os.close(directory)
-                return None
         return directory
 
     def _inventory_fence(self, directory):
@@ -1071,6 +1063,10 @@ class LifecycleService:
         if not marker.is_file() or marker.is_symlink():
             return False
         return True
+
+
+def _synthetic_cleanup_host(host) -> bool:
+    return bool(getattr(host, "test_double", False)) and not bool(getattr(host, "proves_host_capability", True))
 
 
 def _filter_journal(body, grant):

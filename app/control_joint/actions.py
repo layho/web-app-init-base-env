@@ -111,10 +111,14 @@ class ManualActions:
             replay["replayed"] = True
             replay["forwarded"] = False
             replay["accepted_as_success"] = False
-            replay["side_effect"] = False
+            if replay.get("state") == "UNKNOWN":
+                replay["side_effect"] = None
             return replay
         if reserved["kind"] == "blocked":
-            return _result(409, "SIDE_EFFECT_UNKNOWN", "An unresolved operation already exists for this intent.", state="UNKNOWN", replayed=True)
+            return _result(
+                409, "SIDE_EFFECT_UNKNOWN", "An unresolved operation already exists for this intent.",
+                state="UNKNOWN", replayed=True, side_effect=None,
+            )
         if reserved["kind"] == "retry":
             try:
                 _authorize_action(principal, task_id, operation, scope)
@@ -131,12 +135,21 @@ class ManualActions:
             if named is not None:
                 return self._settle(principal.principal_id, key_hash, named)
         if not self._claim(principal.principal_id, key_hash):
-            return _result(409, "SIDE_EFFECT_UNKNOWN", "The operation is already in flight.", state="UNKNOWN", replayed=True)
-        produced = self._execute(principal, intent, parsed, reserved["operation_id"])
+            return _result(409, "SIDE_EFFECT_UNKNOWN", "The operation is already in flight.", state="UNKNOWN", replayed=True, side_effect=None)
+        produced = self._execute(
+            principal,
+            intent,
+            parsed,
+            reserved["operation_id"],
+            key_hash,
+            reserved.get("executor_kind") or _executor_kind(self.executor),
+        )
         settled = self._settle(principal.principal_id, key_hash, produced)
         return settled
 
-    def _execute(self, principal: Principal, intent: dict, parsed: dict, operation_id: str) -> dict:
+    def _execute(self, principal: Principal, intent: dict, parsed: dict, operation_id: str, key_hash: str, executor_kind: str) -> dict:
+        if not self._enter(principal.principal_id, key_hash):
+            return _result(409, "SIDE_EFFECT_UNKNOWN", "The execution fence was not entered.", state="UNKNOWN", side_effect=None)
         payload = dict(intent)
         payload["evidence_ref"] = parsed["evidence"]
         payload["expected_revision"] = parsed["revision"]
@@ -144,29 +157,43 @@ class ManualActions:
         try:
             produced = self.executor(self.root, principal, payload)
         except Exception:
-            return _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN")
+            return _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN", side_effect=None)
         if not isinstance(produced, dict) or produced.get("side_effect") not in (False, None):
-            return _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN")
+            return _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN", side_effect=None)
         http = int(produced.get("http") or 500)
-        if http < 400:
-            receipt = query_operation_receipt(
-                self.root,
-                operation_id=operation_id,
-                expected_revision=intent.get("revision") if type(intent.get("revision")) is int else 0,
-                candidate_digest=intent.get("digest") or "",
-                repo_id=intent.get("repo_id") or "",
-                app_id=intent.get("app_id") or "",
-                authority=_execution_authority(intent),
+        authority = _execution_authority(intent)
+        receipt = query_operation_receipt(
+            self.root,
+            operation_id=operation_id,
+            expected_revision=intent.get("revision") if type(intent.get("revision")) is int else 0,
+            candidate_digest=intent.get("digest") or "",
+            repo_id=intent.get("repo_id") or "",
+            app_id=intent.get("app_id") or "",
+            authority=authority,
+        )
+        if receipt.get("status") == "applied":
+            body = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+            return _result(
+                int(body.get("http") or http),
+                body.get("code", produced.get("code")),
+                body.get("detail") or produced.get("detail") or "",
+                reason=produced.get("reason"),
+                state=body.get("state", produced.get("state")),
+                forwarded=True,
             )
-            if receipt.get("status") != "applied":
-                return _result(409, "SIDE_EFFECT_UNKNOWN", "The action has no execution receipt.", state="UNKNOWN")
+        proof = _non_execution_proof(receipt, authority, executor_kind, self.executor)
+        if http < 400 or proof is None:
+            # A status below 400 is not success without an exact receipt.
+            # A non-success status is not, by itself, proof that nothing ran.
+            return _result(409, "SIDE_EFFECT_UNKNOWN", "The action has no execution receipt.", state="UNKNOWN", side_effect=None)
         return _result(
-            int(produced.get("http") or 200),
+            http,
             produced.get("code"),
             produced.get("detail") or "",
             reason=produced.get("reason"),
             state=produced.get("state"),
             forwarded=True,
+            non_execution_proof=proof,
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -191,6 +218,8 @@ class ManualActions:
                 intent_json TEXT NOT NULL,
                 state TEXT NOT NULL,
                 result_json TEXT,
+                fence_phase TEXT NOT NULL DEFAULT 'RESERVED',
+                executor_kind TEXT NOT NULL DEFAULT 'custom',
                 PRIMARY KEY (principal_id, key_hash)
             )
             """
@@ -201,6 +230,10 @@ class ManualActions:
             conn.execute("ALTER TABLE manual_actions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
         if "effect_id" not in columns:
             conn.execute("ALTER TABLE manual_actions ADD COLUMN effect_id TEXT NOT NULL DEFAULT ''")
+        if "fence_phase" not in columns:
+            conn.execute("ALTER TABLE manual_actions ADD COLUMN fence_phase TEXT NOT NULL DEFAULT 'ENTERED'")
+        if "executor_kind" not in columns:
+            conn.execute("ALTER TABLE manual_actions ADD COLUMN executor_kind TEXT NOT NULL DEFAULT 'custom'")
         return conn
 
     def _reserve(self, principal_id: str, key_hash: str, payload_hash: str, intent: dict, fence_id: str) -> dict:
@@ -234,16 +267,18 @@ class ManualActions:
                 (effect_id,),
             ).fetchone()["generation"] + 1
             operation_id = _operation_id(fence_id, generation)
+            executor_kind = _executor_kind(self.executor)
             conn.execute(
                 """
                 INSERT INTO manual_actions(
-                    operation_id, fence_id, effect_id, generation, principal_id, key_hash, payload_hash, intent_json, state, result_json
-                ) VALUES(?,?,?,?,?,?,?,?,'PENDING',NULL)
+                    operation_id, fence_id, effect_id, generation, principal_id, key_hash, payload_hash, intent_json,
+                    state, result_json, fence_phase, executor_kind
+                ) VALUES(?,?,?,?,?,?,?,?,'PENDING',NULL,'RESERVED',?)
                 """,
-                (operation_id, fence_id, effect_id, generation, principal_id, key_hash, payload_hash, _dump(intent)),
+                (operation_id, fence_id, effect_id, generation, principal_id, key_hash, payload_hash, _dump(intent), executor_kind),
             )
             conn.execute("COMMIT")
-            return {"kind": "reserved", "operation_id": operation_id, "generation": generation}
+            return {"kind": "reserved", "operation_id": operation_id, "generation": generation, "executor_kind": executor_kind}
         except sqlite3.IntegrityError:
             conn.execute("ROLLBACK")
             return {"kind": "blocked"}
@@ -277,15 +312,29 @@ class ManualActions:
             )
             self._mark(conn, row, "SETTLED", result)
             return {"kind": "replay", "result": result}
+        phase = row["fence_phase"] if "fence_phase" in row.keys() else ""
+        kind = row["executor_kind"] if "executor_kind" in row.keys() else "custom"
+        if row["state"] == "IN_FLIGHT" and phase == "RESERVED":
+            self._rearm(conn, row)
+            return {"kind": "retry", "operation_id": row["operation_id"], "generation": row["generation"], "executor_kind": kind}
+        if (
+            row["state"] == "IN_FLIGHT"
+            and receipt.get("status") == "absent"
+            and _execution_authority(intent) == "W04"
+            and kind == "isolated"
+            and self.executor is execute_isolated
+        ):
+            self._rearm(conn, row)
+            return {"kind": "retry", "operation_id": row["operation_id"], "generation": row["generation"], "executor_kind": kind}
         if row["state"] == "IN_FLIGHT":
             return {"kind": "blocked"}
         if row["state"] == "SETTLED" and row["result_json"]:
             return {"kind": "replay", "result": json.loads(row["result_json"])}
         if receipt.get("status") == "absent" and row["state"] == "PENDING":
-            return {"kind": "retry", "operation_id": row["operation_id"], "generation": row["generation"]}
+            return {"kind": "retry", "operation_id": row["operation_id"], "generation": row["generation"], "executor_kind": kind}
         if row["result_json"]:
             return {"kind": "replay", "result": json.loads(row["result_json"])}
-        return {"kind": "replay", "result": _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN", replayed=True)}
+        return {"kind": "replay", "result": _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN", replayed=True, side_effect=None)}
 
     def _claim(self, principal_id: str, key_hash: str) -> bool:
         conn = self._connect()
@@ -293,7 +342,7 @@ class ManualActions:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 """
-                UPDATE manual_actions SET state='IN_FLIGHT'
+                UPDATE manual_actions SET state='IN_FLIGHT', fence_phase='RESERVED'
                 WHERE principal_id=? AND key_hash=? AND state='PENDING'
                 """,
                 (principal_id, key_hash),
@@ -305,6 +354,40 @@ class ManualActions:
             raise
         finally:
             conn.close()
+
+    def _enter(self, principal_id: str, key_hash: str) -> bool:
+        """Record that the executor is about to be called.
+
+        Until this commit, an IN_FLIGHT row is still RESERVED and is proof
+        the executor was not entered.
+        """
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE manual_actions SET fence_phase='ENTERED'
+                WHERE principal_id=? AND key_hash=? AND state='IN_FLIGHT' AND fence_phase='RESERVED'
+                """,
+                (principal_id, key_hash),
+            )
+            conn.execute("COMMIT")
+            return cursor.rowcount == 1
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def _rearm(self, conn, row) -> None:
+        conn.execute(
+            """
+            UPDATE manual_actions SET state='PENDING', fence_phase='RESERVED', result_json=NULL
+            WHERE principal_id=? AND key_hash=? AND state='IN_FLIGHT'
+            """,
+            (row["principal_id"], row["key_hash"]),
+        )
 
     def _mark(self, conn, row, state: str, result: dict) -> None:
         conn.execute(
@@ -621,7 +704,36 @@ def _digest_bytes(payload: dict) -> str:
     return hashlib.sha256(_dump(payload).encode()).hexdigest()
 
 
-def _result(http: int, code, detail: str, *, reason=None, state=None, replayed=False, forwarded=False) -> dict:
+def _executor_kind(executor) -> str:
+    return "isolated" if executor is execute_isolated else "custom"
+
+
+def _non_execution_proof(receipt: dict, authority: str, executor_kind: str, executor) -> str | None:
+    """Proof that the isolated scheduler commit did not happen.
+
+    A non-success HTTP status is not this proof. A snapshot that failed,
+    timed out, or hit its budget is ``unknown`` and is not this proof.
+    """
+
+    if receipt.get("status") != "absent" or authority != "W04":
+        return None
+    if executor_kind == "isolated" and executor is execute_isolated:
+        return "w04_absent"
+    return None
+
+
+def _result(
+    http: int,
+    code,
+    detail: str,
+    *,
+    reason=None,
+    state=None,
+    replayed=False,
+    forwarded=False,
+    side_effect=False,
+    non_execution_proof=None,
+) -> dict:
     return {
         "schema_version": 2,
         "http": http,
@@ -629,7 +741,9 @@ def _result(http: int, code, detail: str, *, reason=None, state=None, replayed=F
         "detail": detail,
         "reason": reason,
         "state": state,
-        "side_effect": False,
+        "side_effect": side_effect,
+        "non_execution_proof": non_execution_proof,
+        "http_proves_no_side_effect": False,
         "accepted_as_success": False,
         "production_enabled": False,
         "replayed": replayed,

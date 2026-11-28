@@ -2,15 +2,14 @@
 
 W04 and W05 are not interchangeable. A W04 absence is a missing row in a
 consistent snapshot whose persisted repository and application binding match.
-A W05 JSON document with ``reconciled`` true, or a missing file, is not that
-proof. An unrelated W05 read does not change a W04 result. When the snapshot
+A W05 file that only repeats its own digest is not that proof. A missing
+W05 transaction is unknown, not absence. An unrelated W05 read does not change a W04 result. When the snapshot
 cannot be shown to be consistent, the status is ``unknown`` and must not be
 used to retry the operation.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -101,57 +100,59 @@ def _applied_row(row, operation_id, expected_revision, candidate_digest, repo_id
 
 
 def _w05(root: Path, operation_id: str, expected_revision: int, candidate_digest: str, repo_id: str, app_id: str) -> dict:
-    """A complete persisted W05 receipt. ``reconciled`` JSON is not one.
+    """A receipt is applied only when the journal issuance head names it.
 
-    A missing file is unknown, not absence. The operation journal is not read,
-    so a conflict there cannot change this result.
+    ``issued``, ``persisted``, and a SHA computed from the receipt file are
+    not an issuance. A missing transaction, a missing head entry, or a
+    digest that does not match the committed transaction is unknown. This
+    read does not write, so it cannot change a W04 result.
     """
 
     if not _safe_name(operation_id):
         return {"status": "unknown"}
-    root_fd = None
-    delivery_fd = None
-    receipt_fd = None
-    try:
-        root_fd = open_root(root)
-        try:
-            info = lstat_at(root_fd, "delivery")
-        except FileNotFoundError:
-            return {"status": "unknown"}
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            return {"status": "unknown"}
-        delivery_fd = open_directory(root_fd, "delivery")
-        try:
-            folder = lstat_at(delivery_fd, "receipt")
-        except FileNotFoundError:
-            return {"status": "unknown"}
-        if stat.S_ISLNK(folder.st_mode) or not stat.S_ISDIR(folder.st_mode):
-            return {"status": "unknown"}
-        receipt_fd = open_directory(delivery_fd, "receipt")
-        filename = operation_id + ".json"
-        try:
-            file_info = lstat_at(receipt_fd, filename)
-        except FileNotFoundError:
-            return {"status": "unknown"}
-        if stat.S_ISLNK(file_info.st_mode) or not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1:
-            return {"status": "unknown"}
-        document = json.loads(read_bounded(receipt_fd, filename, 65536).decode("utf-8"))
-    except (OSError, UnicodeError, ValueError, UnsafePath):
+    transaction = _delivery_json(root, "transaction", operation_id)
+    receipt = _delivery_json(root, "receipt", operation_id)
+    head = _delivery_json(root, "issuance-head", "w05")
+    if transaction is None or receipt is None or head is None:
         return {"status": "unknown"}
-    finally:
-        if receipt_fd is not None:
-            os.close(receipt_fd)
-        if delivery_fd is not None:
-            os.close(delivery_fd)
-        if root_fd is not None:
-            os.close(root_fd)
-    if not isinstance(document, dict):
+    if not isinstance(transaction, dict) or not isinstance(receipt, dict) or not isinstance(head, dict):
         return {"status": "unknown"}
-    if document.get("reconciled") is True and document.get("issued") is not True:
+    result = transaction.get("result")
+    parent = transaction.get("parent") if isinstance(transaction.get("parent"), str) else None
+    commit_seq = transaction.get("commit_seq")
+    if not isinstance(result, dict) or parent is None or isinstance(commit_seq, bool) or type(commit_seq) is not int:
         return {"status": "unknown"}
-    if not _issued_w05(document, operation_id, expected_revision, candidate_digest, repo_id, app_id):
+    from app.control_joint.w05_issue import issuance_digest
+
+    digest = issuance_digest(
+        operation_id=operation_id,
+        expected_revision=expected_revision,
+        candidate_digest=candidate_digest,
+        repo_id=repo_id,
+        app_id=app_id,
+        result=result,
+        commit_seq=commit_seq,
+        parent=parent,
+    )
+    commits = head.get("commits")
+    if transaction.get("issuance_digest") != digest or not isinstance(commits, dict) or commits.get(operation_id) != digest:
         return {"status": "unknown"}
-    result = document.get("result")
+    if transaction.get("status") != "applied" or transaction.get("authority") != "W05":
+        return {"status": "unknown"}
+    if (
+        transaction.get("operation_id") != operation_id
+        or transaction.get("expected_revision") != expected_revision
+        or transaction.get("candidate_digest") != candidate_digest
+        or transaction.get("repo_id") != repo_id
+        or transaction.get("app_id") != app_id
+    ):
+        return {"status": "unknown"}
+    receipt_id = transaction.get("receipt_id")
+    if not isinstance(receipt_id, str) or not receipt_id.startswith("rcpt_"):
+        return {"status": "unknown"}
+    for field in ("operation_id", "expected_revision", "candidate_digest", "repo_id", "app_id", "result", "receipt_id", "status"):
+        if receipt.get(field) != transaction.get(field):
+            return {"status": "unknown"}
     return {
         "status": "applied",
         "operation_id": operation_id,
@@ -160,38 +161,50 @@ def _w05(root: Path, operation_id: str, expected_revision: int, candidate_digest
         "repo_id": repo_id,
         "app_id": app_id,
         "result": result,
-    }
-
-
-def _issued_w05(document, operation_id, expected_revision, candidate_digest, repo_id, app_id) -> bool:
-    result = document.get("result")
-    receipt_id = document.get("receipt_id")
-    if document.get("authority") != "W05" or document.get("issued") is not True or document.get("persisted") is not True:
-        return False
-    if document.get("status") != "applied" or not isinstance(receipt_id, str) or not receipt_id:
-        return False
-    if not isinstance(result, dict):
-        return False
-    if (
-        document.get("operation_id") != operation_id
-        or document.get("expected_revision") != expected_revision
-        or document.get("candidate_digest") != candidate_digest
-        or document.get("repo_id") != repo_id
-        or document.get("app_id") != app_id
-    ):
-        return False
-    binding = {
-        "app_id": app_id,
-        "authority": "W05",
-        "candidate_digest": candidate_digest,
-        "expected_revision": expected_revision,
-        "operation_id": operation_id,
         "receipt_id": receipt_id,
-        "repo_id": repo_id,
-        "result": result,
     }
-    digest = hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-    return document.get("binding_digest") == digest
+
+
+def _delivery_json(root: Path, kind: str, key: str):
+    """Read one journal object. Missing and unsafe paths are both unknown."""
+
+    root_fd = None
+    delivery_fd = None
+    folder_fd = None
+    try:
+        root_fd = open_root(root)
+        try:
+            info = lstat_at(root_fd, "delivery")
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return None
+        delivery_fd = open_directory(root_fd, "delivery")
+        try:
+            folder = lstat_at(delivery_fd, kind)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(folder.st_mode) or not stat.S_ISDIR(folder.st_mode):
+            return None
+        folder_fd = open_directory(delivery_fd, kind)
+        filename = key + ".json"
+        try:
+            file_info = lstat_at(folder_fd, filename)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(file_info.st_mode) or not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1:
+            return None
+        document = json.loads(read_bounded(folder_fd, filename, 65536).decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, UnsafePath):
+        return None
+    finally:
+        if folder_fd is not None:
+            os.close(folder_fd)
+        if delivery_fd is not None:
+            os.close(delivery_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+    return document if isinstance(document, dict) else None
 
 
 def _matches(item, operation_id, expected_revision, candidate_digest, repo_id, app_id) -> bool:

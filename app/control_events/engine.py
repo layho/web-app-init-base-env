@@ -26,6 +26,7 @@ from app.control_authz.proof import checked_message
 from app.feedback_progress import STAGES, STATUSES
 
 from .auth_bind import POLICY_REVISION, STREAM_REPAIR, document_for_event, document_for_report, document_for_resource, evidence_key, guard_key, host_text, report_business_digest
+from .historical_auth import historical_authorization
 from .auth_state import load_state
 from .errors import ControlError
 from .event_outbox import EventOutbox
@@ -448,19 +449,31 @@ class Engine:
     def authorizations(self) -> list[dict]:
         with self.store.transaction() as conn:
             rows = conn.execute("SELECT * FROM authorizations").fetchall()
-        return [
-            {
+            stored = conn.execute("SELECT payload_json FROM events WHERE applied=1").fetchall()
+        grouped = _historical_groups(stored)
+        found = []
+        for row in rows:
+            key = (row["task_id"], row["candidate_id"], row["operation"])
+            verdict = historical_authorization(grouped.get(key, []))
+            if verdict["decision"] == "authorized":
+                revoked = False
+            elif verdict["decision"] == "revoked":
+                revoked = True
+            else:
+                revoked = True
+            found.append({
                 "task_id": row["task_id"],
                 "candidate_id": row["candidate_id"],
                 "operation": row["operation"],
                 "revision": row["revision"],
                 "event_id": row["event_id"],
-                "revoked": bool(row["revoked"]),
+                "revoked": revoked,
+                "historical_decision": verdict["decision"],
+                "historical_reason": verdict["reason"],
                 "source": row["source"],
                 "production_effective": False,
-            }
-            for row in rows
-        ]
+            })
+        return found
 
     def fact(self, key: str) -> dict | None:
         with self.store.transaction() as conn:
@@ -1083,6 +1096,18 @@ class Engine:
         )
 
     def _write_authorization(self, conn, event: dict, *, revoked: int) -> None:
+        # The event type sequence decides. ``authorized`` on the payload is not read.
+        prior = []
+        rows = conn.execute("SELECT payload_json FROM events WHERE applied=1").fetchall()
+        for item in _historical_groups(rows).get((event.get("task_id"), event.get("candidate_id"), event.get("operation")), []):
+            prior.append(item)
+        verdict = historical_authorization(prior + [event])
+        if verdict.get("reason") == "stale_signature":
+            return
+        if verdict["decision"] == "revoked":
+            revoked = 1
+        elif verdict["decision"] == "authorized":
+            revoked = 0
         existing = conn.execute(
             "SELECT revision, revoked FROM authorizations WHERE task_id=? AND candidate_id=? AND operation=?",
             (event["task_id"], event["candidate_id"], event["operation"]),
@@ -1234,6 +1259,28 @@ def _wins(current: dict, event: dict) -> bool:
 def _text_field(resource: dict, name: str) -> str:
     value = resource.get(name)
     return value if isinstance(value, str) else ""
+
+
+def _historical_groups(rows) -> dict:
+    grouped = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("event_type") not in {"authorization.granted", "authorization.revoked"}:
+            continue
+        try:
+            event = _rehydrate(payload)
+        except ControlError:
+            continue
+        if not event.get("_authoritative"):
+            continue
+        key = (event.get("task_id"), event.get("candidate_id"), event.get("operation"))
+        grouped.setdefault(key, []).append(event)
+    return grouped
 
 
 def _rehydrate(payload: dict) -> dict:

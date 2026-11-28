@@ -443,14 +443,17 @@ class ReceiptRoutingTests(unittest.TestCase):
         import json as json_module
 
         from app.control_joint.receipts import query_operation_receipt
+        from app.control_joint.w05_issue import issue_w05_receipt
 
         with tempfile.TemporaryDirectory() as directory:
             os.chmod(directory, 0o700)
-            missing = query_operation_receipt(
-                Path(directory), operation_id="op-5", expected_revision=2, candidate_digest="cd" * 32,
-                repo_id="repo_joint", app_id="base", authority="W05",
+            arguments = dict(
+                operation_id="op-5", expected_revision=2, candidate_digest="cd" * 32,
+                repo_id="repo_joint", app_id="base",
             )
+            missing = query_operation_receipt(Path(directory), authority="W05", **arguments)
             self.assertEqual(missing["status"], "unknown")
+            w04_before = query_operation_receipt(Path(directory), authority="W04", **arguments)
             folder = Path(directory) / "delivery" / "receipt"
             folder.mkdir(parents=True)
             result = {"http": 200, "state": "AUTHORIZED"}
@@ -470,19 +473,23 @@ class ReceiptRoutingTests(unittest.TestCase):
                 json_module.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             (folder / "op-5.json").write_text(json_module.dumps(document), encoding="utf-8")
-            applied = query_operation_receipt(
-                Path(directory), operation_id="op-5", expected_revision=2, candidate_digest="cd" * 32,
-                repo_id="repo_joint", app_id="base", authority="W05",
-            )
+            self_hashed = query_operation_receipt(Path(directory), authority="W05", **arguments)
+            self.assertEqual(self_hashed["status"], "unknown")
+            issued = issue_w05_receipt(Path(directory), result=result, **arguments)
+            self.assertEqual(issued["status"], "applied")
+            self.assertTrue(issued["wrote"])
+            applied = query_operation_receipt(Path(directory), authority="W05", **arguments)
             self.assertEqual(applied["status"], "applied")
-            document["reconciled"] = True
-            document.pop("issued")
-            (folder / "op-5.json").write_text(json_module.dumps(document), encoding="utf-8")
-            rejected = query_operation_receipt(
-                Path(directory), operation_id="op-5", expected_revision=2, candidate_digest="cd" * 32,
-                repo_id="repo_joint", app_id="base", authority="W05",
+            conflict = issue_w05_receipt(
+                Path(directory), result={"http": 500, "state": "FAILED"}, **arguments,
             )
-            self.assertEqual(rejected["status"], "unknown")
+            self.assertEqual(conflict["status"], "conflict")
+            self.assertFalse(conflict["wrote"])
+            still = query_operation_receipt(Path(directory), authority="W05", **arguments)
+            self.assertEqual(still["status"], "applied")
+            self.assertEqual(still["result"], result)
+            w04_after = query_operation_receipt(Path(directory), authority="W04", **arguments)
+            self.assertEqual(w04_before["status"], w04_after["status"])
 
 
 class ManualRecoveryTests(unittest.TestCase):
@@ -550,7 +557,9 @@ class ManualRecoveryTests(unittest.TestCase):
                 scheduler.open_version("v060", baseline="a" * 40)
                 scheduler.open_task(task_id="tsk_w01", version="v060", app_id="base", worktree="work/tree")
                 held = actions.submit(_principal(), _body(idempotency_key="held-key", chain_id="ch"))
-                self.assertEqual(held["code"], "HELD", held)
+                self.assertEqual(held["code"], "SIDE_EFFECT_UNKNOWN", held)
+                self.assertIsNone(held["side_effect"])
+                self.assertFalse(held["http_proves_no_side_effect"])
                 connection = sqlite3.connect(actions.path)
                 connection.execute("UPDATE manual_actions SET state='PENDING', result_json=NULL WHERE key_hash=?", (
                     __import__("hashlib").sha256(b"held-key").hexdigest(),

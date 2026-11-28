@@ -200,6 +200,8 @@ class LifecycleCase(unittest.TestCase):
         inventory = root / "inventory"
         home.mkdir()
         inventory.mkdir()
+        home.chmod(0o700)
+        inventory.chmod(0o700)
         host = SyntheticHost(probe if probe is not None else linux_probe(), faults)
         self.home = home
         self.inventory = inventory
