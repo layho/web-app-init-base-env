@@ -34,6 +34,7 @@ _CLOSED = frozenset({"merge", "deploy", "request_publish"})
 _SCHEDULER = frozenset({"retry_phase", "unblock", "authorize_repair"})
 _HELD = frozenset({"BLOCKED", "FAILED", "RETRY_WAIT"})
 _FENCE_FIELDS = ("action", "repo_id", "app_id", "task_id", "chain_id", "candidate_id", "round_id", "head", "base", "merge", "tree")
+_EFFECT_FIELDS = ("repo_id", "app_id", "task_id", "chain_id", "round_id")
 
 
 def action_specs():
@@ -114,10 +115,23 @@ class ManualActions:
             return replay
         if reserved["kind"] == "blocked":
             return _result(409, "SIDE_EFFECT_UNKNOWN", "An unresolved operation already exists for this intent.", state="UNKNOWN", replayed=True)
-        if action in _SCHEDULER and not custom and binding is not None:
+        if reserved["kind"] == "retry":
+            try:
+                _authorize_action(principal, task_id, operation, scope)
+            except AuthzError as exc:
+                return _result(exc.status, exc.code, exc.detail, reason=exc.reason, state="UNKNOWN")
+            if task_id not in _task_ids(principal):
+                return _result(403, "NOT_AUTHORIZED", "The task is outside the server binding.", reason="cross_task", state="UNKNOWN")
+            if action in _SCHEDULER and not custom and binding is not None:
+                named = _named(parsed, binding, revision=True)
+                if named is not None:
+                    return named
+        elif action in _SCHEDULER and not custom and binding is not None:
             named = _named(parsed, binding, revision=True)
             if named is not None:
                 return self._settle(principal.principal_id, key_hash, named)
+        if not self._claim(principal.principal_id, key_hash):
+            return _result(409, "SIDE_EFFECT_UNKNOWN", "The operation is already in flight.", state="UNKNOWN", replayed=True)
         produced = self._execute(principal, intent, parsed, reserved["operation_id"])
         settled = self._settle(principal.principal_id, key_hash, produced)
         return settled
@@ -133,7 +147,8 @@ class ManualActions:
             return _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN")
         if not isinstance(produced, dict) or produced.get("side_effect") not in (False, None):
             return _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN")
-        if self.executor is execute_isolated and intent.get("chain_id") and int(produced.get("http") or 500) < 400 and not produced.get("code"):
+        http = int(produced.get("http") or 500)
+        if http < 400:
             receipt = query_operation_receipt(
                 self.root,
                 operation_id=operation_id,
@@ -141,6 +156,7 @@ class ManualActions:
                 candidate_digest=intent.get("digest") or "",
                 repo_id=intent.get("repo_id") or "",
                 app_id=intent.get("app_id") or "",
+                authority=_execution_authority(intent),
             )
             if receipt.get("status") != "applied":
                 return _result(409, "SIDE_EFFECT_UNKNOWN", "The action has no execution receipt.", state="UNKNOWN")
@@ -167,6 +183,7 @@ class ManualActions:
             CREATE TABLE IF NOT EXISTS manual_actions (
                 operation_id TEXT NOT NULL UNIQUE,
                 fence_id TEXT NOT NULL,
+                effect_id TEXT NOT NULL,
                 generation INTEGER NOT NULL,
                 principal_id TEXT NOT NULL,
                 key_hash TEXT NOT NULL,
@@ -182,9 +199,12 @@ class ManualActions:
         if "fence_id" not in columns:
             conn.execute("ALTER TABLE manual_actions ADD COLUMN fence_id TEXT NOT NULL DEFAULT ''")
             conn.execute("ALTER TABLE manual_actions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
+        if "effect_id" not in columns:
+            conn.execute("ALTER TABLE manual_actions ADD COLUMN effect_id TEXT NOT NULL DEFAULT ''")
         return conn
 
     def _reserve(self, principal_id: str, key_hash: str, payload_hash: str, intent: dict, fence_id: str) -> dict:
+        effect_id = _effect_id(intent)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -197,30 +217,30 @@ class ManualActions:
                 conn.execute("COMMIT")
                 return recovered
             unresolved = conn.execute(
-                "SELECT * FROM manual_actions WHERE fence_id=? AND state IN ('PENDING','UNKNOWN') ORDER BY generation",
-                (fence_id,),
+                "SELECT * FROM manual_actions WHERE effect_id=? AND state IN ('PENDING','IN_FLIGHT','UNKNOWN') ORDER BY generation",
+                (effect_id,),
             ).fetchone()
             if unresolved is not None:
                 self._recover(conn, unresolved)
                 still = conn.execute(
-                    "SELECT 1 FROM manual_actions WHERE fence_id=? AND state IN ('PENDING','UNKNOWN')",
-                    (fence_id,),
+                    "SELECT 1 FROM manual_actions WHERE effect_id=? AND state IN ('PENDING','IN_FLIGHT','UNKNOWN')",
+                    (effect_id,),
                 ).fetchone()
                 if still is not None:
                     conn.execute("COMMIT")
                     return {"kind": "blocked"}
             generation = conn.execute(
-                "SELECT COALESCE(MAX(generation), 0) AS generation FROM manual_actions WHERE fence_id=?",
-                (fence_id,),
+                "SELECT COALESCE(MAX(generation), 0) AS generation FROM manual_actions WHERE effect_id=?",
+                (effect_id,),
             ).fetchone()["generation"] + 1
             operation_id = _operation_id(fence_id, generation)
             conn.execute(
                 """
                 INSERT INTO manual_actions(
-                    operation_id, fence_id, generation, principal_id, key_hash, payload_hash, intent_json, state, result_json
-                ) VALUES(?,?,?,?,?,?,?,'PENDING',NULL)
+                    operation_id, fence_id, effect_id, generation, principal_id, key_hash, payload_hash, intent_json, state, result_json
+                ) VALUES(?,?,?,?,?,?,?,?,'PENDING',NULL)
                 """,
-                (operation_id, fence_id, generation, principal_id, key_hash, payload_hash, _dump(intent)),
+                (operation_id, fence_id, effect_id, generation, principal_id, key_hash, payload_hash, _dump(intent)),
             )
             conn.execute("COMMIT")
             return {"kind": "reserved", "operation_id": operation_id, "generation": generation}
@@ -243,6 +263,7 @@ class ManualActions:
             candidate_digest=intent.get("digest") or "",
             repo_id=intent.get("repo_id") or "",
             app_id=intent.get("app_id") or "",
+            authority=_execution_authority(intent),
         )
         if receipt.get("status") == "applied":
             body = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
@@ -256,13 +277,34 @@ class ManualActions:
             )
             self._mark(conn, row, "SETTLED", result)
             return {"kind": "replay", "result": result}
+        if row["state"] == "IN_FLIGHT":
+            return {"kind": "blocked"}
         if row["state"] == "SETTLED" and row["result_json"]:
             return {"kind": "replay", "result": json.loads(row["result_json"])}
-        if receipt.get("status") == "absent" and row["state"] in {"PENDING", "UNKNOWN"}:
+        if receipt.get("status") == "absent" and row["state"] == "PENDING":
             return {"kind": "retry", "operation_id": row["operation_id"], "generation": row["generation"]}
         if row["result_json"]:
             return {"kind": "replay", "result": json.loads(row["result_json"])}
         return {"kind": "replay", "result": _result(409, "SIDE_EFFECT_UNKNOWN", "The action result is unknown.", state="UNKNOWN", replayed=True)}
+
+    def _claim(self, principal_id: str, key_hash: str) -> bool:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE manual_actions SET state='IN_FLIGHT'
+                WHERE principal_id=? AND key_hash=? AND state='PENDING'
+                """,
+                (principal_id, key_hash),
+            )
+            conn.execute("COMMIT")
+            return cursor.rowcount == 1
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     def _mark(self, conn, row, state: str, result: dict) -> None:
         conn.execute(
@@ -278,7 +320,7 @@ class ManualActions:
         try:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
-                "UPDATE manual_actions SET state=?, result_json=? WHERE principal_id=? AND key_hash=? AND state='PENDING'",
+                "UPDATE manual_actions SET state=?, result_json=? WHERE principal_id=? AND key_hash=? AND state IN ('PENDING','IN_FLIGHT')",
                 (state, _dump(produced), principal_id, key_hash),
             )
             if cursor.rowcount != 1:
@@ -483,6 +525,17 @@ def _object_digest(body: dict) -> str:
 def _fence_id(intent: dict) -> str:
     encoded = {key: intent.get(key) for key in _FENCE_FIELDS}
     return hashlib.sha256(_dump(encoded).encode()).hexdigest()
+
+
+def _effect_id(intent: dict) -> str:
+    encoded = {key: intent.get(key) for key in _EFFECT_FIELDS}
+    return hashlib.sha256(_dump(encoded).encode()).hexdigest()
+
+
+def _execution_authority(intent: dict) -> str:
+    if intent.get("action") in _SCHEDULER and intent.get("chain_id"):
+        return "W04"
+    return ""
 
 
 def _operation_id(fence_id: str, generation: int) -> str:

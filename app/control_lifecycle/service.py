@@ -1,5 +1,6 @@
 """Isolated lifecycle plans. Execution of host installers stays denied."""
 
+import fcntl
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import stat
 from pathlib import Path
 
 from app.control_diagnostics.safe_io import UnsafePath, open_root, proc_fd_path
+from app.control_lifecycle.flags import HOST_MUTATION, REAL_INSTALL, REAL_UNINSTALL
 from app.control_lifecycle.errors import LifecycleError
 from app.control_lifecycle.fdpath import containment_holds, fd_namespace, string_map_is_safe_path_resolution
 from app.control_lifecycle.grant import DenyAllAuthorizationPort, W02AuthorizationPort
@@ -580,6 +582,8 @@ class LifecycleService:
         ]
 
         def effect():
+            if REAL_UNINSTALL or REAL_INSTALL or HOST_MUTATION:
+                return _outcome("EXECUTION_DENIED", 403, False, "real cleanup is disabled", {"commands": []})
             if "replace_with_symlink_before_unlink" in self.host.faults:
                 self._swap_inventory_symlink(present[0]["relative"] if present else identities[0]["relative"], "keeper.txt")
             removed = []
@@ -937,11 +941,24 @@ class LifecycleService:
             os.close(directory)
 
     def _unlink_inventory(self, relative, inode, device):
-        directory = self._open_inventory()
+        """Unlink one inventory name under the exclusive-directory write fence.
+
+        The descriptor is not authority to unlink the name later. A replacement
+        can occupy that name before ``unlink``, and a following ``nlink`` check
+        cannot restore the file that was removed. Real cleanup stays disabled.
+        """
+
+        if REAL_UNINSTALL or REAL_INSTALL or HOST_MUTATION:
+            return "unsafe"
+        directory = self._open_exclusive_inventory()
         if directory is None:
-            return "unknown"
+            return "unsafe"
+        fence = None
         fd = None
         try:
+            fence = self._inventory_fence(directory)
+            if fence is None:
+                return "unsafe"
             fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
             current = os.fstat(fd)
             if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
@@ -955,13 +972,19 @@ class LifecycleService:
                 return "unsafe"
             if not containment_holds(base, located):
                 return "unsafe"
-            directory_info = os.fstat(directory)
-            if not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_mode & 0o022:
+            if "replace_after_open" in self.host.faults:
+                self._plant_replacement(directory, relative, "keeper.txt")
+            name_info = os.lstat(relative, dir_fd=directory)
+            if (
+                not stat.S_ISREG(name_info.st_mode)
+                or stat.S_ISLNK(name_info.st_mode)
+                or name_info.st_nlink != 1
+                or name_info.st_ino != inode
+                or name_info.st_dev != device
+                or name_info.st_ino != current.st_ino
+            ):
                 return "unsafe"
             os.unlink(relative, dir_fd=directory)
-            after = os.fstat(fd)
-            if after.st_ino != inode or after.st_dev != device or after.st_nlink != 0:
-                return "unknown"
             os.fsync(directory)
             return "removed"
         except OSError:
@@ -969,7 +992,63 @@ class LifecycleService:
         finally:
             if fd is not None:
                 os.close(fd)
+            if fence is not None:
+                try:
+                    fcntl.flock(fence, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fence)
             os.close(directory)
+
+    def _open_exclusive_inventory(self):
+        directory = self._open_inventory()
+        if directory is None:
+            return None
+        info = os.fstat(directory)
+        if info.st_uid != os.getuid() or not stat.S_ISDIR(info.st_mode):
+            os.close(directory)
+            return None
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            try:
+                os.fchmod(directory, 0o700)
+            except OSError:
+                os.close(directory)
+                return None
+            info = os.fstat(directory)
+            if stat.S_IMODE(info.st_mode) != 0o700:
+                os.close(directory)
+                return None
+        return directory
+
+    def _inventory_fence(self, directory):
+        try:
+            fence = os.open(
+                ".write-fence",
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=directory,
+            )
+        except OSError:
+            return None
+        info = os.fstat(fence)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_ISLNK(info.st_mode):
+            os.close(fence)
+            return None
+        try:
+            os.fchmod(fence, 0o600)
+            fcntl.flock(fence, fcntl.LOCK_EX)
+        except OSError:
+            os.close(fence)
+            return None
+        return fence
+
+    def _plant_replacement(self, directory, relative, keeper):
+        """Deterministic stand-in for a name swap after the descriptor is open."""
+
+        try:
+            os.rename(keeper, relative, src_dir_fd=directory, dst_dir_fd=directory)
+        except OSError:
+            return
 
     def _swap_inventory_symlink(self, relative, keeper):
         directory = self._open_inventory()

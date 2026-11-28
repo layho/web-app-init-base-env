@@ -1683,6 +1683,38 @@ class ReviewCounterexampleTests(LifecycleCase):
         self.assertEqual(keeper.read_text(encoding="utf-8"), "keep")
         self.assertFalse(swapped.host_side_effect)
 
+    def test_replacement_after_open_is_not_deleted(self):
+        from app.control_lifecycle.flags import HOST_MUTATION, REAL_INSTALL, REAL_UNINSTALL
+
+        self.assertFalse(REAL_UNINSTALL)
+        self.assertFalse(REAL_INSTALL)
+        self.assertFalse(HOST_MUTATION)
+        svc, host = self.service()
+        owned = self.inventory / "owned.txt"
+        keeper = self.inventory / "keeper.txt"
+        owned.write_text("owned", encoding="utf-8")
+        keeper.write_text("keep", encoding="utf-8")
+        observed = self.call(
+            svc,
+            "resource.observe",
+            "idem-replace-observe",
+            resources=[{"resource_id": "owned", "kind": "file", "owner": APP, "relative": "owned.txt"}],
+        )
+        host.faults.add("replace_after_open")
+        replaced = self.call(
+            svc,
+            "cleanup.synthetic",
+            "idem-replace-clean",
+            revision=observed.revision,
+            run_id="run-replace",
+            resource_ids=["owned"],
+        )
+        self.assertNotEqual(replaced.code, "OK")
+        self.assertFalse(replaced.ok)
+        self.assertFalse(replaced.host_side_effect)
+        self.assertEqual(owned.read_text(encoding="utf-8"), "keep")
+        self.assertFalse(keeper.exists())
+
     def test_authorized_cross_app_port_conflict_blocks(self):
         from app.control_lifecycle.grant import ServerPolicy, W02AuthorizationPort
 

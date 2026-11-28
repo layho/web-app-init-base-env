@@ -1,11 +1,11 @@
 """W01 read port for the joint board.
 
 A stored payload digest is not a trusted source. A row is minted only after
-the signature verifies against the server registry, the append nonce binds
-that principal to the event digest, and ``authorize_source`` agrees with the
-server source recorded for the principal's kind. ``applied`` alone is not
-verification. Corruption that cannot be attributed to the caller's repository
-and application is not counted in the returned page.
+the signature verifies over the W02 proof bytes rebuilt from this event.
+``authority_json`` fields such as ``authorized`` and ``signed`` are not that
+document. ``applied`` alone is not verification. Corruption that cannot be
+attributed to the caller's repository and application is not counted in the
+returned page.
 """
 
 from __future__ import annotations
@@ -15,11 +15,22 @@ import sqlite3
 import stat
 from pathlib import Path
 
+from app.control_authz.canonical import (
+    PROOF_DOMAIN,
+    PROOF_FIELDS,
+    CanonicalError,
+    idempotency_digest,
+    parse_canonical,
+    payload_hash,
+    proof_message,
+    scope_digest,
+)
 from app.control_authz.errors import AuthnError
 from app.control_authz.principal import SOURCE_BY_KIND
 from app.control_authz.proof import verify_signature
 from app.control_diagnostics.safe_io import UnsafePath, lstat_at, open_root, read_bounded
 from app.control_diagnostics.sqlite_fd import verified_sqlite_copy
+from app.control_events.auth_bind import document_for_event
 from app.control_events.engine import _identity
 from app.control_events.errors import ControlError
 from app.control_events.redact import redact
@@ -222,58 +233,122 @@ def _mint(connection, row, payload, registry):
 
 
 def _verdict(connection, row, payload, registry, digest):
+    """Verify the signature over the proof rebuilt from this event.
+
+    ``authorized`` and the stored ``signed`` object are writable columns.
+    They are not the W02 plaintext and they are not the historical decision.
+    """
+
     try:
         authority = json.loads(row["authority_json"]) if isinstance(row["authority_json"], str) else None
     except (TypeError, ValueError):
         return None
-    if not isinstance(authority, dict) or authority.get("authorized") is not True:
+    if not isinstance(authority, dict):
         return None
-    if authority.get("event_digest") != digest:
+    signature = authority.get("signature")
+    message_hex = authority.get("message_hex")
+    if not isinstance(signature, str) or not isinstance(message_hex, str):
         return None
-    principal_id = authority.get("principal_id")
-    record = registry.get(principal_id) if isinstance(principal_id, str) else None
+    try:
+        raw = bytes.fromhex(message_hex)
+    except ValueError:
+        return None
+    signed = _proof_plaintext(raw)
+    if signed is None or signed["operation"] != "event.append" or signed["alg"] != "ed25519":
+        return None
+    principal_id = signed["signer_id"]
+    record = registry.get(principal_id) if isinstance(principal_id, str) and principal_id else None
     if not isinstance(record, dict):
         return None
     server_source = SOURCE_BY_KIND.get(record.get("kind"))
     if not isinstance(server_source, str) or not server_source or server_source == "authoritative":
         return None
-    if authority.get("server_source") != server_source:
-        return None
-    if authority.get("signer_id") != principal_id or authority.get("key_id") != record.get("key_id"):
-        return None
-    signature = authority.get("signature")
-    message_hex = authority.get("message_hex")
     public = record.get("public_key")
-    if not isinstance(signature, str) or not isinstance(message_hex, str) or not isinstance(public, str):
+    if signed["key_id"] != record.get("key_id") or signed["declared_id"] != principal_id or not isinstance(public, str):
         return None
     try:
-        verify_signature(public, signature, bytes.fromhex(message_hex))
-    except (AuthnError, ValueError):
-        return None
-    signed = authority.get("signed")
-    if not isinstance(signed, dict):
-        return None
-    for key in ("repo_id", "app_id", "task_id", "candidate_id", "head", "base", "merge", "tree", "stream_id", "producer_id"):
-        expected = signed.get(key) or ""
-        actual = payload.get(key) or ""
-        if expected != actual:
+        document = document_for_event(
+            payload,
+            operation="event.append",
+            authorizer=principal_id,
+            path="/api/v1/control/events",
+        )
+        if signed["payload_hash"] != payload_hash("event.append", document):
             return None
-    nonce = connection.execute(
-        """
-        SELECT 1 FROM consumed_nonces
-        WHERE principal_id=? AND payload_hash=? AND operation='event.append'
-        """,
-        (principal_id, digest),
-    ).fetchone()
-    if nonce is None:
+        if signed["scope"] != scope_digest(document["scope"]):
+            return None
+    except CanonicalError:
+        return None
+    for name in ("repo_id", "object_id", "candidate_id", "head", "base", "merge", "tree"):
+        if signed[name] != document[name]:
+            return None
+    if signed["policy_revision"] != str(document["policy_revision"]):
+        return None
+    if not _nonce_binds(connection, record, principal_id, signed["nonce"], digest):
         return None
     try:
+        verify_signature(public, signature, raw)
         decided = authorize_source(dict(payload), server_source)
-    except ControlError:
-        return None
-    if bool(authority.get("authoritative")) != bool(decided):
+    except (AuthnError, ControlError, ValueError):
         return None
     return server_source, bool(decided)
+
+
+def _proof_plaintext(raw: bytes):
+    """Rebuild the W02 proof message and require the stored bytes to match."""
+
+    try:
+        parsed = parse_canonical(raw)
+    except CanonicalError:
+        return None
+    if len(parsed) < 2 or parsed[0] != ("version", "v1") or parsed[1] != ("domain", PROOF_DOMAIN):
+        return None
+    names = [name for name, _value in parsed[2:]]
+    if names != list(PROOF_FIELDS):
+        return None
+    fields = {name: value for name, value in parsed[2:]}
+    try:
+        rebuilt = proof_message(fields)
+    except CanonicalError:
+        return None
+    if rebuilt != raw:
+        return None
+    return fields
+
+
+def _nonce_binds(connection, record, principal_id: str, nonce: str, digest: str) -> bool:
+    """The nonce inside the signature must be the one consumed for this digest."""
+
+    if not isinstance(nonce, str) or not nonce:
+        return False
+    try:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    except sqlite3.Error:
+        return False
+    if "consumed_nonces" not in tables:
+        return False
+    slot = idempotency_digest(
+        principal_id=principal_id,
+        kind="nonce",
+        repo_id=record.get("repo_id") if isinstance(record.get("repo_id"), str) else "",
+        app_id=record.get("app_id") if isinstance(record.get("app_id"), str) else "",
+        producer_id=record.get("producer_id") if isinstance(record.get("producer_id"), str) else "",
+        stream_id=record.get("stream_id") if isinstance(record.get("stream_id"), str) else "",
+        task_id="",
+        credential_scope="",
+        phase="",
+        object_id="",
+        operation="nonce",
+        idempotency_key=nonce,
+        target_app_id="",
+    )
+    row = connection.execute(
+        "SELECT payload_hash, operation, principal_id FROM consumed_nonces WHERE slot=?",
+        (slot,),
+    ).fetchone()
+    if row is None:
+        return False
+    return row["payload_hash"] == digest and row["operation"] == "event.append" and row["principal_id"] == principal_id
 
 
 def _page(items, *, truncated, next_rowid, bad, missing):

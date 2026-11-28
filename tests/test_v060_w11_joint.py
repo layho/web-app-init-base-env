@@ -153,7 +153,8 @@ class JointTests(unittest.TestCase):
                 "idempotency_key": raw,
                 "expected_revision": 1,
             })
-            self.assertEqual(first["http"], 202, first)
+            self.assertEqual(first["code"], "SIDE_EFFECT_UNKNOWN", first)
+            self.assertEqual(first["http"], 409)
             self.assertFalse(first["accepted_as_success"])
             mismatch = actions.submit(principal, {
                 "action": "unblock",
