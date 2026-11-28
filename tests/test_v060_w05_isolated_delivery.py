@@ -683,6 +683,53 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertFalse(self.svc.project(actor=self.actor, task_id="tsk_w05", scope=self.scope).ok)
         self.assertNotIn("app_id", self.svc.store.read("task", "tsk_w05"))
 
+    def test_task_claim_rejects_duplicate_chain_before_staging(self):
+        self._submit("fb_duplicate_chain")
+        original = self.svc.store.read("feedback", "fb_duplicate_chain")
+        before = list(self.events.events)
+        outbox_before = self.svc.store.list("outbox")
+        result = self.svc.claim_task(
+            actor=self.actor, scope=self.scope, task_id="tsk_w05",
+            feedback_ids=["fb_duplicate_chain"],
+            chains=[self._chain("ch_a", "a"), self._chain("ch_a", "b")],
+            idempotency_key="duplicate-chain", expected_revision=0)
+        self.assertEqual(result.code, "SCHEMA_UNSUPPORTED")
+        self.assertIsNone(self.svc.store.read("task", "tsk_w05"))
+        self.assertIsNone(self._read_chain("tsk_w05", "ch_a"))
+        self.assertEqual(self.svc.store.read("feedback", "fb_duplicate_chain"), original)
+        self.assertEqual(self.svc.store.list("outbox"), outbox_before)
+        self.assertEqual(self.events.events, before)
+
+    def test_pending_outbox_scope_and_event_fields_cannot_be_substituted(self):
+        append = self.events.append
+
+        def crash(event):
+            raise RuntimeError("interrupt before dispatch")
+
+        self.events.append = crash
+        with self.assertRaisesRegex(RuntimeError, "interrupt before dispatch"):
+            self._submit("fb_bound")
+        saved, = self.svc.store.list("outbox")
+        event_id = saved["event_id"]
+        self.events.append = append
+        for patch in (
+            {"repo_id": "other/repo"}, {"app_id": "other"}, {"task_id": "tsk_foreign"},
+            {"operation": "task.close"}, {"state": "PUBLISHED"}, {"epoch_closed": True},
+            {"producer_seq": True}, {"stream_epoch": 0},
+        ):
+            with self.subTest(patch=patch):
+                corrupted = {**saved, "event": {**saved["event"], **patch}}
+                self.svc.store.write("outbox", event_id, corrupted)
+                result = self._submit("fb_bound", expect_success=False)
+                self.assertEqual(result.body["reason"], "outbox_intent_mismatch")
+                self.assertEqual(self.events.events, [])
+                self.assertIsNone(self.svc.store.read("feedback", "fb_bound"))
+        self.svc.store.write("outbox", event_id, saved)
+        self.clock.advance(30)
+        self._submit("fb_bound")
+        self.assertEqual(len(self.events.events), 1)
+        self.assertEqual(self.events.events[0], saved["event"])
+
     def test_task_claim_rejects_foreign_or_missing_feedback_atomically(self):
         self._submit("fb_local")
         for reason, changes, expected in (
