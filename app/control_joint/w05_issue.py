@@ -38,6 +38,69 @@ def issue_w05_receipt(
     return {"status": "unknown", "wrote": False, "reason": "BUSINESS_TRANSACTION_REQUIRED"}
 
 
+def record_isolated_intent(engine, *, event: dict, sign_request) -> dict:
+    """Send a staged W05 intent to the real isolated W01/W02 engine.
+
+    The signer is supplied by server configuration, not request JSON. An
+    accepted intent only proves that exact signed evidence is in W01; it is
+    NOT a business commit receipt, permission to retry, or publish approval.
+    The original W05 outbox remains unchanged.
+    """
+    from app.control_delivery.ports import event_payload_digest
+    from app.control_events.auth_bind import event_business_digest
+    from app.control_events.engine import Engine
+    from app.control_events.errors import ControlError
+    from app.control_events.schema import split_request
+    from app.control_events.trusted_read import query_exact_event
+    from datetime import datetime, timezone
+
+    unknown = {"status": "unknown", "business_committed": False, "production_effective": False}
+    if (not isinstance(engine, Engine) or not engine.isolated
+            or engine.production_protocol_enabled or not callable(sign_request)
+            or not isinstance(event, dict) or event.get("repo_id") != engine.repo_id
+            or event.get("producer_id") != "w05" or event.get("stream_id") != "w05:task"):
+        return unknown
+    try:
+        note = event["note"]
+        digest = event_payload_digest(event)
+        # The original intent digest alone is not enough to bind the outbox
+        # coordinates. Sign both in separate schema-defined fields.
+        body = {
+            "schema_version": 2, "event_type": "delivery.intent.recorded",
+            "event_class": "evidence", "event_id": event["event_id"],
+            "repo_id": event["repo_id"], "app_id": event["app_id"],
+            "task_id": event["task_id"], "producer_id": "w05", "stream_id": "w05:task",
+            "stream_epoch": event["stream_epoch"], "producer_seq": event["producer_seq"],
+            "occurred_at": datetime.fromtimestamp(event["occurred_at"], timezone.utc).isoformat(),
+            "idempotency_key": digest, "expected_revision": 0,
+            "run_id": event["run_id"], "evidence_ref": note, "note": note,
+            "scope": {"repo": event["repo_id"], "task_id": event["task_id"]},
+            "authorizer": "w05",
+        }
+        expected = split_request({**body, "actor": {"id": "w05"}})
+        expected_digest = event_business_digest(expected)
+        # The signing callback may add only the actor/proof envelope.
+        signed = sign_request(dict(body))
+        if event_business_digest(split_request(signed)) != expected_digest:
+            return unknown
+        response = engine.append(signed)
+        if response.get("http") != 200 or response.get("applied") is not True:
+            return unknown
+        stored = query_exact_event(engine.root, event_id=body["event_id"],
+                                   repo_id=body["repo_id"], app_id=body["app_id"],
+                                   task_id=body["task_id"])
+        if (not isinstance(stored, dict)
+                or stored.get("event_type") != body["event_type"]
+                or stored.get("read_receipt", {}).get("server_source") != "app_service"
+                or event_business_digest(stored) != expected_digest):
+            return unknown
+        return {"status": "intent_verified", "event_id": body["event_id"],
+                "event_digest": digest, "w01_receipt": stored["read_receipt"],
+                "business_committed": False, "production_effective": False}
+    except (ControlError, KeyError, TypeError, ValueError, OverflowError, OSError):
+        return unknown
+
+
 def issuance_digest(
     *,
     operation_id: str,
