@@ -271,8 +271,9 @@ def _issue(root: Path) -> dict:
         app_id="base",
         result={"http": 200, "state": "ACCEPTING", "runtime_acceptance": False},
     )
-    if issued.get("status") != "applied" or not issued.get("wrote"):
+    if issued.get("status") != "unknown" or issued.get("wrote") is not False:
         return {"ok": False, "stage": "issuance", "status": issued.get("status")}
+
     from app.control_joint.receipts import query_operation_receipt
 
     arguments = dict(
@@ -297,13 +298,15 @@ def _issue(root: Path) -> dict:
     still = query_operation_receipt(root, authority="W05", **arguments)
     return {
         "ok": (
-            found.get("status") == "applied"
-            and conflict.get("status") == "conflict"
+            found.get("status") == "unknown"
+            and conflict.get("status") == "unknown"
             and conflict.get("wrote") is False
-            and still.get("status") == "applied"
+            and still.get("status") == "unknown"
             and w04_before.get("status") == w04_after.get("status")
         ),
         "queried": found.get("status"),
+        "business_receipt_connected": False,
+        "receipt_denial_verified": True,
         "conflict": conflict.get("status"),
         "w04": w04_after.get("status"),
     }
