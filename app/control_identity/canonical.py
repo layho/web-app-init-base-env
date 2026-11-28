@@ -1,0 +1,41 @@
+"""Re-export the shared W00 canonical encoding."""
+
+from app.control_authz.canonical import (
+    DOMAIN,
+    PAYLOAD_DOMAIN,
+    PAYLOAD_FIELDS,
+    PROOF_DOMAIN,
+    PROOF_FIELDS,
+    UNIT,
+    candidate_id_for,
+    canonical_bytes,
+    canonical_query,
+    idempotency_digest,
+    parse_canonical,
+    payload_hash,
+    payload_values,
+    proof_message,
+    rate_limit_key,
+    scope_digest,
+    secret_digest,
+)
+
+__all__ = [
+    "DOMAIN",
+    "PAYLOAD_DOMAIN",
+    "PAYLOAD_FIELDS",
+    "PROOF_DOMAIN",
+    "PROOF_FIELDS",
+    "UNIT",
+    "candidate_id_for",
+    "canonical_bytes",
+    "canonical_query",
+    "idempotency_digest",
+    "parse_canonical",
+    "payload_hash",
+    "payload_values",
+    "proof_message",
+    "rate_limit_key",
+    "scope_digest",
+    "secret_digest",
+]
