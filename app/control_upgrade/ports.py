@@ -24,11 +24,64 @@ class ServerClock:
         return self._now
 
 
+class ServerPrincipal:
+    """W02 server principal.
+
+    The server builds this object. A request actor id is not a principal and
+    cannot fill these fields. ``server_assigned`` stays false unless this
+    constructor sets it.
+    """
+
+    def __init__(self, *, principal_id, kind, repo_id, tasks, trusted_source, app_id="", app_ids=None, producer_id="w08", stream_id="upgrade"):
+        self.principal_id = principal_id
+        self.kind = kind
+        self.repo_id = repo_id
+        self.producer_id = producer_id
+        self.stream_id = stream_id
+        self.tasks = frozenset(tasks)
+        self.trusted_source = trusted_source
+        self.server_assigned = True
+        if app_ids is None:
+            app_ids = () if app_id == "" else (app_id,)
+        self.app_ids = frozenset(app_ids)
+        self.app_id = app_id if app_id else (next(iter(self.app_ids)) if len(self.app_ids) == 1 else "")
+
+
+class ServerManifest:
+    """Server-held ownership, diff, and isolation snapshot.
+
+    Callers cannot submit this object. It is not repository proof of a live
+    tree and it is not runtime proof.
+    """
+
+    def __init__(self, *, candidate, allowlist, changes, observed_files, peers, repository_sha=None, repository_version=None, source_id="w08-server-manifest", observed_at=None):
+        self.candidate = {
+            "head": None if not isinstance(candidate, dict) else candidate.get("head"),
+            "base": None if not isinstance(candidate, dict) else candidate.get("base"),
+            "merge": None if not isinstance(candidate, dict) else candidate.get("merge"),
+            "tree": None if not isinstance(candidate, dict) else candidate.get("tree"),
+        }
+        self.allowlist = list(allowlist or [])
+        self.changes = list(changes or [])
+        self.observed_files = list(observed_files or [])
+        self.peers = peers
+        self.repository_sha = repository_sha
+        self.repository_version = repository_version
+        self.source_id = source_id
+        self.observed_at = observed_at
+        self.server_controlled = True
+        self.not_runtime_proof = True
+
+
 class Grant:
-    def __init__(self, principal_id, app_id, action):
+    def __init__(self, principal_id, app_id, action, *, repo=None, task_id=None, candidate_id=None, plan_id=None):
         self.principal_id = principal_id
         self.app_id = app_id
         self.action = action
+        self.repo = repo
+        self.task_id = task_id
+        self.candidate_id = candidate_id
+        self.plan_id = plan_id
 
 
 class _Fixture:
@@ -42,7 +95,12 @@ class _Fixture:
         self.calls.append({"method": "read", "app_id": app_id, "candidate_id": candidate_id})
         data = dict(self.report)
         data["runtime_evidence"] = False
+        data["runtime_proof"] = False
+        data["macci_proof"] = False
         data["synthetic"] = True
+        data["test_double"] = True
+        data["not_runtime_proof"] = True
+        data["proof_label"] = "test_double_not_runtime_proof"
         data.setdefault("status", "test_double")
         data.setdefault("evidence_state", "present")
         return data

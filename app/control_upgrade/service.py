@@ -19,10 +19,9 @@ from app.control_upgrade.flags import (
 )
 from app.control_upgrade.store import Journal
 from app.control_upgrade.versions import (
+    VERSION_RE,
     cache_is_stale,
-    identify_declared,
     identify_scheduler,
-    repository_view,
     sha_view,
     valid_sha,
 )
@@ -50,6 +49,24 @@ BLOCKING = {
     "ambiguous",
     "unknown_path",
     "previous_healthy_unproven",
+    "server_manifest_missing",
+    "manifest_candidate_mismatch",
+    "manifest_source_missing",
+    "evidence_unlabeled",
+}
+
+TUPLE_FIELDS = ("head", "base", "merge", "tree")
+SOURCE_BY_KIND = {
+    "core_session": "core_session",
+    "app_service": "app_service",
+    "agent": "agent",
+    "macci": "macci",
+    "publisher": "publisher",
+    "host": "host_deployer",
+    "hostops": "hostops_readonly",
+    "user_acceptance": "user_acceptance",
+    "candidate": "candidate",
+    "policy_service": "policy_service",
 }
 
 
@@ -71,7 +88,7 @@ def _usable(component):
 
 
 class UpgradeService:
-    def __init__(self, root=None, *, clock, build, schedule, delivery, diagnostics, deploy, grants):
+    def __init__(self, root=None, *, clock, build, schedule, delivery, diagnostics, deploy, grants, principal=None, manifest=None):
         self.clock = clock
         self.build = build
         self.schedule = schedule
@@ -79,6 +96,8 @@ class UpgradeService:
         self.diagnostics = diagnostics
         self.deploy = deploy
         self.grants = list(grants or [])
+        self.principal = principal
+        self.manifest = manifest
         self.journal = Journal(root)
         self._sequence = 0
 
@@ -153,24 +172,20 @@ class UpgradeService:
             return opened
         fresh = self._fresh_components(request)
         cached = self.journal.get_cache(request["app_id"])
-        now = self.clock.now()
-        age = None
-        if cached is not None and isinstance(cached.get("stored_at"), str):
-            age = (now - datetime.fromisoformat(cached["stored_at"])).total_seconds()
         components = {}
         for name, component in fresh.items():
-            if _usable(component) or cached is None or not _usable(cached.get("components", {}).get(name, {})):
+            if _usable(component):
                 chosen = dict(component)
+                chosen["stale"] = False
             else:
-                chosen = dict(cached["components"][name])
-                chosen["source"] = "cache"
-                chosen["stale"] = cache_is_stale(0 if age is None else age)
+                chosen = self._cached_component(cached, name)
+                if chosen.get("source") != "cache":
+                    chosen = dict(component)
+                    chosen["stale"] = False
             components[name] = chosen
         repository_sha = components["repository"].get("sha")
         running_sha = components["running"].get("sha")
         components["running"]["matches_repository"] = bool(repository_sha and running_sha and repository_sha == running_sha)
-        snapshot = {"stored_at": now.isoformat(), "components": components}
-        self.journal.put_cache(request["app_id"], snapshot)
         port_running = fresh["running"].get("sha")
         claim = request.get("running_sha") if "running_sha" in request else None
         return self._public({
@@ -179,8 +194,8 @@ class UpgradeService:
             "state": "STATUS",
             "message": "Component versions are separate observations.",
             "components": components,
-            "stored_at": snapshot["stored_at"],
             "caller_claim_ignored": "running_sha" in request and claim != port_running,
+            "caller_declaration_ignored": request.get("declared") is not None,
             "collapsed": False,
             "journal_recorded": False,
         })
@@ -242,13 +257,11 @@ class UpgradeService:
         if report.get("status") == "BLOCKED":
             return self._error(409, "DEPENDENCY_UNSATISFIED", "The deploy port is not available on this isolated tree.")
         state, claims_commit = self._effect_state(plan, report)
-        plan["state"] = state
-        plan["revision"] = plan["revision"] + 1
-        plan["accepted_commit"] = False
-        plan["port_claims_commit"] = claims_commit
-        self.journal.put_plan(plan)
         original = {"state": state, "plan_id": plan["plan_id"], "http": 200, "code": None}
-        self._remember(request, "reconcile", plan["plan_id"], original)
+        outcome = self._cas_reconcile(request, plan["plan_id"], state, claims_commit, original)
+        replayed = self._cas_replay(outcome, request, "reconcile")
+        if replayed is not None:
+            return replayed
         return self._public({
             "http": 200,
             "code": None,
@@ -297,13 +310,22 @@ class UpgradeService:
         body["previous_healthy_sha"] = port_sha
         body["caller_sha_ignored"] = caller_ignored
         body["recovers_plan_id"] = plan["plan_id"]
-        return self._store_plan(request, "recover", body, recovers_plan_id=plan["plan_id"], previous_healthy_sha=port_sha, caller_sha_ignored=caller_ignored)
+        return self._store_plan(
+            request,
+            "recover",
+            body,
+            recovers_plan_id=plan["plan_id"],
+            previous_healthy_sha=port_sha,
+            caller_sha_ignored=caller_ignored,
+            source_plan_id=plan["plan_id"],
+            source_revision=plan["revision"],
+        )
 
     def _fresh_components(self, request):
         app_id = request["app_id"]
         candidate = request.get("candidate") if isinstance(request.get("candidate"), dict) else {}
         computed = None
-        if all(valid_sha(candidate.get(name)) for name in ("head", "base", "merge", "tree")):
+        if all(valid_sha(candidate.get(name)) for name in TUPLE_FIELDS):
             computed = candidate_id(
                 request["scope"]["repo"],
                 request["scope"]["task_id"],
@@ -317,12 +339,7 @@ class UpgradeService:
         delivery = self.delivery.read(app_id=app_id, candidate_id=computed)
         diagnostic = self.diagnostics.read(app_id=app_id, candidate_id=computed)
         runtime = self.deploy.read(app_id=app_id, candidate_id=computed)
-        repository = repository_view(identify_declared(request.get("declared")))
-        if repository["state"] != "identified":
-            cached = self.journal.get_cache(app_id)
-            previous = None if cached is None else cached.get("components", {}).get("repository")
-            if previous and previous.get("state") == "identified":
-                repository = dict(previous)
+        repository = self._repository_component()
         running = sha_view(None if runtime.get("evidence_state") != "present" or runtime.get("status") == "BLOCKED" else runtime.get("running_sha"))
         running["matches_repository"] = repository.get("sha") == running.get("sha") and running.get("sha") is not None
         scheduler = identify_scheduler(schedule)
@@ -346,6 +363,56 @@ class UpgradeService:
             "launchd": launchd,
         }
 
+    def _repository_component(self):
+        unknown = {"sha": None, "version": None, "state": "unknown", "source": "unknown", "stale": False, "observed_at": None}
+        manifest = self.manifest
+        if manifest is None or getattr(manifest, "server_controlled", False) is not True:
+            return dict(unknown)
+        version = getattr(manifest, "repository_version", None)
+        sha = getattr(manifest, "repository_sha", None)
+        if not isinstance(version, str) or VERSION_RE.fullmatch(version) is None or not valid_sha(sha):
+            return dict(unknown)
+        return {
+            "sha": sha,
+            "version": version,
+            "state": "identified",
+            "source": "server_manifest",
+            "stale": False,
+            "observed_at": getattr(manifest, "observed_at", None),
+        }
+
+    def _cached_component(self, cached, name):
+        unknown = {"sha": None, "state": "unknown", "source": "unknown", "stale": False, "observed_at": None}
+        if name == "launchd":
+            unknown = {"running_sha": None, "state": "unknown", "source": "unknown", "stale": False, "observed_at": None}
+        previous = None
+        if isinstance(cached, dict):
+            sources = cached.get("sources")
+            if isinstance(sources, dict) and isinstance(sources.get(name), dict):
+                previous = dict(sources[name])
+        if previous is None or not _usable(previous):
+            return unknown
+        chosen = previous
+        chosen["source"] = "cache"
+        observed_at = chosen.get("observed_at")
+        if not isinstance(observed_at, str):
+            chosen["stale"] = True
+            chosen["state"] = "unknown"
+            chosen["observed_at"] = None
+            return chosen
+        try:
+            observed = datetime.fromisoformat(observed_at)
+            if observed.tzinfo is None:
+                raise ValueError(observed_at)
+            age = (self.clock.now() - observed).total_seconds()
+        except ValueError:
+            chosen["stale"] = True
+            chosen["state"] = "unknown"
+            return chosen
+        chosen["observed_at"] = observed_at
+        chosen["stale"] = cache_is_stale(age)
+        return chosen
+
     def _judge(self, request):
         app_id = request["app_id"]
         bound = self._bound_candidate(request)
@@ -357,24 +424,71 @@ class UpgradeService:
         delivery = self.delivery.read(app_id=app_id, candidate_id=computed)
         if build.get("status") == "BLOCKED" or delivery.get("status") == "BLOCKED":
             return {"error": self._error(409, "DEPENDENCY_UNSATISFIED", "A required port is not available on this isolated tree.")}
-        if self._candidate_stale(computed, tup, build, delivery):
+        if self._evidence_binding(build, tup, computed) == "stale" or self._evidence_binding(delivery, tup, computed) == "stale":
             return {"error": self._error(409, "CANDIDATE_STALE", "The candidate tuple does not match the recorded evidence.")}
         reasons = []
         decisions = []
         preserved = set()
-        allowlist = request.get("foundation_allowlist") if isinstance(request.get("foundation_allowlist"), list) else []
+        if request.get("copy_mode") == "blanket_frontend_src":
+            reasons.append("blanket_frontend_src_copy")
+        self._apply_manifest(app_id, tup, reasons, decisions, preserved)
+        labeled = _labeled_double(build) and _labeled_double(delivery)
+        if not labeled:
+            reasons.append("evidence_unlabeled")
+        else:
+            build_problem = _build_problem(build, self._evidence_binding(build, tup, computed))
+            if build_problem:
+                reasons.append(build_problem)
+            if valid_sha(build.get("target_sha")) and build.get("target_sha") != request.get("target_sha"):
+                reasons.append("version_mismatch")
+            if _macci_problem(delivery, self._evidence_binding(delivery, tup, computed)):
+                reasons.append("macci_not_success")
+        unique = sorted(set(reasons))
+        state = "BLOCKED" if reasons_block(unique) else "PLANNED"
+        body = {
+            "http": 200,
+            "code": None,
+            "state": state,
+            "message": "The plan is a check. It does not apply an upgrade.",
+            "reasons": unique,
+            "decisions": decisions,
+            "preserved": sorted(preserved),
+            "compatible": state == "PLANNED",
+            "mergeable_is_compatibility": False,
+            "candidate_id": computed,
+            "evidence_reused": False,
+            "isolation_proven": False,
+            "test_double_not_runtime_proof": labeled,
+            "journal_recorded": False,
+        }
+        return {"body": body}
+
+    def _apply_manifest(self, app_id, tup, reasons, decisions, preserved):
+        manifest = self.manifest
+        if manifest is None or getattr(manifest, "server_controlled", False) is not True:
+            reasons.append("server_manifest_missing")
+            return
+        source_id = getattr(manifest, "source_id", None)
+        if not isinstance(source_id, str) or not source_id:
+            reasons.append("manifest_source_missing")
+        candidate = getattr(manifest, "candidate", None)
+        if not isinstance(candidate, dict):
+            reasons.append("manifest_candidate_mismatch")
+            return
+        manifest_tuple = tuple(candidate.get(name) for name in TUPLE_FIELDS)
+        if manifest_tuple != tup:
+            reasons.append("manifest_candidate_mismatch")
+            return
+        allowlist = list(getattr(manifest, "allowlist", []) or [])
         problem = allowlist_problem(allowlist)
         if problem:
             reasons.append(problem)
-        if request.get("copy_mode") == "blanket_frontend_src":
-            reasons.append("blanket_frontend_src_copy")
-        changes = request.get("changes") if isinstance(request.get("changes"), list) else []
-        observed = request.get("observed_files") if isinstance(request.get("observed_files"), list) else []
+        changes = list(getattr(manifest, "changes", []) or [])
+        observed = list(getattr(manifest, "observed_files", []) or [])
         path_list = [item.get("path") for item in changes if isinstance(item, dict)] + list(observed)
         if case_collision(path_list):
             reasons.append("case_collision")
-        peer_reasons = isolation_reasons(request.get("peers"), app_id)
-        reasons.extend(peer_reasons)
+        reasons.extend(isolation_reasons(getattr(manifest, "peers", None), app_id))
         for path in observed:
             kind = classify_path(path, allowlist)
             if kind in PRESERVE:
@@ -420,32 +534,6 @@ class UpgradeService:
                     "applied": False,
                     "result": None,
                 })
-        if build.get("evidence_state") != "present":
-            reasons.append("build_evidence_missing")
-        elif build.get("frontend_failed") is True or build.get("exit_code") not in (0, None):
-            reasons.append("build_failed_not_compatible")
-        if valid_sha(build.get("target_sha")) and build.get("target_sha") != request.get("target_sha"):
-            reasons.append("version_mismatch")
-        if delivery.get("macci_state") != "success":
-            reasons.append("macci_not_success")
-        unique = sorted(set(reasons))
-        state = "BLOCKED" if reasons_block(unique) else "PLANNED"
-        body = {
-            "http": 200,
-            "code": None,
-            "state": state,
-            "message": "The plan is a check. It does not apply an upgrade.",
-            "reasons": unique,
-            "decisions": decisions,
-            "preserved": sorted(preserved),
-            "compatible": state == "PLANNED",
-            "mergeable_is_compatibility": False,
-            "candidate_id": computed,
-            "evidence_reused": False,
-            "isolation_proven": False,
-            "journal_recorded": False,
-        }
-        return {"body": body}
 
     def _bound_candidate(self, request):
         candidate = request.get("candidate")
@@ -462,16 +550,15 @@ class UpgradeService:
             return {"error": self._error(422, "SCHEMA_UNSUPPORTED", "The request was rejected.")}
         return {"candidate_id": computed, "tuple": tuple(fields)}
 
-    def _candidate_stale(self, computed, tup, build, delivery):
-        if delivery.get("evidence_state") == "present":
-            reported = (delivery.get("head"), delivery.get("base"), delivery.get("merge"), delivery.get("tree"))
-            if reported != tup:
-                return True
-            if delivery.get("candidate_id") not in (None, computed):
-                return True
-        if build.get("evidence_state") == "present" and build.get("candidate_id") not in (None, computed):
-            return True
-        return False
+    def _evidence_binding(self, report, tup, computed):
+        if report.get("evidence_state") != "present":
+            return "missing"
+        fields = tuple(report.get(name) for name in TUPLE_FIELDS)
+        if not all(valid_sha(item) for item in fields) or not isinstance(report.get("candidate_id"), str) or not report.get("candidate_id"):
+            return "unbound"
+        if fields != tup or report.get("candidate_id") != computed:
+            return "stale"
+        return "bound"
 
     def _effect_state(self, plan, report):
         port_state = report.get("state")
@@ -488,7 +575,7 @@ class UpgradeService:
             return plan["state"], False
         return "RECONCILE", False
 
-    def _store_plan(self, request, operation, body, *, recovers_plan_id, previous_healthy_sha, caller_sha_ignored=False):
+    def _store_plan(self, request, operation, body, *, recovers_plan_id, previous_healthy_sha, caller_sha_ignored=False, source_plan_id=None, source_revision=None):
         self._sequence += 1
         raw = f"{id(self)}:{operation}:{request['app_id']}:{self.clock.now().isoformat()}:{self._sequence}".encode("utf-8")
         plan_id = "upl_" + hashlib.sha256(raw).hexdigest()[:24]
@@ -496,6 +583,8 @@ class UpgradeService:
             "plan_id": plan_id,
             "revision": 1,
             "state": body["state"],
+            "repo": request["scope"]["repo"],
+            "task_id": request["scope"]["task_id"],
             "app_id": request["app_id"],
             "candidate_id": body.get("candidate_id"),
             "reasons": list(body.get("reasons") or []),
@@ -508,9 +597,19 @@ class UpgradeService:
             "previous_healthy_sha": previous_healthy_sha,
             "created_at": self.clock.now().isoformat(),
         }
-        self.journal.put_plan(plan)
         original = {"state": plan["state"], "plan_id": plan_id, "http": 200, "code": None}
-        self._remember(request, operation, plan_id, original)
+        outcome = self._cas_insert(
+            request,
+            operation,
+            plan,
+            original,
+            observations=None,
+            source_plan_id=source_plan_id,
+            source_revision=source_revision,
+        )
+        replayed = self._cas_replay(outcome, request, operation)
+        if replayed is not None:
+            return replayed
         published = dict(body)
         published.update({
             "plan_id": plan_id,
@@ -524,17 +623,113 @@ class UpgradeService:
 
     def _owned_plan(self, request):
         plan = self.journal.get_plan(request.get("plan_id"))
+        scope = request.get("scope") if isinstance(request.get("scope"), dict) else {}
         if plan is None or plan.get("app_id") != request.get("app_id"):
+            return self._error(409, "EVIDENCE_MISSING", "The plan is not in this application journal.")
+        if plan.get("repo") != scope.get("repo") or plan.get("task_id") != scope.get("task_id"):
+            return self._error(409, "EVIDENCE_MISSING", "The plan is not in this application journal.")
+        if not self._principal_covers(plan.get("repo"), plan.get("task_id"), plan.get("app_id")):
+            return self._error(403, "POLICY_DENIED", "The actor is not allowed to do this.")
+        candidate = request.get("candidate") if isinstance(request.get("candidate"), dict) else None
+        if isinstance(candidate, dict) and all(valid_sha(candidate.get(name)) for name in TUPLE_FIELDS):
+            computed = candidate_id(scope["repo"], scope["task_id"], *(candidate[name] for name in TUPLE_FIELDS))
+            if computed != plan.get("candidate_id"):
+                return self._error(409, "EVIDENCE_MISSING", "The plan is not in this application journal.")
+        supplied = request.get("candidate_id")
+        if supplied is not None and supplied != plan.get("candidate_id"):
             return self._error(409, "EVIDENCE_MISSING", "The plan is not in this application journal.")
         return plan
 
     def _remember(self, request, operation, plan_id, original):
-        self.journal.put_idem(self._idem_key(request, operation), {
+        key = self._idem_key(request, operation)
+        record = {
             "hash": _payload_hash(request),
             "plan_id": plan_id,
             "operation": operation,
             "original": original,
-        })
+        }
+
+        def mutate(state):
+            state["idempotency"][key] = record
+            return True, None
+
+        self.journal.persist(mutate)
+
+    def _cas_insert(self, request, operation, plan, original, *, observations, source_plan_id, source_revision):
+        key = self._idem_key(request, operation)
+        payload = _payload_hash(request)
+
+        def mutate(state):
+            existing = state["idempotency"].get(key)
+            if existing is not None:
+                return False, {"replay": existing, "mismatch": existing.get("hash") != payload}
+            if source_plan_id is not None:
+                source = state["plans"].get(source_plan_id)
+                if source is None:
+                    return False, {"missing": True}
+                if source.get("state") == "SAFE_FROZEN":
+                    return False, {"frozen": True}
+                if source.get("revision") != source_revision:
+                    return False, {"conflict": True}
+            state["plans"][plan["plan_id"]] = plan
+            state["idempotency"][key] = {
+                "hash": payload,
+                "plan_id": plan["plan_id"],
+                "operation": operation,
+                "original": original,
+            }
+            if observations is not None:
+                state["cache"][request["app_id"]] = observations
+            return True, {"applied": True}
+
+        return self.journal.persist(mutate)
+
+    def _cas_reconcile(self, request, plan_id, state_name, claims_commit, original):
+        key = self._idem_key(request, "reconcile")
+        payload = _payload_hash(request)
+        expected = request.get("expected_revision")
+
+        def mutate(state):
+            existing = state["idempotency"].get(key)
+            if existing is not None:
+                return False, {"replay": existing, "mismatch": existing.get("hash") != payload}
+            current = state["plans"].get(plan_id)
+            if current is None:
+                return False, {"missing": True}
+            if current.get("state") == "SAFE_FROZEN":
+                return False, {"frozen": True}
+            if current.get("revision") != expected:
+                return False, {"conflict": True, "revision": current.get("revision")}
+            updated = dict(current)
+            updated["state"] = state_name
+            updated["revision"] = expected + 1
+            updated["accepted_commit"] = False
+            updated["port_claims_commit"] = claims_commit
+            state["plans"][plan_id] = updated
+            state["idempotency"][key] = {
+                "hash": payload,
+                "plan_id": plan_id,
+                "operation": "reconcile",
+                "original": original,
+            }
+            return True, {"applied": True}
+
+        return self.journal.persist(mutate)
+
+    def _cas_replay(self, outcome, request, operation):
+        if not isinstance(outcome, dict):
+            return self._error(409, "EVIDENCE_MISSING", "The plan is not in this application journal.")
+        if outcome.get("applied") is True:
+            return None
+        if outcome.get("mismatch") is True:
+            return self._error(409, "IDEMPOTENCY_PAYLOAD_MISMATCH", "The idempotency key was reused with a different payload.")
+        if outcome.get("replay") is not None:
+            return self._replay(request, operation)
+        if outcome.get("frozen") is True:
+            return self._error(403, "POLICY_DENIED", "SAFE_FROZEN cannot be rewritten.", reason="safe_frozen_no_rewrite")
+        if outcome.get("conflict") is True:
+            return self._error(409, "CONFLICT_REVISION", "The expected revision does not match.")
+        return self._error(409, "EVIDENCE_MISSING", "The plan is not in this application journal.")
 
     def _replay(self, request, operation):
         record = self.journal.get_idem(self._idem_key(request, operation))
@@ -566,7 +761,10 @@ class UpgradeService:
             return schema_error
         if not _actor_ok(request.get("actor")):
             return self._error(403, "NOT_AUTHORIZED", "The actor is not accepted.")
-        if not self._granted(request["actor"]["id"], request["app_id"], action):
+        principal = self.principal
+        if principal is None or getattr(principal, "server_assigned", False) is not True:
+            return self._error(403, "NOT_AUTHORIZED", "The actor is not accepted.")
+        if not self._granted(principal, request, action):
             return self._error(403, "POLICY_DENIED", "The actor is not allowed to do this.")
         if request.get("production_database") is True or request.get("database_url"):
             return self._error(403, "PRODUCTION_DB_FORBIDDEN", "Production database access is forbidden.")
@@ -593,15 +791,39 @@ class UpgradeService:
                 return self._error(422, "SCHEMA_UNSUPPORTED", "The request was rejected.")
         return None
 
-    def _granted(self, principal, app_id, action):
+    def _granted(self, principal, request, action):
+        scope = request["scope"]
+        if not self._principal_covers(scope.get("repo"), scope.get("task_id"), scope.get("app_id"), principal=principal):
+            return False
         return any(
-            grant.principal_id == principal and grant.app_id == app_id and grant.action == action
+            grant.principal_id == principal.principal_id
+            and grant.action == action
+            and grant.app_id == scope.get("app_id")
+            and getattr(grant, "repo", None) == scope.get("repo")
+            and getattr(grant, "task_id", None) == scope.get("task_id")
             for grant in self.grants
         )
 
+    def _principal_covers(self, repo, task_id, app_id, principal=None):
+        principal = self.principal if principal is None else principal
+        if principal is None or getattr(principal, "server_assigned", False) is not True:
+            return False
+        if getattr(principal, "trusted_source", None) != SOURCE_BY_KIND.get(getattr(principal, "kind", None)):
+            return False
+        if getattr(principal, "repo_id", None) != repo:
+            return False
+        apps = getattr(principal, "app_ids", None)
+        if not apps:
+            single = getattr(principal, "app_id", None)
+            apps = () if not single else (single,)
+        if app_id not in set(apps):
+            return False
+        tasks = getattr(principal, "tasks", ()) or ()
+        return task_id in set(tasks)
+
     def _idem_key(self, request, operation):
         return "|".join([
-            request["actor"]["id"],
+            self.principal.principal_id,
             request["scope"]["repo"],
             request["scope"]["task_id"],
             request["app_id"],
@@ -677,6 +899,32 @@ class UpgradeService:
 
 def reasons_block(reasons):
     return any(reason in BLOCKING for reason in reasons)
+
+
+def _labeled_double(report):
+    return (
+        isinstance(report, dict)
+        and report.get("not_runtime_proof") is True
+        and report.get("test_double") is True
+        and report.get("proof_label") == "test_double_not_runtime_proof"
+        and report.get("runtime_proof") is not True
+        and report.get("macci_proof") is not True
+    )
+
+
+def _build_problem(build, binding):
+    if build.get("evidence_state") != "present" or binding != "bound":
+        return "build_evidence_missing"
+    exit_code = build.get("exit_code")
+    if build.get("frontend_failed") is True or type(exit_code) is not int or exit_code != 0:
+        return "build_failed_not_compatible"
+    return None
+
+
+def _macci_problem(delivery, binding):
+    if binding != "bound" or delivery.get("macci_state") != "success" or not valid_sha(delivery.get("macci_sha")):
+        return "macci_not_success"
+    return None
 
 
 def isolation_reasons(peers, app_id):

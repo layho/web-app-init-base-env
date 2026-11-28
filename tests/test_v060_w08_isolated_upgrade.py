@@ -42,6 +42,8 @@ from app.control_upgrade.ports import (
     FixtureDeploy,
     FixtureDiagnostics,
     FixtureSchedule,
+    ServerManifest,
+    ServerPrincipal,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,8 +76,8 @@ def clock():
     return ServerClock(WHEN)
 
 
-def grants(*actions, app_id=APP, principal="fixture"):
-    return [Grant(principal, app_id, action) for action in actions]
+def grants(*actions, app_id=APP, principal="fixture", repo=REPO, task_id=TASK):
+    return [Grant(principal, app_id, action, repo=repo, task_id=task_id) for action in actions]
 
 
 def all_grants(app_id=APP):
@@ -90,6 +92,10 @@ def build_report(**overrides):
     report = {
         "evidence_state": "present",
         "candidate_id": CANDIDATE,
+        "head": HEAD,
+        "base": BASE,
+        "merge": MERGE,
+        "tree": TREE,
         "exit_code": 0,
         "frontend_failed": False,
         "mergeable": True,
@@ -169,7 +175,54 @@ def foundation_change(path="app/foundation_version.py", old="v1\n", new="v2\n", 
     }
 
 
-def service(root=None, build=None, schedule=None, delivery=None, diagnostics=None, deploy=None, grant_rows=None, now=None):
+def server_manifest(**overrides):
+    body = {
+        "candidate": candidate_body(),
+        "allowlist": ["app/foundation_version.py"],
+        "changes": [foundation_change()],
+        "observed_files": [
+            ".app-init.json",
+            "app/project_info.json",
+            "data/app.db",
+            "frontend/src/app-modules/widget.tsx",
+        ],
+        "peers": [
+            {"app_id": APP, "data_root": "/apps/panel/data", "table_prefix": "mod_panel__"},
+            {"app_id": OTHER, "data_root": "/apps/ledger/data", "table_prefix": "mod_ledger__"},
+        ],
+        "repository_sha": C,
+        "repository_version": "0.6.0",
+        "source_id": "w08-server-manifest",
+        "observed_at": WHEN.isoformat(),
+    }
+    body.update(overrides)
+    return ServerManifest(**body)
+
+
+def server_principal(rows):
+    apps = []
+    tasks = []
+    principal_id = "w02-server"
+    repo = REPO
+    for grant in rows:
+        apps.append(grant.app_id)
+        if grant.task_id:
+            tasks.append(grant.task_id)
+        if grant.repo:
+            repo = grant.repo
+        principal_id = grant.principal_id
+    return ServerPrincipal(
+        principal_id=principal_id,
+        kind="app_service",
+        repo_id=repo,
+        app_ids=apps or [APP],
+        tasks=tasks or [TASK],
+        trusted_source="app_service",
+    )
+
+
+def service(root=None, build=None, schedule=None, delivery=None, diagnostics=None, deploy=None, grant_rows=None, now=None, principal=None, manifest=None):
+    rows = all_grants() if grant_rows is None else grant_rows
     return UpgradeService(
         root,
         clock=clock() if now is None else now,
@@ -178,7 +231,9 @@ def service(root=None, build=None, schedule=None, delivery=None, diagnostics=Non
         delivery=FixtureDelivery(delivery_report() if delivery is None else delivery),
         diagnostics=FixtureDiagnostics(diagnostics_report() if diagnostics is None else diagnostics),
         deploy=FixtureDeploy(deploy_report() if deploy is None else deploy),
-        grants=all_grants() if grant_rows is None else grant_rows,
+        grants=rows,
+        principal=server_principal(rows) if principal is None else principal,
+        manifest=server_manifest() if manifest is None else manifest,
     )
 
 
@@ -373,9 +428,13 @@ class IsolatedUpgradeTests(unittest.TestCase):
         foreign = service(schedule=schedule_report(owner_matches=False))
         self.assertFalse(foreign.status(read_request())["components"]["scheduler"]["identified"])
         bad_pin = service()
-        unknown = bad_pin.status(read_request(declared={"schema": 1, "repository": REPO, "version": "nope", "sha": C}))
+        bad_pin.manifest.repository_sha = None
+        bad_pin.manifest.repository_version = None
+        unknown = bad_pin.status(read_request(declared={"schema": 1, "repository": REPO, "version": "0.6.0", "sha": C}))
         self.assertIsNone(unknown["components"]["repository"]["sha"])
-        self.assertEqual(unknown["components"]["repository"]["state"], "unidentified")
+        self.assertEqual(unknown["components"]["repository"]["state"], "unknown")
+        self.assertNotEqual(unknown["components"]["repository"].get("source"), "request")
+        self.assertTrue(unknown["caller_declaration_ignored"])
         self.assertEqual(enrolled["code"], "POLICY_DENIED")
         self.assertEqual(enrolled["http"], 403)
         self.assertFalse(enrolled["enrolled"])
@@ -384,37 +443,56 @@ class IsolatedUpgradeTests(unittest.TestCase):
     def test_u04_status_cache_is_persistent_and_does_not_fetch(self):
         with tempfile.TemporaryDirectory() as folder:
             now = clock()
+            observed = WHEN.isoformat()
             first = service(root=folder, now=now)
             seen = first.status(read_request(running_sha="deadbeef" * 5))
             self.assertEqual(seen["components"]["running"]["sha"], F)
+            self.assertEqual(seen["components"]["running"]["source"], "port")
             self.assertTrue(seen["caller_claim_ignored"])
+            self.assertTrue(seen["caller_declaration_ignored"])
             self.assertFalse(seen["fetched"])
             self.assertFalse(seen["network_under_lock"])
             self.assertEqual(seen["components"]["repository"]["sha"], C)
-            self.assertNotEqual(seen["stored_at"], "2099-01-01T00:00:00+00:00")
+            self.assertEqual(seen["components"]["repository"]["source"], "server_manifest")
+            self.assertNotEqual(seen["components"]["repository"].get("observed_at"), "2099-01-01T00:00:00+00:00")
+            self.assertEqual(list(Path(folder).glob("state.json")), [])
+            components = {
+                "repository": {"sha": C, "version": "0.6.0", "state": "identified", "source": "server_manifest", "observed_at": observed},
+                "running": {"sha": F, "state": "present", "source": "port", "observed_at": observed},
+                "scheduler": {"sha": E, "identified": True, "enrolled": False, "state": "present", "source": "port", "observed_at": observed},
+                "macci": {"sha": D, "state": "present", "source": "port", "observed_at": observed},
+                "hostops": {"sha": None, "state": "unknown", "source": "missing", "observed_at": observed},
+                "launchd": {"running_sha": "2" * 40, "state": "present", "source": "port", "observed_at": observed},
+            }
+            first.journal.put_cache(APP, {"sources": components})
             self.assertEqual((Path(folder) / "state.json").stat().st_mode & 0o077, 0)
-            second = UpgradeService(
-                folder,
-                clock=now,
-                build=FixtureBuild({"status": "BLOCKED", "evidence_state": "missing"}),
-                schedule=FixtureSchedule({"status": "BLOCKED", "evidence_state": "missing"}),
-                delivery=FixtureDelivery({"status": "BLOCKED", "evidence_state": "missing"}),
-                diagnostics=FixtureDiagnostics({"status": "BLOCKED", "evidence_state": "missing"}),
-                deploy=FixtureDeploy({"status": "BLOCKED", "evidence_state": "missing"}),
-                grants=all_grants(),
+            before = (Path(folder) / "state.json").read_bytes()
+            blocked = {"status": "BLOCKED", "evidence_state": "missing"}
+            second = service(
+                root=folder,
+                now=now,
+                build=blocked,
+                schedule=blocked,
+                delivery=blocked,
+                diagnostics=blocked,
+                deploy=blocked,
+                manifest=server_manifest(repository_sha=None, repository_version=None),
             )
             cached = second.status(read_request(declared=None, occurred_at="1999-01-01T00:00:00+00:00"))
             self.assertEqual(cached["components"]["running"]["sha"], F)
             self.assertEqual(cached["components"]["scheduler"]["sha"], E)
             self.assertEqual(cached["components"]["repository"]["sha"], C)
             self.assertEqual(cached["components"]["running"]["source"], "cache")
+            self.assertEqual(cached["components"]["running"]["observed_at"], observed)
             self.assertFalse(cached["components"]["running"]["stale"])
             self.assertFalse(cached["fetched"])
             now.advance(301)
             stale = second.status(read_request(declared=None))
             self.assertTrue(stale["components"]["running"]["stale"])
             self.assertEqual(stale["components"]["running"]["sha"], F)
+            self.assertEqual(stale["components"]["running"]["observed_at"], observed)
             self.assertFalse(stale["fetched"])
+            self.assertEqual((Path(folder) / "state.json").read_bytes(), before)
 
     def test_u05_preserves_app_data_config_and_custom_code(self):
         changes = [
@@ -427,6 +505,10 @@ class IsolatedUpgradeTests(unittest.TestCase):
             {"path": "app/link.py", "op": "modify", "owner": "foundation", "old": "a", "new": "b", "local": "a", "symlink": True, "app_id": APP},
         ]
         engine = service()
+        engine.manifest = server_manifest(
+            allowlist=["app/foundation_version.py", "app/main.py", "data/app.db"],
+            changes=changes,
+        )
         result = engine.plan(plan_request(changes=changes, foundation_allowlist=["app/foundation_version.py", "app/main.py", "data/app.db"]))
         self.assertEqual(result["state"], "BLOCKED")
         self.assertEqual(result["write_set"], [])
@@ -446,6 +528,7 @@ class IsolatedUpgradeTests(unittest.TestCase):
         self.assertEqual(blanket["state"], "BLOCKED")
         self.assertIn("blanket_frontend_src_copy", blanket["reasons"])
         self.assertEqual(blanket["write_set"], [])
+        engine.manifest = server_manifest(allowlist=["frontend/src/"])
         broad = engine.plan(plan_request(idempotency_key="idem-w08-broad", foundation_allowlist=["frontend/src/"]))
         self.assertEqual(broad["state"], "BLOCKED")
         self.assertIn("blanket_ownership", broad["reasons"])
@@ -456,13 +539,16 @@ class IsolatedUpgradeTests(unittest.TestCase):
             foundation_change(path="app/main.py"),
             foundation_change(path="App/Main.py"),
         ]
+        engine.manifest = server_manifest(changes=changes, allowlist=["app/main.py", "App/Main.py"])
         result = engine.plan(plan_request(changes=changes, foundation_allowlist=["app/main.py", "App/Main.py"], idempotency_key="idem-w08-case"))
         self.assertEqual(result["state"], "BLOCKED")
         self.assertIn("case_collision", result["reasons"])
         self.assertEqual(result["write_set"], [])
+        ambiguous_changes = [{**foundation_change(path="app/main.py"), "owner": "app"}]
+        engine.manifest = server_manifest(changes=ambiguous_changes, allowlist=["app/main.py"])
         ambiguous = engine.plan(plan_request(
             idempotency_key="idem-w08-ambiguous-owner",
-            changes=[{**foundation_change(path="app/main.py"), "owner": "app"}],
+            changes=ambiguous_changes,
             foundation_allowlist=["app/main.py"],
         ))
         self.assertEqual(ambiguous["state"], "BLOCKED")
@@ -474,12 +560,15 @@ class IsolatedUpgradeTests(unittest.TestCase):
         self.assertIn(ambiguous["plan_id"], engine.list_plans(read_request())["plan_ids"])
 
     def test_u06_apps_stay_isolated(self):
-        collided = service().plan(plan_request(
+        collision_peers = [
+            {"app_id": APP, "data_root": "/apps/shared/data", "table_prefix": "mod_panel__"},
+            {"app_id": OTHER, "data_root": "/apps/shared/data", "table_prefix": "mod_ledger__"},
+        ]
+        collision = service()
+        collision.manifest = server_manifest(peers=collision_peers)
+        collided = collision.plan(plan_request(
             idempotency_key="idem-w08-collision",
-            peers=[
-                {"app_id": APP, "data_root": "/apps/shared/data", "table_prefix": "mod_panel__"},
-                {"app_id": OTHER, "data_root": "/apps/shared/data", "table_prefix": "mod_ledger__"},
-            ],
+            peers=collision_peers,
         ))
         self.assertEqual(collided["state"], "BLOCKED")
         self.assertIn("isolation_collision", collided["reasons"])
@@ -496,12 +585,15 @@ class IsolatedUpgradeTests(unittest.TestCase):
         self.assertEqual(denied["code"], "POLICY_DENIED")
         self.assertEqual(reader.diagnostics.calls, [])
         panel = service(grant_rows=all_grants(APP) + all_grants(OTHER))
+        crossed_changes = [{**foundation_change(), "app_id": OTHER}]
+        panel.manifest = server_manifest(changes=crossed_changes)
         crossed = panel.plan(plan_request(
             idempotency_key="idem-w08-cross-app",
-            changes=[{**foundation_change(), "app_id": OTHER}],
+            changes=crossed_changes,
         ))
         self.assertEqual(crossed["state"], "BLOCKED")
         self.assertIn("isolation_cross_app", crossed["reasons"])
+        panel.manifest = server_manifest()
         panel.plan(plan_request())
         listed = panel.list_plans(read_request(app_id=OTHER, scope={"repo": REPO, "task_id": TASK, "app_id": OTHER}))
         self.assertEqual(listed["plan_ids"], [])
@@ -509,7 +601,9 @@ class IsolatedUpgradeTests(unittest.TestCase):
     def test_u07_ambiguous_conflict_is_not_resolved_and_merge_stays_off(self):
         old, new, local = "a\nb\nc\n", "a\nB\nc\n", "a\nX\nc\n"
         engine = service()
-        result = engine.plan(plan_request(changes=[foundation_change(old=old, new=new, local=local)]))
+        overlap = [foundation_change(old=old, new=new, local=local)]
+        engine.manifest = server_manifest(changes=overlap)
+        result = engine.plan(plan_request(changes=overlap))
         self.assertEqual(result["state"], "BLOCKED")
         self.assertEqual(result["decisions"][0]["classification"], "ambiguous")
         self.assertIsNone(result["decisions"][0]["result"])
@@ -523,7 +617,10 @@ class IsolatedUpgradeTests(unittest.TestCase):
 
     def test_u07_separable_text_is_not_applied(self):
         old, new, local = "a\nb\nc\n", "a\nB\nc\n", "A\nb\nc\n"
-        result = service().plan(plan_request(changes=[foundation_change(old=old, new=new, local=local)]))
+        separated = [foundation_change(old=old, new=new, local=local)]
+        engine = service()
+        engine.manifest = server_manifest(changes=separated)
+        result = engine.plan(plan_request(changes=separated))
         self.assertEqual(result["state"], "PLANNED")
         self.assertEqual(result["decisions"][0]["classification"], "text_separable")
         self.assertEqual(result["decisions"][0]["action"], "review")
@@ -542,19 +639,25 @@ class IsolatedUpgradeTests(unittest.TestCase):
         self.assertFalse(result["real_merge"])
 
     def test_u07_migration_and_host_script_are_not_executed(self):
-        migration = service().plan(plan_request(
+        migration_changes = [foundation_change(path="migrations/004_app.sql", old="select 1;\n", new="select 2;\n", local="select 1;\n")]
+        migration_engine = service()
+        migration_engine.manifest = server_manifest(allowlist=["migrations/004_app.sql"], changes=migration_changes)
+        migration = migration_engine.plan(plan_request(
             idempotency_key="idem-w08-sql",
             foundation_allowlist=["migrations/004_app.sql"],
-            changes=[foundation_change(path="migrations/004_app.sql", old="select 1;\n", new="select 2;\n", local="select 1;\n")],
+            changes=migration_changes,
         ))
         self.assertEqual(migration["state"], "BLOCKED")
         self.assertIn("migration_requires_review", migration["reasons"])
         self.assertEqual(migration["write_set"], [])
         self.assertFalse(migration["production_db_access"])
-        host = service().plan(plan_request(
+        host_changes = [foundation_change(path="deploy/macmini/manage.sh")]
+        host_engine = service()
+        host_engine.manifest = server_manifest(allowlist=["deploy/macmini/manage.sh"], changes=host_changes)
+        host = host_engine.plan(plan_request(
             idempotency_key="idem-w08-host",
             foundation_allowlist=["deploy/macmini/manage.sh"],
-            changes=[foundation_change(path="deploy/macmini/manage.sh")],
+            changes=host_changes,
         ))
         self.assertIsNone(host["decisions"][0]["result"])
         self.assertFalse(host["decisions"][0]["auto_resolved"])
@@ -562,9 +665,11 @@ class IsolatedUpgradeTests(unittest.TestCase):
         self.assertFalse(host["applicable"])
 
     def test_u08_component_shas_stay_separate(self):
-        seen = service().status(read_request())
+        seen = service().status(read_request(declared={"schema": 1, "repository": REPO, "version": "0.6.0", "sha": A}))
         components = seen["components"]
         self.assertEqual(components["repository"]["sha"], C)
+        self.assertEqual(components["repository"]["source"], "server_manifest")
+        self.assertTrue(seen["caller_declaration_ignored"])
         self.assertEqual(components["running"]["sha"], F)
         self.assertEqual(components["scheduler"]["sha"], E)
         self.assertEqual(components["macci"]["sha"], D)
@@ -807,6 +912,254 @@ class IsolatedUpgradeTests(unittest.TestCase):
         self.assertFalse(outcome["runtime_proof"])
         for plan in engine.journal.plans_for(APP):
             self.assertNotEqual(plan["state"], "COMMIT")
+
+    def test_p0_status_does_not_persist_or_treat_declared_as_repository(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine = service(root=folder)
+            engine.manifest = None
+            seen = engine.status(read_request(declared={"schema": 1, "repository": REPO, "version": "0.6.0", "sha": C}))
+            self.assertEqual(list(Path(folder).iterdir()), [])
+            self.assertIsNone(engine.journal.get_cache(APP))
+            self.assertIsNone(seen["components"]["repository"]["sha"])
+            self.assertNotEqual(seen["components"]["repository"].get("source"), "request")
+            self.assertIn(seen["components"]["repository"]["state"], {"unknown", "unidentified"})
+            self.assertTrue(seen["caller_declaration_ignored"])
+            self.assertFalse(seen["runtime_proof"])
+
+    def test_p0_cache_fallback_keeps_original_observation_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            now = clock()
+            past = (WHEN - timedelta(seconds=301)).isoformat()
+            blocked = {"status": "BLOCKED", "evidence_state": "missing"}
+            engine = service(
+                root=folder,
+                now=now,
+                build=blocked,
+                schedule=blocked,
+                delivery=blocked,
+                diagnostics=blocked,
+                deploy=blocked,
+            )
+            engine.manifest = None
+            components = {
+                "repository": {"sha": C, "version": "0.6.0", "state": "identified", "source": "server_manifest"},
+                "running": {"sha": F, "state": "present", "source": "port"},
+                "scheduler": {"sha": E, "identified": True, "enrolled": False, "state": "present", "source": "port"},
+                "macci": {"sha": D, "state": "present", "source": "port"},
+                "hostops": {"sha": None, "state": "unknown", "source": "missing"},
+                "launchd": {"running_sha": "2" * 40, "state": "present", "source": "port"},
+            }
+            engine.journal.put_cache(APP, {
+                "stored_at": past,
+                "components": components,
+                "sources": {name: {**component, "observed_at": past} for name, component in components.items()},
+            })
+            before = (Path(folder) / "state.json").read_bytes()
+            seen = engine.status(read_request(declared=None))
+            running = seen["components"]["running"]
+            self.assertEqual(running["sha"], F)
+            self.assertEqual(running.get("observed_at"), past)
+            self.assertTrue(running["stale"])
+            self.assertEqual(running["source"], "cache")
+            self.assertNotEqual(seen.get("stored_at"), WHEN.isoformat())
+            again = engine.status(read_request(declared=None))
+            self.assertEqual(again["components"]["running"].get("observed_at"), past)
+            self.assertTrue(again["components"]["running"]["stale"])
+            self.assertEqual((Path(folder) / "state.json").read_bytes(), before)
+
+    def test_p0_caller_manifest_is_not_ownership_or_isolation_evidence(self):
+        engine = service()
+        engine.manifest = None
+        result = engine.plan(plan_request())
+        self.assertEqual(result["http"], 200)
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertFalse(result["compatible"])
+        self.assertFalse(result["runtime_proof"])
+        self.assertIn("server_manifest_missing", result["reasons"])
+        self.assertEqual(result["decisions"], [])
+        self.assertEqual(result["write_set"], [])
+        self.assertFalse(result["applicable"])
+
+    def test_p0_build_exit_code_none_is_not_success(self):
+        report = build_report(exit_code=None, frontend_failed=False, mergeable=True)
+        report.update(head=HEAD, base=BASE, merge=MERGE, tree=TREE, candidate_id=CANDIDATE)
+        result = service(build=report).plan(plan_request(idempotency_key="idem-w08-exit-none"))
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertFalse(result["compatible"])
+        self.assertIn("build_failed_not_compatible", result["reasons"])
+        self.assertFalse(result["runtime_proof"])
+        self.assertFalse(result["upgrade_executed"])
+
+    def test_p0_macci_success_requires_a_complete_candidate(self):
+        report = delivery_report(macci_state="success", macci_sha=D, mergeable=True)
+        for name in ("head", "base", "merge", "tree", "candidate_id"):
+            report[name] = None
+        result = service(delivery=report).plan(plan_request(idempotency_key="idem-w08-macci-unbound"))
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertIn("macci_not_success", result["reasons"])
+        self.assertFalse(result["compatible"])
+        self.assertFalse(result["runtime_proof"])
+        self.assertNotEqual(result.get("code"), "CANDIDATE_STALE")
+
+    def test_p0_unlabeled_port_success_is_not_compatibility(self):
+        class ClaimingPort:
+            def __init__(self, report):
+                self.report = dict(report)
+                self.calls = []
+
+            def read(self, *, app_id, candidate_id=None):
+                self.calls.append({"method": "read", "app_id": app_id, "candidate_id": candidate_id})
+                data = dict(self.report)
+                data["runtime_proof"] = True
+                data["macci_proof"] = True
+                return data
+
+        engine = service()
+        engine.build = ClaimingPort(build_report(exit_code=0, head=HEAD, base=BASE, merge=MERGE, tree=TREE))
+        engine.delivery = ClaimingPort(delivery_report())
+        result = engine.plan(plan_request(idempotency_key="idem-w08-unlabeled"))
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertIn("evidence_unlabeled", result["reasons"])
+        self.assertFalse(result["compatible"])
+        self.assertFalse(result["runtime_proof"])
+
+    def test_p0_fixture_reads_are_labeled_not_runtime_proof(self):
+        engine = service()
+        engine.build.report["runtime_proof"] = True
+        engine.delivery.report["runtime_proof"] = True
+        engine.delivery.report["macci_proof"] = True
+        seen = engine.build.read(app_id=APP, candidate_id=CANDIDATE)
+        self.assertFalse(seen["runtime_proof"])
+        self.assertTrue(seen["not_runtime_proof"])
+        self.assertTrue(seen["test_double"])
+        self.assertEqual(seen["proof_label"], "test_double_not_runtime_proof")
+        self.assertFalse(seen["macci_proof"])
+
+    def test_p0_actor_id_grant_is_not_a_server_principal(self):
+        engine = service(grant_rows=grants("upgrade.read", "upgrade.plan", "upgrade.reconcile", "upgrade.recover"))
+        engine.principal = type("Principal", (), {
+            "principal_id": "w02-server",
+            "server_assigned": True,
+            "kind": "app_service",
+            "repo_id": REPO,
+            "app_id": APP,
+            "tasks": frozenset({TASK}),
+            "trusted_source": "app_service",
+        })()
+        result = engine.plan(plan_request())
+        self.assertEqual(result["code"], "POLICY_DENIED")
+        self.assertEqual(result["http"], 403)
+        self.assertEqual(engine.journal.plans_for(APP), [])
+        self.assertEqual(engine.journal.idem_reads, 0)
+
+    def test_p0_owned_plan_requires_repo_task_candidate_scope(self):
+        engine = service()
+        planned = engine.plan(plan_request())
+        self.assertEqual(planned["state"], "PLANNED")
+        stolen = engine.reconcile(plan_request(
+            idempotency_key="idem-w08-steal-candidate",
+            plan_id=planned["plan_id"],
+            expected_revision=1,
+            candidate_id=expected_candidate(head=A),
+            candidate=candidate_body(head=A),
+        ))
+        self.assertIn(stolen["code"], {"POLICY_DENIED", "EVIDENCE_MISSING", "NOT_AUTHORIZED"})
+        self.assertEqual(engine.journal.get_plan(planned["plan_id"])["revision"], 1)
+        self.assertEqual(engine.journal.get_plan(planned["plan_id"])["state"], "PLANNED")
+        other_task = engine.reconcile(plan_request(
+            idempotency_key="idem-w08-steal-task",
+            plan_id=planned["plan_id"],
+            expected_revision=1,
+            scope={"repo": REPO, "task_id": "tsk_other", "app_id": APP},
+        ))
+        self.assertIn(other_task["code"], {"POLICY_DENIED", "EVIDENCE_MISSING", "NOT_AUTHORIZED"})
+        self.assertEqual(engine.journal.get_plan(planned["plan_id"])["revision"], 1)
+
+    def test_p0_stale_reconcile_cannot_clobber_plan_and_idempotency(self):
+        with tempfile.TemporaryDirectory() as folder:
+            now = clock()
+            rows = all_grants()
+            principal = server_principal(rows)
+            manifest = server_manifest()
+            first = service(
+                root=folder,
+                now=now,
+                deploy=deploy_report(effect="unknown", state="RECONCILE"),
+                grant_rows=rows,
+                principal=principal,
+                manifest=manifest,
+            )
+            planned = first.plan(plan_request())
+            second = UpgradeService(
+                folder,
+                clock=now,
+                build=FixtureBuild(build_report()),
+                schedule=FixtureSchedule(schedule_report()),
+                delivery=FixtureDelivery(delivery_report()),
+                diagnostics=FixtureDiagnostics(diagnostics_report()),
+                deploy=FixtureDeploy(deploy_report(effect="failed", state="FAILED")),
+                grants=rows,
+                principal=principal,
+                manifest=manifest,
+            )
+            done = first.reconcile(plan_request(
+                idempotency_key="idem-w08-cas-a",
+                plan_id=planned["plan_id"],
+                expected_revision=1,
+            ))
+            self.assertEqual(done["http"], 200)
+            self.assertEqual(done["state"], "RECONCILE")
+            lost = second.reconcile(plan_request(
+                idempotency_key="idem-w08-cas-b",
+                plan_id=planned["plan_id"],
+                expected_revision=1,
+            ))
+            self.assertEqual(lost["code"], "CONFLICT_REVISION")
+            reloaded = UpgradeService(
+                folder,
+                clock=now,
+                build=FixtureBuild(build_report()),
+                schedule=FixtureSchedule(schedule_report()),
+                delivery=FixtureDelivery(delivery_report()),
+                diagnostics=FixtureDiagnostics(diagnostics_report()),
+                deploy=FixtureDeploy(deploy_report(effect="unknown", state="RECONCILE")),
+                grants=rows,
+                principal=principal,
+                manifest=manifest,
+            )
+            stored = reloaded.journal.get_plan(planned["plan_id"])
+            self.assertEqual(stored["revision"], 2)
+            self.assertEqual(stored["state"], "RECONCILE")
+            replay = reloaded.reconcile(plan_request(
+                idempotency_key="idem-w08-cas-a",
+                plan_id=planned["plan_id"],
+                expected_revision=1,
+            ))
+            self.assertEqual(replay["code"], "IDEMPOTENCY_REPLAY")
+            self.assertEqual(replay["original_result"]["state"], "RECONCILE")
+
+    def test_p0_safe_frozen_reconcile_does_not_rewrite(self):
+        engine = service(deploy=deploy_report(effect="unknown", state="SAFE_FROZEN"))
+        planned = engine.plan(plan_request())
+        seen = engine.reconcile(plan_request(
+            idempotency_key="idem-w08-freeze",
+            plan_id=planned["plan_id"],
+            expected_revision=1,
+        ))
+        self.assertEqual(seen["state"], "SAFE_FROZEN")
+        self.assertEqual(engine.journal.get_plan(planned["plan_id"])["revision"], 2)
+        engine.deploy.report = deploy_report(effect="failed", state="FAILED")
+        again = engine.reconcile(plan_request(
+            idempotency_key="idem-w08-freeze-rewrite",
+            plan_id=planned["plan_id"],
+            expected_revision=2,
+        ))
+        self.assertEqual(again["code"], "POLICY_DENIED")
+        self.assertEqual(again["reason"], "safe_frozen_no_rewrite")
+        stored = engine.journal.get_plan(planned["plan_id"])
+        self.assertEqual(stored["state"], "SAFE_FROZEN")
+        self.assertEqual(stored["revision"], 2)
+        self.assertEqual(len(engine.journal.plans_for(APP)), 1)
 
 
 if __name__ == "__main__":
