@@ -401,6 +401,45 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertEqual(reasons["c9"], "cross_author")
         self.assertNotEqual(self._feedback("fb_notes")["progress_status"], "accepted")
 
+    def test_feedback_sync_metadata_and_reads_stay_inside_authorized_scope(self):
+        self._submit("fb_local")
+        self._submit("fb_local_pending")
+        other = {"kind": "test", "id": "other", "proof_ref": "test-proof://w05/other"}
+        self._submit("fb_other_author", author=other)
+        for key, changes in (
+            ("fb_other_repo", {"repo_id": "other/repo"}),
+            ("fb_other_app", {"app_id": "other"}),
+            ("fb_other_task", {"scope_task_id": "tsk_other"}),
+        ):
+            row = {**self.svc.store.read("feedback", "fb_local"), "feedback_id": key, **changes}
+            self.svc.store.write("feedback", key, row)
+        self.assertIsNone(self._feedback("fb_other_author"))
+        self.assertIsNone(self.svc.feedback("fb_local", actor=other, scope=self.scope))
+        for key in ("fb_other_repo", "fb_other_app", "fb_other_task"):
+            self.assertIsNone(self._feedback(key))
+        outbound = self._sync(batch_limit=1, key="scoped-out")
+        self.assertTrue(outbound.ok, outbound.as_dict())
+        self.assertEqual(outbound.body["remaining"], ["fb_local_pending"])
+        self.assertEqual(outbound.body["continuation"], "fb_local_pending")
+        self.assertEqual(self.svc.store.read("cursor", "outbound")["retained_ids"],
+                         ["fb_local", "fb_local_pending"])
+        inbound = self.svc.sync_inbound(
+            actor=self.actor, scope=self.scope, feedback_id="fb_local",
+            idempotency_key="scoped-in", expected_revision=self._feedback("fb_local")["revision"])
+        self.assertTrue(inbound.ok, inbound.as_dict())
+        self.assertEqual(inbound.body["retained_ids"], ["fb_local", "fb_local_pending"])
+        self.assertEqual([call for call in self.remote.calls if call[0] == "create"],
+                         [("create", "fb_local")])
+        for fields in (
+            {"repo_id": self.scope["repo"], "app_id": "base", "task_id": "tsk_other"},
+            {"repo_id": self.scope["repo"], "app_id": "other", "task_id": "tsk_w05"},
+            {"repo_id": "other/repo", "app_id": "base", "task_id": "tsk_w05"},
+            {"repo_id": self.scope["repo"], "task_id": "tsk_w05"},
+        ):
+            self.svc.store.append_trace({"action": "foreign_trace", **fields})
+        self.assertNotIn("foreign_trace",
+                         [row["action"] for row in self.svc.traces(actor=self.actor, scope=self.scope)])
+
     def test_f03_batch_and_page_budget_do_not_drop_or_pretend_complete(self):
         for feedback_id in ("fb_a", "fb_b", "fb_c"):
             self._submit(feedback_id)
