@@ -180,7 +180,9 @@ def verify_isolated_business_commit(root: Path, *, events_root: Path, event_id: 
             event = outbox["event"]
             receipt = outbox["receipt"]
             scope = {"repo": repo_id, "task_id": task_id}
-            mode = "signed-isolated-v1"
+            mode = commit.get("intent_mode")
+            if mode not in {"signed-isolated-v1", "signed-business-v1"}:
+                return unknown
             if (commit.get("authority") != "W05_LOCAL" or commit.get("production_effective") is not False
                     or commit.get("intent_mode") != mode or outbox.get("intent_mode") != mode
                     or outbox.get("delivery_state") != "RECEIPT_RECORDED"
@@ -227,12 +229,59 @@ def verify_isolated_business_commit(root: Path, *, events_root: Path, event_id: 
             if (idem.get("payload_hash") != request_digest or idem.get("state") != commit.get("state")
                     or idem.get("public") != commit.get("result")):
                 return unknown
-            intent = "w05-intent-v1:" + digest({
+            intent_material = {
                 "principal_id": commit["principal_id"], "scope": scope,
                 "operation": commit["operation"], "request_digest": request_digest,
                 "expected_revision": expected_revision, "changes": changes,
                 "result": commit["result"],
-            })
+            }
+            business_verified = False
+            if mode == "signed-business-v1":
+                from app.control_authz import AuthzService, PrincipalRegistry
+                from app.control_events.auth_bind import POLICY_REVISION
+                from app.control_joint.w05_issue import verify_feedback_submit_proof
+
+                auth = commit.get("business_auth")
+                if (not isinstance(auth, dict) or auth != outbox.get("business_auth")
+                        or auth != idem.get("business_auth") or idem.get("intent_mode") != mode
+                        or auth.get("principal_id") != commit.get("principal_id")
+                        or read("configuration", "business-mode") != {"mode": mode}
+                        or commit.get("operation") != "feedback.submit"
+                        or len(changes) != 1 or changes[0].get("kind") != "feedback"):
+                    return unknown
+                reservation = read("business-nonce", auth["nonce_key"])
+                proof_record = read("business-proof", event_id)
+                if (reservation != {"event_id": event_id, "authorization_digest": auth["authorization_digest"]}
+                        or proof_record.get("event_id") != event_id
+                        or proof_record.get("business_auth") != auth):
+                    return unknown
+                envelope = proof_record["signed"]
+                feedback = read("feedback", changes[0]["key"])
+                payload = {k: feedback[k] for k in ("author_id", "feedback_id", "category", "body")}
+                if digest(payload) != request_digest:
+                    return unknown
+                if digest({"principal": auth["principal_id"], "repo": repo_id, "task_id": task_id,
+                           "operation": "feedback.submit", "key": envelope["idempotency_key"]}) != commit["idem_key"]:
+                    return unknown
+                events_fd = held(open_root(events_root))
+                state = json.loads(read_bounded(events_fd, "auth-state.json", 1048576).decode("utf-8"))
+                if (not isinstance(state, dict) or not isinstance(state.get("principals"), dict)
+                        or not isinstance(state.get("policy"), dict)
+                        or not isinstance(state.get("revoked_signers"), list)):
+                    return unknown
+                authz = AuthzService(registry=PrincipalRegistry(isolated=True),
+                                     isolated=True, policy_revision=POLICY_REVISION)
+                if verify_feedback_submit_proof(
+                        authz, state, repo_id=repo_id, signed=envelope,
+                        scope={**scope, "app_id": app_id}, payload=payload,
+                        idempotency_key=envelope["idempotency_key"],
+                        expected_revision=expected_revision) != auth:
+                    return unknown
+                intent_material["business_auth"] = auth
+                business_verified = True
+            elif any(item.get("business_auth") is not None for item in (commit, outbox, idem)):
+                return unknown
+            intent = "w05-intent-v1:" + digest(intent_material)
             if intent != commit.get("intent_binding") or intent != event.get("note"):
                 return unknown
             signed = query_exact_event(events_root, event_id=event_id, repo_id=repo_id,
@@ -250,7 +299,8 @@ def verify_isolated_business_commit(root: Path, *, events_root: Path, event_id: 
                            ("stream_id", "stream_epoch", "producer_seq", "run_id"))):
                 return unknown
             return {"status": "verified_isolated", "event_id": event_id,
-                    "business_commit_verified": True, "production_effective": False}
+                    "business_commit_verified": True, "business_signature_verified": business_verified,
+                    "production_effective": False}
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return unknown
 
