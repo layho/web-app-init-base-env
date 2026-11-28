@@ -109,6 +109,152 @@ def _w05(root: Path, operation_id: str, expected_revision: int, candidate_digest
     return {"status": "unknown", "reason": "BUSINESS_TRANSACTION_REQUIRED"}
 
 
+def verify_isolated_business_commit(root: Path, *, events_root: Path, event_id: str,
+                                    repo_id: str, app_id: str, task_id: str,
+                                    request_digest: str, expected_revision: int) -> dict:
+    """Verify a signed isolated intent AND its exact local business commit.
+
+    Roots and scope must come from trusted server configuration. This is
+    read-only and never authorizes retry or promotes an isolated operation
+    to the production receipt API. Later object revisions are unknown,
+    not proof that an old operation was absent.
+    """
+    import fcntl
+    import hashlib
+    import re
+    from contextlib import ExitStack
+    from app.control_delivery.ports import event_payload_digest
+    from app.control_events.trusted_read import query_exact_event
+
+    unknown = {"status": "unknown", "production_effective": False}
+    key_pattern = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
+    digest_pattern = re.compile(r"[a-f0-9]{64}")
+
+    def safe_key(value):
+        return isinstance(value, str) and key_pattern.fullmatch(value) is not None and value not in {".", ".."}
+
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                         ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+    if (not safe_key(event_id) or not isinstance(request_digest, str)
+            or digest_pattern.fullmatch(request_digest) is None
+            or type(expected_revision) is not int or expected_revision < 0
+            or not all(isinstance(v, str) and v for v in (repo_id, app_id, task_id))):
+        return unknown
+    try:
+        with ExitStack() as stack:
+            def held(fd):
+                stack.callback(os.close, fd)
+                return fd
+
+            root_fd = held(open_root(root))
+            delivery_fd = held(open_directory(root_fd, "delivery"))
+            lock_fd = held(os.open(".journal.lock", os.O_RDONLY | os.O_NOFOLLOW |
+                                   os.O_NONBLOCK, dir_fd=delivery_fd))
+            info = os.fstat(lock_fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.getuid() or info.st_mode & 0o022):
+                return unknown
+            fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            try:
+                lstat_at(delivery_fd, ".journal.pending.json")
+                return unknown
+            except FileNotFoundError:
+                pass
+
+            def read(kind, key):
+                if not safe_key(kind) or not safe_key(key):
+                    raise ValueError("unsafe journal coordinate")
+                folder = open_directory(delivery_fd, kind)
+                try:
+                    value = json.loads(read_bounded(folder, key + ".json", 262144).decode("utf-8"))
+                    if not isinstance(value, dict):
+                        raise ValueError("not a journal object")
+                    return value
+                finally:
+                    os.close(folder)
+
+            commit = read("business-commit", event_id)
+            outbox = read("outbox", event_id)
+            event = outbox["event"]
+            receipt = outbox["receipt"]
+            scope = {"repo": repo_id, "task_id": task_id}
+            mode = "signed-isolated-v1"
+            if (commit.get("authority") != "W05_LOCAL" or commit.get("production_effective") is not False
+                    or commit.get("intent_mode") != mode or outbox.get("intent_mode") != mode
+                    or outbox.get("delivery_state") != "RECEIPT_RECORDED"
+                    or outbox.get("local_is_authority") is not False
+                    or commit.get("event_id") != event_id or outbox.get("event_id") != event_id
+                    or commit.get("scope") != scope or outbox.get("scope") != scope
+                    or commit.get("request_digest") != request_digest or outbox.get("request_digest") != request_digest
+                    or type(commit.get("expected_revision")) is not int
+                    or commit["expected_revision"] != expected_revision
+                    or event.get("event_id") != event_id or event.get("repo_id") != repo_id
+                    or event.get("app_id") != app_id or event.get("task_id") != task_id
+                    or event.get("operation") != commit.get("operation")
+                    or event.get("idempotency_key") != commit.get("idem_key")
+                    or digest(event) != commit.get("event_digest")
+                    or digest(receipt) != commit.get("receipt_digest")):
+                return unknown
+            if (receipt.get("isolated_signature_verified") is not True or receipt.get("w01_proof") is not False
+                    or receipt.get("production_effective") is not False
+                    or receipt.get("event_digest") != event_payload_digest(event)):
+                return unknown
+            changes = commit["changes"]
+            if not isinstance(changes, list) or not 1 <= len(changes) <= 200:
+                return unknown
+            plan = []
+            seen = set()
+            for change in changes:
+                kind, key = change["kind"], change["key"]
+                if not safe_key(kind) or not safe_key(key) or (kind, key) in seen:
+                    return unknown
+                seen.add((kind, key))
+                old, new = change["expected_revision"], change["revision"]
+                if type(old) is not int or type(new) is not int or old < 0 or new != old + 1:
+                    return unknown
+                row = read(kind, key)
+                fence = read("fence", kind + "__" + key)
+                if (type(row.get("revision")) is not int or row["revision"] != new
+                        or digest(row) != change["digest"] or fence.get("state") != "closed"
+                        or fence.get("event_id") != event_id):
+                    return unknown
+                plan.append({"kind": kind, "key": key, "expected_revision": old})
+            if outbox.get("change_plan") != plan:
+                return unknown
+            idem = read("idem", commit["idem_key"])
+            if (idem.get("payload_hash") != request_digest or idem.get("state") != commit.get("state")
+                    or idem.get("public") != commit.get("result")):
+                return unknown
+            intent = "w05-intent-v1:" + digest({
+                "principal_id": commit["principal_id"], "scope": scope,
+                "operation": commit["operation"], "request_digest": request_digest,
+                "expected_revision": expected_revision, "changes": changes,
+                "result": commit["result"],
+            })
+            if intent != commit.get("intent_binding") or intent != event.get("note"):
+                return unknown
+            signed = query_exact_event(events_root, event_id=event_id, repo_id=repo_id,
+                                       app_id=app_id, task_id=task_id)
+            if not isinstance(signed, dict):
+                return unknown
+            proof = signed.get("read_receipt")
+            if (not isinstance(proof, dict) or proof.get("evidence") != "verified"
+                    or proof.get("authority") != "W01" or proof.get("server_source") != "app_service"
+                    or proof != receipt.get("signed_intent_receipt")
+                    or signed.get("event_type") != "delivery.intent.recorded"
+                    or signed.get("idempotency_key") != event_payload_digest(event)
+                    or signed.get("note") != intent or signed.get("evidence_ref") != intent
+                    or any(signed.get(k) != event.get(k) for k in
+                           ("stream_id", "stream_epoch", "producer_seq", "run_id"))):
+                return unknown
+            return {"status": "verified_isolated", "event_id": event_id,
+                    "business_commit_verified": True, "production_effective": False}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return unknown
+
+
 def _delivery_json(root: Path, kind: str, key: str):
     """Read one journal object. Missing and unsafe paths are both unknown."""
 
