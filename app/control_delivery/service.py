@@ -146,6 +146,20 @@ class DeliveryService:
         self._intent_mode = ("signed-business-v1" if require_business_signature else
                              "signed-isolated-v1" if intent_engine is not None else "fixture")
         self.store = Journal(root)
+        # The signed-business journal must be separately provisioned. Never
+        # mix its records with the legacy fixture delivery service.
+        def bind_mode(view):
+            bound = view.read("configuration", "business-mode")
+            if bound is not None:
+                return self._require_business_signature and bound == {"mode": "signed-business-v1"}
+            if not self._require_business_signature:
+                return True
+            if any(view.list(kind) for kind in ("feedback", "task", "chain", "outbox", "idem", "producer")):
+                return False
+            view.stage("configuration", "business-mode", {"mode": "signed-business-v1"})
+            return True
+        if not self.store.mutate(bind_mode):
+            raise ValueError("signed business mode requires a dedicated journal")
         self.auth = auth
         self.events = events
         self.schedule = schedule
@@ -1403,7 +1417,7 @@ class DeliveryService:
         return _ok("SUPERSEDED", public)
 
     def project(self, *, actor, task_id, scope=None):
-        if self._require_business_signature:
+        if self._require_business_signature or self.store.read("configuration", "business-mode") is not None:
             return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "business_read_unmapped"})
         if not isinstance(scope, dict) or not scope.get("repo") or not scope.get("task_id"):
             return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "scope"})
@@ -1496,7 +1510,7 @@ class DeliveryService:
             return lock
 
     def _read_allowed(self, actor, scope, kind, object_id, *, return_document=False):
-        if self._require_business_signature:
+        if self._require_business_signature or self.store.read("configuration", "business-mode") is not None:
             return False  # No signed business read mapping yet.
         if not isinstance(actor, dict) or not isinstance(scope, dict):
             return False
@@ -2038,6 +2052,8 @@ class DeliveryService:
             return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "cross_app"})
         if type(expected_revision) is not int or expected_revision < 0:
             return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "expected_revision"})
+        if not self._require_business_signature and self.store.read("configuration", "business-mode") is not None:
+            return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "business_mode_required"})
         self._local.repo = scope["repo"]
         self._local.task = scope["task_id"]
         business_auth = None
@@ -2187,6 +2203,9 @@ class DeliveryService:
             idem_body["business_auth"] = begun["business_auth"]
 
         def mutator(view):
+            if not self._require_business_signature and view.read("configuration", "business-mode") is not None:
+                view.abort()
+                return "conflict"
             owner = begun.get("event_id")
             if chain_snapshot is not None:
                 current_chains = [row for row in view.list("chain")
@@ -2274,6 +2293,9 @@ class DeliveryService:
         key = begun["object_id"]
 
         def mutator(view):
+            if not self._require_business_signature and view.read("configuration", "business-mode") is not None:
+                view.abort()
+                return "conflict"
             business_auth = begun.get("business_auth")
             if business_auth is not None:
                 nonce_key = business_auth["nonce_key"]
@@ -2484,7 +2506,7 @@ class DeliveryService:
         # Bind the authorized request and complete business change plan to
         # the event before dispatch. An eventual W01 adapter must sign this
         # digest in its accepted schema, not just the event coordinates.
-        event["note"] = "w05-intent-v1:" + _hash({
+        intent_material = {
             "principal_id": begun["principal"],
             "scope": begun["scope"],
             "operation": begun["operation"],
@@ -2496,7 +2518,10 @@ class DeliveryService:
                 for kind, key, doc, expected in pairs
             ],
             "result": {key: value for key, value in public.items() if key != "lease_token"},
-        })
+        }
+        if begun.get("business_auth") is not None:
+            intent_material["business_auth"] = begun["business_auth"]
+        event["note"] = "w05-intent-v1:" + _hash(intent_material)
         planned = dict(begun)
         planned["change_plan"] = [
             {"kind": item_kind, "key": item_key, "expected_revision": expected}
