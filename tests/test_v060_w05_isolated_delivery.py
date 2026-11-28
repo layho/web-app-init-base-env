@@ -437,6 +437,38 @@ class IsolatedDeliveryTest(unittest.TestCase):
             ["fb_a", "fb_b", "fb_c"],
         )
 
+    def test_task_claim_rejects_foreign_or_missing_feedback_atomically(self):
+        self._submit("fb_local")
+        for reason, changes, expected in (
+            ("repo", {"repo_id": "other/repo"}, "NOT_AUTHORIZED"),
+            ("scope", {"scope_task_id": "tsk_other"}, "NOT_AUTHORIZED"),
+            ("author", {"author_id": "other"}, "NOT_AUTHORIZED"),
+            ("linked", {"task_id": "tsk_other"}, "NOT_AUTHORIZED"),
+            ("missing", None, "EVIDENCE_MISSING"),
+        ):
+            with self.subTest(reason=reason):
+                target = "fb_" + reason
+                if changes is not None:
+                    self._submit(target)
+                    row = self.svc.store.read("feedback", target)
+                    row.update(changes)
+                    self.svc.store.write("feedback", target, row)
+                local_before = self.svc.store.read("feedback", "fb_local")
+                events_before = len(self.events.events)
+                result = self.svc.claim_task(
+                    actor=self.actor, scope=self.scope, task_id="tsk_w05",
+                    feedback_ids=["fb_local", target],
+                    chains=[self._chain("ch_a", "a")],
+                    idempotency_key="claim-" + reason,
+                    expected_revision=0,
+                )
+                self.assertFalse(result.ok)
+                self.assertEqual(result.code, expected)
+                self.assertIsNone(self.svc.store.read("task", "tsk_w05"))
+                self.assertIsNone(self._read_chain("tsk_w05", "ch_a"))
+                self.assertEqual(self.svc.store.read("feedback", "fb_local"), local_before)
+                self.assertEqual(len(self.events.events), events_before)
+
     def test_f06_multiple_prs_and_completion_condition(self):
         self._submit("fb_multi")
         claimed = self._claim_task(
