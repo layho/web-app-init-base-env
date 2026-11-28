@@ -447,6 +447,9 @@ class DeliveryService:
             return begun
         if begun["doc"] is not None:
             return _denied(409, "CONFLICT_REVISION", begun["doc"]["phase"], {"reason": "task_exists"})
+        if (any(not isinstance(item, str) or not item for item in feedback_ids)
+                or len(set(feedback_ids)) != len(feedback_ids)):
+            return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "feedback_ids"})
         built = []
         for spec in chains:
             if not all(valid_sha(spec.get(field)) for field in ("head", "base", "merge", "tree")):
@@ -501,7 +504,12 @@ class DeliveryService:
         for feedback_id in feedback_ids:
             row = self.store.read("feedback", feedback_id)
             if row is None:
-                continue
+                return _denied(409, "EVIDENCE_MISSING", "REJECTED", {"reason": "feedback_missing"})
+            if (row.get("repo_id") != scope["repo"]
+                    or row.get("scope_task_id") != task_id
+                    or row.get("author_id") != begun["principal"]
+                    or row.get("task_id") not in (None, task_id)):
+                return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "feedback_binding"})
             old = row["revision"]
             row = dict(row)
             row["task_id"] = task_id
