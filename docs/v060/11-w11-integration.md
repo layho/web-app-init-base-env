@@ -35,10 +35,10 @@
 | W04 | 7228604869 | 对账要 payload digest 和预期权威；发布绑定要成功测试和完整候选 | `_reconcile_event` 要求字段一致且 `trusted_source` 等于 `event_authority`。同序号不同事件不采纳任一方。发布要求测试 outcome 和完整四元组，并把链的 tree 绑到选定版本树 |
 | W05 | 7233342568 | 多对象 CAS、absent 证明、对账绑定 author/repo/digest | outbox 保存 `change_plan` 并围栏每个对象。absent 需要证明。对账缺 author、repo、scope 或 digest 时为 unknown，不把缺记录当成已接受 |
 | W06 | 7233311341 | Darwin/Linux fd、FIFO、未知键、幂等键不明文 | `proc_fd_path` 区分平台。读文件使用 `O_NONBLOCK`。未知键只记 `[REDACTED]`。幂等 scope 保存哈希 |
-| W07 | 7231884875 | 持锁后复验 generation/run/inode；manage.sh 独立适配 | `Fence.reclaim` / `takeover` 在持锁后复验。`deploy/macmini/control_journal_adapter.sh` 默认拒绝，未被 `manage.sh` 引用 |
+| W07 | 7231884875 | 持锁后复验 generation/run/inode；manage.sh 独立适配 | `Fence.reclaim` / `takeover` 在持锁后复验。`manage.sh update` 调用 `control_journal_adapter.sh`。默认拒绝与隔离写入分开；隔离模式不切换服务 |
 | W08 | 7234123859 | fresh 来源也按 `observed_at` 判断，不能一律 `stale=False` | `_mark_freshness` 覆盖可用的 fresh 来源。真实升级仍关闭 |
 | W09 | 7234812462 | grant 必须来自服务端主体；inspect 过滤；清理竞态；端口代次不复用 | `server_principal()` 不一致则拒绝。inspect 按 repo/app/host 过滤。unlink 在 fd 仍打开时执行，并确认 nlink 降为 0。已释放代次不能再预约。真实安装仍拒绝 |
-| W10 | 7234124286 | 服务端 principal、完整 read receipt、同序号不先采纳、React 真实路由 | `_gate` 使用服务端 principal。receipt 缺 digest、stream、epoch 或 seq 时不是权威。同序号冲突不进入 applied。页面读取 `/api/v1/control/board`，无配置时没有演示行 |
+| W10 | 7234124286 | 服务端 principal、完整 read receipt、同序号不先采纳、React 真实路由 | `_gate` 使用服务端 principal。receipt 缺 digest、stream、epoch 或 seq 时不是权威。同序号冲突不进入 applied。页面读取已登录的 `/api/v1/control/board`，按授权范围投影真实记录；无配置或无记录时没有演示行 |
 
 ## 74 项
 

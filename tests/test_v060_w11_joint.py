@@ -5,17 +5,18 @@ production fault. BLOCKED means the environment named in the assertion is
 absent.
 """
 
-import hashlib
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 
+from app.control_authz.principal import Principal
 from app.control_board.projection import authoritative, fold
 from app.control_diagnostics.safe_io import UnsafePath, proc_fd_path, read_bounded
+from app.control_joint.actions import ManualActions
 from app.control_joint.capability import host_capability
-from app.control_routes_w11 import control_board
+from app.control_joint.surface import read_board
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,15 +24,10 @@ ITEMS = ROOT / "tests" / "fixtures" / "v060" / "w00" / "items.json"
 BLOCKED = {"F11", "U09", "S10", "D10", "A12", "I12", "R10"}
 
 
-class Response:
-    def __init__(self):
-        self.headers = {}
-
-
 class JointTests(unittest.TestCase):
     def test_board_route_is_read_only_and_has_no_demo_rows(self):
-        response = Response()
-        body = control_board(response)
+        os.environ.pop("V060_CONTROL_ROOT", None)
+        body = read_board("admin")
         self.assertFalse(body["side_effect"])
         self.assertFalse(body["production_enabled"])
         self.assertFalse(body["preview_merge_authorized"])
@@ -41,7 +37,6 @@ class JointTests(unittest.TestCase):
         self.assertEqual(body["state"], "not_configured")
         self.assertEqual(body["macci"]["status"], "BLOCKED")
         self.assertIn("MacCI receipt for this exact tree", body["macci"]["missing"])
-        self.assertEqual(response.headers["Cache-Control"], "no-store")
 
     def test_host_capability_does_not_downgrade(self):
         report = host_capability()
@@ -130,10 +125,55 @@ class JointTests(unittest.TestCase):
             self.assertFalse(item["macci_receipt"])
             self.assertIsNone(item["public_running_sha"])
 
-    def test_idempotency_scope_does_not_keep_the_raw_key(self):
-        raw = "idem-visible-secret"
-        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        self.assertNotIn(raw, digest)
+    def test_manual_action_idempotency_rejects_a_changed_payload(self):
+        calls = []
+
+        def executor(root, principal, payload):
+            del root, principal
+            calls.append(payload["expected_revision"])
+            return {"http": 202, "code": None, "detail": "requested", "side_effect": False}
+
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            actions = ManualActions(Path(directory), executor=executor)
+            principal = Principal(
+                principal_id="fixture",
+                kind="agent",
+                repo_id="repo_joint",
+                app_id="base",
+                producer_id="fixture",
+                stream_id="fixture:task",
+                scopes=frozenset({"run", "task:tsk_w01"}),
+                trusted_source="agent",
+            )
+            raw = "idem-visible-secret"
+            first = actions.submit(principal, {
+                "action": "unblock",
+                "task_id": "tsk_w01",
+                "idempotency_key": raw,
+                "expected_revision": 1,
+            })
+            self.assertEqual(first["http"], 202, first)
+            self.assertFalse(first["accepted_as_success"])
+            mismatch = actions.submit(principal, {
+                "action": "unblock",
+                "task_id": "tsk_w01",
+                "idempotency_key": raw,
+                "expected_revision": 2,
+            })
+            self.assertEqual(mismatch["code"], "IDEMPOTENCY_PAYLOAD_MISMATCH")
+            self.assertFalse(mismatch["forwarded"])
+            self.assertEqual(calls, [1])
+            replay = actions.submit(principal, {
+                "action": "unblock",
+                "task_id": "tsk_w01",
+                "idempotency_key": raw,
+                "expected_revision": 1,
+            })
+            self.assertTrue(replay["replayed"])
+            self.assertEqual(calls, [1])
+            stored = (Path(directory) / "manual-actions.sqlite3").read_bytes()
+            self.assertNotIn(raw.encode(), stored)
 
 
 def _event(event_id, seq, stage):

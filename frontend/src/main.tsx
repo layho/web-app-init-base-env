@@ -2,7 +2,7 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { AppstoreOutlined, HistoryOutlined, ProfileOutlined, CloudDownloadOutlined, UnorderedListOutlined, ProjectOutlined } from '@ant-design/icons'
-import { Alert, Button, Card, ConfigProvider, Descriptions, Drawer, Empty, Form, Image, Input, Layout, Modal, Select, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, ConfigProvider, Descriptions, Drawer, Empty, Form, Image, Input, Layout, Modal, Select, Space, Table, Tag, Typography, theme } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import 'antd/dist/reset.css'
 import { ReleasePage, SystemLogPage } from './OperationsPage'
@@ -19,6 +19,7 @@ import { WorkspaceShell } from './WorkspaceShell'
 import { ScreenshotPicker } from './ScreenshotPicker'
 import { FeedbackDelivery } from './FeedbackDelivery'
 import { ControlBoardPanel } from './ControlBoardPanel'
+import { workspaceTheme } from './workspace-theme.ts'
 import type { Delivery } from './FeedbackDelivery'
 
 type DeployStatus = { state: string; event: {at: string; code: string; sha: string; detail?: string} | null; last_successful_deployment?: {at:string; sha:string} | null; locked: boolean; age_seconds: number | null; requested_at: string | null; running_sha: string; rollback_failed: boolean }
@@ -458,7 +459,7 @@ function App() {
 
   if (loading) return <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>正在验证登录状态…</div>
   if (!session) return (
-    <Layout style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#f1f5f9', padding: 20 }}>
+    <Layout style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#0f1419', padding: 20 }}>
       <Card style={{ width: '100%', maxWidth: 390 }}>
         <Typography.Title level={3}>{branding.reference_name}</Typography.Title>
         {notice && <Alert type={notice.type} showIcon message={notice.text} style={{ marginBottom: 16 }} />}
@@ -566,7 +567,7 @@ function App() {
             </Typography.Paragraph>
             {manualPrResult && <Alert showIcon type={manualPrResult.type} message={manualPrResult.text} />}
           </Card>}
-        <ControlBoardPanel />
+        <ControlBoardPanel csrf={session.csrf_token} />
         <DevelopmentTasksPage data={developmentTasks} loading={loadingOperations === 'tasks'}
           onRefresh={() => void loadOperations('tasks', true)}
           onRequestRepair={async (number, head, base) => {
@@ -695,24 +696,9 @@ function App() {
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConfigProvider locale={zhCN} theme={{
-      token: {
-        colorPrimary: '#2563eb',
-        colorBgLayout: '#f1f5f9',
-        colorBgContainer: '#ffffff',
-        colorText: '#172033',
-        colorTextSecondary: '#64748b',
-        colorBorder: '#e2e8f0',
-        colorSuccess: '#16a34a',
-        colorWarning: '#d97706',
-        borderRadius: 9,
-        fontFamily: '-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif',
-      },
-      components: {
-        Layout: { siderBg: '#f8fafc', headerBg: '#ffffff', bodyBg: '#f1f5f9' },
-        Menu: { itemBg: '#f8fafc', itemColor: '#475569', itemSelectedBg: '#e5edff', itemSelectedColor: '#2563eb', itemHoverBg: '#edf2f7', itemBorderRadius: 8 },
-        Card: { headerBg: '#ffffff' },
-        Table: { headerBg: '#f8fafc', headerColor: '#475569' },
-      },
+      algorithm: workspaceTheme.algorithm === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
+      token: workspaceTheme.token,
+      components: workspaceTheme.components,
     }}>
       <App />
     </ConfigProvider>

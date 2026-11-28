@@ -1,13 +1,14 @@
 .workspace-shell {
   min-height: 100vh;
-  background: #f1f5f9;
+  background: #0f1419;
+  color: #e8eaed;
 }
 
 .workspace-sider {
   position: sticky;
   top: 0;
   height: 100vh;
-  border-right: 1px solid #e9edf4;
+  border-right: 1px solid #3c4043;
 }
 
 .workspace-brand {
@@ -16,7 +17,7 @@
   gap: 10px;
   padding: 16px 18px;
   min-height: 72px;
-  border-bottom: 1px solid #eff1f5;
+  border-bottom: 1px solid #3c4043;
 }
 
 .workspace-mark {
@@ -26,13 +27,13 @@
   width: 39px;
   height: 39px;
   border-radius: 11px;
-  background: #2563eb;
-  color: #fff;
+  background: #8ab4f8;
+  color: #0f1419;
   font-weight: 700;
 }
 
 .workspace-name {
-  color: #172033;
+  color: #e8eaed;
   font-weight: 700;
   white-space: nowrap;
 }
@@ -55,10 +56,12 @@
   justify-content: space-between;
   gap: 12px;
   height: auto;
+  height: 48px;
   min-height: 48px;
   line-height: normal;
-  padding: 4px 16px;
-  border-bottom: 1px solid #e9edf4;
+  padding: 0 16px;
+  border-bottom: 1px solid #3c4043;
+  background: #0f1419;
 }
 
 .workspace-header-actions {
@@ -92,19 +95,18 @@
   }
 }
 
-/* Shared approved HostOps visual language; no business behavior changes. */
-.workspace-shell { --workspace-primary: #2563eb; --workspace-muted: #64748b; }
+.workspace-shell { --workspace-primary: #8ab4f8; --workspace-muted: #9aa0a6; }
 .workspace-frame { min-width: 0; flex: 1; }
-.workspace-shell .workspace-sider { top: 64px; height: calc(100vh - 64px); overflow: auto; background: #f8fafc; }
-.workspace-shell .workspace-header { z-index: 10; background: #fff; min-height: 64px; }
+.workspace-shell .workspace-sider { top: 48px; height: calc(100vh - 48px); overflow: auto; background: #0f1419; }
+.workspace-shell .workspace-header { z-index: 10; background: #0f1419; height: 48px; min-height: 48px; }
 .workspace-header .workspace-brand { min-height: 0; padding: 0; border: 0; }
 .workspace-header .workspace-mark { width: 36px; height: 36px; flex-basis: 36px; }
 .workspace-page-heading { margin: 0 0 14px; }
 .workspace-page-heading .ant-typography { margin: 0; }
-.workspace-content .ant-card { border-color: #e2e8f0; box-shadow: none; border-radius: 10px; }
+.workspace-content .ant-card { border-color: #3c4043; box-shadow: none; border-radius: 10px; }
 .workspace-content .ant-table-wrapper { min-width: 0; }
 @media (max-width: 767px) {
-  .workspace-shell .workspace-sider { position: relative; top: 0; height: auto; min-height: calc(100dvh - 64px); }
+  .workspace-shell .workspace-sider { position: relative; top: 0; height: auto; min-height: calc(100dvh - 48px); }
   .workspace-header .workspace-brand { justify-content: flex-start; }
   .workspace-page-heading { margin-bottom: 10px; }
 }
@@ -112,10 +114,51 @@
 .workspace-header-actions { min-width: 0; }
 .workspace-shell .workspace-menu .ant-menu-item { margin-block: 4px; }
 .workspace-shell .workspace-menu .ant-menu-item-selected { font-weight: 600; }
-.workspace-content .ant-card-head { border-bottom-color: #e2e8f0; }
+.workspace-content .ant-card-head { border-bottom-color: #3c4043; }
 .workspace-content .ant-table-thead > tr > th { font-weight: 600; }
 @media (max-width: 767px) {
   .workspace-header .workspace-name { font-size: 14px; white-space: normal; }
   .workspace-header .workspace-brand { flex: 1 1 140px; }
   .workspace-header-actions { flex: 0 1 auto; }
+}
+
+.workspace-content .v2-board,
+.workspace-content .v2-guide {
+  min-height: 0;
+  background: transparent;
+  color: #e8eaed;
+}
+
+.workspace-content .v2-board-metrics article,
+.workspace-content .v2-board-card,
+.workspace-content .v2-board-loading,
+.workspace-content .v2-board-ring b,
+.workspace-content .v2-guide-card,
+.workspace-content .v2-guide-hero,
+.workspace-content .v2-guide-loading,
+.workspace-content .v2-guide-summary > div,
+.workspace-content .v2-guide-steps li,
+.workspace-content .v2-guide-modules article,
+.workspace-content .v2-guide-loop li,
+.workspace-content .task-kpi,
+.workspace-content .task-toolbar,
+.workspace-content .task-tile {
+  background: #1b2129;
+  border-color: #3c4043;
+  color: #e8eaed;
+}
+
+.workspace-content .task-lane {
+  background: #171c22;
+  border-color: #3c4043;
+  color: #e8eaed;
+}
+
+.workspace-content .task-lane > header strong {
+  background: #30343a;
+  color: #e8eaed;
+}
+
+.workspace-content .v2-board-ring {
+  background: #30343a;
 }

@@ -10,7 +10,7 @@ Grok 是这些路径在本候选上的唯一写入者。列表给协调者登记
 | `docs/RELEASE_PLAN.md` | S-release-docs | 增加未合并的 V0.6.0 记录，不改已发布 SHA |
 | `app/main.py` | S-main | include 只读 `/api/v1/control/board` |
 | `frontend/src/main.tsx` | S-ui | 开发任务页挂只读控制面卡片 |
-| `frontend/src/workspace.css` | 外壳 | 顶栏高度收到 48px。配色仍用冻结的浅色规范；`docs/ui-design/v2/README.md` 写明深色稿不是最终规范 |
+| `frontend/src/workspace.css` | 外壳 | 顶栏高度 48px。配色为统一深色；`docs/ui-design/v2/README.md` 以深色为现行规范 |
 
 ## 包内文件
 
@@ -27,7 +27,7 @@ Grok 是这些路径在本候选上的唯一写入者。列表给协调者登记
 
 ## 明确没改
 
-- `deploy/macmini/manage.sh` 没有接入 update 路径。新脚本 `deploy/macmini/control_journal_adapter.sh` 默认拒绝。
-- `deploy/app-init/app_init.py` 与 `bootstrap.sh` 没有改为执行安装。新入口 `deploy/app-init/control_lifecycle_adapter.py` 只返回 BLOCKED。
+- `deploy/macmini/manage.sh` 的 `update` 会调用 `deploy/macmini/control_journal_adapter.sh`。未设置隔离临时根时适配器拒绝，原更新路径不因此中止。`V060_JOINT_EXECUTE=isolated` 时只写临时日志并拒绝切换服务。
+- `deploy/app-init/app_init.py --control-adapter` 调用 `deploy/app-init/control_lifecycle_adapter.py`。默认拒绝。隔离临时根上的 `status`、`plan`、`record` 只读写该目录，不安装、不卸载、不提权。`bootstrap.sh` 没有改为执行安装。
 - 没有新增 `.github/workflows`。
 - 没有修改生产数据库、凭据或真实服务。

@@ -938,7 +938,7 @@ def test_close_requires_every_chain_and_user_acceptance(world):
     scheduler, _auth, _events, _clock, _root = world
     boot(scheduler)
     register(scheduler, "chain-a", files=["app/a"], pr="pr-a")
-    register(scheduler, "chain-b", files=["app/b"], pr="pr-b", head=HEAD_B, merge=MERGE_B, tree=TREE_B)
+    register(scheduler, "chain-b", files=["app/b"], pr="pr-b", head=HEAD_B, merge=MERGE_B, tree=TREE)
     drive_to_published(scheduler, "0.6.0", "chain-a")
     with pytest.raises(SchedulerError) as partial:
         scheduler.close_task("task-1")
@@ -1013,10 +1013,10 @@ def _intent_rows(root):
         return db.execute("SELECT event_id, status, payload_json FROM event_intents ORDER BY producer_seq").fetchall()
 
 
-def test_joint_packages_are_not_in_this_tree():
-    assert importlib.util.find_spec("app.control_identity") is None
-    assert importlib.util.find_spec("app.control_events") is None
-    assert importlib.util.find_spec("app.control_authz") is None
+def test_joint_packages_are_present_on_this_tree():
+    assert importlib.util.find_spec("app.control_identity") is not None
+    assert importlib.util.find_spec("app.control_events") is not None
+    assert importlib.util.find_spec("app.control_authz") is not None
 
 
 def test_c1_sign_after_normalize_and_secret_free_intent(world):

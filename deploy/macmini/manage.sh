@@ -500,8 +500,21 @@ finish_update() {
   fi
   rmdir "$LOCK" 2>/dev/null || true
 }
+control_journal() {
+  local adapter="$ROOT/deploy/macmini/control_journal_adapter.sh"
+  test -x "$adapter" || { echo "BLOCKED: control journal adapter is missing" >&2; return 2; }
+  V060_JOINT_CALLER=manage.sh "$adapter" "${1:-status}"
+}
 update() {
   local old new
+  if [ "${V060_JOINT_EXECUTE:-}" = "isolated" ]; then
+    control_journal record
+    log "isolated control journal recorded; refusing host service switch"
+    exit 0
+  fi
+  if [ -x "$ROOT/deploy/macmini/control_journal_adapter.sh" ]; then
+    control_journal status >/dev/null 2>&1 || log "control journal adapter denied; existing update path is unchanged"
+  fi
   old="$(git rev-parse HEAD)"
   if ! mkdir "$LOCK" 2>/dev/null; then
     record_operation update_locked "$old"
@@ -599,7 +612,8 @@ case "$1" in
   serve) serve;;
   install) install;;
   update) update;;
+  control-journal) control_journal "${2:-status}";;
   feedback) feedback;;
   status) launchctl print "gui/$(id -u)/$WEB" | head -n 30;;
-  *) echo 'Usage: manage.sh {install|serve|update|feedback|status}' >&2; exit 2;;
+  *) echo 'Usage: manage.sh {install|serve|update|control-journal|feedback|status}' >&2; exit 2;;
 esac
