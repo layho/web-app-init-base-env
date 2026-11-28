@@ -502,6 +502,59 @@ class IsolatedDeliveryTest(unittest.TestCase):
                 self.assertEqual(self.svc.store.read("feedback", "fb_local"), local_before)
                 self.assertEqual(len(self.events.events), events_before)
 
+    def test_completion_rejects_cross_repo_chain_and_foreign_feedback(self):
+        self._submit("fb_good")
+        self._submit("fb_bad")
+        self._claim_task(feedback_ids=["fb_good", "fb_bad"])
+        self._to_published("tsk_w05", "ch_a")
+        chain = self._read_chain("tsk_w05", "ch_a")
+        self.svc.store.write("chain", "tsk_w05__foreign", {**chain, "chain_id": "foreign",
+                                                           "repo_id": "other/repo"})
+        denied = self.svc.project(actor=self.actor, scope=self.scope, task_id="tsk_w05")
+        self.assertFalse(denied.ok)
+        self.assertEqual(denied.code, "EVIDENCE_MISSING")
+        # Reclassify the synthetic record outside this task before acceptance.
+        foreign = self.svc.store.read("chain", "tsk_w05__foreign")
+        foreign["task_id"] = "tsk_foreign"
+        self.svc.store.write("chain", "tsk_w05__foreign", foreign)
+        accepted = self.svc.record_task_acceptance(
+            actor=self.actor, scope=self.scope, task_id="tsk_w05", signer_kind="user_acceptance",
+            idempotency_key="accept-scope", expected_revision=1)
+        self.assertTrue(accepted.ok, accepted.as_dict())
+        bad = self.svc.store.read("feedback", "fb_bad")
+        bad["app_id"] = "other"
+        self.svc.store.write("feedback", "fb_bad", bad)
+        denied = self.svc.close_task(actor=self.actor, scope=self.scope, task_id="tsk_w05",
+                                     idempotency_key="close-scope", expected_revision=accepted.body["revision"])
+        self.assertFalse(denied.ok)
+        self.assertFalse(self._feedback("fb_good")["closed"])
+        self.assertEqual(self.svc.store.read("feedback", "fb_bad"), bad)
+        self.assertNotEqual(self.svc.store.read("task", "tsk_w05")["phase"], "close")
+
+    def test_close_rejects_concurrent_chain_addition(self):
+        self._submit("fb_race")
+        self._claim_task(feedback_ids=["fb_race"])
+        self._to_published("tsk_w05", "ch_a")
+        accepted = self.svc.record_task_acceptance(
+            actor=self.actor, scope=self.scope, task_id="tsk_w05", signer_kind="user_acceptance",
+            idempotency_key="accept-race", expected_revision=1)
+        self.assertTrue(accepted.ok, accepted.as_dict())
+        commit = self.svc._commit_local
+
+        def inject(begun, pairs, public, state, **kwargs):
+            chain = self._read_chain("tsk_w05", "ch_a")
+            self.svc.store.write("chain", "tsk_w05__late", {**chain, "chain_id": "late",
+                                                         "state": "OPEN", "publish_evidence": None})
+            return commit(begun, pairs, public, state, **kwargs)
+
+        self.svc._commit_local = inject
+        denied = self.svc.close_task(actor=self.actor, scope=self.scope, task_id="tsk_w05",
+                                     idempotency_key="close-race", expected_revision=accepted.body["revision"])
+        self.assertFalse(denied.ok)
+        self.assertEqual(denied.code, "CONFLICT_REVISION")
+        self.assertFalse(self._feedback("fb_race")["closed"])
+        self.assertNotEqual(self.svc.store.read("task", "tsk_w05")["phase"], "close")
+
     def test_f06_multiple_prs_and_completion_condition(self):
         self._submit("fb_multi")
         claimed = self._claim_task(
