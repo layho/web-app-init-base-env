@@ -242,6 +242,46 @@ def test_w05_intent_bridge_uses_signed_w01_evidence_without_business_commit(tmp_
     assert eng.store.count("events") == 1
 
 
+def test_w05_intent_rejects_control_fields_and_signer_scope_mutation(tmp_path):
+    from app.control_events.schema import split_request
+    from app.control_joint.w05_issue import record_isolated_intent
+
+    eng = engine(tmp_path)
+    event = {
+        "event_id": "evt_w05_scope", "repo_id": eng.repo_id, "app_id": "base",
+        "task_id": "tsk_w01", "run_id": "run_w05_scope",
+        "producer_id": "w05", "stream_id": "w05:task", "stream_epoch": 1,
+        "producer_seq": 1, "occurred_at": 1700000000,
+        "note": "w05-intent-v1:" + "a" * 64,
+    }
+    captured = {}
+    def capture(body):
+        captured.update(body)
+        return None
+    assert record_isolated_intent(eng, event=event, sign_request=capture)["status"] == "unknown"
+    request = {**captured, "actor": actor("w05")}
+    assert split_request(request)["event_type"] == "delivery.intent.recorded"
+    for fields in (
+        {"epoch_closed": True, "closed_through_seq": 1},
+        {"classification": "never_existed"}, {"delivery_channels": ["external"]},
+        {"expected_revision": 1}, {"idempotency_key": "bad-digest"},
+        {"scope": {"repo": eng.repo_id, "task_id": "tsk_foreign"}},
+        {"scope": {**request["scope"], "extra": True}}, {"authorizer": "fixture"},
+        {"state": "PUBLISHED"},
+    ):
+        with pytest.raises(ControlError):
+            split_request({**request, **fields})
+    def changed_scope(body):
+        body["scope"]["task_id"] = "tsk_foreign"
+        return sign_event(eng, body, signer="w05")
+    assert record_isolated_intent(eng, event=event, sign_request=changed_scope)["status"] == "unknown"
+    assert eng.store.count("events") == 0
+    verified = record_isolated_intent(eng, event=event,
+                                     sign_request=lambda body: sign_event(eng, body, signer="w05"))
+    assert verified["status"] == "intent_verified", verified
+    assert eng.store.count("events") == 1
+
+
 def test_w05_signed_intent_waits_for_gap_and_reconciles_applied_row(tmp_path):
     from app.control_joint.w05_issue import record_isolated_intent
 
