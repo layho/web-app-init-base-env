@@ -1,8 +1,8 @@
-"""Isolated view model for the unified task board.
+"""Isolated Python view model for the unified task board.
 
-This is the W10 UI component. It does not mount a page and does not write
-authoritative state. Shared frontend files stay untouched until a later
-reservation.
+This module builds a Python view model. It does not mount a page and does
+not write authoritative state. Formal integration still needs a reserved
+shared UI. An independent component is enough for this package.
 """
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ def render_view(page, flags):
         "banners": banners,
         "production_healthy": False,
         "mounted": False,
+        "react_page": False,
+        "component": "python_view_model",
         "page": {
             "http": page.get("http"),
             "code": page.get("code"),

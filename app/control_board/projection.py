@@ -9,16 +9,24 @@ from __future__ import annotations
 
 from .flags import PHASES
 
-TRUSTED_SOURCE = {
-    "ci.test.finished": "macci",
-    "run.observed": "macci",
-    "deployment.commit": "host_deployer",
-    "deployment.health": "host_deployer",
-    "authorization.granted": "policy_service",
-    "authorization.revoked": "policy_service",
-    "diagnostic.observation": "hostops_readonly",
+# Real W00 event types, plus the two structural types W01 accepts.
+# A client source string is not an entry in this table.
+W00_EVENT_TYPES = {
+    "authorization.granted": ("authorization", "policy_service"),
+    "authorization.revoked": ("authorization", "policy_service"),
+    "deployment.health": ("deployment", "host_deployer"),
+    "deployment.commit": ("deployment", "host_deployer"),
+    "ci.test.finished": ("evidence", "macci"),
+    "diagnostic.observation": ("diagnostic", "hostops_readonly"),
+    "run.started": ("task", "agent"),
+    "authorization.epoch_closed": ("authorization", "policy_service"),
 }
-TASK_SOURCES = frozenset({"macci", "policy_service", "host_deployer"})
+# W00 has no candidate event type. This projection accepts one only when a
+# trusted W01 read receipt carries verified or accepted evidence.
+EVIDENCED_READ_TYPES = {
+    "candidate.registered": ("candidate", "policy_service"),
+}
+TRUSTED_SOURCE = {name: source for name, (_kind, source) in W00_EVENT_TYPES.items()}
 EXECUTE_OPERATIONS = frozenset({"run.execute", "task.execute"})
 LANES = {
     "development": ("develop", "review"),
@@ -37,8 +45,9 @@ def reject_reason(event):
         return "event 不是对象"
     if event.get("schema_version") != 2:
         return "schema_version 不受支持"
-    if "received_at" in event:
-        return "received_at 由调用方填写，已拒绝"
+    receipt_problem = _received_at_conflict(event)
+    if receipt_problem:
+        return receipt_problem
     if not isinstance(event.get("event_id"), str) or not event["event_id"]:
         return "event_id 缺失"
     if not isinstance(event.get("stream_id"), str) or ":" not in event["stream_id"]:
@@ -55,17 +64,71 @@ def reject_reason(event):
     return None
 
 
+def _read_receipt(event):
+    receipt = event.get("read_receipt")
+    if not isinstance(receipt, dict):
+        return None
+    if receipt.get("kind") != "read" or receipt.get("authority") != "W01":
+        return None
+    if receipt.get("event_id") not in (None, event.get("event_id")):
+        return None
+    return receipt
+
+
+def _received_at_conflict(event):
+    """Caller received_at is kept only when it matches a W01 read receipt.
+
+    A submit receipt is not that read receipt. A missing receipt, a submit
+    receipt, or a different server timestamp is a contradiction.
+    """
+    if "received_at" not in event:
+        return None
+    receipt = _read_receipt(event)
+    if receipt is None or receipt.get("received_at") != event.get("received_at"):
+        return "received_at 与 W01 服务端回执矛盾"
+    submit = event.get("submit_receipt")
+    if isinstance(submit, dict) and submit.get("kind") == "submit":
+        if submit.get("received_at") not in (None, receipt.get("received_at")):
+            return "received_at 与 W01 服务端回执矛盾"
+    return None
+
+
 def authoritative(event):
-    event_type = event.get("event_type")
-    source = event.get("source")
-    if not isinstance(source, str) or not source:
+    """Authority comes from a W01 read receipt and accepted evidence.
+
+    ``source`` and ``trusted_source`` are caller strings. The word
+    ``authoritative`` is one of those strings. Neither one proves authority.
+    A submit receipt records an append; it is not a trusted read.
+    """
+    if not isinstance(event, dict):
         return False
-    if event_type == "task.stage" and source in TASK_SOURCES:
-        return True
-    if event_type == "candidate.registered" and source == "policy_service":
-        return True
-    expected = TRUSTED_SOURCE.get(event_type)
-    return expected is not None and source == expected
+    receipt = _read_receipt(event)
+    if receipt is None:
+        return False
+    if isinstance(event.get("submit_receipt"), dict) and event["submit_receipt"].get("kind") == "submit":
+        if event["submit_receipt"].get("received_at") not in (None, receipt.get("received_at")):
+            return False
+    fact_state = receipt.get("fact_state") or event.get("fact_state")
+    if fact_state != "ACCEPTED":
+        return False
+    evidence = receipt.get("evidence") if receipt.get("evidence") in {"verified", "accepted"} else event.get("evidence")
+    if evidence not in {"verified", "accepted"}:
+        return False
+    server_source = receipt.get("server_source")
+    if not isinstance(server_source, str) or not server_source or server_source == "authoritative":
+        return False
+    spec = W00_EVENT_TYPES.get(event.get("event_type"))
+    if spec is None:
+        spec = EVIDENCED_READ_TYPES.get(event.get("event_type"))
+    if spec is None:
+        return False
+    expected_class, expected_source = spec
+    if event.get("event_class") != expected_class or server_source != expected_source:
+        return False
+    claimed = event.get("trusted_source")
+    if isinstance(claimed, str) and claimed not in ("", server_source):
+        return False
+    return True
 
 
 def fold(events):
@@ -94,11 +157,17 @@ def fold(events):
                 continue
             watermark = 0
             stopped = False
+            seen_seq = {}
             for event in batch:
                 if stopped:
                     held.append(_held(event, "gap"))
                     continue
                 seq = event["producer_seq"]
+                prior = seen_seq.get(seq)
+                if prior is not None and prior != event.get("event_id"):
+                    held.append(_held(event, "same_seq"))
+                    continue
+                seen_seq[seq] = event.get("event_id")
                 if seq <= watermark:
                     held.append(_held(event, "duplicate"))
                     continue

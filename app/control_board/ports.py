@@ -40,15 +40,22 @@ def _blocked(operation):
 
 
 class Grant:
-    def __init__(self, principal_id, app_id, action):
+    def __init__(self, principal_id, app_id, action, role=None):
         self.principal_id = principal_id
         self.app_id = app_id
         self.action = action
+        self.role = role
 
 
 class BlockedAuthorizationPort:
     calls = ()
     action_calls = ()
+    grants = ()
+    identities = {}
+
+    def authenticate(self, principal):
+        del principal
+        return _blocked("authenticate")
 
     def evaluate(self, principal, *, app_id, action, task_id=None, candidate_id=None):
         del principal, app_id, task_id, candidate_id
@@ -78,6 +85,7 @@ class BlockedSchedulePort:
     def __init__(self):
         self.calls = []
         self.intervene_calls = []
+        self.reconcile_calls = []
 
     def snapshot(self, principal, *, app_id, version):
         del principal, app_id, version
@@ -89,10 +97,16 @@ class BlockedSchedulePort:
         self.intervene_calls.append(action)
         return _blocked("schedule.intervene")
 
+    def reconcile(self, principal, *, action, subject_id, idempotency_key, expected_revision, task_id, chain_id):
+        del principal, subject_id, idempotency_key, expected_revision, task_id, chain_id
+        self.reconcile_calls.append(action)
+        return _blocked("schedule.reconcile")
+
 
 class BlockedDeliveryPort:
     def __init__(self):
         self.calls = []
+        self.reconcile_calls = []
 
     def project(self, principal, *, app_id, task_id, scope):
         del principal, app_id, task_id, scope
@@ -107,6 +121,11 @@ class BlockedDeliveryPort:
         del task_id, chain_id, idempotency_key, expected_revision, scope, principal
         self.calls.append("request_publish")
         return _blocked("delivery.request_publish")
+
+    def reconcile(self, principal, *, action, subject_id, idempotency_key, expected_revision, task_id, chain_id):
+        del principal, subject_id, idempotency_key, expected_revision, task_id, chain_id
+        self.reconcile_calls.append(action)
+        return _blocked("delivery.reconcile")
 
 
 class BlockedDiagnosticPort:
@@ -124,16 +143,51 @@ class FixtureAuthorizationPort:
         self.calls = []
         self.action_calls = []
         self.allow_any = False
+        self.identities = {}
+        self.object_allow = {}
+
+    def authenticate(self, principal):
+        principal_id = principal.get("id") if isinstance(principal, dict) else None
+        self.calls.append(("authenticate", principal_id))
+        if not isinstance(principal, dict):
+            return self._deny("NOT_AUTHORIZED")
+        record = self.identities.get(principal_id)
+        if record is None:
+            roles = {
+                grant.role
+                for grant in self.grants
+                if grant.principal_id == principal_id and grant.app_id == principal.get("app_id") and grant.role
+            }
+            if len(roles) != 1:
+                return self._deny("NOT_AUTHORIZED")
+            record = {"role": next(iter(roles)), "app_id": principal.get("app_id")}
+        if record.get("app_id") != principal.get("app_id") or record.get("role") != principal.get("role"):
+            return self._deny("NOT_AUTHORIZED")
+        if record.get("role") not in {"agent", "session", "host", "hostops", "reader", "publisher", "macci"}:
+            return self._deny("NOT_AUTHORIZED")
+        return {
+            "ok": True,
+            "allowed": True,
+            "blocked": False,
+            "http": 200,
+            "code": None,
+            "side_effect": False,
+            "test_double": True,
+            "principal_id": principal_id,
+            "app_id": record.get("app_id"),
+            "role": record.get("role"),
+            "interface": "test_double",
+        }
 
     def evaluate(self, principal, *, app_id, action, task_id=None, candidate_id=None):
         del task_id, candidate_id
         self.calls.append(("evaluate", action, app_id))
         if self.allow_any:
-            return self._allow(action)
+            return self._allow(principal, app_id, action)
         principal_id = principal.get("id") if isinstance(principal, dict) else None
         for grant in self.grants:
             if grant.principal_id == principal_id and grant.app_id == app_id and grant.action == action:
-                return self._allow(action)
+                return self._allow(principal, app_id, action)
         return {
             "ok": False,
             "allowed": False,
@@ -175,7 +229,24 @@ class FixtureAuthorizationPort:
         body["connected_executor"] = False
         return body
 
-    def _allow(self, action):
+    def _deny(self, code):
+        return {
+            "ok": False,
+            "allowed": False,
+            "allow": False,
+            "blocked": False,
+            "http": 403,
+            "code": code,
+            "side_effect": False,
+            "test_double": True,
+            "github_proof": False,
+            "macci_proof": False,
+            "interface": "test_double",
+        }
+
+    def _allow(self, principal, app_id, action):
+        principal_id = principal.get("id") if isinstance(principal, dict) else None
+        allowed = self.object_allow.get((principal_id, app_id))
         return {
             "ok": True,
             "allowed": True,
@@ -189,6 +260,8 @@ class FixtureAuthorizationPort:
             "macci_proof": False,
             "interface": "test_double",
             "action": action,
+            "objects": None if allowed is None else sorted(allowed),
+            "scope": {"app_id": app_id, "principal_id": principal_id, "action": action},
         }
 
 
@@ -263,6 +336,7 @@ class FixtureSchedulePort:
         self.snapshot_body = snapshot
         self.calls = []
         self.intervene_calls = []
+        self.reconcile_calls = []
 
     def snapshot(self, principal, *, app_id, version):
         del principal, app_id
@@ -299,12 +373,33 @@ class FixtureSchedulePort:
             "ok": True,
         }
 
+    def reconcile(self, principal, *, action, subject_id, idempotency_key, expected_revision, task_id, chain_id):
+        del principal, subject_id
+        self.reconcile_calls.append((action, task_id, chain_id, expected_revision, idempotency_key))
+        return {
+            "http": 409,
+            "code": "SIDE_EFFECT_UNKNOWN",
+            "state": "UNKNOWN",
+            "classification": "unknown",
+            "performed": False,
+            "forwarded": False,
+            "reconciled": True,
+            "changed": False,
+            "side_effect": False,
+            "test_double": True,
+            "github_proof": False,
+            "macci_proof": False,
+            "real_merge": False,
+            "real_deploy": False,
+        }
+
 
 class FixtureDeliveryPort:
     def __init__(self, projects):
         self.projects = projects
         self.calls = []
         self.read_calls = []
+        self.reconcile_calls = []
 
     def project(self, principal, *, app_id, task_id, scope):
         del principal, app_id, scope
@@ -347,6 +442,26 @@ class FixtureDeliveryPort:
             "code": "POLICY_DENIED",
             "allow": False,
             "performed": False,
+            "changed": False,
+            "side_effect": False,
+            "test_double": True,
+            "github_proof": False,
+            "macci_proof": False,
+            "real_merge": False,
+            "real_deploy": False,
+        }
+
+    def reconcile(self, principal, *, action, subject_id, idempotency_key, expected_revision, task_id, chain_id):
+        del principal, subject_id
+        self.reconcile_calls.append((action, task_id, chain_id, expected_revision, idempotency_key))
+        return {
+            "http": 409,
+            "code": "SIDE_EFFECT_UNKNOWN",
+            "state": "UNKNOWN",
+            "classification": "unknown",
+            "performed": False,
+            "forwarded": False,
+            "reconciled": True,
             "changed": False,
             "side_effect": False,
             "test_double": True,

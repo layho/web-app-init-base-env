@@ -13,6 +13,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from app.control_board.projection import W00_EVENT_TYPES
 from app.control_board import (
     ACCEPTANCE_ENABLED,
     AUTHORITATIVE_MUTATION,
@@ -72,15 +73,52 @@ def grants_for(*roles):
     }
     for app_id, role in roles:
         for action in mapping[role]:
-            items.append(Grant(f"fixture-{role}-{app_id}", app_id, action))
+            items.append(Grant(f"fixture-{role}-{app_id}", app_id, action, role))
     return items
+
+
+_SERVER_SOURCE = {
+    "run.started": "agent",
+    "authorization.granted": "policy_service",
+    "authorization.revoked": "policy_service",
+    "authorization.epoch_closed": "policy_service",
+    "deployment.health": "host_deployer",
+    "deployment.commit": "host_deployer",
+    "ci.test.finished": "macci",
+    "diagnostic.observation": "hostops_readonly",
+    "candidate.registered": "policy_service",
+}
+
+
+def _with_read_receipt(item, overrides):
+    if any(key in overrides for key in ("read_receipt", "received_at", "submit_receipt")):
+        if item.get("read_receipt") is None:
+            item.pop("read_receipt", None)
+        return item
+    if not item.get("source"):
+        return item
+    server_source = _SERVER_SOURCE.get(item.get("event_type"))
+    if server_source is None:
+        return item
+    item["fact_state"] = "ACCEPTED"
+    item["evidence"] = "verified"
+    item["read_receipt"] = {
+        "kind": "read",
+        "authority": "W01",
+        "received_at": "2026-11-28T01:00:01Z",
+        "server_source": server_source,
+        "fact_state": "ACCEPTED",
+        "evidence": "verified",
+        "event_id": item.get("event_id"),
+    }
+    return item
 
 
 def event(seq, **overrides):
     item = {
         "event_id": f"evt-{seq}",
         "schema_version": 2,
-        "event_type": "task.stage",
+        "event_type": "run.started",
         "event_class": "task",
         "repo_id": REPO,
         "producer_id": "fixture",
@@ -103,7 +141,7 @@ def event(seq, **overrides):
         "schedule_mode": "scheduled",
     }
     item.update(overrides)
-    return item
+    return _with_read_receipt(item, overrides)
 
 
 def candidate(seq, candidate_id, **overrides):
@@ -122,9 +160,10 @@ def candidate(seq, candidate_id, **overrides):
         merge="c" * 40,
         tree="d" * 40,
         pr_number=seq,
+        read_receipt=None,
     )
     item.update(overrides)
-    return item
+    return _with_read_receipt(item, overrides)
 
 
 def board_with(events=None, schedule=None, diagnostics=None, delivery=None, responses=None, extra_grants=()):
@@ -848,6 +887,396 @@ class TaskBoardTests(unittest.TestCase):
         self.assertEqual(board.schedule.intervene_calls, [])
         self.assertEqual(board.delivery.calls, [])
         self.assertEqual(board.auth.action_calls, [])
+
+    def test_refresh_filters_foreign_apps_and_binds_w01_query(self):
+        foreign = event(
+            1,
+            app_id="app-b",
+            task_id="tsk_secret",
+            owner="secret-owner-b",
+            stream_id="b:task",
+            event_id="evt-foreign",
+            received_at="2026-11-28T00:00:00Z",
+        )
+        seen = []
+
+        class Leaky(FixtureEventPort):
+            def query(self, *, request, stream_id, stream_epoch, after_seq=0, task_id=None, limit=50):
+                seen.append(dict(request))
+                return super().query(
+                    request=request,
+                    stream_id=stream_id,
+                    stream_epoch=stream_epoch,
+                    after_seq=after_seq,
+                    task_id=task_id,
+                    limit=limit,
+                )
+
+        board = board_with([event(1), foreign])
+        board.events = Leaky(board.events.events)
+        refreshed = board.refresh(principal(), "app-a", version="v060")
+        blob = json.dumps(refreshed)
+        self.assertNotIn("evt-foreign", blob)
+        self.assertNotIn("tsk_secret", blob)
+        self.assertNotIn("secret-owner-b", blob)
+        self.assertEqual(board.retained_event_ids("app-b"), [])
+        listed = board.list_tasks(principal("app-b"), "app-b")
+        self.assertNotIn("tsk_secret", json.dumps(listed))
+        self.assertNotIn("secret-owner-b", json.dumps(listed))
+        self.assertTrue(seen)
+        self.assertTrue(all(item.get("app_id") == "app-a" for item in seen))
+        self.assertTrue(all(isinstance(item.get("authorization"), dict) for item in seen))
+        self.assertNotIn("evt-foreign", json.dumps(refreshed.get("rejected")))
+        self.assertEqual(refreshed.get("unscoped_event_count", 0), 0)
+
+    def test_cache_is_isolated_by_permission_scope(self):
+        events = [
+            event(1, task_id="tsk_visible", stream_id="vis:task", event_id="evt-visible"),
+            event(1, task_id="tsk_hidden", stream_id="hid:task", event_id="evt-hidden", owner="hidden-owner"),
+        ]
+        board = board_with(events, extra_grants=(Grant("fixture-reader-b", "app-a", "board.read"),))
+        board.auth.object_allow = {("fixture-reader-b", "app-a"): frozenset({"tsk_visible"})}
+        wide = principal()
+        narrow = principal(pid="fixture-reader-b", role="reader")
+        board.refresh(wide, "app-a", version="v060")
+        before = board.list_tasks(narrow, "app-a")
+        self.assertEqual(before["items"], [])
+        self.assertNotIn("tsk_hidden", json.dumps(before))
+        self.assertNotIn("hidden-owner", json.dumps(before))
+        board.refresh(narrow, "app-a", version="v060")
+        after = board.list_tasks(narrow, "app-a")
+        self.assertEqual([item["task_id"] for item in after["items"]], ["tsk_visible"])
+        self.assertNotIn("hidden-owner", json.dumps(after))
+        wide_page = board.list_tasks(wide, "app-a")
+        self.assertEqual(sorted(item["task_id"] for item in wide_page["items"]), ["tsk_hidden", "tsk_visible"])
+
+    def test_source_string_and_submit_receipt_are_not_authority(self):
+        forged = {
+            "event_id": "evt-forged",
+            "schema_version": 2,
+            "event_type": "task.stage",
+            "event_class": "task",
+            "repo_id": REPO,
+            "producer_id": "fixture",
+            "source": "macci",
+            "trusted_source": "macci",
+            "stream_id": "fixture:task",
+            "stream_epoch": 1,
+            "producer_seq": 1,
+            "occurred_at": "2026-11-28T01:00:00Z",
+            "idempotency_key": "idem-forged",
+            "app_id": "app-a",
+            "host_id": None,
+            "task_id": "tsk_forged",
+            "run_id": "run_1",
+            "attempt": 1,
+            "revision": 1,
+            "stage": "develop",
+            "state": "SUCCEEDED",
+            "fact_state": "ACCEPTED",
+            "submit_receipt": {
+                "kind": "submit",
+                "authority": "W01",
+                "received_at": "2026-11-28T01:00:01Z",
+                "server_source": "macci",
+                "fact_state": "ACCEPTED",
+                "evidence": "verified",
+            },
+        }
+        witnessed = {
+            "event_id": "evt-read",
+            "schema_version": 2,
+            "event_type": "run.started",
+            "event_class": "task",
+            "repo_id": REPO,
+            "producer_id": "fixture",
+            "source": "authoritative",
+            "stream_id": "read:task",
+            "stream_epoch": 1,
+            "producer_seq": 1,
+            "occurred_at": "2026-11-28T01:00:00Z",
+            "idempotency_key": "idem-read",
+            "app_id": "app-a",
+            "host_id": None,
+            "task_id": "tsk_read",
+            "run_id": "run_1",
+            "attempt": 1,
+            "revision": 1,
+            "stage": "develop",
+            "state": "SUCCEEDED",
+            "fact_state": "ACCEPTED",
+            "evidence": "verified",
+            "read_receipt": {
+                "kind": "read",
+                "authority": "W01",
+                "received_at": "2026-11-28T01:00:01Z",
+                "server_source": "agent",
+                "fact_state": "ACCEPTED",
+                "evidence": "verified",
+                "event_id": "evt-read",
+            },
+        }
+        contradicted = dict(witnessed)
+        contradicted.update({
+            "event_id": "evt-clock",
+            "task_id": "tsk_clock",
+            "stream_id": "clock:task",
+            "idempotency_key": "idem-clock",
+            "received_at": "1999-01-01T00:00:00Z",
+        })
+        contradicted["read_receipt"] = dict(witnessed["read_receipt"], event_id="evt-clock")
+        matched = dict(witnessed)
+        matched.update({
+            "event_id": "evt-matched",
+            "task_id": "tsk_matched",
+            "stream_id": "matched:task",
+            "idempotency_key": "idem-matched",
+            "received_at": "2026-11-28T01:00:01Z",
+        })
+        matched["read_receipt"] = dict(witnessed["read_receipt"], event_id="evt-matched")
+        bare_candidate = candidate(
+            1, "cand_bare", pr_number=9, state="SUPERSEDED", task_id="tsk_bare",
+            stream_id="bare:candidate", read_receipt=None,
+        )
+        board = board_with([forged, witnessed, contradicted, matched, bare_candidate])
+        refreshed = board.refresh(principal(), "app-a", version="v060")
+        rejected_ids = {item["event_id"] for item in refreshed["rejected"]}
+        self.assertIn("evt-clock", rejected_ids)
+        self.assertNotIn("evt-matched", rejected_ids)
+        forged_task = board.task(principal(), "app-a", "tsk_forged")
+        self.assertNotEqual(forged_task["stages"]["develop"]["evidence"], "present")
+        self.assertFalse(forged_task["stages"]["develop"]["authoritative"])
+        read_task = board.task(principal(), "app-a", "tsk_read")
+        self.assertEqual(read_task["stages"]["develop"]["evidence"], "present")
+        self.assertTrue(read_task["stages"]["develop"]["authoritative"])
+        bare = board.task(principal(), "app-a", "tsk_bare")
+        self.assertFalse(bare["prs"][0]["authoritative"])
+        self.assertFalse(bare["archived"])
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        for name, spec in contract["entities"]["event"]["event_types"].items():
+            self.assertEqual(W00_EVENT_TYPES[name], (spec["class"], spec["trusted_source"]))
+        self.assertEqual(W00_EVENT_TYPES["run.started"], ("task", "agent"))
+        self.assertNotIn("task.stage", W00_EVENT_TYPES)
+
+    def test_refresh_does_not_forge_complete_or_ignore_conflicts(self):
+        class Unbounded(FixtureEventPort):
+            def __init__(self):
+                super().__init__([event(1, event_id="evt-loop", stream_id="loop:task")])
+                self.queries = 0
+
+            def catalog(self, *, request, app_id):
+                return {"side_effect": False, "streams": [{"stream_id": "loop:task", "stream_epoch": 1, "app_id": app_id}]}
+
+            def query(self, *, request, stream_id, stream_epoch, after_seq=0, task_id=None, limit=50):
+                self.queries += 1
+                if self.queries > 30:
+                    raise RuntimeError("refresh pagination did not stop")
+                return {
+                    "side_effect": False,
+                    "items": [event(1, event_id=f"evt-loop-{self.queries}", stream_id="loop:task", producer_seq=self.queries)],
+                    "truncated": True,
+                    "next_after_seq": 1,
+                }
+
+        looping = Board(
+            auth=FixtureAuthorizationPort(grants_for(("app-a", "agent"))),
+            events=Unbounded(),
+            schedule=FixtureSchedulePort({"tasks": [], "chains": [], "rounds": []}),
+            delivery=FixtureDeliveryPort({}),
+            diagnostics=FixtureDiagnosticPort([]),
+        )
+        refreshed = looping.refresh(principal(), "app-a", version="v060")
+        self.assertFalse(refreshed["complete"])
+        self.assertLess(looping.events.queries, 30)
+
+        class MissingTruncation(FixtureEventPort):
+            def query(self, *, request, stream_id, stream_epoch, after_seq=0, task_id=None, limit=50):
+                page = super().query(
+                    request=request, stream_id=stream_id, stream_epoch=stream_epoch,
+                    after_seq=after_seq, task_id=task_id, limit=limit,
+                )
+                page.pop("truncated", None)
+                return page
+
+        quiet = board_with([event(1)])
+        quiet.events = MissingTruncation(quiet.events.events)
+        missing_flag = quiet.refresh(principal(), "app-a", version="v060")
+        self.assertFalse(missing_flag["complete"])
+
+        class HoleySchedule(FixtureSchedulePort):
+            def snapshot(self, principal, *, app_id, version):
+                body = super().snapshot(principal, app_id=app_id, version=version)
+                body["truncated"] = True
+                body["gap"] = True
+                return body
+
+        class HoleyDiagnostics(FixtureDiagnosticPort):
+            def poll(self, principal, *, app_id, subject=None, after_seq=0):
+                return {"side_effect": False, "blocked": False, "truncated": True}
+
+        incomplete = Board(
+            auth=FixtureAuthorizationPort(grants_for(("app-a", "agent"))),
+            events=FixtureEventPort([event(1)]),
+            schedule=HoleySchedule({"tasks": [{"task_id": "tsk_1", "app_id": "app-a"}], "chains": [], "rounds": []}),
+            delivery=FixtureDeliveryPort({}),
+            diagnostics=HoleyDiagnostics([]),
+        )
+        partial = incomplete.refresh(principal(), "app-a", version="v060")
+        self.assertFalse(partial["complete"])
+        self.assertFalse(partial.get("schedule_complete"))
+        self.assertFalse(partial.get("diagnostics_complete"))
+
+        first = event(1, event_id="evt-dup", state="SUCCEEDED", owner="owner-a")
+        second = event(1, event_id="evt-dup", state="FAILED", owner="owner-b", failure_reason="other digest")
+        conflicted = board_with([first, second])
+        conflict = conflicted.refresh(principal(), "app-a", version="v060")
+        reasons = {item["reason"] for item in conflict["conflicts"]}
+        self.assertIn("digest_mismatch", reasons)
+        self.assertIn("evt-dup", {item["event_id"] for item in conflict["conflicts"]})
+        task = conflicted.task(principal(), "app-a", "tsk_1")
+        self.assertNotEqual(task["stages"]["develop"]["evidence"], "present")
+
+        same_seq_a = event(1, event_id="evt-seq-a", stream_id="seq:task", producer_seq=1, stage="develop")
+        same_seq_b = event(1, event_id="evt-seq-b", stream_id="seq:task", producer_seq=1, stage="review")
+        sequenced = board_with([same_seq_a, same_seq_b])
+        sequenced_refresh = sequenced.refresh(principal(), "app-a", version="v060")
+        named = {item["event_id"] for item in sequenced_refresh["conflicts"]}
+        self.assertIn("evt-seq-a", named)
+        self.assertIn("evt-seq-b", named)
+        self.assertTrue(any(item["reason"] == "same_seq" for item in sequenced_refresh["conflicts"]))
+        history = sequenced.history(principal(), "app-a", "tsk_1")
+        again = sequenced.history(principal(), "app-a", "tsk_1")
+        self.assertEqual([item["event_id"] for item in history["items"]], [item["event_id"] for item in again["items"]])
+        self.assertEqual(history["items"], sorted(history["items"], key=lambda item: (item.get("revision") or 0, item["event_id"])))
+
+    def test_submit_authorizes_before_idempotency_and_reconciles_unknown(self):
+        board = board_with(
+            [event(1)],
+            responses={"nudge": {"http": 200, "state": "SUCCEEDED", "lease_token": "secret-lease", "github_proof": True, "proof_ref": "test-proof://secret"}},
+        )
+        who = principal()
+        board.refresh(who, "app-a", version="v060")
+        board._replays[(who["id"], "app-a", "nudge", "idem-w10-early")] = {
+            "http": 200,
+            "code": "FORGED",
+            "replayed": False,
+            "accepted_as_success": True,
+        }
+        early = board.submit(who, "app-a", action="nudge", task_id="tsk_1", idempotency_key="idem-w10-early")
+        self.assertNotEqual(early["code"], "FORGED")
+        self.assertFalse(early.get("accepted_as_success"))
+        self.assertIn(("evaluate", "task.request_action", "app-a"), board.auth.calls)
+        self.assertNotIn("secret-lease", json.dumps(early))
+        self.assertNotIn("test-proof://secret", json.dumps(early))
+        self.assertFalse(early["port_response"].get("github_proof", False))
+
+        board.auth.grants = [grant for grant in board.auth.grants if grant.action != "task.request_action"]
+        denied = board.submit(who, "app-a", action="nudge", task_id="tsk_1", idempotency_key="idem-w10-lie")
+        self.assertEqual(denied["code"], "POLICY_DENIED")
+        self.assertFalse(denied.get("replayed"))
+        self.assertEqual(board.auth.action_calls, [])
+
+        rebound = board_with([event(1)])
+        rebound.refresh(who, "app-a", version="v060")
+        first = rebound.submit(who, "app-a", action="nudge", task_id="tsk_1", idempotency_key="idem-w10-bind", expected_revision=1)
+        other_task = rebound.submit(who, "app-a", action="nudge", task_id="tsk_other", idempotency_key="idem-w10-bind", expected_revision=1)
+        self.assertEqual(other_task["code"], "IDEMPOTENCY_PAYLOAD_MISMATCH")
+        self.assertEqual(len(rebound.auth.action_calls), 1)
+        other_rev = rebound.submit(who, "app-a", action="nudge", task_id="tsk_1", idempotency_key="idem-w10-bind", expected_revision=2)
+        self.assertEqual(other_rev["code"], "IDEMPOTENCY_PAYLOAD_MISMATCH")
+        session = principal(role="session")
+        merged = rebound.submit(
+            session, "app-a", action="merge", task_id="tsk_1", chain_id="cand_a",
+            idempotency_key="idem-w10-chain", expected_revision=1,
+        )
+        self.assertFalse(merged["accepted_as_success"])
+        other_chain = rebound.submit(
+            session, "app-a", action="merge", task_id="tsk_1", chain_id="cand_b",
+            idempotency_key="idem-w10-chain", expected_revision=1,
+        )
+        self.assertEqual(other_chain["code"], "IDEMPOTENCY_PAYLOAD_MISMATCH")
+        self.assertEqual(rebound.delivery.calls, ["coordinate:merge"])
+        self.assertFalse(first["accepted_as_success"])
+
+        class UnknownSchedule(FixtureSchedulePort):
+            def __init__(self):
+                super().__init__({"tasks": [], "chains": [], "rounds": []})
+                self.reconcile_calls = []
+
+            def intervene(self, principal, *, action, subject_id, evidence_ref, successor_id="", note=""):
+                self.intervene_calls.append(action)
+                return {
+                    "http": 202,
+                    "state": "UNKNOWN",
+                    "code": "DELIVERY_UNKNOWN",
+                    "lease_token": "secret-fence",
+                    "performed": True,
+                    "real_merge": True,
+                    "github_proof": True,
+                    "side_effect": False,
+                }
+
+            def reconcile(self, principal, *, action, subject_id, idempotency_key, expected_revision, task_id, chain_id):
+                self.reconcile_calls.append((action, task_id, chain_id, expected_revision, idempotency_key))
+                return {
+                    "http": 409,
+                    "code": "SIDE_EFFECT_UNKNOWN",
+                    "state": "UNKNOWN",
+                    "classification": "unknown",
+                    "performed": False,
+                    "forwarded": False,
+                    "reconciled": True,
+                    "side_effect": False,
+                }
+
+        unknown_schedule = UnknownSchedule()
+        unknown_board = Board(
+            auth=FixtureAuthorizationPort(grants_for(("app-a", "agent"))),
+            events=FixtureEventPort([event(1)]),
+            schedule=unknown_schedule,
+            delivery=FixtureDeliveryPort({}),
+            diagnostics=FixtureDiagnosticPort([]),
+        )
+        unknown_board.refresh(who, "app-a", version="v060")
+        opened = unknown_board.submit(
+            who, "app-a", action="retry_phase", task_id="tsk_1", chain_id="cand_a",
+            idempotency_key="idem-w10-unknown", evidence_ref="test-proof://w10/retry", expected_revision=3,
+        )
+        self.assertFalse(opened["accepted_as_success"])
+        self.assertNotIn("secret-fence", json.dumps(opened))
+        self.assertFalse(opened["port_response"].get("github_proof"))
+        self.assertFalse(opened["port_response"].get("real_merge"))
+        again = unknown_board.submit(
+            who, "app-a", action="retry_phase", task_id="tsk_1", chain_id="cand_a",
+            idempotency_key="idem-w10-unknown", evidence_ref="test-proof://w10/retry", expected_revision=3,
+        )
+        self.assertEqual(unknown_schedule.intervene_calls, ["retry_phase"])
+        self.assertEqual(len(unknown_schedule.reconcile_calls), 1)
+        self.assertFalse(again["accepted_as_success"])
+        self.assertFalse(again.get("forwarded", False))
+        self.assertTrue(again.get("reconciled"))
+
+        forged_role = principal(role="agent", pid="fixture-hostops-app-a")
+        role_board = board_with([event(1)])
+        role_board.auth.identities = {"fixture-hostops-app-a": {"role": "hostops", "app_id": "app-a"}}
+        forced = role_board.submit(
+            forged_role, "app-a", action="execute_now", task_id="tsk_1", idempotency_key="idem-w10-role",
+        )
+        self.assertEqual(forced["code"], "NOT_AUTHORIZED")
+        self.assertEqual(role_board.auth.action_calls, [])
+        self.assertFalse(forced.get("replayed"))
+
+    def test_view_model_is_not_a_react_page(self):
+        board = board_with([event(1)])
+        who = principal()
+        board.refresh(who, "app-a", version="v060")
+        view = board.render(who, "app-a")
+        self.assertFalse(view["react_page"])
+        self.assertFalse(view["mounted"])
+        self.assertEqual(view["component"], "python_view_model")
+        source = (ROOT / "app" / "control_board" / "view.py").read_text(encoding="utf-8")
+        self.assertNotIn("React", source)
+        self.assertFalse((ROOT / "frontend" / "src" / "TaskBoardPage.tsx").exists())
 
 
 if __name__ == "__main__":
