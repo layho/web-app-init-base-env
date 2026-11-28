@@ -8,8 +8,8 @@ import stat
 from pathlib import Path
 
 from app.control_lifecycle.errors import LifecycleError
-from app.control_lifecycle.fdpath import containment_holds, fd_namespace
-from app.control_lifecycle.grant import Authorizer
+from app.control_lifecycle.fdpath import containment_holds, fd_namespace, string_map_is_safe_path_resolution
+from app.control_lifecycle.grant import DenyAllAuthorizationPort, W02AuthorizationPort
 from app.control_lifecycle.journal import Journal
 from app.control_lifecycle.platform import (
     ADAPTERS,
@@ -31,6 +31,7 @@ REQUIRED_SCOPE = {
     "preflight": "lifecycle.preflight",
     "path.resolve": "lifecycle.plan",
     "port.reserve": "lifecycle.reserve_port",
+    "port.release": "lifecycle.reserve_port",
     "journal.note_counter_loss": "lifecycle.plan",
     "cloudflare.plan": "lifecycle.cloudflare",
     "cloudflare.apply_synthetic": "lifecycle.cloudflare",
@@ -61,6 +62,7 @@ CHECK_ORDER = (
     "domain",
 )
 RELATIVE_NAME = re.compile(r"[A-Za-z0-9._-]{1,80}\Z")
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
 
 class Result:
@@ -72,7 +74,7 @@ class Result:
 
 
 class LifecycleService:
-    def __init__(self, workspace, host, clock=None):
+    def __init__(self, workspace, host, clock=None, authorizer=None):
         self.workspace = Path(workspace)
         if self.workspace.is_symlink() or not self.workspace.is_dir():
             raise LifecycleError("UNSAFE_PATH", 403, "workspace is not a real directory")
@@ -80,13 +82,23 @@ class LifecycleService:
         self.inventory = self.workspace / "inventory"
         self.host = host
         self.clock = clock
-        self.auth = Authorizer()
+        if not isinstance(authorizer, (W02AuthorizationPort, DenyAllAuthorizationPort)):
+            authorizer = DenyAllAuthorizationPort()
+        self.auth = authorizer
         self.journal = Journal(self.workspace / "lifecycle-journal.json", host.faults)
 
     def issue_grant(self, principal, scopes, object_id):
-        return self.auth.issue(principal, scopes, object_id)
+        grant = self.auth.issue(principal, scopes, object_id)
+        if grant is None:
+            raise LifecycleError("NOT_AUTHORIZED", 403, "authorization port denied the request")
+        return grant
 
-    def inspect(self):
+    def inspect(self, grant):
+        if not self.auth.authenticate(grant):
+            raise LifecycleError("NOT_AUTHORIZED", 403, "inspect requires a server grant")
+        policy = getattr(self.auth, "policy", None)
+        if policy is None or grant.object_id != policy.app_id or grant.repo != policy.repo or grant.host_id != policy.host_id:
+            raise LifecycleError("POLICY_DENIED", 403, "inspect is outside the server grant")
         return self.journal.inspect()
 
     def call(self, grant, operation, payload, *, idempotency_key, expected_revision):
@@ -95,7 +107,7 @@ class LifecycleService:
         except LifecycleError as exc:
             return self._blocked(exc, operation, payload)
         scope = REQUIRED_SCOPE[operation]
-        digest = _payload_hash(payload)
+        digest = _binding_hash(grant, operation, idempotency_key, payload)
         run_id = payload.get("run_id") or ""
         return self.journal.transact(
             expected_revision=expected_revision,
@@ -121,10 +133,25 @@ class LifecycleService:
             raise LifecycleError("SCHEMA_UNSUPPORTED", 422, "operation is not in the lifecycle contract")
         if not self.auth.authenticate(grant):
             raise LifecycleError("NOT_AUTHORIZED", 403, "server grant is missing")
+        if grant.authority != "w02-server-policy":
+            raise LifecycleError("NOT_AUTHORIZED", 403, "test double is not an authorization authority")
         if REQUIRED_SCOPE[operation] not in grant.scopes:
             raise LifecycleError("POLICY_DENIED", 403, "scope does not allow this operation")
         if payload.get("app_id") != grant.object_id:
             raise LifecycleError("POLICY_DENIED", 403, "object is outside the server grant")
+        if payload.get("repo") != grant.repo:
+            raise LifecycleError("POLICY_DENIED", 403, "repo is outside the server grant")
+        policy = getattr(self.auth, "policy", None)
+        if policy is None or grant.host_id != policy.host_id:
+            raise LifecycleError("POLICY_DENIED", 403, "host is outside the server grant")
+        run_id = str(payload.get("run_id") or "")
+        if run_id and RUN_ID_PATTERN.fullmatch(run_id) is None:
+            raise LifecycleError("POLICY_DENIED", 403, "run is outside the server grant")
+        if grant.run_scope != f"runs:{grant.object_id}" or grant.resource_scope != f"inventory:{grant.object_id}":
+            raise LifecycleError("POLICY_DENIED", 403, "resource or run scope is outside the server grant")
+        for resource_id in _resource_ids(payload):
+            if not isinstance(resource_id, str) or RELATIVE_NAME.fullmatch(resource_id) is None:
+                raise LifecycleError("POLICY_DENIED", 403, "resource is outside the server grant")
         if "home" in payload and not self._home_allowed(payload["home"]):
             raise LifecycleError("PATH_OUTSIDE_AUTHORIZATION", 403, "home is outside the authorized workspace", {"commands": []})
 
@@ -136,7 +163,7 @@ class LifecycleService:
         return requested == self.home.resolve()
 
     def _blocked(self, exc, operation, payload):
-        state = self.inspect()
+        state = self.journal._public(self.journal.data)
         return Result(
             ok=False,
             code=exc.code,
@@ -331,6 +358,22 @@ class LifecycleService:
 
     def _op_port_reserve(self, grant, payload, data):
         port = payload.get("port")
+        if not _legal_port(port):
+            return _outcome("PORT_ILLEGAL", 422, False, "port is not legal", {"port": port, "killed": False, "moved": False, "commands": []})
+        generation = _reservation_generation(payload)
+        if generation is None:
+            return _outcome("LEASE_FENCE_REJECTED", 409, False, "reservation generation is not exact", {"port": port, "killed": False, "moved": False, "commands": []})
+        existing = data["reservations"].get(str(port))
+        if existing:
+            if not _reservation_matches(existing, grant, generation):
+                return _outcome(
+                    "PORT_CONFLICT",
+                    409,
+                    False,
+                    "port is held by another owner",
+                    {"port": port, "occupant": dict(existing), "killed": False, "moved": False, "commands": []},
+                )
+            return _outcome("OK", 200, True, "port reservation already matches the owner and generation", {"port": port, "killed": False, "moved": False})
         occupant = (self.host.probe.get("ports") or {}).get(port)
         if occupant:
             return _outcome(
@@ -340,8 +383,33 @@ class LifecycleService:
                 "port is held by another owner",
                 {"port": port, "occupant": dict(occupant), "killed": False, "moved": False, "commands": []},
             )
-        data["reservations"][str(port)] = {"owner": grant.object_id, "held": True, "port": port}
+        data["reservations"][str(port)] = {
+            "owner": grant.object_id,
+            "held": True,
+            "port": port,
+            "generation": generation,
+            "repo": grant.repo,
+            "host_id": grant.host_id,
+        }
         return _outcome("OK", 200, True, "port reserved in the journal", {"port": port, "killed": False, "moved": False})
+
+    def _op_port_release(self, grant, payload, data):
+        port = payload.get("port")
+        if not _legal_port(port):
+            return _outcome("PORT_ILLEGAL", 422, False, "port is not legal", {"port": port, "killed": False, "moved": False, "commands": []})
+        generation = _reservation_generation(payload)
+        existing = data["reservations"].get(str(port))
+        if generation is None or not existing or not _reservation_matches(existing, grant, generation):
+            occupant = dict(existing) if isinstance(existing, dict) else {}
+            return _outcome(
+                "PORT_CONFLICT",
+                409,
+                False,
+                "release requires the exact owner and generation",
+                {"port": port, "occupant": occupant, "killed": False, "moved": False, "commands": []},
+            )
+        del data["reservations"][str(port)]
+        return _outcome("OK", 200, True, "port reservation released in the journal", {"port": port, "killed": False, "moved": False})
 
     def _op_journal_note_counter_loss(self, grant, payload, data):
         old = str(data["epoch"])
@@ -363,27 +431,52 @@ class LifecycleService:
         blocked = self._cloudflare_boundary(payload)
         if blocked is not None:
             return blocked
-        remote = self.host.probe["cloudflare"]
-        domain = payload["domain"]
-        service = f"http://127.0.0.1:{payload['port']}"
-        ingress = list(remote.get("ingress") or [])
-        if not any(item.get("hostname") == domain for item in ingress):
-            ingress = [{"hostname": domain, "path": None, "service": service}, *ingress]
-            remote["ingress"] = ingress
-        if "dns_fails" in self.host.faults:
-            data["deployment_state"] = "PARTIAL"
-            return _outcome(
-                "PARTIAL",
-                409,
-                False,
-                "ingress was simulated and DNS was not; nothing was deleted",
-                {"deletes": [], "commands": []},
-                simulated=True,
-            )
-        alias = remote.get("tunnel_alias")
-        remote["dns"] = [{"type": "CNAME", "name": domain, "content": alias, "proxied": True}]
-        data["deployment_state"] = "MAPPED"
-        return _outcome("OK", 200, True, "synthetic mapping applied", {"deletes": [], "commands": []}, simulated=True)
+        intent = _intent(
+            f"cloudflare:{payload.get('domain')}:{payload.get('port')}",
+            "cloudflare.apply_synthetic",
+            str(payload.get("domain") or ""),
+            grant,
+            data.get("service_generation", 0),
+        )
+
+        def effect():
+            remote = self.host.probe["cloudflare"]
+            domain = payload["domain"]
+            service = f"http://127.0.0.1:{payload['port']}"
+            ingress = list(remote.get("ingress") or [])
+            if not any(item.get("hostname") == domain for item in ingress):
+                ingress = [{"hostname": domain, "path": None, "service": service}, *ingress]
+                remote["ingress"] = ingress
+            if "dns_fails" in self.host.faults:
+
+                def mutate_partial(stored):
+                    stored["deployment_state"] = "PARTIAL"
+                    _mark_intent(stored, intent["intent_id"], "partial")
+
+                return {
+                    **_outcome(
+                        "PARTIAL",
+                        409,
+                        False,
+                        "ingress was simulated and DNS was not; nothing was deleted",
+                        {"deletes": [], "commands": []},
+                        simulated=True,
+                    ),
+                    "mutate": mutate_partial,
+                }
+            alias = remote.get("tunnel_alias")
+            remote["dns"] = [{"type": "CNAME", "name": domain, "content": alias, "proxied": True}]
+
+            def mutate_mapped(stored):
+                stored["deployment_state"] = "MAPPED"
+                _mark_intent(stored, intent["intent_id"], "reconciled")
+
+            return {
+                **_outcome("OK", 200, True, "synthetic mapping applied", {"deletes": [], "commands": []}, simulated=True),
+                "mutate": mutate_mapped,
+            }
+
+        return {**_outcome("OK", 200, True, "synthetic mapping applied", {"deletes": [], "commands": []}, simulated=True), "effect": effect, "intent": intent}
 
     def _op_recovery_plan(self, grant, payload, data):
         remote = self.host.probe.get("cloudflare") or {}
@@ -401,10 +494,14 @@ class LifecycleService:
 
     def _op_resource_observe(self, grant, payload, data):
         for item in payload.get("resources") or []:
+            generation = item.get("generation", 0)
+            if type(generation) is not int or generation < 0:
+                return _outcome("SCHEMA_UNSUPPORTED", 422, False, "resource generation is not exact", {"commands": []})
             data["resources"][item["resource_id"]] = {
                 "kind": item.get("kind"),
                 "owner": item.get("owner"),
                 "relative": item.get("relative"),
+                "generation": generation,
             }
         return _outcome("OK", 200, True, "resource observation recorded", {"commands": []})
 
@@ -418,27 +515,64 @@ class LifecycleService:
         for record in records:
             if record.get("owner") != grant.object_id:
                 return _outcome("CROSS_APP_BOUNDARY", 403, False, "cross-app resource blocks cleanup", {"commands": []})
-        paths = []
+        identities = []
         for record in records:
             relative = record.get("relative")
             if not isinstance(relative, str) or RELATIVE_NAME.fullmatch(relative) is None:
                 return _outcome("PATH_OUTSIDE_AUTHORIZATION", 403, False, "resource path is outside inventory", {"commands": []})
-            path = self.inventory / relative
-            try:
-                info = os.lstat(path)
-            except FileNotFoundError:
-                info = None
-            if info is not None and stat.S_ISLNK(info.st_mode):
+            identity = self._inventory_identity(relative)
+            if identity is None:
                 return _outcome("UNSAFE_PATH", 409, False, "symlink cleanup is refused", {"commands": []})
-            if info is not None and not stat.S_ISREG(info.st_mode):
-                return _outcome("UNSAFE_PATH", 409, False, "cleanup only unlinks a regular file", {"commands": []})
-            paths.append(path)
+            if identity == "missing":
+                identities.append({"relative": relative, "record": record, "missing": True})
+                continue
+            identities.append({"relative": relative, "record": record, "missing": False, **identity})
         if "cleanup_fails" in self.host.faults:
             return _outcome("RECOVERY_FAILED", 409, False, "cleanup fault left owned files in place", {"commands": []})
-        for path in paths:
-            if path.exists():
-                os.unlink(path)
-        return _outcome("OK", 200, True, "owned synthetic file removed", {"commands": []}, simulated=True)
+        present = [item for item in identities if not item["missing"]]
+        intent = _intent(
+            "cleanup:" + ",".join(item["relative"] for item in identities),
+            "cleanup.synthetic",
+            ",".join(record.get("relative") or "" for record in records),
+            grant,
+            records[0].get("generation", 0) if records else 0,
+        )
+        intent["identities"] = [
+            {
+                "relative": item["relative"],
+                "inode": item.get("inode"),
+                "device": item.get("device"),
+                "generation": item["record"].get("generation", 0),
+                "owner": item["record"].get("owner"),
+            }
+            for item in identities
+        ]
+
+        def effect():
+            if "replace_with_symlink_before_unlink" in self.host.faults:
+                self._swap_inventory_symlink(present[0]["relative"] if present else identities[0]["relative"], "keeper.txt")
+            removed = []
+            for item in present:
+                status = self._unlink_inventory(item["relative"], item["inode"], item["device"])
+                if status == "unsafe":
+                    return _outcome("UNSAFE_PATH", 409, False, "symlink cleanup is refused", {"commands": []})
+                if status != "removed":
+                    return _outcome("SIDE_EFFECT_UNKNOWN", 409, False, "cleanup result is not confirmed", {"commands": []})
+                removed.append(item["relative"])
+
+            def mutate(stored):
+                _mark_intent(stored, intent["intent_id"], "reconciled")
+
+            return {
+                **_outcome("OK", 200, True, "owned synthetic file removed", {"commands": [], "removed": removed}, simulated=True),
+                "mutate": mutate,
+            }
+
+        return {
+            **_outcome("OK", 200, True, "owned synthetic file removed", {"commands": []}, simulated=True),
+            "effect": effect,
+            "intent": intent,
+        }
 
     def _op_uninstall_plan(self, grant, payload, data):
         previous = payload.get("previous_healthy_sha") or ""
@@ -482,9 +616,37 @@ class LifecycleService:
         if payload.get("overwrite_user_data"):
             return _outcome("USER_DATA_PROTECTED", 409, False, "overwrite of user data is disabled", {"preserves_user_data": True, "commands": []})
         code = logical_install_path(self.home, payload["repo"]) / "app" / "code.py"
-        code.parent.mkdir(parents=True, exist_ok=True)
-        code.write_text(payload.get("replacement") or "", encoding="utf-8")
-        return _outcome("OK", 200, True, "synthetic rebuild preserved user data", {"preserves_user_data": True, "commands": []}, simulated=True)
+        identity = _regular_file_identity(code)
+        if not identity:
+            return _outcome("UNSAFE_PATH", 409, False, "rebuild target is not a regular file", {"preserves_user_data": True, "commands": []})
+        intent = _intent(
+            f"rebuild:{code.name}:{identity['inode']}",
+            "rebuild.apply_synthetic",
+            code.name,
+            grant,
+            data.get("service_generation", 0),
+        )
+        intent["inode"] = identity["inode"]
+        intent["device"] = identity["device"]
+        replacement = payload.get("replacement") or ""
+
+        def effect():
+            if not _write_regular_file(code.parent, code.name, replacement, identity["inode"], identity["device"]):
+                return _outcome("SIDE_EFFECT_UNKNOWN", 409, False, "rebuild result is not confirmed", {"preserves_user_data": True, "commands": []})
+
+            def mutate(stored):
+                _mark_intent(stored, intent["intent_id"], "reconciled")
+
+            return {
+                **_outcome("OK", 200, True, "synthetic rebuild preserved user data", {"preserves_user_data": True, "commands": []}, simulated=True),
+                "mutate": mutate,
+            }
+
+        return {
+            **_outcome("OK", 200, True, "synthetic rebuild preserved user data", {"preserves_user_data": True, "commands": []}, simulated=True),
+            "effect": effect,
+            "intent": intent,
+        }
 
     def _op_seed_observe(self, grant, payload, data):
         if payload.get("static_only") is True:
@@ -532,21 +694,62 @@ class LifecycleService:
             if "health_fails" in self.host.faults or not (self.host.probe.get("health") or {}).get("ok"):
                 return _outcome("HEALTH_FAILED", 409, False, "health probe failed", plan)
             receipt = data.get("receipt")
-            if not receipt:
+            if not receipt or receipt.get("proves_service") is not False:
                 data["deployment_state"] = "RECONCILE"
                 return _outcome("RECONCILE", 409, False, "health has no durable receipt", plan)
+            plan["proves_service"] = False
             data["deployment_state"] = "COMMIT_PENDING"
             return _outcome("COMMIT_PENDING", 200, True, "health is pending a commit that this package does not perform", plan)
         return _outcome("OK", 200, True, "service plan only; execution denied", plan)
 
     def _op_service_record_receipt(self, grant, payload, data):
         context = payload.get("context")
+        if payload.get("proves_service") or payload.get("host_capability_proof") or payload.get("service_proven"):
+            return _outcome(
+                "EVIDENCE_MISSING",
+                409,
+                False,
+                "caller context and running_sha do not prove a real service",
+                {"proves_service": False, "commands": []},
+            )
         if context == "macmini/isolated-tests-v1":
-            return _outcome("FORGED_MACCI_CONTEXT", 409, False, "MacCI context cannot be recorded by this package", {"commands": []})
+            return _outcome(
+                "FORGED_MACCI_CONTEXT",
+                409,
+                False,
+                "MacCI context cannot be recorded by this package",
+                {"proves_service": False, "commands": []},
+            )
         if context != "linux-host/isolated-tests-v1":
-            return _outcome("EVIDENCE_MISSING", 409, False, "receipt context is not the linux isolated context", {"commands": []})
-        data["receipt"] = {"context": context, "running_sha": payload.get("running_sha")}
-        return _outcome("OK", 200, True, "synthetic receipt stored", {"context": context, "commands": []})
+            return _outcome(
+                "EVIDENCE_MISSING",
+                409,
+                False,
+                "receipt context is not the linux isolated context",
+                {"proves_service": False, "commands": []},
+            )
+        probe_sha = (self.host.probe.get("health") or {}).get("running_sha")
+        if not isinstance(probe_sha, str) or payload.get("running_sha") != probe_sha or SHA_PATTERN.fullmatch(probe_sha) is None:
+            return _outcome(
+                "EVIDENCE_MISSING",
+                409,
+                False,
+                "running_sha from the caller is not service proof",
+                {"proves_service": False, "commands": []},
+            )
+        data["receipt"] = {
+            "context": context,
+            "running_sha": payload.get("running_sha"),
+            "proves_service": False,
+            "authority": "not-a-service-proof",
+        }
+        return _outcome(
+            "OK",
+            200,
+            True,
+            "synthetic receipt stored; it does not prove a real service",
+            {"context": context, "proves_service": False, "commands": []},
+        )
 
     def _op_service_commit(self, grant, payload, data):
         if payload.get("install_kind") == "first_install" and payload.get("action") == "no_change":
@@ -555,6 +758,16 @@ class LifecycleService:
 
     def _op_fd_observe(self, grant, payload, data):
         adapter_id = payload.get("adapter_id")
+        if payload.get("resolve_dev_fd") or "dev_fd_map" in payload:
+            if not string_map_is_safe_path_resolution(adapter_id, payload.get("dev_fd_map")):
+                prefix = "/dev/fd" if adapter_id == "darwin-launchd" else ""
+                return _outcome(
+                    "DEV_FD_STRING_MAP_UNSAFE",
+                    409,
+                    False,
+                    "a Darwin /dev/fd string map is not safe path resolution",
+                    {"contained": False, "safe_path_resolution": False, "prefix": prefix, "commands": []},
+                )
         if adapter_id == "darwin-launchd" and payload.get("use_w06_proc_path"):
             return _outcome(
                 "W06_PROC_FD_INCOMPATIBLE",
@@ -572,7 +785,13 @@ class LifecycleService:
                     200,
                     True,
                     "synthetic Darwin fd containment",
-                    {"contained": True, "prefix": "/dev/fd", "observation": "darwin-dev-fd-synthetic", "commands": []},
+                    {
+                        "contained": True,
+                        "prefix": "/dev/fd",
+                        "observation": "darwin-dev-fd-synthetic",
+                        "safe_path_resolution": False,
+                        "commands": [],
+                    },
                 )
             return _outcome("PATH_ESCAPED", 409, False, "synthetic path escaped the directory", {"contained": False, "prefix": "/dev/fd", "commands": []})
         if adapter_id != "linux-systemd":
@@ -589,7 +808,14 @@ class LifecycleService:
             200,
             True,
             "local linux fd containment; not a Darwin or MacCI proof",
-            {"contained": True, "prefix": "/proc/self/fd", "observation": "linux-proc-self-fd", "commands": []},
+            {
+                "contained": True,
+                "prefix": "/proc/self/fd",
+                "observation": "linux-proc-self-fd",
+                "safe_path_resolution": True,
+                "two_platform_proof": False,
+                "commands": [],
+            },
         )
 
     def _cloudflare_boundary(self, payload):
@@ -639,6 +865,86 @@ class LifecycleService:
             return False
         return left != right
 
+    def _open_inventory(self):
+        try:
+            directory = os.open(self.inventory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            return None
+        info = os.fstat(directory)
+        if not stat.S_ISDIR(info.st_mode):
+            os.close(directory)
+            return None
+        return directory
+
+    def _inventory_identity(self, relative):
+        directory = self._open_inventory()
+        if directory is None:
+            return None
+        try:
+            try:
+                info = os.stat(relative, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return "missing"
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return None
+            fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            try:
+                current = os.fstat(fd)
+            finally:
+                os.close(fd)
+            if (
+                current.st_ino != info.st_ino
+                or current.st_dev != info.st_dev
+                or current.st_nlink != 1
+                or not stat.S_ISREG(current.st_mode)
+            ):
+                return None
+            return {"inode": current.st_ino, "device": current.st_dev}
+        except OSError:
+            return None
+        finally:
+            os.close(directory)
+
+    def _unlink_inventory(self, relative, inode, device):
+        directory = self._open_inventory()
+        if directory is None:
+            return "unknown"
+        fd = None
+        try:
+            fd = os.open(relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            current = os.fstat(fd)
+            if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                return "unsafe"
+            if current.st_ino != inode or current.st_dev != device:
+                return "unsafe"
+            base = os.path.realpath(f"/proc/self/fd/{directory}")
+            located = os.path.realpath(f"/proc/self/fd/{fd}")
+            if not containment_holds(base, located):
+                return "unsafe"
+            os.close(fd)
+            fd = None
+            os.unlink(relative, dir_fd=directory)
+            return "removed"
+        except OSError:
+            return "unsafe"
+        finally:
+            if fd is not None:
+                os.close(fd)
+            os.close(directory)
+
+    def _swap_inventory_symlink(self, relative, keeper):
+        directory = self._open_inventory()
+        if directory is None:
+            return
+        try:
+            try:
+                os.unlink(relative, dir_fd=directory)
+            except OSError:
+                return
+            os.symlink(keeper, relative, dir_fd=directory)
+        finally:
+            os.close(directory)
+
     def _cluster_complete(self, payload):
         cluster = self.host.probe.get("cluster") or {}
         marker = logical_install_path(self.home, payload["repo"]) / ".postgres" / "PG_VERSION"
@@ -679,6 +985,129 @@ def _reject_secrets(payload):
 def _payload_hash(payload):
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _binding_hash(grant, operation, idempotency_key, payload):
+    body = {
+        "app_id": grant.object_id,
+        "host_id": grant.host_id,
+        "idempotency_key": idempotency_key,
+        "operation": operation,
+        "payload_hash": _payload_hash(payload),
+        "principal": grant.principal,
+        "repo": grant.repo,
+        "resource_ids": sorted(str(item) for item in _resource_ids(payload)),
+        "resource_scope": grant.resource_scope,
+        "run_id": str(payload.get("run_id") or ""),
+        "run_scope": grant.run_scope,
+        "scope": REQUIRED_SCOPE.get(operation, ""),
+        "scopes": sorted(grant.scopes),
+    }
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _resource_ids(payload):
+    found = []
+    if isinstance(payload.get("resource_ids"), list):
+        found.extend(payload["resource_ids"])
+    if isinstance(payload.get("resources"), list):
+        for item in payload["resources"]:
+            if isinstance(item, dict) and "resource_id" in item:
+                found.append(item["resource_id"])
+    return found
+
+
+def _legal_port(port):
+    return type(port) is int and 1 <= port <= 65535
+
+
+def _reservation_generation(payload):
+    value = payload.get("reservation_generation", 0)
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _reservation_matches(existing, grant, generation):
+    return (
+        existing.get("owner") == grant.object_id
+        and existing.get("generation") == generation
+        and existing.get("repo") == grant.repo
+        and existing.get("host_id") == grant.host_id
+        and existing.get("held") is True
+    )
+
+
+def _intent(intent_id, operation, resource_id, grant, generation):
+    return {
+        "intent_id": intent_id,
+        "operation": operation,
+        "resource_id": resource_id,
+        "owner": grant.object_id,
+        "repo": grant.repo,
+        "host_id": grant.host_id,
+        "generation": generation,
+        "state": "intent",
+    }
+
+
+def _mark_intent(data, intent_id, state):
+    intent = data.setdefault("intents", {}).get(intent_id)
+    if intent is not None:
+        intent["state"] = state
+
+
+def _regular_file_identity(path):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        current = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if current.st_ino != info.st_ino or current.st_nlink != 1 or not stat.S_ISREG(current.st_mode):
+        return None
+    return {"inode": current.st_ino, "device": current.st_dev}
+
+
+def _write_regular_file(directory, relative, content, inode, device):
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    fd = None
+    try:
+        fd = os.open(relative, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        current = os.fstat(fd)
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            return False
+        if current.st_ino != inode or current.st_dev != device:
+            return False
+        payload = content.encode("utf-8")
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            wrote = os.write(fd, view[offset:])
+            if wrote <= 0:
+                return False
+            offset += wrote
+        os.fsync(fd)
+        os.fsync(dir_fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(dir_fd)
 
 
 def _foreign_dns(remote, domain):

@@ -23,6 +23,7 @@ from app.control_lifecycle import (
     service_unit_digest,
     w06_proc_self_fd_compatible,
 )
+from app.control_lifecycle.grant import ServerPolicy, W02AuthorizationPort
 from app.control_lifecycle.flags import (
     ACCEPTANCE_ENABLED,
     GITHUB_ACTIONS,
@@ -176,7 +177,21 @@ class LifecycleCase(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def service(self, probe=None, faults=()):
+    def server_policy(self, **overrides):
+        fields = {
+            "principal": "installer",
+            "app_id": APP,
+            "repo": REPO,
+            "host_id": "synthetic-unverified-host",
+            "scopes": PLAN_SCOPES | frozenset({"lifecycle.uninstall"}),
+            "run_scope": f"runs:{APP}",
+            "resource_scope": f"inventory:{APP}",
+            "enabled": True,
+        }
+        fields.update(overrides)
+        return ServerPolicy(**fields)
+
+    def service(self, probe=None, faults=(), policy=None):
         self._boxes += 1
         root = self.tmp / f"ws{self._boxes}"
         root.mkdir()
@@ -188,7 +203,11 @@ class LifecycleCase(unittest.TestCase):
         self.home = home
         self.inventory = inventory
         self.ws = root
-        return LifecycleService(root, host=host), host
+        self.policy = policy or self.server_policy()
+        return LifecycleService(root, host=host, authorizer=W02AuthorizationPort(self.policy)), host
+
+    def view(self, svc):
+        return svc.inspect(self.grant(svc))
 
     def grant(self, svc, scopes=PLAN_SCOPES, object_id=APP, principal="installer"):
         return svc.issue_grant(principal, scopes, object_id)
@@ -505,8 +524,8 @@ class JournalTests(LifecycleCase):
         self.assertEqual(first.current_state["epoch"], 1)
         self.assertGreaterEqual(first.current_state["seq"], 1)
         self.assertEqual(first.plan["run_id"], "run-1")
-        restarted = LifecycleService(self.ws, host=host)
-        self.assertEqual(restarted.inspect()["revision"], first.revision)
+        restarted = LifecycleService(self.ws, host=host, authorizer=W02AuthorizationPort(self.policy))
+        self.assertEqual(self.view(restarted)["revision"], first.revision)
         replay = self.call(restarted, "preflight", "idem-journal", revision=99, grant=self.grant(restarted))
         self.assertEqual(replay.code, "IDEMPOTENCY_REPLAY")
         self.assertEqual(replay.original_result["code"], "OK")
@@ -527,14 +546,14 @@ class JournalTests(LifecycleCase):
         )
         self.assertEqual(denied.code, "NOT_AUTHORIZED")
         self.assertEqual(denied.http, 403)
-        self.assertEqual(svc.inspect()["revision"], 0)
-        self.assertEqual(svc.inspect()["idempotency_count"], 0)
+        self.assertEqual(self.view(svc)["revision"], 0)
+        self.assertEqual(self.view(svc)["idempotency_count"], 0)
         mismatch = self.call(svc, "entry.plan", "idem-object", app_id="other--app")
         self.assertEqual(mismatch.code, "POLICY_DENIED")
-        self.assertEqual(svc.inspect()["idempotency_count"], 0)
+        self.assertEqual(self.view(svc)["idempotency_count"], 0)
         allowed = self.call(svc, "preflight", "idem-auth")
         self.assertEqual(allowed.code, "OK")
-        self.assertEqual(svc.inspect()["idempotency_count"], 1)
+        self.assertEqual(self.view(svc)["idempotency_count"], 1)
 
     def test_payload_mismatch_does_not_change_the_reservation(self):
         svc, _host = self.service(linux_probe(ports={PORT: None, PORT + 1: None}))
@@ -543,7 +562,7 @@ class JournalTests(LifecycleCase):
         second = self.call(svc, "port.reserve", "idem-cas-payload", revision=first.revision, port=PORT + 1)
         self.assertEqual(second.code, "IDEMPOTENCY_PAYLOAD_MISMATCH")
         self.assertEqual(second.http, 409)
-        self.assertEqual(list(svc.inspect()["reservations"]), [str(PORT)])
+        self.assertEqual(list(self.view(svc)["reservations"]), [str(PORT)])
 
     def test_lost_counter_opens_a_new_epoch_without_filling_the_old_gap(self):
         svc, _host = self.service()
@@ -558,7 +577,7 @@ class JournalTests(LifecycleCase):
             run_id="run-2",
         )
         self.assertEqual(second.code, "OK")
-        epochs = svc.inspect()["epochs"]
+        epochs = self.view(svc)["epochs"]
         self.assertTrue(epochs["1"]["gap"])
         self.assertFalse(epochs["1"]["closed"])
         self.assertEqual(epochs["2"]["applied_seqs"], [1])
@@ -653,7 +672,7 @@ class ReentryRecoveryTests(LifecycleCase):
         self.assertEqual(first.code, "OK")
         second = self.call(svc, "port.reserve", "idem-run-b", revision=first.revision, port=PORT + 1)
         self.assertEqual(second.code, "RUN_REENTRY")
-        self.assertEqual(list(svc.inspect()["reservations"]), [str(PORT)])
+        self.assertEqual(list(self.view(svc)["reservations"]), [str(PORT)])
 
     def test_unknown_cross_app_symlink_and_failed_cleanup_delete_nothing_unowned(self):
         svc, host = self.service()
@@ -742,7 +761,7 @@ class RebuildAndUserDataTests(LifecycleCase):
         svc, _host = self.service()
         denied = self.call(svc, "uninstall.plan", "idem-uninstall")
         self.assertEqual(denied.code, "POLICY_DENIED")
-        self.assertEqual(svc.inspect()["idempotency_count"], 0)
+        self.assertEqual(self.view(svc)["idempotency_count"], 0)
         privileged = self.grant(svc, scopes=frozenset({"lifecycle.uninstall"}))
         frozen = self.call(
             svc,
@@ -1070,7 +1089,7 @@ class PlatformFdAndFenceTests(LifecycleCase):
         )
         self.assertEqual(forged.code, "FORGED_MACCI_CONTEXT")
         self.assertFalse(forged.macci_proof)
-        self.assertNotEqual(svc.inspect()["deployment_state"], "COMMIT")
+        self.assertNotEqual(self.view(svc)["deployment_state"], "COMMIT")
         health = self.call(
             svc,
             "service.plan",
@@ -1161,7 +1180,7 @@ class PlatformFdAndFenceTests(LifecycleCase):
         for thread in threads:
             thread.join()
         self.assertEqual(sorted(result.code for result in results), ["CONFLICT_REVISION", "OK"])
-        self.assertEqual(len(svc.inspect()["reservations"]), 1)
+        self.assertEqual(len(self.view(svc)["reservations"]), 1)
         for result in results:
             self.assert_unproven(result)
 
@@ -1169,9 +1188,565 @@ class PlatformFdAndFenceTests(LifecycleCase):
         svc, _host = self.service(faults={"journal_fsync_fails"})
         failed = self.call(svc, "preflight", "idem-journal-fault")
         self.assertEqual(failed.code, "JOURNAL_FAILED")
-        self.assertEqual(svc.inspect()["revision"], 0)
+        self.assertEqual(self.view(svc)["revision"], 0)
         self.assertFalse((self.ws / "lifecycle-journal.json").exists())
-        self.assertEqual(svc.inspect()["idempotency_count"], 0)
+        self.assertEqual(self.view(svc)["idempotency_count"], 0)
+
+
+def w09_cross_process_reserve(workspace, port, key, run_id, ready, start, out):
+    """Child used to show whether two processes really compare-and-swap one journal."""
+
+    import json
+    import time
+    from pathlib import Path
+
+    from app.control_lifecycle import LifecycleService, SyntheticHost
+    from app.control_lifecycle.grant import ServerPolicy, W02AuthorizationPort
+
+    workspace = Path(workspace)
+    probe = linux_probe(ports={PORT: None, PORT + 1: None})
+    policy = ServerPolicy(
+        principal="installer",
+        app_id=APP,
+        repo=REPO,
+        host_id="synthetic-unverified-host",
+        scopes=PLAN_SCOPES | frozenset({"lifecycle.uninstall"}),
+        run_scope=f"runs:{APP}",
+        resource_scope=f"inventory:{APP}",
+        enabled=True,
+    )
+    svc = LifecycleService(workspace, host=SyntheticHost(probe), authorizer=W02AuthorizationPort(policy))
+    grant = svc.issue_grant("installer", PLAN_SCOPES, APP)
+    Path(ready).write_text("ready", encoding="utf-8")
+    start_path = Path(start)
+    while not start_path.exists():
+        time.sleep(0.02)
+    payload = {
+        "run_id": run_id,
+        "app_id": APP,
+        "repo": REPO,
+        "domain": DOMAIN,
+        "port": port,
+        "track": "main",
+        "title": "app",
+        "foundation_digest": DIGEST,
+        "parameters": {"install_deps": False, "github_https": False},
+    }
+    result = svc.call(grant, "port.reserve", payload, idempotency_key=key, expected_revision=0)
+    Path(out).write_text(
+        json.dumps({"code": result.code, "ok": result.ok, "http": result.http}),
+        encoding="utf-8",
+    )
+
+
+class ReviewCounterexampleTests(LifecycleCase):
+    """P0 counterexamples. These describe the required contract and fail on the unfixed tree."""
+
+    def test_issue_grant_rejects_unbound_principal_scope_and_app(self):
+        from app.control_lifecycle.errors import LifecycleError
+
+        svc, _host = self.service()
+        with self.assertRaises(LifecycleError):
+            svc.issue_grant("intruder", PLAN_SCOPES, APP)
+        with self.assertRaises(LifecycleError):
+            svc.issue_grant("installer", PLAN_SCOPES | frozenset({"lifecycle.godmode"}), APP)
+        with self.assertRaises(LifecycleError):
+            svc.issue_grant("installer", PLAN_SCOPES, "other--app")
+
+    def test_default_authorizer_and_host_double_are_not_authority(self):
+        from app.control_lifecycle.errors import LifecycleError
+
+        root = self.tmp / "deny-ws"
+        root.mkdir()
+        (root / "home").mkdir()
+        (root / "inventory").mkdir()
+        host = SyntheticHost(linux_probe())
+        svc = LifecycleService(root, host=host)
+        with self.assertRaises(LifecycleError) as caught:
+            svc.issue_grant("installer", PLAN_SCOPES, APP)
+        self.assertEqual(caught.exception.code, "NOT_AUTHORIZED")
+        forged = Grant("installer", PLAN_SCOPES, APP, "forged", True)
+        denied = svc.call(
+            forged,
+            "preflight",
+            self.payload(),
+            idempotency_key="idem-default-deny",
+            expected_revision=0,
+        )
+        self.assertEqual(denied.code, "NOT_AUTHORIZED")
+        self.assertFalse(denied.ok)
+        self.assertNotEqual(denied.http, 200)
+        promoted = LifecycleService(root, host=host, authorizer=host)
+        with self.assertRaises(LifecycleError):
+            promoted.issue_grant("installer", PLAN_SCOPES, APP)
+
+    def test_inspect_requires_a_server_grant(self):
+        from app.control_lifecycle.errors import LifecycleError
+
+        svc, _host = self.service()
+        forged = Grant("installer", PLAN_SCOPES, APP, "forged", True)
+        with self.assertRaises(LifecycleError):
+            svc.inspect(forged)
+        seen = svc.inspect(self.grant(svc))
+        self.assertIn("revision", seen)
+
+    def test_failed_receipt_replay_is_not_http_200(self):
+        svc, _host = self.service()
+        forged = self.call(
+            svc,
+            "service.record_receipt",
+            "idem-forged-replay",
+            context="macmini/isolated-tests-v1",
+            running_sha=SHA,
+        )
+        self.assertEqual(forged.code, "FORGED_MACCI_CONTEXT")
+        self.assertFalse(forged.ok)
+        replay = self.call(
+            svc,
+            "service.record_receipt",
+            "idem-forged-replay",
+            revision=99,
+            context="macmini/isolated-tests-v1",
+            running_sha=SHA,
+        )
+        self.assertFalse(replay.ok)
+        self.assertNotEqual(replay.http, 200)
+        self.assertEqual(replay.original_result["code"], "FORGED_MACCI_CONTEXT")
+        self.assertNotEqual(replay.current_state["deployment_state"], "COMMIT")
+
+    def test_caller_context_and_running_sha_do_not_prove_a_service(self):
+        svc, _host = self.service()
+        claimed = self.call(
+            svc,
+            "service.record_receipt",
+            "idem-prove",
+            context="linux-host/isolated-tests-v1",
+            running_sha=SHA,
+            proves_service=True,
+        )
+        self.assertFalse(claimed.ok)
+        self.assertFalse(claimed.host_capability_proof)
+        self.assertFalse(claimed.macci_proof)
+        self.assertNotEqual(claimed.current_state["deployment_state"], "COMMIT")
+        mismatched = self.call(
+            svc,
+            "service.record_receipt",
+            "idem-sha",
+            revision=claimed.revision,
+            run_id="run-sha",
+            context="linux-host/isolated-tests-v1",
+            running_sha="b" * 40,
+        )
+        self.assertFalse(mismatched.ok)
+        self.assertFalse(mismatched.host_capability_proof)
+        self.assertNotEqual(mismatched.current_state["deployment_state"], "COMMIT")
+
+    def test_repo_and_run_scope_are_bound_before_idempotency(self):
+        svc, _host = self.service()
+        other_repo = self.call(svc, "preflight", "idem-repo", repo="other/repo")
+        self.assertEqual(other_repo.code, "POLICY_DENIED")
+        self.assertEqual(other_repo.http, 403)
+        self.assertEqual(self.view(svc)["idempotency_count"], 0)
+        bad_run = self.call(svc, "preflight", "idem-run", run_id="../escape")
+        self.assertEqual(bad_run.code, "POLICY_DENIED")
+        self.assertEqual(self.view(svc)["idempotency_count"], 0)
+
+    def test_same_key_on_another_host_is_not_a_successful_replay(self):
+        svc, host = self.service()
+        first = self.call(svc, "preflight", "idem-host-bind")
+        self.assertEqual(first.code, "OK")
+        other = LifecycleService(
+            self.ws,
+            host=SyntheticHost(linux_probe()),
+            authorizer=W02AuthorizationPort(self.server_policy(host_id="host-b")),
+        )
+        replay = other.call(
+            other.issue_grant("installer", PLAN_SCOPES, APP),
+            "preflight",
+            self.payload(),
+            idempotency_key="idem-host-bind",
+            expected_revision=99,
+        )
+        self.assertEqual(replay.code, "IDEMPOTENCY_PAYLOAD_MISMATCH")
+        self.assertFalse(replay.ok)
+        self.assertNotEqual(replay.http, 200)
+        self.assertEqual(replay.original_result, None)
+
+    def test_cross_instance_compare_and_swap_re_reads(self):
+        probe = linux_probe(ports={PORT: None, PORT + 1: None})
+        svc, host = self.service(probe)
+        other = LifecycleService(self.ws, host=host, authorizer=W02AuthorizationPort(self.policy))
+        first = self.call(svc, "port.reserve", "idem-instance-a")
+        self.assertEqual(first.code, "OK")
+        second = other.call(
+            other.issue_grant("installer", PLAN_SCOPES, APP),
+            "port.reserve",
+            self.payload(port=PORT + 1, run_id="run-instance-b"),
+            idempotency_key="idem-instance-b",
+            expected_revision=0,
+        )
+        self.assertEqual(second.code, "CONFLICT_REVISION")
+        self.assertFalse(second.ok)
+        journal = __import__("json").loads((self.ws / "lifecycle-journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["revision"], first.revision)
+        self.assertEqual(set(journal["reservations"]), {str(PORT)})
+        self.assertEqual(journal["reservations"][str(PORT)]["owner"], APP)
+
+    def test_cross_process_compare_and_swap_holds(self):
+        import multiprocessing
+
+        svc, _host = self.service(linux_probe(ports={PORT: None, PORT + 1: None}))
+        self.assertIsNotNone(svc)
+        ctx = multiprocessing.get_context("fork")
+        ready_a = self.ws / "ready-a"
+        ready_b = self.ws / "ready-b"
+        start = self.ws / "start"
+        out_a = self.ws / "out-a.json"
+        out_b = self.ws / "out-b.json"
+        procs = [
+            ctx.Process(
+                target=w09_cross_process_reserve,
+                args=(str(self.ws), PORT, "idem-proc-a", "run-proc-a", str(ready_a), str(start), str(out_a)),
+            ),
+            ctx.Process(
+                target=w09_cross_process_reserve,
+                args=(str(self.ws), PORT, "idem-proc-b", "run-proc-b", str(ready_b), str(start), str(out_b)),
+            ),
+        ]
+        for proc in procs:
+            proc.start()
+        deadline = __import__("time").time() + 10
+        while __import__("time").time() < deadline and not (ready_a.exists() and ready_b.exists()):
+            __import__("time").sleep(0.02)
+        start.write_text("go", encoding="utf-8")
+        for proc in procs:
+            proc.join(10)
+        self.assertTrue(out_a.exists(), "process A produced no result")
+        self.assertTrue(out_b.exists(), "process B produced no result")
+        import json
+
+        results = [json.loads(out_a.read_text(encoding="utf-8")), json.loads(out_b.read_text(encoding="utf-8"))]
+        self.assertEqual(sorted(item["code"] for item in results), ["CONFLICT_REVISION", "OK"])
+        self.assertEqual(sorted(item["ok"] for item in results), [False, True])
+        journal = json.loads((self.ws / "lifecycle-journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["revision"], 1)
+        self.assertEqual(list(journal["reservations"]), [str(PORT)])
+        self.assertEqual(journal["reservations"][str(PORT)]["owner"], APP)
+        for proc in procs:
+            self.assertEqual(proc.exitcode, 0)
+
+    def test_port_reserve_does_not_overwrite_another_app(self):
+        svc, _host = self.service(linux_probe(ports={PORT: None}))
+        first = self.call(svc, "port.reserve", "idem-app-a")
+        self.assertEqual(first.code, "OK")
+        self.assertEqual(first.current_state["reservations"][str(PORT)]["owner"], APP)
+        try:
+            other = svc.issue_grant("installer", PLAN_SCOPES, "other--app")
+        except Exception as exc:
+            from app.control_lifecycle.errors import LifecycleError
+
+            self.assertIsInstance(exc, LifecycleError)
+            self.assertEqual(first.current_state["reservations"][str(PORT)]["owner"], APP)
+            return
+        second = svc.call(
+            other,
+            "port.reserve",
+            self.payload(app_id="other--app", run_id="run-other-app"),
+            idempotency_key="idem-app-b",
+            expected_revision=first.revision,
+        )
+        self.assertEqual(second.code, "PORT_CONFLICT")
+        self.assertFalse(second.ok)
+        self.assertEqual(second.current_state["reservations"][str(PORT)]["owner"], APP)
+
+    def test_illegal_port_generation_and_release_are_exact(self):
+        svc, _host = self.service(linux_probe(ports={PORT: None, PORT + 1: None}))
+        illegal = self.call(svc, "port.reserve", "idem-zero", port=0)
+        self.assertEqual(illegal.code, "PORT_ILLEGAL")
+        self.assertFalse(illegal.ok)
+        self.assertNotEqual(illegal.http, 200)
+        self.assertNotIn("0", illegal.current_state["reservations"])
+        huge = self.call(
+            svc,
+            "port.reserve",
+            "idem-huge",
+            revision=illegal.revision,
+            run_id="run-huge",
+            port=70000,
+        )
+        self.assertEqual(huge.code, "PORT_ILLEGAL")
+        held = self.call(
+            svc,
+            "port.reserve",
+            "idem-gen-hold",
+            revision=huge.revision,
+            run_id="run-gen-hold",
+            reservation_generation=1,
+        )
+        self.assertEqual(held.code, "OK")
+        self.assertEqual(held.current_state["reservations"][str(PORT)]["generation"], 1)
+        mismatch = self.call(
+            svc,
+            "port.reserve",
+            "idem-gen-mismatch",
+            revision=held.revision,
+            run_id="run-gen-mismatch",
+            reservation_generation=2,
+        )
+        self.assertEqual(mismatch.code, "PORT_CONFLICT")
+        self.assertEqual(mismatch.current_state["reservations"][str(PORT)]["owner"], APP)
+        self.assertEqual(mismatch.current_state["reservations"][str(PORT)]["generation"], 1)
+        wrong = self.call(
+            svc,
+            "port.release",
+            "idem-release-wrong",
+            revision=mismatch.revision,
+            run_id="run-release-wrong",
+            reservation_generation=2,
+        )
+        self.assertEqual(wrong.code, "PORT_CONFLICT")
+        self.assertTrue(wrong.current_state["reservations"][str(PORT)]["held"])
+        released = self.call(
+            svc,
+            "port.release",
+            "idem-release",
+            revision=wrong.revision,
+            run_id="run-release",
+            reservation_generation=1,
+        )
+        self.assertEqual(released.code, "OK")
+        self.assertNotIn(str(PORT), released.current_state["reservations"])
+
+    def test_cleanup_crash_persists_intent_and_unknown_is_not_replayed(self):
+        svc, host = self.service()
+        owned = self.inventory / "owned.txt"
+        keeper = self.inventory / "keeper.txt"
+        owned.write_text("owned", encoding="utf-8")
+        keeper.write_text("keep", encoding="utf-8")
+        observed = self.call(
+            svc,
+            "resource.observe",
+            "idem-crash-observe",
+            resources=[{"resource_id": "owned", "kind": "file", "owner": APP, "relative": "owned.txt"}],
+        )
+        self.assertEqual(observed.code, "OK")
+        host.faults.add("crash_after_intent")
+        crashed = self.call(
+            svc,
+            "cleanup.synthetic",
+            "idem-crash-clean",
+            revision=observed.revision,
+            run_id="run-crash-clean",
+            resource_ids=["owned"],
+        )
+        self.assertFalse(crashed.ok)
+        self.assertNotEqual(crashed.http, 200)
+        self.assertEqual(owned.read_text(encoding="utf-8"), "owned")
+        journal = (self.ws / "lifecycle-journal.json").read_text(encoding="utf-8")
+        self.assertIn("intent", journal)
+        self.assertIn("owned.txt", journal)
+        replay = self.call(
+            svc,
+            "cleanup.synthetic",
+            "idem-crash-clean",
+            revision=99,
+            run_id="run-crash-clean",
+            resource_ids=["owned"],
+        )
+        self.assertFalse(replay.ok)
+        self.assertNotEqual(replay.http, 200)
+        self.assertEqual(owned.read_text(encoding="utf-8"), "owned")
+        self.assertNotEqual(replay.code, "OK")
+
+    def test_rebuild_crash_does_not_write_before_a_durable_intent(self):
+        svc, host = self.service()
+        root = self.logical()
+        (root / "app").mkdir(parents=True)
+        code = root / "app" / "code.py"
+        code.write_text("old\n", encoding="utf-8")
+        host.faults.add("crash_after_intent")
+        crashed = self.call(
+            svc,
+            "rebuild.apply_synthetic",
+            "idem-crash-rebuild",
+            install_kind="upgrade",
+            previous_healthy_sha=SHA,
+            overwrite_user_data=False,
+            replacement="new\n",
+        )
+        self.assertFalse(crashed.ok)
+        self.assertNotEqual(crashed.http, 200)
+        self.assertEqual(code.read_text(encoding="utf-8"), "old\n")
+        journal = (self.ws / "lifecycle-journal.json").read_text(encoding="utf-8")
+        self.assertIn("intent", journal)
+
+    def test_symlink_journal_is_not_followed(self):
+        import json
+
+        svc, host = self.service()
+        self.assertIsNotNone(svc)
+        outside = self.tmp / "outside-journal.json"
+        outside.write_text(json.dumps({"revision": 0, "secret": "outside-marker"}), encoding="utf-8")
+        link = self.ws / "lifecycle-journal.json"
+        link.symlink_to(outside)
+        restarted = LifecycleService(self.ws, host=host, authorizer=W02AuthorizationPort(self.policy))
+        result = restarted.call(
+            restarted.issue_grant("installer", PLAN_SCOPES, APP),
+            "preflight",
+            self.payload(),
+            idempotency_key="idem-symlink",
+            expected_revision=0,
+        )
+        self.assertFalse(result.ok)
+        self.assertNotEqual(result.http, 200)
+        self.assertTrue(link.is_symlink())
+        self.assertIn("outside-marker", outside.read_text(encoding="utf-8"))
+
+    def test_hardlink_and_corrupt_journal_are_rejected(self):
+        import json
+        import os
+
+        svc, host = self.service()
+        first = self.call(svc, "preflight", "idem-hard-seed")
+        self.assertEqual(first.code, "OK")
+        journal = self.ws / "lifecycle-journal.json"
+        alias = self.ws / "journal-alias.json"
+        os.link(journal, alias)
+        linked = self.call(
+            svc,
+            "path.resolve",
+            "idem-hard-use",
+            revision=first.revision,
+            run_id="run-hard",
+        )
+        self.assertFalse(linked.ok)
+        self.assertNotEqual(linked.http, 200)
+        self.assertEqual(os.lstat(journal).st_ino, os.lstat(alias).st_ino)
+        os.unlink(alias)
+        journal.write_text("{", encoding="utf-8")
+        restarted = LifecycleService(self.ws, host=host, authorizer=W02AuthorizationPort(self.policy))
+        corrupt = restarted.call(
+            restarted.issue_grant("installer", PLAN_SCOPES, APP),
+            "preflight",
+            self.payload(run_id="run-corrupt"),
+            idempotency_key="idem-corrupt",
+            expected_revision=0,
+        )
+        self.assertFalse(corrupt.ok)
+        self.assertEqual(corrupt.code, "CORRUPT_JOURNAL")
+        self.assertNotEqual(corrupt.http, 200)
+        self.assertEqual(journal.read_text(encoding="utf-8"), "{")
+
+    def test_dev_fd_string_map_is_not_safe_resolution(self):
+        svc, _host = self.service()
+        mapped = self.call(
+            svc,
+            "fd.observe",
+            "idem-devfd-map",
+            adapter_id="darwin-launchd",
+            synthetic_directory="/dev/fd",
+            synthetic_located="/dev/fd/3",
+            resolve_dev_fd=True,
+            dev_fd_map={"3": "/etc/passwd"},
+        )
+        self.assertEqual(mapped.code, "DEV_FD_STRING_MAP_UNSAFE")
+        self.assertFalse(mapped.ok)
+        self.assertFalse(mapped.plan["contained"])
+        self.assertFalse(mapped.plan["safe_path_resolution"])
+        self.assertFalse(mapped.host_capability_proof)
+
+    def test_cleanup_refuses_a_symlink_swap_before_unlink(self):
+        svc, host = self.service()
+        owned = self.inventory / "owned.txt"
+        keeper = self.inventory / "keeper.txt"
+        owned.write_text("owned", encoding="utf-8")
+        keeper.write_text("keep", encoding="utf-8")
+        observed = self.call(
+            svc,
+            "resource.observe",
+            "idem-swap-observe",
+            resources=[{"resource_id": "owned", "kind": "file", "owner": APP, "relative": "owned.txt"}],
+        )
+        host.faults.add("replace_with_symlink_before_unlink")
+        swapped = self.call(
+            svc,
+            "cleanup.synthetic",
+            "idem-swap-clean",
+            revision=observed.revision,
+            run_id="run-swap",
+            resource_ids=["owned"],
+        )
+        self.assertNotEqual(swapped.code, "OK")
+        self.assertFalse(swapped.ok)
+        self.assertEqual(keeper.read_text(encoding="utf-8"), "keep")
+        self.assertFalse(swapped.host_side_effect)
+
+    def test_authorized_cross_app_port_conflict_blocks(self):
+        from app.control_lifecycle.grant import ServerPolicy, W02AuthorizationPort
+
+        probe = linux_probe(ports={PORT: None})
+        root = self.tmp / "two-app"
+        root.mkdir()
+        (root / "home").mkdir()
+        (root / "inventory").mkdir()
+        host = SyntheticHost(probe)
+        policy_a = ServerPolicy(
+            principal="installer",
+            app_id=APP,
+            repo=REPO,
+            host_id="host-a",
+            scopes=PLAN_SCOPES | frozenset({"lifecycle.uninstall"}),
+            run_scope=f"runs:{APP}",
+            resource_scope=f"inventory:{APP}",
+            enabled=True,
+        )
+        policy_b = ServerPolicy(
+            principal="installer",
+            app_id="other--app",
+            repo="other/app",
+            host_id="host-a",
+            scopes=PLAN_SCOPES,
+            run_scope="runs:other--app",
+            resource_scope="inventory:other--app",
+            enabled=True,
+        )
+        left = LifecycleService(root, host=host, authorizer=W02AuthorizationPort(policy_a))
+        right = LifecycleService(root, host=host, authorizer=W02AuthorizationPort(policy_b))
+        grant_a = left.issue_grant("installer", PLAN_SCOPES, APP)
+        first = left.call(
+            grant_a,
+            "port.reserve",
+            self.payload(),
+            idempotency_key="idem-two-a",
+            expected_revision=0,
+        )
+        self.assertEqual(first.code, "OK")
+        grant_b = right.issue_grant("installer", PLAN_SCOPES, "other--app")
+        second = right.call(
+            grant_b,
+            "port.reserve",
+            self.payload(app_id="other--app", repo="other/app", run_id="run-two-b"),
+            idempotency_key="idem-two-b",
+            expected_revision=first.revision,
+        )
+        self.assertEqual(second.code, "PORT_CONFLICT")
+        self.assertFalse(second.ok)
+        self.assertEqual(second.current_state["reservations"][str(PORT)]["owner"], APP)
+
+    def test_residuals_stay_unclaimed(self):
+        from app.control_lifecycle import flags
+
+        self.assertFalse(flags.W06_IN_TREE)
+        self.assertFalse(flags.JOINT_INTEGRATION_READY)
+        self.assertFalse(flags.HOST_MUTATION)
+        self.assertFalse(flags.MACCI_PROOF)
+        self.assertFalse(flags.REAL_DEPLOY)
+        self.assertFalse(flags.ACCEPTANCE_ENABLED)
+        text = " ".join(flags.RESIDUALS)
+        self.assertIn("w06", text)
+        self.assertIn("two-platform", text)
+        self.assertIn("joint", text)
+        self.assertIn("macci", text)
 
 
 if __name__ == "__main__":

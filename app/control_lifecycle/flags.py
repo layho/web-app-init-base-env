@@ -31,6 +31,18 @@ W06_HEAD = "2bc963e735072ec75751b106e4ed6fe929519c51"
 W06_FD_SOURCE = "app/control_diagnostics/safe_io.py"
 W06_IN_TREE = False
 
+# W11 hard gates. This package does not satisfy or claim them.
+RESIDUALS = (
+    "local-unittest-only",
+    "not-macci",
+    "not-two-platform-host-verification",
+    "not-w06-real-adaptation",
+    "not-joint-tree",
+    "not-merge",
+    "not-deploy",
+    "not-acceptance",
+)
+
 RESERVED_SHARED = (
     "app/main.py",
     "app/control_routes_w09.py",
