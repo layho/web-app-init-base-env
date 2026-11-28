@@ -51,3 +51,7 @@ Cloudflare API Token 需能读取和更新指定的 Tunnel 配置及该 Zone 的
 仅生成基座可运行 `bash deploy/app-init/app-init --seed-only`。再次运行会复用已有仓库和
 本地配置。生成后的仓库可用 `bash deploy/macmini/acceptance.sh --release PR号 完整候选SHA`
 执行验收、合并和部署。
+
+### V0.6.0 候选宿主预检
+
+在候选仓库内运行 `bash deploy/app-init/app-init --host-preflight`。该命令从当前宿主读取发行版、架构、依赖命令的可见性及主目录所在文件系统的可用空间，按 W09 平台表判定。输出 JSON。退出码 0 表示这些预检通过，2 表示有缺项。该结果仅用于安装前检查；服务启动、端口预约、凭据、部署回滚和 MacCI 需单独验证。

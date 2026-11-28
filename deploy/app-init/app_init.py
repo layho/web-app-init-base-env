@@ -690,8 +690,18 @@ def main():
     parser.add_argument("--seed-only", action="store_true", help="仅在 GitHub 初始化仓库")
     parser.add_argument("--install-deps", action="store_true", help="用 Homebrew 安装缺失的部署依赖")
     parser.add_argument("--github-https", action="store_true", help="通过 GitHub 浏览器登录初始化仓库")
+    parser.add_argument("--host-preflight", action="store_true", help="只读检查当前宿主的平台、依赖及可用磁盘")
     parser.add_argument("--control-adapter", choices=["status", "plan", "record"], help="只运行隔离生命周期适配器")
     args = parser.parse_args()
+    if args.host_preflight:
+        if args.install_deps or args.seed_only or args.github_https or args.control_adapter:
+            parser.error("--host-preflight must run alone")
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(SOURCE))
+        from app.control_lifecycle.platform import host_preflight
+        report = host_preflight()
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report["checks_passed"] else 2
     if args.control_adapter:
         return _control_adapter(args.control_adapter)
     os.umask(0o077)

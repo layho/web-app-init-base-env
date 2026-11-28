@@ -6,6 +6,8 @@ systemctl, brew, or apt, and it does not treat a plan as MacCI.
 
 import hashlib
 import json
+import platform
+import shutil
 import re
 from pathlib import Path
 
@@ -99,3 +101,30 @@ def classify(probe):
     if linux and (ubuntu or debian):
         return "linux-systemd", True
     return None, False
+
+def host_preflight():
+    """Measure local prerequisites without installing or starting services."""
+    system = platform.system().lower()
+    arch = platform.machine().lower()
+    probe = {"os": system, "arch": "arm64" if arch == "aarch64" else arch,
+             "distro": None, "version": None, "package_manager": None, "service_manager": None}
+    if system == "darwin":
+        probe.update(distro="macos", version=platform.mac_ver()[0],
+                     package_manager="brew" if shutil.which("brew") else None,
+                     service_manager="launchd" if shutil.which("launchctl") else None)
+    elif system == "linux":
+        try:
+            release = platform.freedesktop_os_release()
+        except OSError:
+            release = {}
+        probe.update(distro=release.get("ID"), version=release.get("VERSION_ID"),
+                     package_manager="apt" if shutil.which("apt-get") else None,
+                     service_manager="systemd" if Path("/run/systemd/system").is_dir()
+                     and shutil.which("systemctl") else None)
+    adapter, supported = classify(probe)
+    dependencies = {name: shutil.which(name) is not None for name in DEPENDENCIES}
+    free_bytes = shutil.disk_usage(Path.home()).free
+    return {"platform": probe, "adapter": adapter, "dependencies": dependencies,
+            "disk_free_bytes": free_bytes, "disk_required_bytes": REQUIRED_DISK_BYTES,
+            "checks_passed": supported and all(dependencies.values()) and free_bytes >= REQUIRED_DISK_BYTES,
+            "host_mutated": False}
