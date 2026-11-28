@@ -17,14 +17,19 @@ def historical_authorization(events: list[dict]) -> dict:
     """
 
     usable = []
+    scopes = set()
     for event in events:
         if not isinstance(event, dict):
             continue
         kind = event.get("event_type")
         if kind not in {"authorization.granted", "authorization.revoked"}:
             continue
-        if event.get("_authoritative") is False:
-            continue
+        if event.get("_authoritative") is not True or not isinstance(event.get("signature"), str) or not event["signature"]:
+            return {"decision": "unknown", "reason": "unverified_event", "revision": None}
+        scope = tuple(event.get(field) for field in ("repo_id", "app_id", "task_id", "candidate_id", "operation", "stream_id", "stream_epoch"))
+        if not all(isinstance(value, str) and value for value in scope[:-1]) or type(scope[-1]) is not int:
+            return {"decision": "unknown", "reason": "incomplete_scope", "revision": None}
+        scopes.add(scope)
         revision = event.get("revision")
         seq = event.get("producer_seq")
         if isinstance(revision, bool) or type(revision) is not int:
@@ -34,6 +39,8 @@ def historical_authorization(events: list[dict]) -> dict:
         usable.append(event)
     if not usable:
         return {"decision": "unknown", "reason": "no_authorization_event", "revision": None}
+    if len(scopes) != 1:
+        return {"decision": "unknown", "reason": "mixed_scope", "revision": None}
     ordered = sorted(usable, key=_rank)
     winner = ordered[-1]
     signature = winner.get("signature")
@@ -62,6 +69,6 @@ def historical_authorization(events: list[dict]) -> dict:
 def _rank(event: dict) -> tuple:
     revision = event.get("revision")
     seq = event.get("producer_seq")
-    # A revocation at the same revision and sequence is the later decision.
+    # A revocation dominates every grant at the same revision.
     revocation = 1 if event.get("event_type") == "authorization.revoked" else 0
-    return (int(revision), int(seq), revocation)
+    return (int(revision), revocation, int(seq))
