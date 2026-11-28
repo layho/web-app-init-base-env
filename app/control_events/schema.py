@@ -27,6 +27,8 @@ OPTIONAL = (
 STRUCTURAL_TYPES = {
     "run.started": "task",
     "authorization.epoch_closed": "authorization",
+    # Isolated W11 bridge; evidence only, never a run-state transition.
+    "delivery.intent.recorded": "evidence",
 }
 _SHA = set("0123456789abcdef")
 
@@ -127,6 +129,17 @@ def validate_event(event: dict) -> None:
         raise _schema("event_type does not match its class")
     _strict_types(event)
     _known_event_type(event)
+    if event["event_type"] == "delivery.intent.recorded":
+        note = event.get("note")
+        prefix = "w05-intent-v1:"
+        if (not isinstance(note, str) or not note.startswith(prefix)
+                or len(note) != len(prefix) + 64 or any(c not in _SHA for c in note[len(prefix):])
+                or event.get("evidence_ref") != note
+                or channel != "task" or event.get("producer_id") != "w05"
+                or not isinstance(event.get("app_id"), str) or not event["app_id"]
+                or not isinstance(event.get("task_id"), str) or not event["task_id"]
+                or not isinstance(event.get("run_id"), str) or not event["run_id"]):
+            raise _schema("invalid isolated W05 intent evidence")
     if event.get("epoch_closed") and type(event.get("closed_through_seq")) is not int:
         raise _schema("epoch close requires closed_through_seq")
     channels = event.get("delivery_channels")
@@ -230,6 +243,8 @@ def authorize_source(event: dict, server_source: str | None = None) -> bool:
         return server_source == "agent"
     if event_type == "authorization.epoch_closed":
         return server_source == "policy_service"
+    if event_type == "delivery.intent.recorded":
+        return server_source == "app_service"
     if registered is None:
         return False
     if server_source != registered["trusted_source"]:
