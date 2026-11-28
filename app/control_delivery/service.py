@@ -2213,28 +2213,23 @@ class DeliveryService:
         return body
 
     def _receipt_from_query(self, event, queried):
-        if not isinstance(queried, dict) or queried.get("blocked") or queried.get("classification") == "unknown":
+        if (not isinstance(queried, dict) or queried.get("ok") is not True
+                or queried.get("blocked") is not False or queried.get("classification") != "present"
+                or queried.get("event_id") != event["event_id"] or queried.get("authority") != "W01"):
             return None
-        for item in queried.get("items") or []:
-            if item.get("event_id") != event.get("event_id"):
-                continue
-            if (
-                item.get("producer_seq") != event.get("producer_seq")
-                or item.get("stream_id") != event.get("stream_id")
-                or item.get("stream_epoch") != event.get("stream_epoch")
-            ):
-                return None
-            return {
-                "authority": "W01",
-                "event_id": item["event_id"],
-                "stream_id": item["stream_id"],
-                "stream_epoch": item["stream_epoch"],
-                "producer_seq": item["producer_seq"],
-                "fact_state": "ACCEPTED",
-                "test_double": True,
-                "w01_proof": False,
-            }
-        return None
+        items = queried.get("items")
+        if not isinstance(items, list) or len(items) != 1 or _hash(items[0]) != _hash(event):
+            return None
+        return {
+            "authority": "W01",
+            "event_id": event["event_id"],
+            "stream_id": event["stream_id"],
+            "stream_epoch": event["stream_epoch"],
+            "producer_seq": event["producer_seq"],
+            "fact_state": "ACCEPTED",
+            "test_double": True,
+            "w01_proof": False,
+        }
 
     def _dispatch(self, event):
         queried = self.events.query(
@@ -2357,7 +2352,9 @@ class DeliveryService:
 
 
 def _absence_proven(event, queried):
-    if not isinstance(queried, dict) or queried.get("classification") != "absent":
+    if (not isinstance(queried, dict) or queried.get("classification") != "absent"
+            or queried.get("ok") is not True or queried.get("blocked") is not False
+            or queried.get("event_id") != event["event_id"] or queried.get("items") != []):
         return False
     proof = queried.get("absence_proof")
     if not isinstance(proof, dict) or proof.get("accepted") is not False or proof.get("trusted") is not True:

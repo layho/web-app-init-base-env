@@ -1036,6 +1036,20 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertEqual(entered, ["fb_once"])
         self.assertEqual(self.svc.store.read("feedback", "fb_once")["state"], "SYNCED")
 
+    def test_reconcile_requires_unambiguous_exact_event(self):
+        self._submit("fb_exact")
+        event = self.events.events[-1]
+        original = self.events.query
+        for changes in ({"items": [{**event, "note": "other-intent"}]},
+                        {"items": [event, event]}, {"authority": "other"},
+                        {"classification": "absent"}, {"ok": False}):
+            def query(**kwargs):
+                return {**original(**kwargs), **changes}
+            self.events.query = query
+            with self.subTest(changes=list(changes)):
+                self.assertIsNone(self.svc._dispatch(event))
+        self.assertEqual(len(self.events.events), 1)
+
     def test_p0_outbox_crash_recovers_exact_receipt_once(self):
         class CrashEvents(FixtureEvents):
             def __init__(self):
