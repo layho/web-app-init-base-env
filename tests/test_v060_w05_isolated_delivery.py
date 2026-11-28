@@ -41,7 +41,7 @@ from app.control_delivery.ports import (
     ServerClock,
 )
 from app.control_delivery.projection import project_chain
-from app.control_delivery.service import DeliveryService, operation_id_for
+from app.control_delivery.service import DeliveryService, operation_id_for, outbound_cursor_key
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -270,7 +270,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         row = self._feedback("fb_dup")
         row["state"] = "PENDING"
         self.svc.store.write("feedback", "fb_dup", row)
-        cursor = self.svc.store.read("cursor", "outbound")
+        cursor = self.svc.store.read("cursor", outbound_cursor_key(self.scope, self.actor["id"]))
         second = self._sync(key="sync-dup-2", expected_revision=cursor["revision"])
         self.assertTrue(second.ok, second.as_dict())
         self.assertFalse(second.body["results"][0]["created"])
@@ -300,7 +300,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
             "body": "foreign",
             "feedback_id": "fb_owned",
         }
-        cursor = self.svc.store.read("cursor", "outbound")
+        cursor = self.svc.store.read("cursor", outbound_cursor_key(self.scope, self.actor["id"]))
         owned = self._sync(key="sync-owned", expected_revision=cursor["revision"])
         owned_row = {row["feedback_id"]: row for row in owned.body["results"]}["fb_owned"]
         self.assertEqual(owned_row["reason"], "cross_author")
@@ -401,6 +401,44 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertEqual(reasons["c9"], "cross_author")
         self.assertNotEqual(self._feedback("fb_notes")["progress_status"], "accepted")
 
+    def test_outbound_cursors_are_independent_and_legacy_cursor_is_not_adopted(self):
+        self._submit("fb_first")
+        other = {"kind": "test", "id": "other", "proof_ref": "test-proof://w05/other"}
+        self._submit("fb_second", author=other)
+        legacy = {"revision": 99, "repo_id": self.scope["repo"],
+                  "scope_task_id": self.scope["task_id"], "retained_ids": ["legacy"]}
+        self.svc.store.write("cursor", "outbound", legacy)
+        first = self._sync(key="same-key")
+        self.assertTrue(first.ok, first.as_dict())
+        self.assertEqual(first.body["cursor_revision"], 1)
+        second = self.svc.sync_outbound(actor=other, scope=self.scope,
+                                        idempotency_key="same-key", credential_present=True,
+                                        expected_revision=0)
+        self.assertTrue(second.ok, second.as_dict())
+        self.assertEqual(second.body["cursor_revision"], 1)
+        first_key = outbound_cursor_key(self.scope, self.actor["id"])
+        second_key = outbound_cursor_key(self.scope, other["id"])
+        self.assertNotEqual(first_key, second_key)
+        self.assertEqual(self.svc.store.read("cursor", first_key)["retained_ids"], ["fb_first"])
+        self.assertEqual(self.svc.store.read("cursor", second_key)["retained_ids"], ["fb_second"])
+        self.assertEqual(self.svc.store.read("cursor", "outbound"), legacy)
+        other_scope = {**self.scope, "task_id": "tsk_other"}
+        third = self.svc.sync_outbound(actor=self.actor, scope=other_scope,
+                                       idempotency_key="same-key", credential_present=True,
+                                       expected_revision=0)
+        self.assertTrue(third.ok, third.as_dict())
+        self.assertEqual(third.body["cursor_revision"], 1)
+        self.assertEqual(self.svc.store.read("cursor", outbound_cursor_key(
+            other_scope, self.actor["id"]))["retained_ids"], [])
+        stale = self._sync(key="stale-cursor", expected_revision=0)
+        self.assertEqual(stale.code, "CONFLICT_REVISION")
+        foreign = self.svc.store.read("cursor", first_key)
+        foreign["principal_id"] = other["id"]
+        self.svc.store.write("cursor", first_key, foreign)
+        rejected = self._sync(key="forged-cursor", expected_revision=1)
+        self.assertEqual(rejected.code, "NOT_AUTHORIZED")
+        self.assertEqual(self.svc.store.read("cursor", first_key), foreign)
+
     def test_feedback_sync_metadata_and_reads_stay_inside_authorized_scope(self):
         self._submit("fb_local")
         self._submit("fb_local_pending")
@@ -421,7 +459,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertTrue(outbound.ok, outbound.as_dict())
         self.assertEqual(outbound.body["remaining"], ["fb_local_pending"])
         self.assertEqual(outbound.body["continuation"], "fb_local_pending")
-        self.assertEqual(self.svc.store.read("cursor", "outbound")["retained_ids"],
+        self.assertEqual(self.svc.store.read("cursor", outbound_cursor_key(self.scope, self.actor["id"]))["retained_ids"],
                          ["fb_local", "fb_local_pending"])
         inbound = self.svc.sync_inbound(
             actor=self.actor, scope=self.scope, feedback_id="fb_local",
@@ -452,7 +490,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
             sorted(row["feedback_id"] for row in self.svc.store.list("feedback")),
             ["fb_a", "fb_b", "fb_c"],
         )
-        cursor = self.svc.store.read("cursor", "outbound")
+        cursor = self.svc.store.read("cursor", outbound_cursor_key(self.scope, self.actor["id"]))
         rest = self._sync(key="sync-rest", expected_revision=cursor["revision"])
         self.assertTrue(rest.ok, rest.as_dict())
         self.assertIsNone(rest.body["continuation"])
@@ -1105,7 +1143,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
 
         self.remote.reconcile = reconcile
         self.remote.calls.clear()
-        cursor = self.svc.store.read("cursor", "outbound")
+        cursor = self.svc.store.read("cursor", outbound_cursor_key(self.scope, self.actor["id"]))
         gap = self._sync(key="sync-gap", expected_revision=cursor["revision"])
         self.assertTrue(gap.ok, gap.as_dict())
         self.assertEqual([call for call in self.remote.calls if call[0] == "create"], [])
@@ -1142,7 +1180,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertIsNotNone(self.svc.store.read("operation", list(self.remote.reconcile_result)[0]))
         self.remote.create_issue = lambda payload: FixtureRemote.create_issue(self.remote, payload)
         self.remote.calls.clear()
-        cursor = self.svc.store.read("cursor", "outbound")
+        cursor = self.svc.store.read("cursor", outbound_cursor_key(self.scope, self.actor["id"]))
         expected = 0 if cursor is None else cursor["revision"]
         recovered = self._sync(key="sync-crash-recover", expected_revision=expected)
         self.assertTrue(recovered.ok, recovered.as_dict())
@@ -1342,7 +1380,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         foreign["body"] = "foreign-body"
         foreign["scope_task_id"] = "tsk_other"
         self.svc.store.write("feedback", "fb_foreign", foreign)
-        cursor = self.svc.store.read("cursor", "outbound")
+        cursor = self.svc.store.read("cursor", outbound_cursor_key(self.scope, self.actor["id"]))
         expected = 0 if cursor is None else cursor["revision"]
         synced = self._sync(key="sync-batch-iso", expected_revision=expected)
         self.assertTrue(synced.ok, synced.as_dict())
