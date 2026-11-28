@@ -50,6 +50,71 @@ def sha(mark):
     return mark * 40
 
 
+class JournalPathSafetyTest(unittest.TestCase):
+    def setUp(self):
+        from app.control_delivery.store import Journal
+
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve() / "journal"
+        self.out = self.root.parent / "outside"
+        self.out.mkdir()
+        self.j = Journal(self.root)
+
+    def test_symlink_kind(self):
+        (self.out / "x.json").write_text('{"secret":true}', encoding="utf-8")
+        (self.root / "task").symlink_to(self.out, target_is_directory=True)
+        for action in (
+            lambda: self.j.read("task", "x"),
+            lambda: self.j.write("task", "x", {}),
+            lambda: self.j.list("task"),
+            lambda: self.j.mutate(lambda view: view.stage("task", "x", {})),
+        ):
+            with self.subTest(action=action), self.assertRaises((OSError, ValueError, RuntimeError)):
+                action()
+        self.assertEqual(json.loads((self.out / "x.json").read_text()), {"secret": True})
+
+    def test_same_directory_alias(self):
+        self.j.write("task", "x", {"secret": True})
+        (self.root / "task" / "y.json").symlink_to("x.json")
+        with self.assertRaises((OSError, ValueError, RuntimeError)):
+            self.j.read("task", "y")
+
+    def test_hardlink(self):
+        import os
+
+        self.j.write("task", "x", {"secret": True})
+        os.link(self.root / "task" / "x.json", self.out / "copy")
+        with self.assertRaises((OSError, ValueError, RuntimeError)):
+            self.j.read("task", "x")
+
+    def test_predictable_temp_symlink(self):
+        self.j.write("task", "x", {})
+        target = self.out / "target"
+        target.write_text("outside", encoding="utf-8")
+        (self.root / "task" / "x.tmp").symlink_to(target)
+        self.j.write("task", "x", {"new": True})
+        self.assertEqual(target.read_text(), "outside")
+        self.assertEqual(self.j.read("task", "x"), {"new": True})
+
+    def test_pending_symlink(self):
+        (self.root / ".journal.pending.json").symlink_to(self.out / "missing")
+        with self.assertRaises((OSError, ValueError, RuntimeError)):
+            self.j.read("task", "x")
+
+    def test_normal_redo(self):
+        def update(view):
+            view.stage("task", "x", {"revision": 1})
+            view.stage("task", "y", {"revision": 1})
+
+        self.j.crash_after_replacements = 1
+        with self.assertRaises(RuntimeError):
+            self.j.mutate(update)
+        self.j.crash_after_replacements = None
+        self.assertEqual(self.j.list("task"), [{"revision": 1}, {"revision": 1}])
+        self.assertFalse((self.root / ".journal.pending.json").exists())
+
+
 class IsolatedDeliveryTest(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
