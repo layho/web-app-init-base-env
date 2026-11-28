@@ -14,6 +14,7 @@ POLICY_REVISION = 1
 
 SCOPE_FOR_OPERATION = {
     "event.append": "event.append",
+    "feedback.write": "feedback",
     "event.read": "event.read",
     "diagnostic.read": "read",
     "diagnostic.cursor": "diagnostic.cursor",
