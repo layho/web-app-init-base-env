@@ -129,7 +129,18 @@ def _limits():
 
 
 class DeliveryService:
-    def __init__(self, root, *, auth, events, schedule, deploy, remote, clock):
+    def __init__(self, root, *, auth, events, schedule, deploy, remote, clock,
+                 intent_engine=None, intent_signer=None):
+        if (intent_engine is None) != (intent_signer is None):
+            raise ValueError("isolated intent engine and signer must be configured together")
+        if intent_engine is not None:
+            from app.control_events.engine import Engine
+            if (not isinstance(intent_engine, Engine) or not intent_engine.isolated
+                    or intent_engine.production_protocol_enabled or not callable(intent_signer)):
+                raise ValueError("only a server-configured isolated W01 engine is supported")
+        self._intent_engine = intent_engine
+        self._intent_signer = intent_signer
+        self._intent_mode = "signed-isolated-v1" if intent_engine is not None else "fixture"
         self.store = Journal(root)
         self.auth = auth
         self.events = events
@@ -2179,6 +2190,9 @@ class DeliveryService:
                 if isinstance(outbox, dict):
                     outbox = dict(outbox)
                     outbox.pop("pending_lease", None)
+                    if outbox.get("intent_mode", "fixture") != self._intent_mode:
+                        view.abort()
+                        return "conflict"
                     outbox["receipt"] = begun["receipt"]
                     outbox["delivery_state"] = "RECEIPT_RECORDED"
                     outbox["authority"] = "W01"
@@ -2206,6 +2220,7 @@ class DeliveryService:
                         "receipt_digest": _hash(begun["receipt"]),
                         "result": idem_body["public"],
                         "authority": "W05_LOCAL",
+                        "intent_mode": self._intent_mode,
                         "production_effective": False,
                     })
                 for kind, key, doc, expected in pairs:
@@ -2255,6 +2270,7 @@ class DeliveryService:
                 "event_id": event_id,
                 "revision": 1,
                 "delivery_state": "PENDING",
+                "intent_mode": self._intent_mode,
                 "authority": "W01",
                 "local_is_authority": False,
                 "event": event,
@@ -2335,6 +2351,28 @@ class DeliveryService:
         }
 
     def _dispatch(self, event):
+        if self._intent_mode == "signed-isolated-v1":
+            from app.control_joint.w05_issue import record_isolated_intent
+            verified = record_isolated_intent(self._intent_engine, event=event,
+                                              sign_request=self._intent_signer)
+            if (verified.get("status") != "intent_verified"
+                    or verified.get("event_id") != event["event_id"]
+                    or verified.get("event_digest") != event_payload_digest(event)
+                    or verified.get("business_committed") is not False
+                    or verified.get("production_effective") is not False):
+                return None
+            read = verified.get("w01_receipt") or {}
+            if (read.get("authority") != "W01" or read.get("evidence") != "verified"
+                    or read.get("fact_state") != "ACCEPTED" or read.get("server_source") != "app_service"
+                    or any(read.get(key) != event.get(key) for key in
+                           ("event_id", "stream_id", "stream_epoch", "producer_seq"))):
+                return None
+            return {"authority": "W01", "event_id": event["event_id"],
+                    "stream_id": event["stream_id"], "stream_epoch": event["stream_epoch"],
+                    "producer_seq": event["producer_seq"], "fact_state": "ACCEPTED",
+                    "event_digest": verified["event_digest"], "signed_intent_receipt": read,
+                    "isolated_signature_verified": True, "test_double": False,
+                    "w01_proof": False, "production_effective": False}
         # This path has no W01/W02 production signer. Never relabel a real
         # or unclassified port response as an accepted isolated receipt.
         if getattr(self.events, "is_test_double", False) is not True:
@@ -2428,6 +2466,7 @@ class DeliveryService:
         if (not isinstance(staged_event, dict) or staged_event.get("event_id") != event_id
                 or staged_event.get("note") != event["note"]
                 or staged.get("request_digest") != begun["payload_hash"]
+                or staged.get("intent_mode", "fixture") != self._intent_mode
                 or staged.get("change_plan") != planned["change_plan"]):
             return _denied(409, "CONFLICT_REVISION", state, {"reason": "outbox_intent_mismatch"})
         event_digest = _hash(staged_event)
