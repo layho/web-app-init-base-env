@@ -750,6 +750,10 @@ class Engine:
 
     def _authorize_append(self, principal, event: dict) -> None:
         task_id = event.get("task_id") if isinstance(event.get("task_id"), str) else ""
+        if event["event_type"] == "delivery.intent.recorded":
+            if (principal.kind != "app_service" or principal.producer_id != "w05"
+                    or "delivery.intent" not in principal.scopes):
+                raise ControlError("NOT_AUTHORIZED", 403, "isolated W05 intent requires a dedicated server grant")
         if event["event_class"] == "authorization" and event["event_type"] != "authorization.epoch_closed":
             business = event.get("operation")
             if not isinstance(business, str) or business not in principal.scopes:
