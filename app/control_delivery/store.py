@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -29,7 +30,15 @@ class Journal:
     def __init__(self, root):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self._lock_path = self.root / ".journal.lock"
+        root_fd = open_root(self.root)
+        try:
+            info = os.fstat(root_fd)
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise ValueError("unsafe journal root")
+            self._root_identity = (info.st_dev, info.st_ino)
+        finally:
+            os.close(root_fd)
+        self._local = threading.local()
         self.crash_before_commit = False
         self.crash_after_replacements = None
         self._pending_path = self.root / ".journal.pending.json"
@@ -42,16 +51,10 @@ class Journal:
         if kind in {".", ".."} or key in {".", ".."}:
             raise ValueError("unsafe journal name")
         folder = self.root / kind
-        try:
-            info = folder.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            if not stat.S_ISDIR(info.st_mode):
-                raise ValueError("unsafe journal directory")
         path = folder / (key + ".json")
         try:
-            self._check_record(path.lstat())
+            with self._parent_fd(path) as fd:
+                self._check_record(os.lstat(path.name, dir_fd=fd))
         except FileNotFoundError:
             pass
         return path
@@ -64,7 +67,7 @@ class Journal:
 
     @contextmanager
     def _parent_fd(self, path, *, create=False):
-        root_fd = open_root(self.root)
+        root_fd = self._local.root_fd
         folder_fd = None
         try:
             if path.parent == self.root:
@@ -80,25 +83,33 @@ class Journal:
                 except FileExistsError:
                     pass
             folder_fd = open_directory(root_fd, kind)
+            info = os.fstat(folder_fd)
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise ValueError("unsafe journal directory")
             yield folder_fd
         finally:
             if folder_fd is not None:
                 os.close(folder_fd)
-            os.close(root_fd)
 
     @contextmanager
     def _locked(self):
-        with _Lock(self._lock_path):
-            self._recover_pending()
-            yield
-
-    @staticmethod
-    def _sync_dir(directory):
-        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        if hasattr(self._local, "root_fd"):
+            raise RuntimeError("nested journal transaction")
+        root_fd = open_root(self.root)
         try:
-            os.fsync(fd)
+            info = os.fstat(root_fd)
+            if ((info.st_dev, info.st_ino) != self._root_identity
+                    or info.st_uid != os.getuid() or info.st_mode & 0o022):
+                raise ValueError("journal root changed or unsafe")
+            with _Lock(root_fd):
+                self._local.root_fd = root_fd
+                try:
+                    self._recover_pending()
+                    yield
+                finally:
+                    del self._local.root_fd
         finally:
-            os.close(fd)
+            os.close(root_fd)
 
     def _replace_durable(self, path, payload):
         with self._parent_fd(path, create=True) as fd:
@@ -109,7 +120,10 @@ class Journal:
             replace_bytes(fd, path.name, payload.encode("utf-8"))
 
     def _recover_pending(self, *, inject=False):
-        if not os.path.lexists(self._pending_path):
+        root_fd = self._local.root_fd
+        try:
+            os.lstat(self._pending_path.name, dir_fd=root_fd)
+        except FileNotFoundError:
             return
         pending = self._read_path(self._pending_path)
         if not isinstance(pending, dict) or pending.get("version") != 1 or not isinstance(pending.get("writes"), list):
@@ -124,14 +138,13 @@ class Journal:
             self._replace_durable(path, payload)
             if inject and self.crash_after_replacements == index:
                 raise RuntimeError("crash during local commit")
-        self._pending_path.unlink()
-        self._sync_dir(self.root)
+        os.unlink(self._pending_path.name, dir_fd=root_fd)
+        os.fsync(root_fd)
 
 
     def read(self, kind, key):
-        path = self._path(kind, key)
         with self._locked():
-            return self._read_path(path)
+            return self._read_path(self._path(kind, key))
 
     def mutate(self, mutator):
         """Run ``mutator(view)`` under the journal lock and commit staged writes.
@@ -157,9 +170,7 @@ class Journal:
                 self._replace_durable(self._pending_path, json.dumps(pending, sort_keys=True))
                 self._recover_pending(inject=True)
             if view.trace_lines:
-                trace = self.root / "trace.jsonl"
-                with trace.open("a", encoding="utf-8") as handle:
-                    handle.writelines(view.trace_lines)
+                self._append_trace_locked(view.trace_lines)
             return result
 
     def _read_path(self, path):
@@ -187,23 +198,42 @@ class Journal:
         with self._locked():
             return _View(self).list(kind)
 
+    def _append_trace_locked(self, lines):
+        root_fd = self._local.root_fd
+        fd = os.open("trace.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                     os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=root_fd)
+        try:
+            self._check_record(os.fstat(fd))
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                fd = None
+                handle.writelines(lines)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.fsync(root_fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
     def append_trace(self, entry):
-        path = self.root / "trace.jsonl"
         line = json.dumps(entry, sort_keys=True) + "\n"
         with self._locked():
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
+            self._append_trace_locked([line])
 
     def traces(self):
-        path = self.root / "trace.jsonl"
         with self._locked():
-            if not path.exists():
+            try:
+                fd = os.open("trace.jsonl", os.O_RDONLY | os.O_NOFOLLOW |
+                             os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=self._local.root_fd)
+            except FileNotFoundError:
                 return []
-            rows = []
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if line:
-                    rows.append(json.loads(line))
-            return rows
+            try:
+                self._check_record(os.fstat(fd))
+                with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                    fd = None
+                    return [json.loads(line) for line in handle if line.strip()]
+            finally:
+                if fd is not None:
+                    os.close(fd)
 
 
 class _View:
@@ -222,8 +252,12 @@ class _View:
 
     def list(self, kind):
         """Read a complete kind snapshot under the enclosing journal lock."""
-        folder = self.journal._path(kind, "snapshot").parent
-        keys = {path.stem for path in folder.glob("*.json")}
+        probe = self.journal._path(kind, "snapshot")
+        try:
+            with self.journal._parent_fd(probe) as fd:
+                keys = {name[:-5] for name in os.listdir(fd) if name.endswith(".json")}
+        except FileNotFoundError:
+            keys = set()
         keys.update(key for staged_kind, key in self.staged if staged_kind == kind)
         return [self.read(kind, key) for key in sorted(keys)]
 
@@ -241,14 +275,15 @@ class _View:
 
 
 class _Lock:
-    def __init__(self, path):
-        self.path = path
+    def __init__(self, root_fd):
+        self.root_fd = root_fd
         self.handle = None
 
     def __enter__(self):
         if fcntl is None:
             raise RuntimeError("journal locking unavailable")
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        fd = os.open(".journal.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW |
+                     os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=self.root_fd)
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_mode & 0o022:
