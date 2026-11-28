@@ -128,7 +128,7 @@ class DeliveryReadTests(unittest.TestCase):
             second = query_tasks(root, after=first["next_cursor"], **args)
             self.assertEqual(set(second["items"]), {"z"})
             self.assertFalse(second["truncated"])
-            for cursor in ("../z.json", "a\\x00.json", "x" * 251 + ".json"):
+            for cursor in ("../z.json", "a" + chr(0) + ".json", "x" * 251 + ".json"):
                 with self.subTest(cursor=cursor), self.assertRaises(DeliveryReadError):
                     query_tasks(root, after=cursor, **args)
 
