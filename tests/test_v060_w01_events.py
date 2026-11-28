@@ -264,6 +264,71 @@ def test_w05_signed_intent_waits_for_gap_and_reconciles_applied_row(tmp_path):
     assert eng.store.count("events") == 2
 
 
+def test_w05_signed_business_actor_is_independent_of_event_signer(tmp_path):
+    from app.control_authz.proof import sign_request
+    from app.control_events.auth_state import load_state, save_state
+    from app.control_joint.w05_issue import feedback_submit_document
+    from app.control_delivery.ports import BlockedAuth, BlockedEvents, BlockedRemote, BlockedSchedule, BlockedDeploy, ServerClock
+    from app.control_delivery.service import DeliveryService
+
+    eng = engine(tmp_path)
+    keys = ensure_principals(eng)
+    registry = load_state(eng.auth_path)
+    registry["principals"]["fixture"]["scopes"].append("feedback")
+    save_state(eng.auth_path, registry)
+    eng.reload_auth_state()
+    scope = {"repo": eng.repo_id, "task_id": "tsk_w01"}
+    options = dict(auth=BlockedAuth(), events=BlockedEvents(), remote=BlockedRemote(),
+                   schedule=BlockedSchedule(), deploy=BlockedDeploy(), clock=ServerClock(),
+                   intent_engine=eng, intent_signer=lambda body: sign_event(eng, body, signer="w05"),
+                   require_business_signature=True)
+    root = tmp_path / "signed-business"
+    svc = DeliveryService(root, **options)
+
+    def submit(feedback_id, key, *, signer="fixture", nonce="business-nonce", task_id="tsk_w01",
+               alter_body=None, signed=True):
+        actual_scope = {**scope, "task_id": task_id}
+        payload = {"author_id": signer, "feedback_id": feedback_id,
+                   "category": "bug", "body": "signed feedback"}
+        document = feedback_submit_document(
+            principal_id=signer, producer_id=signer, stream_id=signer + ":task",
+            repo_id=eng.repo_id, task_id=task_id, app_id="base", payload=payload,
+            idempotency_key=key, expected_revision=0)
+        actor_envelope = sign_request(
+            keys[signer], signer_id=signer, key_id=signer + "-key",
+            operation="feedback.write", body=document, declared_kind="test",
+            declared_id=signer, declared_proof_ref="test-proof://business/" + signer,
+            issued_at=int(time.time()) - 5, expires_at=int(time.time()) + 3600, nonce=nonce)
+        if alter_body is not None:
+            payload["body"] = alter_body
+        return svc.submit_feedback(actor=actor_envelope if signed else actor(signer),
+                                   scope=actual_scope, **payload, idempotency_key=key)
+
+    assert not submit("fb_unsigned", "unsigned", signed=False).ok
+    assert not submit("fb_tampered", "tampered", alter_body="tampered").ok
+    assert not submit("fb_other_task", "other-task", task_id="tsk_other").ok
+    assert not submit("fb_no_grant", "no-grant", signer="fixture_b").ok
+    assert not submit("fb_event_signer", "event-signer", signer="w05").ok
+    assert eng.store.count("events") == 0
+    result = submit("fb_business", "business")
+    assert result.ok, result.as_dict()
+    assert submit("fb_business", "business").ok
+    assert not submit("fb_nonce_reuse", "nonce-reuse").ok
+    assert svc.store.read("feedback", "fb_nonce_reuse") is None
+    assert eng.store.count("events") == 1
+    outbox, = svc.store.list("outbox")
+    assert outbox["business_auth"]["principal_id"] == "fixture"
+    assert outbox["receipt"]["isolated_signature_verified"] is True
+    assert outbox["receipt"]["production_effective"] is False
+    with pytest.raises(ValueError, match="dedicated journal"):
+        DeliveryService(root, **{**options, "require_business_signature": False})
+    registry = load_state(eng.auth_path)
+    registry["revoked_signers"].append("fixture")
+    save_state(eng.auth_path, registry)
+    assert not submit("fb_business", "business").ok
+    assert eng.store.count("events") == 1
+
+
 def test_w05_signed_intent_business_cas_recovers_without_fixture_fallback(tmp_path):
     from app.control_delivery.ports import (
         FixtureAuth, FixtureEvents, BlockedRemote, BlockedSchedule, BlockedDeploy, ServerClock,
