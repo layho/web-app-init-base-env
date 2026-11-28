@@ -2146,6 +2146,7 @@ class DeliveryService:
         }
         if business_auth is not None:
             begun["business_auth"] = business_auth
+            begun["business_proof"] = actor
         if stop_before_idempotency:
             return begun
         idem_key = _hash({
@@ -2244,6 +2245,16 @@ class DeliveryService:
                             or outbox.get("business_auth") != begun.get("business_auth")):
                         view.abort()
                         return "conflict"
+                    business_auth = begun.get("business_auth")
+                    if business_auth is not None:
+                        reservation = view.read("business-nonce", business_auth["nonce_key"])
+                        proof_record = view.read("business-proof", owner)
+                        if (reservation != {"event_id": owner, "authorization_digest": business_auth["authorization_digest"]}
+                                or not isinstance(proof_record, dict)
+                                or proof_record.get("event_id") != owner
+                                or proof_record.get("business_auth") != business_auth):
+                            view.abort()
+                            return "conflict"
                     outbox["receipt"] = begun["receipt"]
                     outbox["delivery_state"] = "RECEIPT_RECORDED"
                     outbox["authority"] = "W01"
@@ -2272,6 +2283,7 @@ class DeliveryService:
                         "result": idem_body["public"],
                         "authority": "W05_LOCAL",
                         "intent_mode": self._intent_mode,
+                        "business_auth": begun.get("business_auth"),
                         "production_effective": False,
                     })
                 for kind, key, doc, expected in pairs:
@@ -2297,15 +2309,27 @@ class DeliveryService:
                 view.abort()
                 return "conflict"
             business_auth = begun.get("business_auth")
+            existing = view.read("outbox", event_id)
             if business_auth is not None:
                 nonce_key = business_auth["nonce_key"]
                 nonce = view.read("business-nonce", nonce_key)
+                proof_record = view.read("business-proof", event_id)
                 reservation = {"event_id": event_id, "authorization_digest": business_auth["authorization_digest"]}
-                if nonce is not None and nonce != reservation:
-                    view.abort()
-                    return "conflict"
-                view.stage("business-nonce", nonce_key, reservation)
-            existing = view.read("outbox", event_id)
+                if existing is not None:
+                    if (nonce != reservation or not isinstance(proof_record, dict)
+                            or proof_record.get("business_auth") != business_auth
+                            or proof_record.get("event_id") != event_id):
+                        view.abort()
+                        return "conflict"
+                else:
+                    if nonce is not None or proof_record is not None:
+                        view.abort()
+                        return "conflict"
+                    view.stage("business-nonce", nonce_key, reservation)
+                    view.stage("business-proof", event_id, {
+                        "event_id": event_id, "business_auth": business_auth,
+                        "signed": begun["business_proof"],
+                    })
             if isinstance(existing, dict):
                 if existing.get("business_auth") != business_auth:
                     view.abort()
