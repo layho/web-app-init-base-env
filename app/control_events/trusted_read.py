@@ -94,6 +94,45 @@ def query_applied(
             connection.close()
 
 
+def query_exact_event(root: Path, *, event_id: str, repo_id: str, app_id: str, task_id: str) -> dict | None:
+    """Read one cryptographically verified applied event, never a fixture receipt.
+
+    An absent, corrupt, mismatched or non-authoritative row is unknown.
+    The caller supplies the trusted configured root and authorized scope.
+    """
+    if not all(isinstance(value, str) and 0 < len(value) <= 200
+               for value in (event_id, repo_id, app_id, task_id)):
+        return None
+    try:
+        registry = _registry(root)
+        with verified_sqlite_copy(root, "events.sqlite3") as copied:
+            connection = sqlite3.connect(Path(copied).as_uri() + "?mode=ro", uri=True)
+            try:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                row = connection.execute(
+                    "SELECT * FROM events WHERE event_id=? AND applied=1", (event_id,)
+                ).fetchone()
+                if row is None:
+                    return None
+                payload = _payload(row)
+                if not isinstance(payload, dict):
+                    return None
+                expected = {"event_id": event_id, "repo_id": repo_id, "app_id": app_id, "task_id": task_id}
+                if any(payload.get(key) != value for key, value in expected.items()):
+                    return None
+                if any(payload.get(key) != row[key] for key in ("event_id", "stream_id", "stream_epoch", "producer_seq")):
+                    return None
+                event = _mint(connection, row, payload, registry)
+                if event is None or event["read_receipt"]["evidence"] != "verified":
+                    return None
+                return event
+            finally:
+                connection.close()
+    except (OSError, UnsafePath, sqlite3.Error, TrustedReadError, ValueError, TypeError, KeyError, IndexError):
+        return None
+
+
 def _registry(root: Path) -> dict:
     root_fd = open_root(root)
     try:
