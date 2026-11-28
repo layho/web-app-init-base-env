@@ -500,6 +500,9 @@ class Engine:
                 event = dict(payload)
                 event.pop("received_at", None)
                 authority = json.loads(row["authority_json"] or "{}")
+                if not isinstance(authority, dict):
+                    bucket.append({"_invalid_authorization": True})
+                    continue
                 proof = _verdict(conn, row, event, registry, digest) if _identity(event) == digest else None
                 if (
                     proof is None or proof != ("policy_service", True)
@@ -1146,18 +1149,19 @@ class Engine:
         )
 
     def _write_authorization(self, conn, event: dict, *, revoked: int) -> None:
-        # The event type sequence decides. ``authorized`` on the payload is not read.
-        prior = []
-        rows = conn.execute("SELECT payload_json FROM events WHERE applied=1").fetchall()
-        for item in _historical_groups(rows).get((event.get("task_id"), event.get("candidate_id"), event.get("operation")), []):
-            prior.append(item)
-        verdict = historical_authorization(prior + [event])
-        if verdict.get("reason") == "stale_signature":
+        # The current event has been inserted but not marked applied yet.
+        # Verify it and the applied history inside the same transaction.
+        rows = conn.execute(
+            "SELECT * FROM events WHERE applied=1 OR event_id=?",
+            (event["event_id"],),
+        ).fetchall()
+        key = (event.get("task_id"), event.get("candidate_id"), event.get("operation"))
+        verdict = historical_authorization(self._verified_authorization_groups(conn, rows).get(key, []))
+        if verdict.get("decision") not in {"authorized", "revoked"}:
             return
-        if verdict["decision"] == "revoked":
-            revoked = 1
-        elif verdict["decision"] == "authorized":
-            revoked = 0
+        if verdict.get("event_id") != event["event_id"] or verdict.get("revision") != event["revision"]:
+            return
+        revoked = int(verdict["decision"] == "revoked")
         existing = conn.execute(
             "SELECT revision, revoked FROM authorizations WHERE task_id=? AND candidate_id=? AND operation=?",
             (event["task_id"], event["candidate_id"], event["operation"]),
