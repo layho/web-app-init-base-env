@@ -449,12 +449,14 @@ class Engine:
     def authorizations(self) -> list[dict]:
         with self.store.transaction() as conn:
             rows = conn.execute("SELECT * FROM authorizations").fetchall()
-            stored = conn.execute("SELECT payload_json FROM events WHERE applied=1").fetchall()
-        grouped = _historical_groups(stored)
+            stored = conn.execute("SELECT * FROM events WHERE applied=1").fetchall()
+            grouped = self._verified_authorization_groups(conn, stored)
         found = []
         for row in rows:
             key = (row["task_id"], row["candidate_id"], row["operation"])
             verdict = historical_authorization(grouped.get(key, []))
+            if verdict.get("event_id") != row["event_id"] or verdict.get("revision") != row["revision"]:
+                verdict = {"decision": "unknown", "reason": "projection_not_bound"}
             if verdict["decision"] == "authorized":
                 revoked = False
             elif verdict["decision"] == "revoked":
@@ -474,6 +476,54 @@ class Engine:
                 "production_effective": False,
             })
         return found
+
+    def _verified_authorization_groups(self, conn, rows) -> dict:
+        # Use the same W01 proof verifier as the trusted board read. A stored
+        # source label, applied bit or mutable authorization projection is not proof.
+        from .trusted_read import _verdict
+
+        groups = {}
+        registry = self.auth_state.get("principals") or {}
+        revoked = self.auth_state.get("revoked_signers") or []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("event_type") not in {"authorization.granted", "authorization.revoked"}:
+                    continue
+                key = (payload.get("task_id"), payload.get("candidate_id"), payload.get("operation"))
+                if not all(isinstance(part, str) and part for part in key):
+                    continue
+                bucket = groups.setdefault(key, [])
+                digest = row["payload_hash"]
+                event = dict(payload)
+                event.pop("received_at", None)
+                authority = json.loads(row["authority_json"] or "{}")
+                proof = _verdict(conn, row, event, registry, digest) if _identity(event) == digest else None
+                if (
+                    proof is None or proof != ("policy_service", True)
+                    or authority.get("signer_id") in revoked
+                    or event.get("repo_id") != self.repo_id
+                    or any(event.get(field) != row[field] for field in ("event_id", "stream_id", "stream_epoch", "producer_seq"))
+                ):
+                    bucket.append({"_invalid_authorization": True})
+                    continue
+                event["_authoritative"] = True
+                event["signature"] = authority.get("signature")
+                if not self._evidence_proven(event):
+                    bucket.append({"_invalid_authorization": True})
+                    continue
+                bucket.append(event)
+            except (ValueError, TypeError, ControlError, KeyError, IndexError):
+                # A malformed row cannot prove any grant. Fail closed for
+                # all projected decisions in this snapshot.
+                return {}
+        return {
+            key: events for key, events in groups.items()
+            if not any(event.get("_invalid_authorization") for event in events)
+            and len({(event.get("repo_id"), event.get("app_id"), event.get("stream_id"), event.get("stream_epoch")) for event in events}) == 1
+        }
 
     def fact(self, key: str) -> dict | None:
         with self.store.transaction() as conn:
