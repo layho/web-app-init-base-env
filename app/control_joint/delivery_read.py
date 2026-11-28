@@ -10,13 +10,16 @@ from __future__ import annotations
 import json
 import fcntl
 import os
+import re
 import stat
 from pathlib import Path
 
 from app.control_diagnostics.safe_io import UnsafePath, lstat_at, open_directory, open_root, read_bounded
 
 _MAX = 65536
-_NAME = 80
+_NAME = 205  # Journal keys allow 200 characters plus .json.
+_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
+_SCAN_LIMIT = 200
 
 
 class DeliveryReadError(Exception):
@@ -28,16 +31,18 @@ class DeliveryReadError(Exception):
 def query_tasks(root: Path, *, repo_id: str, app_id: str, task_ids: set[str], limit: int = 50, after: str | None = None) -> dict:
     if type(limit) is not int or isinstance(limit, bool) or limit < 1 or limit > 100:
         raise DeliveryReadError("page")
-    directory = Path(root) / "delivery"
-    if not directory.exists():
-        return {"items": {}, "missing": True, "truncated": False, "bad": 0, "unscoped": 0, "next_cursor": None}
+    if after is not None and (not isinstance(after, str) or len(after) > _NAME or not after.endswith(".json")):
+        raise DeliveryReadError("cursor")
     root_fd = None
     delivery_fd = None
     task_fd = None
     lock_fd = None
     try:
         root_fd = open_root(root)
-        info = lstat_at(root_fd, "delivery")
+        try:
+            info = lstat_at(root_fd, "delivery")
+        except FileNotFoundError:
+            return {"items": {}, "missing": True, "truncated": False, "bad": 0, "unscoped": 0, "next_cursor": None}
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise DeliveryReadError("special")
         delivery_fd = open_directory(root_fd, "delivery")
@@ -67,7 +72,7 @@ def query_tasks(root: Path, *, repo_id: str, app_id: str, task_ids: set[str], li
         if stat.S_ISLNK(folder.st_mode) or not stat.S_ISDIR(folder.st_mode):
             raise DeliveryReadError("special")
         task_fd = open_directory(delivery_fd, "task")
-        names = sorted(name for name in os.listdir(task_fd) if name.endswith(".json") and len(name) <= _NAME)
+        names = sorted(name for name in os.listdir(task_fd) if name.endswith(".json"))
         if after is not None:
             names = [name for name in names if name > after]
         items = {}
@@ -75,9 +80,12 @@ def query_tasks(root: Path, *, repo_id: str, app_id: str, task_ids: set[str], li
         unscoped = 0
         used = []
         for name in names:
-            if len(items) >= limit:
+            if len(items) >= limit or len(used) >= _SCAN_LIMIT:
                 break
             used.append(name)
+            if len(name) > _NAME or not _KEY.fullmatch(name[:-5]) or name[:-5] in {".", ".."}:
+                bad += 1
+                continue
             try:
                 info = lstat_at(task_fd, name)
             except OSError as exc:
@@ -99,7 +107,14 @@ def query_tasks(root: Path, *, repo_id: str, app_id: str, task_ids: set[str], li
                     unscoped += 1
                 continue
             task_id = document.get("task_id")
+            if not isinstance(task_id, str) or task_id + ".json" != name:
+                bad += 1
+                continue
             if task_id not in task_ids:
+                continue
+            if (type(document.get("revision")) is not int or document["revision"] < 1
+                    or not isinstance(document.get("phase"), str) or not document["phase"]):
+                bad += 1
                 continue
             items[task_id] = {
                 "phase": document.get("phase") if isinstance(document.get("phase"), str) else None,
