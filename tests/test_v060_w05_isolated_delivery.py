@@ -1231,6 +1231,38 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertEqual(entered, ["fb_once"])
         self.assertEqual(self.svc.store.read("feedback", "fb_once")["state"], "SYNCED")
 
+    def test_append_receipt_must_bind_complete_event_intent(self):
+        self._submit("fb_exact_append")
+        event = self.events.events[-1]
+        reply = self.events._receipt(event)
+        self.assertIsNotNone(self.svc._exact_receipt(event, reply))
+        for field, value in (("note", "different-intent"), ("app_id", "other"),
+                             ("task_id", "other"), ("revision", 999)):
+            with self.subTest(field=field):
+                modified = {**event, field: value}
+                self.assertIsNone(self.svc._exact_receipt(modified, reply))
+                self.assertFalse(self.events.append(modified)["applied"])
+        for changes in ({"authority": "other"}, {"fact_state": "HELD"},
+                        {"test_double": False}, {"w01_proof": True}):
+            forged = {**reply, "receipt": {**reply["receipt"], **changes}}
+            self.assertIsNone(self.svc._exact_receipt(event, forged))
+        self.events.is_test_double = False
+        self.assertIsNone(self.svc._dispatch(event))
+
+    def test_absence_proof_cannot_be_reused_for_other_intent(self):
+        from app.control_delivery.service import _absence_proven
+
+        self._submit("fb_exact_absence")
+        event = {**self.events.events[-1], "event_id": "evt_absent"}
+        fields = ("stream_id", "stream_epoch", "event_id", "producer_seq",
+                  "repo_id", "event_type", "idempotency_key", "state", "operation")
+        reply = self.events.query(**{field: event[field] for field in fields},
+                                  expected_event=event)
+        self.assertTrue(_absence_proven(event, reply))
+        self.assertFalse(_absence_proven({**event, "note": "different-intent"}, reply))
+        self.assertFalse(_absence_proven({**event, "app_id": "other"}, reply))
+        self.assertFalse(_absence_proven({**event, "task_id": "other"}, reply))
+
     def test_reconcile_requires_unambiguous_exact_event(self):
         self._submit("fb_exact")
         event = self.events.events[-1]
