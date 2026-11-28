@@ -104,6 +104,46 @@ class DeliveryReadTests(unittest.TestCase):
             self.assertEqual(page["bad"], 3)
             self.assertFalse(page["items"][long_id]["authoritative"])
 
+    def test_malformed_long_name_does_not_break_continuation(self):
+        from app.control_joint.delivery_read import query_tasks, DeliveryReadError
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            delivery = root / "delivery"
+            folder = delivery / "task"
+            folder.mkdir(parents=True)
+            (delivery / ".journal.lock").touch(mode=0o600)
+            for index in range(199):
+                (folder / f"a{index:03}.json").write_text("{}", encoding="utf-8")
+            invalid = "b" * 210 + ".json"
+            (folder / invalid).write_text("{}", encoding="utf-8")
+            (folder / "z.json").write_text(json.dumps({
+                "repo_id": "repo", "app_id": "base", "task_id": "z",
+                "revision": 1, "phase": "claim",
+            }), encoding="utf-8")
+            args = dict(repo_id="repo", app_id="base", task_ids={"z"})
+            first = query_tasks(root, **args)
+            self.assertEqual(first["next_cursor"], invalid)
+            self.assertEqual(first["bad"], 1)
+            second = query_tasks(root, after=first["next_cursor"], **args)
+            self.assertEqual(set(second["items"]), {"z"})
+            self.assertFalse(second["truncated"])
+            for cursor in ("../z.json", "a\\x00.json", "x" * 251 + ".json"):
+                with self.subTest(cursor=cursor), self.assertRaises(DeliveryReadError):
+                    query_tasks(root, after=cursor, **args)
+
+    def test_board_delivery_rejects_dangling_symlink(self):
+        from app.control_joint.surface import _delivery
+
+        principal = Principal(principal_id="reader", kind="agent", repo_id="repo",
+                              app_id="base", producer_id="reader", stream_id="reader:task",
+                              scopes=frozenset({"event.read", "task:z"}), trusted_source="agent")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.assertEqual(_delivery(root, principal, {"z"}), ({}, "missing"))
+            (root / "delivery").symlink_to(root / "missing")
+            self.assertEqual(_delivery(root, principal, {"z"}), ({}, "blocked"))
+
     def test_sparse_page_has_continuation_even_without_visible_rows(self):
         from app.control_delivery.store import Journal
         from app.control_joint.delivery_read import query_tasks
