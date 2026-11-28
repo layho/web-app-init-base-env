@@ -115,6 +115,77 @@ class JournalPathSafetyTest(unittest.TestCase):
         self.assertFalse((self.root / ".journal.pending.json").exists())
 
 
+class JournalLockTraceTest(unittest.TestCase):
+    def setUp(self):
+        from app.control_delivery.store import Journal
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve() / "journal"
+        self.j = Journal(self.root)
+
+    def test_trace_symlink(self):
+        target = self.root.parent / "outside.jsonl"
+        target.write_text('{"secret":true}\n', encoding="utf-8")
+        (self.root / "trace.jsonl").symlink_to(target)
+        with self.assertRaises((OSError, ValueError, RuntimeError)):
+            self.j.traces()
+        with self.assertRaises((OSError, ValueError, RuntimeError)):
+            self.j.append_trace({"bad": True})
+        self.assertEqual(target.read_text(), '{"secret":true}\n')
+
+    def test_trace_hardlink(self):
+        import os
+
+        target = self.root.parent / "outside.jsonl"
+        target.write_text('{"secret":true}\n', encoding="utf-8")
+        os.link(target, self.root / "trace.jsonl")
+        with self.assertRaises((OSError, ValueError, RuntimeError)):
+            self.j.append_trace({"bad": True})
+        self.assertEqual(target.read_text(), '{"secret":true}\n')
+
+    def test_root_replacement_before_lock(self):
+        self.root.rename(self.root.parent / "old")
+        self.root.mkdir()
+        with self.assertRaises((OSError, ValueError, RuntimeError)):
+            self.j.write("task", "x", {"revision": 1})
+        self.assertFalse((self.root / "task").exists())
+
+    def test_root_replacement_under_lock(self):
+        old = self.root.parent / "old"
+
+        def mutate(view):
+            self.root.rename(old)
+            self.root.mkdir()
+            view.stage("task", "x", {"revision": 1})
+            view.trace({"action": "test"})
+
+        self.j.mutate(mutate)
+        self.assertFalse((self.root / "task").exists())
+        self.assertEqual(json.loads((old / "task" / "x.json").read_text()), {"revision": 1})
+        self.assertFalse((old / ".journal.pending.json").exists())
+        self.assertEqual(json.loads((old / "trace.jsonl").read_text()), {"action": "test"})
+
+    def test_concurrent_mutations(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def advance(_):
+            def mutate(view):
+                row = view.read("task", "x") or {"revision": 0}
+                view.stage("task", "x", {"revision": row["revision"] + 1})
+
+            self.j.mutate(mutate)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(advance, range(12)))
+        self.assertEqual(self.j.read("task", "x"), {"revision": 12})
+
+    def test_normal_trace(self):
+        self.j.append_trace({"a": 1})
+        self.j.mutate(lambda view: view.trace({"a": 2}))
+        self.assertEqual(self.j.traces(), [{"a": 1}, {"a": 2}])
+
+
 class IsolatedDeliveryTest(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
