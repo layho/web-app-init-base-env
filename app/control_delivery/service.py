@@ -2096,6 +2096,8 @@ class DeliveryService:
                             for kind, key, doc, expected in pairs
                         ],
                         "event_digest": _hash(outbox["event"]),
+                        "intent_binding": outbox["event"].get("note"),
+                        "expected_revision": begun["observed_revision"],
                         "receipt_digest": _hash(begun["receipt"]),
                         "result": idem_body["public"],
                         "authority": "W05_LOCAL",
@@ -2276,6 +2278,22 @@ class DeliveryService:
             "w01_proof": False,
         }
         event.update({key: value for key, value in fields.items() if key != "received_at"})
+        # Bind the authorized request and complete business change plan to
+        # the event before dispatch. An eventual W01 adapter must sign this
+        # digest in its accepted schema, not just the event coordinates.
+        event["note"] = "w05-intent-v1:" + _hash({
+            "principal_id": begun["principal"],
+            "scope": begun["scope"],
+            "operation": begun["operation"],
+            "request_digest": begun["payload_hash"],
+            "expected_revision": begun["observed_revision"],
+            "changes": [
+                {"kind": kind, "key": key, "expected_revision": expected,
+                 "revision": _revision(doc), "digest": _hash(doc)}
+                for kind, key, doc, expected in pairs
+            ],
+            "result": {key: value for key, value in public.items() if key != "lease_token"},
+        })
         planned = dict(begun)
         planned["change_plan"] = [
             {"kind": item_kind, "key": item_key, "expected_revision": expected}
