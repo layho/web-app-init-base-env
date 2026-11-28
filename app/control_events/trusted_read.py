@@ -302,6 +302,14 @@ def _verdict(connection, row, payload, registry, digest):
     server_source = SOURCE_BY_KIND.get(record.get("kind"))
     if not isinstance(server_source, str) or not server_source or server_source == "authoritative":
         return None
+    if payload.get("event_type") == "delivery.intent.recorded":
+        if (record.get("kind") != "app_service" or record.get("producer_id") != "w05"
+                or record.get("repo_id") != payload.get("repo_id")
+                or record.get("app_id") != payload.get("app_id")
+                or record.get("stream_id") != payload.get("stream_id")
+                or "delivery.intent" not in (record.get("scopes") or [])
+                or "task:" + str(payload.get("task_id")) not in (record.get("scopes") or [])):
+            return None
     public = record.get("public_key")
     if signed["key_id"] != record.get("key_id") or signed["declared_id"] != principal_id or not isinstance(public, str):
         return None
