@@ -185,6 +185,13 @@ class _View:
             return self.staged[token]
         return self.journal._read_path(self.journal._path(kind, key))
 
+    def list(self, kind):
+        """Read a complete kind snapshot under the enclosing journal lock."""
+        folder = self.journal._path(kind, "snapshot").parent
+        keys = {path.stem for path in folder.glob("*.json")}
+        keys.update(key for staged_kind, key in self.staged if staged_kind == kind)
+        return [self.read(kind, key) for key in sorted(keys)]
+
     def stage(self, kind, key, doc):
         path = self.journal._path(kind, key)
         payload = json.dumps(doc, sort_keys=True, indent=2) + "\n"
