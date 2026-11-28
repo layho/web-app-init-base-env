@@ -242,6 +242,28 @@ def test_w05_intent_bridge_uses_signed_w01_evidence_without_business_commit(tmp_
     assert eng.store.count("events") == 1
 
 
+def test_w05_signed_intent_waits_for_gap_and_reconciles_applied_row(tmp_path):
+    from app.control_joint.w05_issue import record_isolated_intent
+
+    eng = engine(tmp_path)
+    event = {
+        "event_id": "evt_w05_first", "repo_id": eng.repo_id, "app_id": "base",
+        "task_id": "tsk_w01", "run_id": "run_w05_first",
+        "producer_id": "w05", "stream_id": "w05:task", "stream_epoch": 1,
+        "producer_seq": 1, "occurred_at": 1700000000,
+        "note": "w05-intent-v1:" + "a" * 64,
+    }
+    second = {**event, "event_id": "evt_w05_second", "producer_seq": 2,
+              "note": "w05-intent-v1:" + "b" * 64}
+    signer = lambda body: sign_event(eng, body, signer="w05")
+    assert record_isolated_intent(eng, event=second, sign_request=signer)["status"] == "unknown"
+    assert record_isolated_intent(eng, event=event, sign_request=signer)["status"] == "intent_verified"
+    recovered = record_isolated_intent(eng, event=second, sign_request=signer)
+    assert recovered["status"] == "intent_verified", recovered
+    assert recovered["business_committed"] is False
+    assert eng.store.count("events") == 2
+
+
 def test_w05_signed_intent_business_cas_recovers_without_fixture_fallback(tmp_path):
     from app.control_delivery.ports import (
         FixtureAuth, FixtureEvents, BlockedRemote, BlockedSchedule, BlockedDeploy, ServerClock,
