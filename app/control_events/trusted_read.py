@@ -11,6 +11,7 @@ returned page.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
 from pathlib import Path
@@ -34,7 +35,7 @@ from app.control_events.auth_bind import document_for_event
 from app.control_events.engine import _identity
 from app.control_events.errors import ControlError
 from app.control_events.redact import redact
-from app.control_events.schema import authorize_source
+from app.control_events.schema import authorize_source, validate_event
 
 _PAGE = 50
 _SCAN = 2000
@@ -60,11 +61,18 @@ def query_applied(
         raise TrustedReadError("page")
     if type(after_rowid) is not int or isinstance(after_rowid, bool) or after_rowid < 0:
         raise TrustedReadError("page")
-    path = Path(root) / "events.sqlite3"
-    if not path.exists():
-        return _page([], truncated=False, next_rowid=None, bad=0, missing=True)
     connection = None
     try:
+        root_fd = open_root(root)
+        try:
+            try:
+                info = lstat_at(root_fd, "events.sqlite3")
+            except FileNotFoundError:
+                return _page([], truncated=False, next_rowid=None, bad=0, missing=True)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise TrustedReadError("unsafe")
+        finally:
+            os.close(root_fd)
         registry = _registry(root)
         with verified_sqlite_copy(root, "events.sqlite3") as copied:
             connection = sqlite3.connect(copied)
@@ -165,7 +173,8 @@ def _collect(connection, *, registry, repo_id, app_id, task_ids, stream_id, limi
     while len(items) < limit and scanned < _SCAN:
         rows = connection.execute(
             """
-            SELECT rowid, payload_hash, payload_json, received_at, applied, authority_json
+            SELECT rowid, event_id, stream_id, stream_epoch, producer_seq,
+                   payload_hash, payload_json, received_at, applied, authority_json
             FROM events
             WHERE applied=1 AND rowid>?
             ORDER BY rowid
@@ -186,7 +195,7 @@ def _collect(connection, *, registry, repo_id, app_id, task_ids, stream_id, limi
             if minted.get("repo_id") != repo_id or minted.get("app_id") != app_id:
                 continue
             task_id = minted.get("task_id") or minted.get("subject_id")
-            if task_id not in task_ids:
+            if not isinstance(task_id, str) or task_id not in task_ids:
                 continue
             if stream_id is not None and minted.get("stream_id") != stream_id:
                 continue
@@ -230,6 +239,20 @@ def _owned(payload, repo_id, app_id) -> bool:
 def _mint(connection, row, payload, registry):
     if payload is None:
         return None
+    # The physical row and signed payload must identify the same event.
+    # Exact lookup and paged projection share this check.
+    if any(payload.get(key) != row[key] for key in
+           ("event_id", "stream_id", "stream_epoch", "producer_seq")):
+        return None
+    if payload.get("event_type") == "delivery.intent.recorded":
+        if type(payload.get("expected_revision")) is not int or payload["expected_revision"] != 0:
+            return None
+        candidate = {key: value for key, value in payload.items()
+                     if key not in {"expected_revision", "received_at", "trusted_source"}}
+        try:
+            validate_event(candidate)
+        except (ControlError, KeyError, TypeError, ValueError):
+            return None
     authority = row["payload_hash"]
     if not isinstance(authority, str) or not authority:
         return None
