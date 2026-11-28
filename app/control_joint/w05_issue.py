@@ -29,83 +29,13 @@ def issue_w05_receipt(
     app_id: str,
     result: dict,
 ) -> dict:
-    """Commit one receipt. A conflict leaves the previous transaction in place."""
+    """Legacy standalone issuer is disabled: no business transaction, no proof.
 
-    if not _binding_ok(operation_id, expected_revision, candidate_digest, repo_id, app_id, result):
-        return {"status": "unknown", "wrote": False}
-    journal = Journal(Path(root) / "delivery")
-
-    def mutator(view):
-        current = view.read("transaction", operation_id)
-        head = view.read(HEAD_KIND, HEAD_KEY) or {"revision": 0, "seq": 0, "head": "", "commits": {}}
-        if not isinstance(head, dict) or not isinstance(head.get("commits"), dict):
-            view.abort()
-            return "unknown"
-        if current is not None:
-            if _same_transaction(current, operation_id, expected_revision, candidate_digest, repo_id, app_id, result):
-                return "replay"
-            view.abort()
-            return "conflict"
-        parent = head.get("head") if isinstance(head.get("head"), str) else ""
-        commit_seq = int(head.get("seq") or 0) + 1
-        digest = issuance_digest(
-            operation_id=operation_id,
-            expected_revision=expected_revision,
-            candidate_digest=candidate_digest,
-            repo_id=repo_id,
-            app_id=app_id,
-            result=result,
-            commit_seq=commit_seq,
-            parent=parent,
-        )
-        receipt_id = "rcpt_" + digest[:24]
-        transaction = {
-            "authority": "W05",
-            "operation_id": operation_id,
-            "expected_revision": expected_revision,
-            "candidate_digest": candidate_digest,
-            "repo_id": repo_id,
-            "app_id": app_id,
-            "result": result,
-            "commit_seq": commit_seq,
-            "parent": parent,
-            "receipt_id": receipt_id,
-            "issuance_digest": digest,
-            "status": "applied",
-        }
-        commits = dict(head["commits"])
-        commits[operation_id] = digest
-        view.stage("transaction", operation_id, transaction)
-        view.stage("receipt", operation_id, {
-            "authority": "W05",
-            "operation_id": operation_id,
-            "expected_revision": expected_revision,
-            "candidate_digest": candidate_digest,
-            "repo_id": repo_id,
-            "app_id": app_id,
-            "result": result,
-            "receipt_id": receipt_id,
-            "status": "applied",
-        })
-        view.stage(HEAD_KIND, HEAD_KEY, {
-            "revision": int(head.get("revision") or 0) + 1,
-            "seq": commit_seq,
-            "head": digest,
-            "commits": commits,
-        })
-        return "applied"
-
-    try:
-        outcome = journal.mutate(mutator)
-    except (OSError, ValueError, TypeError):
-        return {"status": "unknown", "wrote": False}
-    if outcome == "applied":
-        return {"status": "applied", "wrote": True}
-    if outcome == "replay":
-        return {"status": "applied", "wrote": False, "replayed": True}
-    if outcome == "conflict":
-        return {"status": "conflict", "wrote": False}
-    return {"status": "unknown", "wrote": False}
+    Retain the interface for existing callers, but never mint a receipt from
+    an arbitrary result dictionary. The delivery service must commit a
+    business operation and its evidence before an authority can issue one.
+    """
+    return {"status": "unknown", "wrote": False, "reason": "BUSINESS_TRANSACTION_REQUIRED"}
 
 
 def issuance_digest(
