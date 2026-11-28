@@ -25,6 +25,7 @@ from app.control_delivery.flags import (
 from app.control_delivery.ports import event_identity_digest
 from app.control_delivery.store import Journal
 
+_ISOLATED_APP = "base"  # Existing W05 event authority is base-only.
 _TERMINAL_PR = {"merged", "closed", "superseded"}
 _SUPERSEDE_FROM = {"OPEN", "TESTING", "INTEGRATING"}
 
@@ -176,6 +177,7 @@ class DeliveryService:
             "closed": False,
             "close_evidence": None,
             "repo_id": scope["repo"],
+            "app_id": _ISOLATED_APP,
             "scope_task_id": scope["task_id"],
         }
         public = {"feedback_id": feedback_id, "state": "PENDING", "revision": 1}
@@ -319,6 +321,7 @@ class DeliveryService:
             if row["state"] in {"PENDING", "FAILED"}
             and row.get("author_id") == begun["principal"]
             and row.get("repo_id") == scope["repo"]
+            and row.get("app_id") == _ISOLATED_APP
             and row.get("scope_task_id") == scope["task_id"]
         ]
         rows.sort(key=lambda row: row["feedback_id"])
@@ -479,6 +482,7 @@ class DeliveryService:
                 "historical_blocked": bool(spec.get("historical_blocked", False)),
                 "recorded_steps": {},
                 "repo_id": scope["repo"],
+                "app_id": _ISOLATED_APP,
             })
         run_id = "run_" + task_id + "_1"
         task = {
@@ -491,6 +495,7 @@ class DeliveryService:
             "task_acceptance": None,
             "acceptance_issue_closed": False,
             "repo_id": scope["repo"],
+            "app_id": _ISOLATED_APP,
             "actor_id": begun["principal"],
             "completion_condition": (
                 "every required chain is PUBLISHED and each chain has publish_evidence "
@@ -506,6 +511,7 @@ class DeliveryService:
             if row is None:
                 return _denied(409, "EVIDENCE_MISSING", "REJECTED", {"reason": "feedback_missing"})
             if (row.get("repo_id") != scope["repo"]
+                    or row.get("app_id") != _ISOLATED_APP
                     or row.get("scope_task_id") != task_id
                     or row.get("author_id") != begun["principal"]
                     or row.get("task_id") not in (None, task_id)):
@@ -1342,6 +1348,7 @@ class DeliveryService:
             "historical_blocked": False,
             "recorded_steps": {},
             "repo_id": scope["repo"],
+            "app_id": _ISOLATED_APP,
             "follows_chain_id": chain_id,
         }
         self.store.write("chain", key, chain)
@@ -1379,7 +1386,9 @@ class DeliveryService:
         task = self.store.read("task", task_id)
         if task is None:
             return _denied(409, "EVIDENCE_MISSING", "ABSENT")
-        if task.get("repo_id") != scope["repo"] or task.get("task_id") != scope["task_id"]:
+        if (scope.get("app_id", _ISOLATED_APP) != _ISOLATED_APP
+                or task.get("app_id") != _ISOLATED_APP
+                or task.get("repo_id") != scope["repo"] or task.get("task_id") != scope["task_id"]):
             return _denied(403, "NOT_AUTHORIZED", task.get("phase", "REJECTED"), {"reason": "object_scope"})
         authz = self.auth.authorize(
             actor, {"repo": task["repo_id"], "task_id": task["task_id"]}, "task.project", None,
@@ -1429,7 +1438,8 @@ class DeliveryService:
     def _read_allowed(self, actor, scope, kind, object_id):
         if not isinstance(actor, dict) or not isinstance(scope, dict):
             return False
-        if not scope.get("repo") or not scope.get("task_id"):
+        if (not scope.get("repo") or not scope.get("task_id")
+                or scope.get("app_id", _ISOLATED_APP) != _ISOLATED_APP):
             return False
         authn = self.auth.authenticate(actor)
         if not isinstance(authn, dict) or authn.get("blocked") or not authn.get("ok"):
@@ -1445,6 +1455,8 @@ class DeliveryService:
             return False
         doc = None if object_id is None else self.store.read(kind, object_id)
         if isinstance(doc, dict):
+            if kind in {"task", "chain", "feedback"} and doc.get("app_id") != _ISOLATED_APP:
+                return False
             if doc.get("repo_id") and doc.get("repo_id") != scope["repo"]:
                 return False
             if doc.get("scope_task_id") and doc.get("scope_task_id") != scope["task_id"]:
@@ -1468,6 +1480,8 @@ class DeliveryService:
                 return "forged_scope"
         if not isinstance(doc, dict):
             return None
+        if kind in {"task", "chain", "feedback"} and doc.get("app_id") != _ISOLATED_APP:
+            return "cross_app_or_unbound"
         if doc.get("repo_id") and doc.get("repo_id") != scope["repo"]:
             return "cross_repo"
         if kind in {"task", "chain", "snapshot"} and doc.get("task_id") and doc["task_id"] != scope["task_id"]:
@@ -1648,7 +1662,8 @@ class DeliveryService:
 
     def _push_row(self, principal, scope, row):
         feedback_id = row["feedback_id"]
-        if row.get("author_id") != principal or row.get("repo_id") != scope["repo"] or row.get("scope_task_id") != scope["task_id"]:
+        if (row.get("author_id") != principal or row.get("repo_id") != scope["repo"]
+                or row.get("app_id") != _ISOLATED_APP or row.get("scope_task_id") != scope["task_id"]):
             self._trace("feedback.hijack", feedback_id=feedback_id, actor=principal)
             return {
                 "feedback_id": feedback_id,
@@ -1951,6 +1966,8 @@ class DeliveryService:
             return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "idempotency_key"})
         if not isinstance(scope, dict) or not scope.get("repo") or not scope.get("task_id"):
             return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "scope"})
+        if scope.get("app_id", _ISOLATED_APP) != _ISOLATED_APP:
+            return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "cross_app"})
         if not isinstance(expected_revision, int) or expected_revision < 0:
             return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "expected_revision"})
         self._local.repo = scope["repo"]
@@ -2291,7 +2308,7 @@ class DeliveryService:
             "attempt": 1,
             "revision": pairs[0][2].get("revision", 1) if pairs and isinstance(pairs[0][2], dict) else 1,
             "stage": state,
-            "app_id": "base",
+            "app_id": _ISOLATED_APP,
             "host_id": None,
             "test_double": True,
             "w01_proof": False,
