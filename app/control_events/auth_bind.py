@@ -97,9 +97,9 @@ def _revision(value: object) -> int:
 
 
 def document_for_event(event: dict, *, operation: str, authorizer: str, path: str) -> dict:
-    """Projection of an event into the W02 payload. Extra event fields stay unsigned."""
+    """Bind every effective event field using the existing signed result slot."""
 
-    return _document(
+    document = _document(
         operation=operation,
         authorizer=authorizer,
         repo_id=_text(event.get("repo_id")),
@@ -120,6 +120,24 @@ def document_for_event(event: dict, *, operation: str, authorizer: str, path: st
         method="POST",
         path=path,
     )
+    document["result"] = event_business_digest(event)
+    return document
+
+
+def event_business_digest(event: dict) -> str:
+    """Canonical schema fields, excluding only server-derived metadata.
+
+    Normalize the request and persisted event identically. Guard is ignored
+    by the engine, and trusted_source is independently derived from the signer.
+    """
+    from .schema import _extract
+
+    business = _extract(event)
+    business["expected_revision"] = event.get("expected_revision")
+    business.pop("guard", None)
+    business.pop("trusted_source", None)
+    encoded = json.dumps(business, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(b"w01.event.business.v1\x00" + encoded).hexdigest()
 
 
 _REPORT_UNSIGNED = {"actor", "proof", "channels", "payload_hash"}
