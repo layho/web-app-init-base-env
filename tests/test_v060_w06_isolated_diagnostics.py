@@ -6,10 +6,14 @@ PYTHONPATH=. python3 -m unittest tests.test_v060_w06_isolated_diagnostics -v
 
 import hashlib
 import json
+import multiprocessing
+import os
+import shutil
 import tempfile
 import unittest
 from datetime import timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from app.control_diagnostics import (
     DISPATCH_EXPANSION,
@@ -111,6 +115,8 @@ class IsolatedDiagnosticsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "journal"
+        self.log_root = Path(self.tmp.name) / "server-logs"
+        self.log_root.mkdir(mode=0o700)
         self.clock = ServerClock(NOW)
         self.probe = SideEffectProbe()
         self.authz = FixtureAuthorizationPort(grants(), self.clock)
@@ -132,12 +138,15 @@ class IsolatedDiagnosticsTest(unittest.TestCase):
             deployment=kwargs.pop("deployment", self.deployment),
             probe=kwargs.pop("probe", self.probe),
             limits=kwargs.pop("limits", Limits(max_records_per_segment=10)),
+            log_root=kwargs.pop("log_root", self.log_root),
         )
 
-    def write_log(self, name, text):
-        path = Path(self.tmp.name) / name
+    def write_log(self, name, text, app_id="app-a"):
+        directory = self.log_root / app_id
+        directory.mkdir(mode=0o700, exist_ok=True)
+        path = directory / name
         path.write_text(text, encoding="utf-8")
-        return path
+        return name
 
     def test_u02_pytest_and_typescript_extract_and_other_phases_are_not_empty(self):
         pytest_summary = summarize_failure(
@@ -753,3 +762,373 @@ class IsolatedDiagnosticsTest(unittest.TestCase):
             self.assertNotIn(banned, source)
         self.assertNotIn("control_diagnostics", (ROOT / "app" / "main.py").read_text(encoding="utf-8"))
         self.assertEqual(self.probe.calls, [])
+
+    def test_p0_failure_log_rejects_parent_symlink_cross_app_hardlink_and_production_files(self):
+        secret = "COMPILE src/app.c:1: error C1000: PRODUCTION_FILE_SECRET\n"
+        outside = Path(self.tmp.name) / "production"
+        outside.mkdir()
+        secret_file = outside / "failure.log"
+        secret_file.write_text(secret, encoding="utf-8")
+        envelope = {
+            "phase": "compile-failed",
+            "idempotency_key": "idem-parent-link",
+            "subject_id": "tsk_1",
+            "run_id": "run_link",
+            "occurred_at": "2026-11-28T01:00:00+00:00",
+        }
+        linked_parent = Path(self.tmp.name) / "via-parent"
+        linked_parent.symlink_to(outside, target_is_directory=True)
+        parent = self.service.ingest_failure_log(
+            principal(), "app-a", linked_parent / "failure.log", envelope,
+        )
+        self.assertNotEqual(parent.get("http"), 200, parent)
+        self.assertNotIn("PRODUCTION_FILE_SECRET", json.dumps(parent))
+        self.assertNotIn("C1000", json.dumps(parent))
+        self.assertEqual(secret_file.read_text(encoding="utf-8"), secret)
+
+        absolute = self.service.ingest_failure_log(
+            principal(), "app-a", secret_file, dict(envelope, idempotency_key="idem-absolute"),
+        )
+        self.assertNotEqual(absolute.get("http"), 200, absolute)
+        self.assertNotIn("PRODUCTION_FILE_SECRET", json.dumps(absolute))
+
+        other = Path(self.tmp.name) / "app-b-logs"
+        other.mkdir()
+        other_file = other / "failure.log"
+        other_file.write_text("COMPILE src/app.c:2: error C1001: APP_B_LOG_SECRET\n", encoding="utf-8")
+        cross = self.service.ingest_failure_log(
+            principal(), "app-a", other_file, dict(envelope, idempotency_key="idem-cross-app"),
+        )
+        self.assertNotEqual(cross.get("http"), 200, cross)
+        self.assertNotIn("APP_B_LOG_SECRET", json.dumps(cross) + journal_text(self.root))
+
+        inside = Path(self.tmp.name) / "hardlink-dir"
+        inside.mkdir()
+        linked = inside / "failure.log"
+        os.link(secret_file, linked)
+        hard = self.service.ingest_failure_log(
+            principal(), "app-a", linked, dict(envelope, idempotency_key="idem-hardlink"),
+        )
+        self.assertNotEqual(hard.get("http"), 200, hard)
+        self.assertNotIn("PRODUCTION_FILE_SECRET", json.dumps(hard) + journal_text(self.root))
+        self.assertEqual(secret_file.read_text(encoding="utf-8"), secret)
+        self.assertEqual(self.service.journal.records()[0], [])
+
+        app_dir = self.log_root / "app-a"
+        if app_dir.exists() or app_dir.is_symlink():
+            if app_dir.is_symlink() or app_dir.is_file():
+                app_dir.unlink()
+            else:
+                shutil.rmtree(app_dir)
+        app_dir.symlink_to(outside, target_is_directory=True)
+        rooted = self.service.ingest_failure_log(
+            principal(), "app-a", "failure.log", dict(envelope, idempotency_key="idem-rooted-parent"),
+        )
+        self.assertNotEqual(rooted.get("http"), 200, rooted)
+        self.assertNotIn("PRODUCTION_FILE_SECRET", json.dumps(rooted) + journal_text(self.root))
+        app_dir.unlink()
+        app_dir.mkdir(mode=0o700)
+        planted = app_dir / "failure.log"
+        os.link(secret_file, planted)
+        rooted_hard = self.service.ingest_failure_log(
+            principal(), "app-a", "failure.log", dict(envelope, idempotency_key="idem-rooted-hard"),
+        )
+        self.assertNotEqual(rooted_hard.get("http"), 200, rooted_hard)
+        self.assertNotIn("PRODUCTION_FILE_SECRET", json.dumps(rooted_hard) + journal_text(self.root))
+        service_source = (PACKAGE / "service.py").read_text(encoding="utf-8")
+        journal_source = (PACKAGE / "journal.py").read_text(encoding="utf-8")
+        self.assertNotIn(".read_text(", service_source)
+        self.assertNotIn(".read_text(", journal_source)
+        safe_source = (PACKAGE / "safe_io.py").read_text(encoding="utf-8")
+        self.assertIn("O_NOFOLLOW", safe_source)
+        self.assertIn("same file descriptor", safe_source)
+
+    def test_p0_external_report_and_journal_reads_do_not_follow_links_into_production_files(self):
+        target = Path(self.tmp.name) / "outside-report.txt"
+        target.write_text("EXTERNAL_REPORT_SECRET github_pat_EXTERNAL\n", encoding="utf-8")
+        opened = []
+        real_open = os.open
+
+        def spy(path, flags, *args, **kwargs):
+            opened.append(os.fspath(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", spy):
+            report = self.service.external_report(str(target))
+        self.assertFalse(any(os.fspath(target) == item for item in opened))
+        self.assertNotIn("EXTERNAL_REPORT_SECRET", json.dumps(report))
+        self.assertNotIn("github_pat_EXTERNAL", json.dumps(report))
+        self.assertIsNone(report["failures"])
+        self.assertFalse(report["success"])
+        self.assertFalse(report["opened"])
+        self.assertEqual(report["bytes_read"], 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "EXTERNAL_REPORT_SECRET github_pat_EXTERNAL\n")
+
+        self.service.ingest_event(principal(), "app-a", event(1, idempotency_key="idem-before-segment-link"))
+        production = Path(self.tmp.name) / "production-segments"
+        production.mkdir()
+        leaked = {
+            "schema_version": 2,
+            "record_id": "rec_production",
+            "app_id": "app-a",
+            "stream_id": "fixture:diagnostic",
+            "stream_epoch": 1,
+            "producer_seq": 9,
+            "receipt_seq": 9,
+            "disposition": "stream",
+            "channel": "diagnostic",
+            "event_class": "diagnostic",
+            "body": {"message": "PRODUCTION_SEGMENT_SECRET"},
+        }
+        (production / "seg-000001.jsonl").write_text(json.dumps(leaked) + "\n", encoding="utf-8")
+        segments = self.root / "segments"
+        shutil.rmtree(segments)
+        segments.symlink_to(production, target_is_directory=True)
+        meta_path = self.root / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["segments"] = [1]
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        reopened = self.open_service()
+        listed = reopened.list_records(principal(), "app-a", page_size=20)
+        self.assertNotIn("PRODUCTION_SEGMENT_SECRET", json.dumps(listed))
+        self.assertIn(1, listed["segment_gaps"])
+
+        prod_meta = Path(self.tmp.name) / "production-meta.txt"
+        prod_meta.write_text("PRODUCTION_META_SECRET", encoding="utf-8")
+        (self.root / "meta.json.tmp").symlink_to(prod_meta)
+        kept = reopened.ingest_event(
+            principal(), "app-a", event(2, idempotency_key="idem-meta-symlink"),
+        )
+        self.assertEqual(kept.get("http"), 200, kept)
+        self.assertEqual(prod_meta.read_text(encoding="utf-8"), "PRODUCTION_META_SECRET")
+        self.assertFalse((self.root / "meta.json").is_symlink())
+        prod_active = Path(self.tmp.name) / "production-active.txt"
+        prod_active.write_text("PRODUCTION_ACTIVE_SECRET", encoding="utf-8")
+        active = self.root / "active.jsonl"
+        if active.exists() or active.is_symlink():
+            active.unlink()
+        active.symlink_to(prod_active)
+        refused = reopened.ingest_event(
+            principal(), "app-a", event(4, idempotency_key="idem-active-symlink"),
+        )
+        self.assertNotEqual(refused.get("http"), 200, refused)
+        self.assertEqual(prod_meta.read_text(encoding="utf-8"), "PRODUCTION_META_SECRET")
+        self.assertEqual(prod_active.read_text(encoding="utf-8"), "PRODUCTION_ACTIVE_SECRET")
+        self.assertNotIn("PRODUCTION_META_SECRET", json.dumps(refused))
+        self.assertNotIn("PRODUCTION_ACTIVE_SECRET", json.dumps(refused))
+
+    def test_p0_redaction_allowlist_blocks_quoted_json_variants_responses_and_ports(self):
+        quoted = (
+            '{"api_key":"quoted-api-SECRET99","access_token":"quoted-access-SECRET99",'
+            '"client_secret":"quoted-client-SECRET99"}'
+        )
+        headers = "Authorization: Basic header-auth-SECRET99 Cookie: session=cookie-SECRET99"
+        stored = self.service.ingest_event(
+            principal(),
+            "app-a",
+            event(
+                1,
+                idempotency_key="idem-redact-p0",
+                body={
+                    "message": quoted + " " + headers,
+                    "api_key": "field-api-SECRET99",
+                    "access_token": "field-access-SECRET99",
+                    "client_secret": "field-client-SECRET99",
+                    "X-Authorization": "xauth-SECRET99",
+                    "Set-Cookie": "setcookie-SECRET99",
+                    "user_password": "user-pass-SECRET99",
+                    "debug_dump": "UNKNOWN_KEY_LEAK99",
+                },
+            ),
+        )
+        self.assertEqual(stored["http"], 200, stored)
+        blob = journal_text(self.root) + json.dumps(stored)
+        for marker in (
+            "quoted-api-SECRET99",
+            "quoted-access-SECRET99",
+            "quoted-client-SECRET99",
+            "header-auth-SECRET99",
+            "cookie-SECRET99",
+            "field-api-SECRET99",
+            "field-access-SECRET99",
+            "field-client-SECRET99",
+            "xauth-SECRET99",
+            "setcookie-SECRET99",
+            "user-pass-SECRET99",
+            "UNKNOWN_KEY_LEAK99",
+            "SECRET99",
+        ):
+            self.assertNotIn(marker, blob, marker)
+        hidden_key = self.service.ingest_event(
+            principal(),
+            "app-a",
+            event(
+                3,
+                idempotency_key="idem-key-name",
+                body={"message": "visible-note", "github_pat_ABCDEFGHIJ": "value-SECRET99"},
+            ),
+        )
+        hidden_blob = json.dumps(hidden_key) + journal_text(self.root)
+        self.assertNotIn("github_pat_", hidden_blob)
+        self.assertNotIn("value-SECRET99", hidden_blob)
+        self.assertIn("omitted_fields", json.dumps(stored["body"]))
+        polled = self.service.poll(principal(), "app-a", subject="tsk_1")
+        self.assertNotIn("SECRET99", json.dumps(polled))
+        events = FixtureEventPort([
+            {
+                "event_class": "task",
+                "app_id": "app-a",
+                "run_id": "run_1",
+                "task_id": "tsk_1",
+                "state": "FAILED",
+                "api_key": "port-api-SECRET99",
+                "access_token": "port-access-SECRET99",
+                "client_secret": "port-client-SECRET99",
+                "Authorization": "Bearer port-auth-SECRET99",
+                "Cookie": "cookie=port-cookie-SECRET99",
+                "note": {"user_api_key": "nested-port-SECRET99"},
+            },
+        ])
+        service = self.open_service(events=events)
+        service.ingest_event(
+            principal(),
+            "app-a",
+            event(2, idempotency_key="idem-port-carrier", body={"message": "carrier"}),
+        )
+        viewed = service.query_run(principal(), "app-a", "run_1")
+        rendered = json.dumps(viewed)
+        for marker in (
+            "port-api-SECRET99",
+            "port-access-SECRET99",
+            "port-client-SECRET99",
+            "port-auth-SECRET99",
+            "port-cookie-SECRET99",
+            "nested-port-SECRET99",
+            "SECRET99",
+        ):
+            self.assertNotIn(marker, rendered, marker)
+        self.assertIn("FAILED", json.dumps(viewed["interfaces"]["w01"]))
+        self.assertFalse(viewed["side_effect"])
+        redaction_source = (PACKAGE / "redaction.py").read_text(encoding="utf-8")
+        self.assertIn("does not detect every unknown secret", redaction_source)
+
+    def test_p0_concurrent_commits_keep_duplicates_sequence_rotation_and_crash_gaps(self):
+        for number in (1, 3):
+            first = self.service.ingest_event(
+                principal(), "app-a", event(number, idempotency_key=f"idem-seed-{number}"),
+            )
+            self.assertEqual(first["http"], 200, first)
+        meta_path = self.root / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["idempotency"] = {}
+        meta["next_receipt_seq"] = 1
+        meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+        recovered = self.open_service()
+        replay = recovered.ingest_event(
+            principal(), "app-a", event(1, idempotency_key="idem-seed-1"),
+        )
+        self.assertEqual(replay["code"], "IDEMPOTENCY_REPLAY", replay)
+        self.assertEqual(len(recovered.journal.records()[0]), 2)
+        hole = recovered.poll(principal(), "app-a", subject="tsk_1", stream_id="fixture:diagnostic")
+        classes = {
+            item["producer_seq"]: item["classification"]
+            for item in hole["items"]
+            if item.get("classification") in {"applied", "gap", "held"}
+        }
+        self.assertEqual(classes.get(2), "gap")
+        self.assertFalse(any(
+            item.get("producer_seq") == 2 and item.get("classification") == "applied" for item in hole["items"]
+        ))
+        status = recovered.journal.status()
+        self.assertTrue(any("continuous" in line for line in status["residuals"]))
+        active = (self.root / "active.jsonl").read_text(encoding="utf-8")
+        (self.root / "active.jsonl").write_text(active + '{"receipt_seq":', encoding="utf-8")
+        torn = self.open_service()
+        self.assertGreaterEqual(torn.journal.records()[2], 1)
+        self.assertEqual(len(torn.journal.records()[0]), 2)
+        self.assertTrue(any("torn" in line for line in torn.journal.status()["residuals"]))
+
+        fresh = Path(self.tmp.name) / "rotated"
+        rotated = self.open_service(root=fresh, limits=Limits(max_records_per_segment=2))
+        kept = []
+        for number in range(1, 3):
+            item = rotated.ingest_event(
+                principal(), "app-a", event(number, idempotency_key=f"idem-move-{number}"),
+            )
+            self.assertEqual(item["http"], 200, item)
+            kept.append(item["record_id"])
+        active_path = fresh / "active.jsonl"
+        segment = fresh / "segments" / "seg-000001.jsonl"
+        segment.parent.mkdir(mode=0o700, exist_ok=True)
+        os.replace(active_path, segment)
+        moved_meta = json.loads((fresh / "meta.json").read_text(encoding="utf-8"))
+        moved_meta["segments"] = []
+        moved_meta["active_segment"] = 1
+        (fresh / "meta.json").write_text(json.dumps(moved_meta) + "\n", encoding="utf-8")
+        resumed = self.open_service(root=fresh, limits=Limits(max_records_per_segment=2))
+        for number in range(3, 7):
+            item = resumed.ingest_event(
+                principal(), "app-a", event(number, idempotency_key=f"idem-move-{number}"),
+            )
+            self.assertEqual(item["http"], 200, item)
+        reloaded, missing, corrupt = resumed.journal.records()
+        found = {record["record_id"] for record in reloaded}
+        self.assertTrue(set(kept) <= found)
+        self.assertEqual(corrupt, 0)
+        self.assertEqual(missing, [])
+        self.assertEqual(len(reloaded), 6)
+
+        concurrent_root = Path(self.tmp.name) / "concurrent"
+        primed = self.open_service(root=concurrent_root, limits=Limits(max_records_per_segment=3))
+        self.assertEqual(
+            primed.ingest_event(principal(), "app-a", event(1, idempotency_key="idem-prime"))["http"],
+            200,
+        )
+        duplicate = event(1, idempotency_key="idem-dup", body={"message": "same-body"})
+        batches = []
+        expected = 2
+        for proc in range(4):
+            items = [duplicate]
+            for offset in range(4):
+                number = 2 + proc * 4 + offset
+                items.append(event(number, idempotency_key=f"idem-conc-{number}"))
+                expected += 1
+            batches.append(items)
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(4) as pool:
+            results = pool.map(_p0_commit_worker, [(concurrent_root, batch) for batch in batches])
+        flat = [item for batch in results for item in batch]
+        self.assertTrue(all(item["http"] == 200 for item in flat))
+        replays = [item for item in flat if item["code"] == "IDEMPOTENCY_REPLAY"]
+        self.assertEqual(len(replays), 3)
+        checked = self.open_service(root=concurrent_root, limits=Limits(max_records_per_segment=3))
+        records, missing, corrupt = checked.journal.records()
+        self.assertEqual(missing, [])
+        self.assertEqual(corrupt, 0)
+        self.assertEqual(len(records), expected)
+        receipts = [record["receipt_seq"] for record in records]
+        self.assertEqual(sorted(receipts), list(range(1, expected + 1)))
+        dupes = [record for record in records if "idem-dup" in str(record.get("idempotency_scope"))]
+        self.assertEqual(len(dupes), 1)
+        self.assertEqual(self.probe.calls, [])
+
+
+def _p0_commit_worker(spec):
+    root, batches = spec
+    clock = ServerClock(NOW)
+    authz = FixtureAuthorizationPort(grants(), clock)
+    service = DiagnosticService.open(
+        root,
+        clock=clock,
+        authz=authz,
+        limits=Limits(max_records_per_segment=3),
+    )
+    out = []
+    for item in batches:
+        result = service.ingest_event(principal(), "app-a", item)
+        out.append({
+            "http": result.get("http"),
+            "code": result.get("code"),
+            "replayed": bool(result.get("replayed")),
+        })
+    return out

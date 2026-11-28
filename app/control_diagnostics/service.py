@@ -1,4 +1,12 @@
-"""Unified read-only diagnostics over a durable journal and explicit ports."""
+"""Unified read-only diagnostics over a durable journal and explicit ports.
+
+Failure logs are read only from the server-authorized application directory,
+from the same file descriptor, with a byte cap. External reports are not
+opened. Untrusted objects keep an allowlist; this package does not detect
+every unknown secret. Journal commits share one cross-process lock. A torn
+line or a missing receipt stays visible, and this package does not fabricate
+records to make a sequence look continuous.
+"""
 
 import hashlib
 import json
@@ -8,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.control_diagnostics.extract import external_report_evidence, summarize_failure
-from app.control_diagnostics.journal import Journal, Limits, project_stream
+from app.control_diagnostics.journal import Journal, Limits, commit_fields, project_stream
 from app.control_diagnostics.observations import normalize_observation
 from app.control_diagnostics.ports import (
     BlockedAuthorizationPort,
@@ -18,6 +26,7 @@ from app.control_diagnostics.ports import (
     SideEffectProbe,
 )
 from app.control_diagnostics.redaction import contains_secret, redact_value
+from app.control_diagnostics.safe_io import SafeRoot, UnsafePath
 
 PATH = "/api/v1/control/diagnostics"
 METHOD = "GET"
@@ -77,7 +86,7 @@ def intervention_for(category):
 class DiagnosticService:
     """Isolated diagnostics. Production enablement flags stay false."""
 
-    def __init__(self, journal, *, clock, authz, events, schedule, deployment, probe):
+    def __init__(self, journal, *, clock, authz, events, schedule, deployment, probe, log_root=None):
         self.journal = journal
         self.clock = clock
         self.authz = authz
@@ -85,11 +94,15 @@ class DiagnosticService:
         self.schedule = schedule
         self.deployment = deployment
         self.probe = probe
+        self.log_root = log_root
 
     @classmethod
     def open(cls, root, *, clock, authz=None, events=None, schedule=None, deployment=None,
-             probe=None, limits=None, writable=True):
+             probe=None, limits=None, writable=True, log_root=None):
         journal = Journal.open(Path(root), writable=writable, limits=limits or Limits())
+        authorized = None
+        if log_root is not None:
+            authorized = SafeRoot.open(log_root)
         return cls(
             journal,
             clock=clock,
@@ -98,6 +111,7 @@ class DiagnosticService:
             schedule=schedule or BlockedSchedulePort(),
             deployment=deployment or BlockedDeploymentPort(),
             probe=probe or SideEffectProbe(),
+            log_root=authorized,
         )
 
     def flags(self):
@@ -145,12 +159,17 @@ class DiagnosticService:
             return self._denied(decision)
         if not isinstance(envelope, dict):
             return self._reject("SCHEMA_UNSUPPORTED", "Failure log envelope is missing.")
-        source = Path(path)
-        if source.is_symlink() or not source.is_file():
+        if self.log_root is None:
+            return self._reject("POLICY_DENIED", "No server log root is authorized for this service.")
+        try:
+            raw = self.log_root.read_app_log(app_id, path, self.journal.limits.max_log_bytes)
+        except FileNotFoundError:
             return self._reject("SCHEMA_UNSUPPORTED", "Failure log path is not a regular file.")
-        if source.stat().st_size > self.journal.limits.max_log_bytes:
-            return self._reject("SCHEMA_UNSUPPORTED", "Failure log exceeds the bounded read.")
-        summary = self.summarize(source.read_text(encoding="utf-8", errors="replace"), envelope.get("phase"))
+        except UnsafePath as exc:
+            if exc.kind == "bound":
+                return self._reject("SCHEMA_UNSUPPORTED", "Failure log exceeds the bounded read.")
+            return self._reject("POLICY_DENIED", "Failure log path is outside the server log root.")
+        summary = self.summarize(raw, envelope.get("phase"))
         record = self._base_record(app_id, envelope, summary)
         record["diagnostic_class"] = "failure"
         record["severity"] = "error"
@@ -169,7 +188,10 @@ class DiagnosticService:
         checked = _validate_event(event, app_id)
         if checked is not None:
             return self._reject(checked[0], checked[1])
-        body = redact_value(event.get("body") if isinstance(event.get("body"), dict) else {})
+        try:
+            body = redact_value(event.get("body") if isinstance(event.get("body"), dict) else {})
+        except ValueError:
+            return self._reject("SCHEMA_UNSUPPORTED", "Event body could not be redacted.")
         if contains_secret(json.dumps(body, ensure_ascii=True)):
             return self._reject("SCHEMA_UNSUPPORTED", "Event body could not be redacted.")
         evidence_state = event.get("evidence_state", "present")
@@ -421,6 +443,16 @@ class DiagnosticService:
         }
         category = _intervention_category(related, w07)
         response["human_intervention"] = intervention_for(category) if category else None
+        for field in (
+            "interfaces",
+            "advisory_claims",
+            "items",
+            "deployment_outcome",
+            "candidate_outcome",
+            "schedule",
+            "human_intervention",
+        ):
+            response[field] = _redact_public(response.get(field))
         return response
 
     def _visible(self, app_id):
@@ -476,8 +508,13 @@ class DiagnosticService:
         key = envelope.get("idempotency_key")
         if not isinstance(key, str) or not key:
             return self._reject("SCHEMA_UNSUPPORTED", "idempotency_key is required.")
-        record["intervention"] = redact_value(record.get("intervention"))
-        record["body"] = redact_value(record.get("body"))
+        if contains_secret(key):
+            return self._reject("SCHEMA_UNSUPPORTED", "idempotency_key is not safe to store.")
+        try:
+            record["intervention"] = redact_value(record.get("intervention"))
+            record["body"] = redact_value(record.get("body"))
+        except ValueError:
+            return self._reject("SCHEMA_UNSUPPORTED", "Event body could not be redacted.")
         scope = "|".join([decision.get("principal_id") or "", app_id, "diagnostic.ingest", key])
         basis = _hash_basis(record)
         if record.get("local_seq"):
@@ -485,10 +522,41 @@ class DiagnosticService:
             basis["stream_epoch"] = None
             basis["stream_id"] = "w06:diagnostic"
         payload_hash = hashlib.sha256(json.dumps(basis, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
-        previous = self.journal.find_idempotency(scope)
-        if previous:
-            if previous["hash"] != payload_hash:
-                return self._reject("IDEMPOTENCY_PAYLOAD_MISMATCH", "The idempotency key was reused with a different payload.")
+        record["idempotency_scope"] = scope
+        record["payload_hash"] = payload_hash
+        try:
+            with self.journal.exclusive():
+                previous = self.journal.find_idempotency(scope)
+                if previous:
+                    if previous.get("conflict") or previous.get("hash") != payload_hash:
+                        outcome = "mismatch"
+                        stored = None
+                        replay_id = None
+                    else:
+                        outcome = "replay"
+                        stored = None
+                        replay_id = previous.get("record_id")
+                else:
+                    if record.get("local_seq"):
+                        record["stream_id"] = "w06:diagnostic"
+                        record["stream_epoch"] = self.journal.meta["journal_epoch"]
+                        record["producer_seq"] = self.journal.meta["next_local_producer_seq"]
+                    problem = commit_fields(record)
+                    if problem:
+                        return self._reject("SCHEMA_UNSUPPORTED", problem)
+                    record["receipt_seq"] = self.journal.meta["next_receipt_seq"]
+                    stored = self.journal.write_locked(record)
+                    outcome = "stored"
+                    replay_id = None
+        except UnsafePath:
+            return self._reject("POLICY_DENIED", "Diagnostic journal path is not a regular file inside the journal root.")
+        except OSError:
+            return self._reject("POLICY_DENIED", "Diagnostic journal path is not a regular file inside the journal root.")
+        except ValueError:
+            return self._reject("SCHEMA_UNSUPPORTED", "Event body could not be redacted.")
+        if outcome == "mismatch":
+            return self._reject("IDEMPOTENCY_PAYLOAD_MISMATCH", "The idempotency key was reused with a different payload.")
+        if outcome == "replay":
             return {
                 "schema_version": 2,
                 "http": 200,
@@ -496,26 +564,8 @@ class DiagnosticService:
                 "side_effect": False,
                 "host_mutation": False,
                 "replayed": True,
-                "record_id": previous["record_id"],
+                "record_id": replay_id,
             }
-        if record.get("local_seq"):
-            record["stream_id"] = "w06:diagnostic"
-            record["stream_epoch"] = self.journal.meta["journal_epoch"]
-            record["producer_seq"] = self.journal.meta["next_local_producer_seq"]
-        if not isinstance(record.get("producer_seq"), int) or isinstance(record["producer_seq"], bool) or record["producer_seq"] < 1:
-            return self._reject("SCHEMA_UNSUPPORTED", "producer_seq must be a positive integer.")
-        if not isinstance(record.get("stream_id"), str) or _STREAM.fullmatch(record["stream_id"]) is None:
-            return self._reject("SCHEMA_UNSUPPORTED", "stream_id must be a diagnostic stream.")
-        record["receipt_seq"] = self.journal.meta["next_receipt_seq"]
-        record["idempotency_scope"] = scope
-        record["payload_hash"] = payload_hash
-        try:
-            stored = self.journal.append(record)
-        except ValueError:
-            return self._reject("SCHEMA_UNSUPPORTED", "Event body could not be redacted.")
-        if record.get("local_seq"):
-            self.journal.meta["next_local_producer_seq"] = record["producer_seq"] + 1
-            self.journal._persist_meta()
         return {
             "schema_version": 2,
             "http": 200,
@@ -577,6 +627,13 @@ class DiagnosticService:
             "reason": reason,
             "runtime_evidence": False,
         }
+
+
+def _redact_public(value):
+    try:
+        return redact_value(value)
+    except ValueError:
+        return {"redaction": "failed_closed", "retained": False}
 
 
 def _validate_event(event, app_id):

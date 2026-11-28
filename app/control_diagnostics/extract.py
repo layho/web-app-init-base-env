@@ -155,14 +155,22 @@ def summarize_failure(raw, phase):
 
 
 def external_report_evidence(ref):
-    """An external report that was not re-fetched is missing, not zero failures."""
+    """An external report that was not re-fetched is missing, not zero failures.
+
+    The reference is not a filesystem path. This function does not open,
+    stat, or fetch it. A caller path is not evidence and is not read.
+    """
+    visible = ref if isinstance(ref, str) and len(ref) <= 200 and "\x00" not in ref else None
     return {
-        "ref": ref if isinstance(ref, str) else None,
+        "ref": visible,
         "evidence_state": "missing",
         "failures": None,
         "outcome": None,
         "success": False,
         "runtime_evidence": False,
         "side_effect": False,
+        "opened": False,
+        "fetched": False,
+        "bytes_read": 0,
         "reason": "External report was not re-fetched. An empty failure list is not evidence of success.",
     }
