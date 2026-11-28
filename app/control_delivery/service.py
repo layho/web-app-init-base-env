@@ -316,14 +316,8 @@ class DeliveryService:
                 changed=False, body=public, blocked=True,
             )
 
-        rows = [
-            row for row in self.store.list("feedback")
-            if row["state"] in {"PENDING", "FAILED"}
-            and row.get("author_id") == begun["principal"]
-            and row.get("repo_id") == scope["repo"]
-            and row.get("app_id") == _ISOLATED_APP
-            and row.get("scope_task_id") == scope["task_id"]
-        ]
+        rows = [row for row in self._scoped_feedback(scope, begun["principal"])
+                if row["state"] in {"PENDING", "FAILED"}]
         rows.sort(key=lambda row: row["feedback_id"])
         results = []
         processed = 0
@@ -336,7 +330,7 @@ class DeliveryService:
             results.append(outcome)
             processed += 1
         left = [
-            row["feedback_id"] for row in self.store.list("feedback")
+            row["feedback_id"] for row in self._scoped_feedback(scope, begun["principal"])
             if row["state"] in {"PENDING", "FAILED", "UNKNOWN"}
         ]
         public = {
@@ -351,7 +345,7 @@ class DeliveryService:
         cursor["revision"] = begun["observed_revision"] + 1
         cursor["cursor"] = remainder
         cursor["state"] = "SYNCED"
-        cursor["retained_ids"] = sorted(row["feedback_id"] for row in self.store.list("feedback"))
+        cursor["retained_ids"] = sorted(row["feedback_id"] for row in self._scoped_feedback(scope, begun["principal"]))
         cursor["repo_id"] = scope["repo"]
         cursor["scope_task_id"] = scope["task_id"]
         failed = self._commit_local(
@@ -379,7 +373,7 @@ class DeliveryService:
             return _denied(403, "NOT_AUTHORIZED", row["state"], {"reason": "cross_author"})
         if not row.get("issue_number"):
             return _denied(409, "DEPENDENCY_UNSATISFIED", row["state"], {"reason": "issue_unlinked"})
-        before = sorted(item["feedback_id"] for item in self.store.list("feedback"))
+        before = sorted(item["feedback_id"] for item in self._scoped_feedback(scope, begun["principal"]))
         page = 1
         applied = 0
         while True:
@@ -417,7 +411,7 @@ class DeliveryService:
             page += 1
         expected = begun["observed_revision"]
         row["revision"] = expected + 1
-        after = sorted(item["feedback_id"] for item in self.store.list("feedback"))
+        after = sorted(item["feedback_id"] for item in self._scoped_feedback(scope, begun["principal"]))
         public = {
             "feedback_id": feedback_id,
             "state": row["state"],
@@ -1417,10 +1411,19 @@ class DeliveryService:
         view["completion"] = completion(task, chains)
         return _ok(task["phase"], view, changed=False)
 
+    def _scoped_feedback(self, scope, principal):
+        return [row for row in self.store.list("feedback")
+                if isinstance(row, dict) and row.get("repo_id") == scope["repo"]
+                and row.get("app_id") == _ISOLATED_APP
+                and row.get("scope_task_id") == scope["task_id"]
+                and row.get("author_id") == principal
+                and isinstance(row.get("feedback_id"), str)
+                and isinstance(row.get("state"), str)]
+
     def feedback(self, feedback_id, *, actor=None, scope=None):
-        if not self._read_allowed(actor, scope, "feedback", feedback_id):
-            return None
         row = self.store.read("feedback", feedback_id)
+        if not self._read_allowed(actor, scope, "feedback", feedback_id, document=row):
+            return None
         if isinstance(row, dict) and isinstance(row.get("lease"), dict):
             row["lease"] = {key: value for key, value in row["lease"].items() if key != "token"}
         return row
@@ -1430,7 +1433,8 @@ class DeliveryService:
             return []
         rows = []
         for row in self.store.traces():
-            if row.get("repo_id") not in (None, scope["repo"]):
+            if (row.get("repo_id") != scope["repo"] or row.get("app_id") != _ISOLATED_APP
+                    or row.get("task_id") != scope["task_id"]):
                 continue
             rows.append(row)
         return rows
@@ -1461,7 +1465,7 @@ class DeliveryService:
                 self._operation_locks[operation_id] = lock
             return lock
 
-    def _read_allowed(self, actor, scope, kind, object_id):
+    def _read_allowed(self, actor, scope, kind, object_id, *, document=None):
         if not isinstance(actor, dict) or not isinstance(scope, dict):
             return False
         if (not scope.get("repo") or not scope.get("task_id")
@@ -1479,7 +1483,11 @@ class DeliveryService:
             or not principal
         ):
             return False
-        doc = None if object_id is None else self.store.read(kind, object_id)
+        doc = document
+        if kind == "feedback" and (not isinstance(doc, dict)
+                or doc.get("feedback_id") != object_id or doc.get("author_id") != principal
+                or doc.get("repo_id") != scope["repo"] or doc.get("scope_task_id") != scope["task_id"]):
+            return False
         if isinstance(doc, dict):
             if kind in {"task", "chain", "feedback"} and doc.get("app_id") != _ISOLATED_APP:
                 return False
@@ -2406,6 +2414,7 @@ class DeliveryService:
             fields["repo_id"] = repo
         if task and "task_id" not in fields:
             fields["task_id"] = task
+        fields["app_id"] = _ISOLATED_APP
         fields["action"] = action
         fields["at"] = self.clock()
         fields["production"] = False
