@@ -63,8 +63,8 @@ PLAN_SCOPES = frozenset(
 )
 RESERVED_SHA256 = {
     "deploy/app-init/bootstrap.sh": "328c620d64fa79ff1ea04d03ca59caacd59ce008923dd8b50956f9ff714f7d20",
-    # W11 calls the isolated lifecycle adapter before any install prompt.
-    "deploy/app-init/app_init.py": "2da15d6606a8eff127dbe6fbbed35ec7fc30443371197ac90508fb828e101dab",
+    # W11 routes the read-only host preflight and isolated adapter before install prompts.
+    "deploy/app-init/app_init.py": "f2bfd4935e7b3904a17bdba7916d88cb3cda1f0ac1ec6aeb68fe3a9f58d1cbf2",
     "deploy/app-init/upgrade_plan.py": "e0ec81f5fd54863feb49c499bad81e70784993f1bc668150d623b5747e373959",
     "deploy/app-init/upgrade_pr.py": "db9155ef2ca73b3a6bb0a0b7fd2dc93db95cc5c6e529149b18bb1b8b1b2a7cc9",
     "deploy/app-init/upgrade_scheduler.py": "a08e620d272815792d870eb9b2a10bc653bd39eece960f94e3b38329eedd5052",
