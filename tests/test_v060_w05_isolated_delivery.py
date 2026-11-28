@@ -111,7 +111,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         values.update(ports)
         return DeliveryService(self.tmp.name, clock=self.clock, **values)
 
-    def _submit(self, feedback_id, author=None, key=None):
+    def _submit(self, feedback_id, author=None, key=None, *, expect_success=True):
         author = self.actor if author is None else author
         result = self.svc.submit_feedback(
             actor=author,
@@ -123,7 +123,8 @@ class IsolatedDeliveryTest(unittest.TestCase):
             idempotency_key=key or ("submit-" + feedback_id),
             expected_revision=0,
         )
-        self.assertTrue(result.ok, result.as_dict())
+        if expect_success:
+            self.assertTrue(result.ok, result.as_dict())
         return result
 
     def _sync(self, *, credential=True, batch_limit=None, key="sync-1", expected_revision=0):
@@ -1035,6 +1036,26 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertEqual(len(receipts), 1)
         self.assertFalse(receipts[0].get("local_is_authority", False))
         self.assertFalse(receipts[0]["receipt"].get("w01_proof", False))
+
+    def test_pending_outbox_for_different_intent_cannot_commit(self):
+        append = self.events.append
+
+        def crash(event):
+            append(event)
+            raise RuntimeError("crash before local commit")
+
+        self.events.append = crash
+        with self.assertRaisesRegex(RuntimeError, "crash before"):
+            self._submit("fb_evt")
+        outbox, = self.svc.store.list("outbox")
+        outbox["event"]["note"] = "w05-intent-v1:" + "0" * 64
+        self.svc.store.write("outbox", outbox["event_id"], outbox)
+        self.events.append = append
+
+        result = self._submit("fb_evt", expect_success=False)
+        self.assertEqual(result.http, 409)
+        self.assertEqual(result.body["reason"], "outbox_intent_mismatch")
+        self.assertIsNone(self.svc.store.read("feedback", "fb_evt"))
 
     def test_p0_concurrent_claim_is_cas_and_does_not_duplicate_events(self):
         self._submit("fb_cas")

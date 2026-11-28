@@ -438,7 +438,7 @@ class ReceiptRoutingTests(unittest.TestCase):
             )
             self.assertEqual(blocked["status"], "unknown")
 
-    def test_w05_requires_a_complete_persisted_receipt(self):
+    def test_w05_rejects_detached_receipt_issuance(self):
         import hashlib
         import json as json_module
 
@@ -476,18 +476,16 @@ class ReceiptRoutingTests(unittest.TestCase):
             self_hashed = query_operation_receipt(Path(directory), authority="W05", **arguments)
             self.assertEqual(self_hashed["status"], "unknown")
             issued = issue_w05_receipt(Path(directory), result=result, **arguments)
-            self.assertEqual(issued["status"], "applied")
-            self.assertTrue(issued["wrote"])
-            applied = query_operation_receipt(Path(directory), authority="W05", **arguments)
-            self.assertEqual(applied["status"], "applied")
-            conflict = issue_w05_receipt(
+            self.assertEqual(issued["status"], "unknown")
+            self.assertFalse(issued["wrote"])
+            rejected = issue_w05_receipt(
                 Path(directory), result={"http": 500, "state": "FAILED"}, **arguments,
             )
-            self.assertEqual(conflict["status"], "conflict")
-            self.assertFalse(conflict["wrote"])
+            self.assertEqual(rejected["status"], "unknown")
+            self.assertFalse(rejected["wrote"])
             still = query_operation_receipt(Path(directory), authority="W05", **arguments)
-            self.assertEqual(still["status"], "applied")
-            self.assertEqual(still["result"], result)
+            self.assertEqual(still["status"], "unknown")
+            self.assertEqual(json_module.loads((folder / "op-5.json").read_text()), document)
             w04_after = query_operation_receipt(Path(directory), authority="W04", **arguments)
             self.assertEqual(w04_before["status"], w04_after["status"])
 

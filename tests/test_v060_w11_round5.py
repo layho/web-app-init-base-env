@@ -234,6 +234,8 @@ class HistoricalDecisionTests(unittest.TestCase):
         unverified.pop("_authoritative")
         self.assertEqual(historical_authorization([unverified])["decision"], "unknown")
         self.assertEqual(historical_authorization([grant])["decision"], "authorized")
+        malformed = {**grant, "event_type": "authorization.revoked", "producer_seq": 0}
+        self.assertEqual(historical_authorization([grant, malformed])["reason"], "invalid_event_coordinates")
         revoke = dict(grant, event_type="authorization.revoked", event_id="revoke",
                       signature="sig-b", producer_seq=2)
         later_grant = dict(grant, event_id="late", signature="sig-c", producer_seq=3)

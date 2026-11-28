@@ -2069,7 +2069,7 @@ class DeliveryService:
                 view.stage("idem", begun["idem_key"], idem_body)
             if begun.get("event_id") and begun.get("receipt"):
                 outbox = view.read("outbox", begun["event_id"])
-                if not isinstance(outbox, dict) or outbox.get("event_id") != owner or outbox.get("request_digest") != begun["payload_hash"]:
+                if not isinstance(outbox, dict) or outbox.get("event_id") != owner or outbox.get("request_digest") != begun["payload_hash"] or _hash(outbox.get("event")) != begun["event_digest"]:
                     view.abort()
                     return "conflict"
                 if isinstance(outbox, dict):
@@ -2305,12 +2305,20 @@ class DeliveryService:
         if not isinstance(staged, dict):
             self._trace("event.pending", event_type=event_type, applied=False)
             return False
-        receipt = self._dispatch(staged["event"])
+        staged_event = staged.get("event")
+        if (not isinstance(staged_event, dict) or staged_event.get("event_id") != event_id
+                or staged_event.get("note") != event["note"]
+                or staged.get("request_digest") != begun["payload_hash"]
+                or staged.get("change_plan") != planned["change_plan"]):
+            return _denied(409, "CONFLICT_REVISION", state, {"reason": "outbox_intent_mismatch"})
+        event_digest = _hash(staged_event)
+        receipt = self._dispatch(staged_event)
         if receipt is None:
             self._trace("event.pending", event_type=event_type, applied=False)
             return False
         committed = dict(begun)
         committed["event_id"] = event_id
+        committed["event_digest"] = event_digest
         committed["receipt"] = receipt
         failed = self._commit_local(committed, pairs, public, state)
         if failed is not None:

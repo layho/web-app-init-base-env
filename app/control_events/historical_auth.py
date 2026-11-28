@@ -32,10 +32,8 @@ def historical_authorization(events: list[dict]) -> dict:
         scopes.add(scope)
         revision = event.get("revision")
         seq = event.get("producer_seq")
-        if isinstance(revision, bool) or type(revision) is not int:
-            continue
-        if isinstance(seq, bool) or type(seq) is not int:
-            continue
+        if type(revision) is not int or revision < 0 or type(seq) is not int or seq < 1:
+            return {"decision": "unknown", "reason": "invalid_event_coordinates", "revision": None}
         usable.append(event)
     if not usable:
         return {"decision": "unknown", "reason": "no_authorization_event", "revision": None}
