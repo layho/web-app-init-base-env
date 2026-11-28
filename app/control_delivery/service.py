@@ -833,7 +833,9 @@ class DeliveryService:
         task = begun["doc"]
         if task is None:
             return _denied(409, "EVIDENCE_MISSING", "ABSENT")
-        chains = self._chains(task_id)
+        chains = self._chains(task_id, scope["repo"])
+        if chains is None:
+            return _denied(409, "EVIDENCE_MISSING", task["phase"], {"reason": "chain_scope_invalid"})
         required = [chain for chain in chains if chain.get("required") and chain.get("state") != "SUPERSEDED"]
         if not required or any(chain.get("acceptance_decision") != "accepted" for chain in required):
             return _denied(409, "DEPENDENCY_UNSATISFIED", task["phase"], {"reason": "chains_not_accepted"})
@@ -860,7 +862,8 @@ class DeliveryService:
             "task_acceptance": task["task_acceptance"],
             "counts_as_runtime_user_acceptance": False,
         }
-        failed = self._commit_local(begun, [("task", task_id, task, expected)], public, task["phase"])
+        failed = self._commit_local(begun, [("task", task_id, task, expected)], public, task["phase"],
+                                    chain_snapshot=chains)
         if isinstance(failed, Result):
             return failed
         self._trace("task.accept", task_id=task_id, run_id=task.get("run_id"))
@@ -1228,7 +1231,10 @@ class DeliveryService:
             return _denied(409, "EVIDENCE_MISSING", "ABSENT")
         if task.get("phase") == "close":
             return _denied(409, "DEPENDENCY_UNSATISFIED", "close", {"reason": "already_closed"})
-        report = completion(task, self._chains(task_id))
+        chains = self._chains(task_id, scope["repo"])
+        if chains is None:
+            return _denied(409, "EVIDENCE_MISSING", task["phase"], {"reason": "chain_scope_invalid"})
+        report = completion(task, chains)
         if not report["met"]:
             return _denied(409, "DEPENDENCY_UNSATISFIED", task["phase"], {
                 "completion": report,
@@ -1237,10 +1243,13 @@ class DeliveryService:
         task["phase"] = "close"
         task["revision"] = task["revision"] + 1
         closed_ids = []
+        pairs = [("task", task_id, task, begun["observed_revision"])]
         for feedback_id in task.get("feedback_ids") or []:
             row = self.store.read("feedback", feedback_id)
-            if row is None:
-                continue
+            if not self._linked_feedback(task, row, feedback_id):
+                return _denied(409, "EVIDENCE_MISSING", begun["doc"]["phase"],
+                               {"reason": "feedback_binding_invalid", "feedback_closed": False})
+            old = row["revision"]
             row["closed"] = True
             row["close_evidence"] = {
                 "task_id": task_id,
@@ -1250,9 +1259,8 @@ class DeliveryService:
                 "runtime_acceptance": False,
             }
             row["revision"] = row["revision"] + 1
-            self.store.write("feedback", feedback_id, row)
+            pairs.append(("feedback", feedback_id, row, old))
             closed_ids.append(feedback_id)
-        self.store.write("task", task_id, task)
         public = {
             "state": "close",
             "revision": task["revision"],
@@ -1262,7 +1270,9 @@ class DeliveryService:
             "runtime_closed": False,
             "production_publish_authorized": False,
         }
-        self._remember(begun, public, "close")
+        failed = self._commit_local(begun, pairs, public, "close", chain_snapshot=chains)
+        if isinstance(failed, Result):
+            return failed
         self._trace("task.close", task_id=task_id, run_id=task.get("run_id"), feedback=closed_ids)
         return _ok("close", public)
 
@@ -1351,8 +1361,6 @@ class DeliveryService:
             "app_id": _ISOLATED_APP,
             "follows_chain_id": chain_id,
         }
-        self.store.write("chain", key, chain)
-        self.store.write("chain", task_id + "__" + spec["chain_id"], opened)
         public = {
             "state": "SUPERSEDED",
             "revision": chain["revision"],
@@ -1363,7 +1371,11 @@ class DeliveryService:
             "new_candidate_id": cid,
             "forged_user_acceptance": False,
         }
-        self._remember(begun, public, "SUPERSEDED")
+        failed = self._commit_local(begun, [("chain", key, chain, begun["observed_revision"]),
+                                           ("chain", task_id + "__" + spec["chain_id"], opened, 0)],
+                                    public, "SUPERSEDED")
+        if isinstance(failed, Result):
+            return failed
         self._trace("repair.authorize", task_id=task_id, candidate_id=cid, old=chain["candidate_id"])
         return _ok("SUPERSEDED", public)
 
@@ -1397,8 +1409,11 @@ class DeliveryService:
             return _pending()
         if authz.get("ok") is not True or authz.get("allow") is not True:
             return _denied(403, authz.get("code") or "NOT_AUTHORIZED", task.get("phase", "REJECTED"))
-        view = project_task(task, self._chains(task_id))
-        view["completion"] = completion(task, self._chains(task_id))
+        chains = self._chains(task_id, scope["repo"])
+        if chains is None:
+            return _denied(409, "EVIDENCE_MISSING", task["phase"], {"reason": "chain_scope_invalid"})
+        view = project_task(task, chains)
+        view["completion"] = completion(task, chains)
         return _ok(task["phase"], view, changed=False)
 
     def feedback(self, feedback_id, *, actor=None, scope=None):
@@ -1419,11 +1434,21 @@ class DeliveryService:
             rows.append(row)
         return rows
 
-    def _chains(self, task_id):
-        rows = [
-            row for row in self.store.list("chain")
-            if row.get("task_id") == task_id
-        ]
+    @staticmethod
+    def _linked_feedback(task, row, feedback_id):
+        return (isinstance(row, dict) and row.get("feedback_id") == feedback_id
+                and row.get("repo_id") == task.get("repo_id")
+                and row.get("app_id") == task.get("app_id") == _ISOLATED_APP
+                and row.get("scope_task_id") == row.get("task_id") == task.get("task_id")
+                and row.get("author_id") == task.get("actor_id"))
+
+    def _chains(self, task_id, repo_id):
+        rows = [row for row in self.store.list("chain") if row.get("task_id") == task_id]
+        if any(row.get("repo_id") != repo_id or row.get("app_id") != _ISOLATED_APP
+               or not isinstance(row.get("chain_id"), str) for row in rows):
+            return None
+        if len({row["chain_id"] for row in rows}) != len(rows):
+            return None
         rows.sort(key=lambda row: row["chain_id"])
         return rows
 
@@ -2079,7 +2104,7 @@ class DeliveryService:
             "public": {key: value for key, value in public.items() if key != "lease_token"},
         })
 
-    def _commit_local(self, begun, pairs, public, state):
+    def _commit_local(self, begun, pairs, public, state, *, chain_snapshot=None):
         idem_body = {
             "payload_hash": begun["payload_hash"],
             "state": state,
@@ -2088,6 +2113,13 @@ class DeliveryService:
 
         def mutator(view):
             owner = begun.get("event_id")
+            if chain_snapshot is not None:
+                for chain in chain_snapshot:
+                    key = chain["task_id"] + "__" + chain["chain_id"]
+                    fence = view.read("fence", _fence_key("chain", key))
+                    if view.read("chain", key) != chain or (isinstance(fence, dict) and fence.get("state") == "open"):
+                        view.abort()
+                        return "conflict"
             for kind, key, doc, expected in pairs:
                 current = view.read(kind, key)
                 if _revision(current) != expected:
