@@ -5,7 +5,31 @@ The isolated engine talks to W01 (authoritative deployment facts), W02
 these interfaces. Nothing here copies those packages.
 """
 
+import hashlib
+import json
 from typing import Protocol
+
+
+class NotOccurred:
+    """Trusted proof that one operation id was never dispatched.
+
+    A missing lookup is not this proof. Only an authority that can attest
+    the id was never started may return it, and the id has to match exactly.
+    """
+
+    def __init__(self, operation_id):
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("not_occurred proof requires an operation id")
+        self.operation_id = operation_id
+        self.status = "not_occurred"
+
+
+def fact_digest(fact):
+    """Digest of one deployment fact, ignoring a server receipt timestamp."""
+
+    body = {key: value for key, value in fact.items() if key != "received_at"}
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class EventRejected(Exception):
@@ -85,6 +109,14 @@ class AuthzPort(Protocol):
     def recovery_authorized(self, actor, deployment_id):
         """Preauthorized ordinary recovery of a frozen deployment."""
 
+    def resume_authorized(self, actor, app_id, deployment_id):
+        """Trusted background resume for one app and one deployment.
+
+        Ordinary authentication does not grant this. A false result skips
+        resume. The engine still limits the object to that app, host,
+        service, and deployment.
+        """
+
 
 class EventPort(Protocol):
     def append_deployment(self, fact):
@@ -93,7 +125,17 @@ class EventPort(Protocol):
         The caller must not set received_at. A repeat of the same event_id
         and payload returns the original receipt. A different payload, a
         sequence gap, or a sequence conflict is rejected. This port is the
-        only authority for accepted facts.
+        only authority for accepted facts. A rejection or an unknown result
+        is not an accepted publication.
+        """
+
+    def reconcile_deployment(self, fact):
+        """Read-only proof for one fact that may already have been submitted.
+
+        ``accepted`` requires the authoritative receipt, the full payload
+        digest, and the same identity. ``not_accepted`` requires proof that
+        the fact is absent and that repeating that exact payload is
+        idempotent. Any other result is unknown and must not be appended.
         """
 
 
@@ -137,6 +179,9 @@ class ServicePort(Protocol):
     def operation_result(self, operation_id):
         """Read-only lookup for one stable operation id.
 
-        Return the Effect already produced for that id, or None when this
-        service never started it. Must not call the operation again.
+        Return the Effect already produced for that id. Return NotOccurred
+        for that exact id only when this authority can prove the id was
+        never dispatched. None, a missing row, or a corrupt row is not
+        proof that the effect did not happen, and must not be followed by
+        another call.
         """

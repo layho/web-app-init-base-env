@@ -400,7 +400,92 @@ class Fence:
             _LIVE[name] = {"engine_id": engine_id, "fd": fd}
             return True
 
+    def _load_fd(self, fd):
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                block = os.read(fd, 4096)
+                if not block:
+                    break
+                chunks.append(block)
+            if not chunks:
+                return {"corrupt": True}
+            return json.loads(b"".join(chunks).decode("utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return {"corrupt": True}
+
+    def _generation_exact(self, body, key, generation):
+        return (
+            isinstance(body, dict)
+            and not body.get("corrupt")
+            and not body.get("legacy_directory")
+            and body.get("key") == key
+            and type(body.get("generation")) is int
+            and body.get("generation") == generation
+        )
+
+    def _proof_path(self, key):
+        return self.root / f"{key}.released.json"
+
+    def _proof_matches(self, key, generation):
+        path = self._proof_path(key)
+        if not path.is_file():
+            return False
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return False
+        return (
+            isinstance(body, dict)
+            and body.get("key") == key
+            and body.get("released") is True
+            and type(body.get("generation")) is int
+            and body.get("generation") == generation
+        )
+
+    def _write_release_proof(self, key, generation):
+        path = self._proof_path(key)
+        payload = json.dumps(
+            {"generation": generation, "key": key, "released": True},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        temporary = self.root / f".{key}.released.tmp"
+        fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        try:
+            view = payload
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        except OSError:
+            os.close(fd)
+            return False
+        os.close(fd)
+        os.replace(temporary, path)
+        directory = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return self._proof_matches(key, generation)
+
+    def proven_released(self, key, generation):
+        """True only when this generation is gone and the release proof matches it."""
+
+        path = self._path(key)
+        name = str(path)
+        with _FENCE_GUARD:
+            if _LIVE.get(name) is not None:
+                return False
+            if path.exists():
+                return False
+            return self._proof_matches(key, generation)
+
     def release(self, key, generation, engine_id):
+        if not isinstance(key, str) or type(generation) is not int:
+            return False
         path = self._path(key)
         name = str(path)
         with _FENCE_GUARD:
@@ -408,17 +493,54 @@ class Fence:
             if live is not None and live["engine_id"] != engine_id:
                 return False
             if not path.is_file():
-                self._drop(name)
-                return False
-            current = self._load(path)
-            if current.get("generation") != generation:
-                return False
+                if live is not None:
+                    return False
+                return self._proof_matches(key, generation)
+            before_lock = self._load(path)
+            acquired = False
+            if live is not None:
+                fd = live["fd"]
+            else:
+                fd = self._lock(path)
+                if fd is None:
+                    return False
+                _LIVE[name] = {"engine_id": engine_id, "fd": fd}
+                acquired = True
             try:
-                path.unlink()
+                if not path.is_file():
+                    if acquired:
+                        self._drop(name)
+                    return self._proof_matches(key, generation)
+                after_lock = self._load_fd(fd)
+                if not self._generation_exact(after_lock, key, generation):
+                    if acquired:
+                        self._drop(name)
+                    return False
+                if not isinstance(before_lock, dict):
+                    if acquired:
+                        self._drop(name)
+                    return False
+                if not self._write_release_proof(key, generation):
+                    if acquired:
+                        self._drop(name)
+                    return False
+                confirmed = self._load_fd(fd)
+                if not self._generation_exact(confirmed, key, generation):
+                    if acquired:
+                        self._drop(name)
+                    return False
+                try:
+                    os.unlink(path)
+                except OSError:
+                    if acquired:
+                        self._drop(name)
+                    return False
+                self._drop(name)
+                return self._proof_matches(key, generation) and not path.exists()
             except OSError:
+                if acquired and _LIVE.get(name) is not None:
+                    self._drop(name)
                 return False
-            self._drop(name)
-            return True
 
     def takeover(self, key, run_id, deployment_id, expected_generation, engine_id):
         path = self._path(key)

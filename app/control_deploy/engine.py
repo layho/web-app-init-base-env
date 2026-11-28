@@ -42,7 +42,7 @@ from app.control_deploy.health import (
 )
 from app.control_deploy.journal import Fence, Journal
 from app.control_deploy.migrations import check_migrations
-from app.control_deploy.ports import Effect, EventRejected
+from app.control_deploy.ports import Effect, EventRejected, NotOccurred, fact_digest
 
 
 SKIP_IDEMPOTENCY = {
@@ -156,7 +156,6 @@ class DeployEngine:
         denied = self._gate(request, operation)
         if denied:
             return denied
-        self._resume_incomplete()
         return None
 
     def plan(self, request):
@@ -878,6 +877,9 @@ class DeployEngine:
             return bound
         if not self._lease_bound(request, deployment):
             return self._result(409, "LEASE_FENCE_REJECTED", deployment, record="server_binding", boot_recovery_proved=False)
+        if self._resume_permitted(request, deployment):
+            self._resume_deployment(deployment)
+            deployment = self._dep(deployment["deployment_id"])
         before = (deployment["state"], deployment["revision"])
         store = self.journal.replay()
         key = self._fence_key(deployment["app_id"], deployment["host_id"], deployment["service_id"])
@@ -988,7 +990,9 @@ class DeployEngine:
         if pending.get("action") == action and pending.get("phase") == "intent":
             operation_id = pending.get("operation_id")
             observed = self._recorded_operation(deployment)
-            if isinstance(observed, Effect):
+            if not self._trusted_not_occurred(observed, operation_id):
+                if not isinstance(observed, Effect):
+                    observed = Effect("unknown", detail="record_unprovable")
                 phase = "unknown" if observed.status == "unknown" else "result"
                 deployment["pending"] = observed.as_pending(action)
                 deployment["pending"]["operation_id"] = operation_id
@@ -1035,6 +1039,13 @@ class DeployEngine:
         material = f"{deployment['deployment_id']}:{action}:{deployment['revision']}"
         return "op_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    def _trusted_not_occurred(self, observed, operation_id):
+        return (
+            isinstance(observed, NotOccurred)
+            and isinstance(operation_id, str)
+            and observed.operation_id == operation_id
+        )
+
     def _recorded_operation(self, deployment):
         operation_id = (deployment.get("pending") or {}).get("operation_id")
         if not operation_id:
@@ -1042,11 +1053,18 @@ class DeployEngine:
         lookup = getattr(self.service, "operation_result", None)
         if not callable(lookup):
             return Effect("unknown", detail="operation_unprovable")
-        found = lookup(operation_id)
-        if found is None:
-            return None
-        if not isinstance(found, Effect):
+        try:
+            found = lookup(operation_id)
+        except Exception:
             return Effect("unknown", detail="operation_unprovable")
+        if isinstance(found, NotOccurred):
+            if found.operation_id == operation_id:
+                return found
+            return Effect("unknown", detail="record_corrupt")
+        if found is None:
+            return Effect("unknown", detail="record_missing")
+        if not isinstance(found, Effect):
+            return Effect("unknown", detail="record_corrupt")
         return found
 
     def _locate(self, request):
@@ -1257,22 +1275,40 @@ class DeployEngine:
     PRODUCER_ID = "host_deployer"
     STREAM_EPOCH = 1
 
-    def _resume_incomplete(self):
-        self._retry_deliveries()
-        store = self.journal.replay()
-        for deployment_id in list(store["deployments"]):
-            deployment = store["deployments"][deployment_id]
-            final = deployment.get("finalize") or {}
-            if deployment.get("state") in ("COMMIT", "ROLLED_BACK") and final:
-                if not (final.get("inventory_done") and final.get("release_done") and final.get("delivery_done", True)):
-                    self._complete_finalize(self._dep(deployment_id))
+    def _resume_permitted(self, request, deployment):
+        if deployment.get("app_id") != request.app_id:
+            return False
+        if deployment.get("host_id") != request.host_id:
+            return False
+        if deployment.get("service_id") != request.service_id:
+            return False
+        if request.deployment_id != deployment.get("deployment_id"):
+            return False
+        fn = getattr(self.auth, "resume_authorized", None)
+        if not callable(fn):
+            return False
+        try:
+            allowed = fn(request.actor, deployment["app_id"], deployment["deployment_id"])
+        except Exception:
+            return False
+        return allowed is True
 
-    def _retry_deliveries(self):
+    def _resume_deployment(self, deployment):
+        self._retry_deliveries(deployment)
+        deployment = self._dep(deployment["deployment_id"])
+        final = deployment.get("finalize") or {}
+        if deployment.get("state") in ("COMMIT", "ROLLED_BACK") and final:
+            if not (final.get("inventory_done") and final.get("release_done") and final.get("delivery_done", True)):
+                self._complete_finalize(deployment)
+
+    def _retry_deliveries(self, deployment):
         store = self.journal.replay()
         pending = [
             record
             for record in store["deliveries"].values()
-            if record.get("status") in {"DURABLE_LOCAL", "OUTBOX", "DELIVERY_UNKNOWN"}
+            if record.get("deployment_id") == deployment["deployment_id"]
+            and (record.get("fact") or {}).get("app_id") == deployment["app_id"]
+            and record.get("status") in {"DURABLE_LOCAL", "OUTBOX", "DELIVERY_UNKNOWN"}
         ]
         pending.sort(
             key=lambda record: (
@@ -1281,7 +1317,10 @@ class DeployEngine:
             )
         )
         for record in pending:
-            self._submit_delivery(record)
+            if record.get("status") == "DELIVERY_UNKNOWN":
+                self._reconcile_delivery(record)
+            else:
+                self._submit_delivery(record)
 
     def _finalize_intent(self, deployment, dst):
         key = self._fence_key(deployment["app_id"], deployment["host_id"], deployment["service_id"])
@@ -1333,12 +1372,16 @@ class DeployEngine:
         if not final.get("release_done"):
             key = final.get("release_key")
             generation = final.get("release_generation")
-            if key is not None and generation is not None:
-                self.fence.release(key, generation, self._engine_id)
+            released = False
+            if isinstance(key, str) and type(generation) is int:
+                released = self.fence.release(key, generation, self._engine_id) is True
+                if released:
+                    released = self.fence.proven_released(key, generation) is True
+            if released:
                 self.journal.commit({"type": "lock_release", "key": key, "generation": generation})
-            deployment = self._dep(deployment["deployment_id"])
-            deployment["finalize"]["release_done"] = True
-            deployment = self._put(deployment)
+                deployment = self._dep(deployment["deployment_id"])
+                deployment["finalize"]["release_done"] = True
+                deployment = self._put(deployment)
         return self._dep(deployment["deployment_id"])
 
     def _build_fact(self, deployment, event_type):
@@ -1439,14 +1482,70 @@ class DeployEngine:
             existing = self._save_delivery(fact, "DURABLE_LOCAL")
         if existing.get("status") in {"DELIVERED", "QUARANTINED"}:
             return existing
+        if existing.get("status") == "DELIVERY_UNKNOWN":
+            return self._reconcile_delivery(existing)
         return self._submit_delivery(existing)
+
+    def _delivery_proof_bound(self, proof, fact):
+        if not isinstance(proof, dict) or not isinstance(fact, dict):
+            return False
+        if proof.get("payload_digest") != fact_digest(fact):
+            return False
+        for name in (
+            "event_id",
+            "producer_id",
+            "stream_id",
+            "stream_epoch",
+            "producer_seq",
+            "idempotency_key",
+            "app_id",
+            "deployment_id",
+        ):
+            if proof.get(name) != fact.get(name):
+                return False
+        outcome = proof.get("outcome")
+        if outcome == "accepted":
+            return self._receipt_exact(proof.get("receipt"), fact)
+        if outcome == "not_accepted":
+            return proof.get("idempotent") is True
+        return False
+
+    def _reconcile_delivery(self, record):
+        if record.get("status") != "DELIVERY_UNKNOWN":
+            return self._submit_delivery(record)
+        if self.events is None:
+            return record
+        fact = copy.deepcopy(record.get("fact") or {})
+        fact.pop("received_at", None)
+        lookup = getattr(self.events, "reconcile_deployment", None)
+        if not callable(lookup):
+            return record
+        try:
+            proof = lookup(copy.deepcopy(fact))
+        except Exception:
+            return record
+        if not self._delivery_proof_bound(proof, fact):
+            return record
+        if proof.get("outcome") == "accepted":
+            saved = self._save_delivery(fact, "DELIVERED", receipt=proof.get("receipt"))
+            self._note(
+                name="delivery",
+                deployment_id=fact["deployment_id"],
+                status="DELIVERED",
+                event_type=fact["event_type"],
+                fact=fact,
+                receipt=proof.get("receipt"),
+            )
+            return saved
+        prepared = self._save_delivery(fact, "OUTBOX")
+        return self._submit_delivery(prepared)
 
     def _submit_delivery(self, record):
         if self.events is None:
             return record
         fact = copy.deepcopy(record["fact"])
         fact.pop("received_at", None)
-        if record.get("status") in {"DELIVERED", "QUARANTINED"}:
+        if record.get("status") in {"DELIVERED", "QUARANTINED", "DELIVERY_UNKNOWN"}:
             return record
         record = self._save_delivery(fact, "OUTBOX", rejection=record.get("rejection"), receipt=record.get("receipt"))
         try:
