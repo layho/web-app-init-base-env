@@ -38,6 +38,70 @@ def issue_w05_receipt(
     return {"status": "unknown", "wrote": False, "reason": "BUSINESS_TRANSACTION_REQUIRED"}
 
 
+def feedback_submit_document(*, principal_id, producer_id, stream_id, repo_id,
+                             task_id, app_id, payload, idempotency_key, expected_revision):
+    """Canonical W02 document for the exact W05 feedback submission."""
+    from app.control_events.auth_bind import _document
+    document = _document(
+        operation="feedback.write", authorizer=principal_id, repo_id=repo_id,
+        app_id=app_id, producer_id=producer_id, stream_id=stream_id,
+        task_id=task_id, object_id=payload["feedback_id"], phase="feedback.submit",
+        candidate_id="", head="", base="", merge="", tree="", idempotency_key=idempotency_key,
+        expected_revision=expected_revision, run_id="", method="POST",
+        path="/isolated/w05/feedback",
+    )
+    document["action"] = "feedback.submit"
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False, allow_nan=False).encode("utf-8")
+    document["result"] = hashlib.sha256(raw).hexdigest()
+    return document
+
+
+def verify_feedback_submit(engine, *, signed, scope, payload, idempotency_key, expected_revision):
+    """Verify the business actor independently from the W01 producer signer.
+
+    Signature verification is read-only here; W05 reserves the nonce in its
+    own journal transaction with the matching outbox. Only the identical
+    authorized intent can recover that reservation.
+    """
+    import time
+    from app.control_authz import AuthnError, AuthzError
+    from app.control_events.auth_state import load_state
+    from app.control_events.errors import ControlError
+
+    if not isinstance(signed, dict) or scope.get("repo") != engine.repo_id:
+        return None
+    try:
+        state = load_state(engine.auth_path)
+        actor, proof = signed["actor"], signed["proof"]
+        principal_id = actor["id"]
+        record = state["principals"].get(principal_id)
+        if not isinstance(record, dict):
+            return None
+        expected = feedback_submit_document(
+            principal_id=principal_id, producer_id=record["producer_id"],
+            stream_id=record["stream_id"], repo_id=scope["repo"],
+            task_id=scope["task_id"], app_id=scope.get("app_id", "base"),
+            payload=payload, idempotency_key=idempotency_key, expected_revision=expected_revision,
+        )
+        if {k: v for k, v in signed.items() if k not in {"actor", "proof"}} != expected:
+            return None
+        principal = engine.authz.authenticate(
+            operation="feedback.write", body=signed, route_class="isolated",
+            now=int(time.time()), state=state, write=False,
+        )
+        engine.authz.authorize(principal, "feedback.write",
+                               engine.authz.binding_for(principal, "feedback.write", expected))
+        if principal.principal_id != payload["author_id"]:
+            return None
+        nonce_key = hashlib.sha256(json.dumps([principal.principal_id, proof["nonce"]],
+                                              separators=(",", ":")).encode()).hexdigest()
+        return {"principal_id": principal.principal_id, "nonce_key": nonce_key,
+                "authorization_digest": proof["payload_hash"]}
+    except (AuthnError, AuthzError, ControlError, KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
 def record_isolated_intent(engine, *, event: dict, sign_request) -> dict:
     """Send a staged W05 intent to the real isolated W01/W02 engine.
 
