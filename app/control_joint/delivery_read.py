@@ -8,6 +8,7 @@ not a silent skip that looks complete.
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import stat
 from pathlib import Path
@@ -33,12 +34,32 @@ def query_tasks(root: Path, *, repo_id: str, app_id: str, task_ids: set[str], li
     root_fd = None
     delivery_fd = None
     task_fd = None
+    lock_fd = None
     try:
         root_fd = open_root(root)
         info = lstat_at(root_fd, "delivery")
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise DeliveryReadError("special")
         delivery_fd = open_directory(root_fd, "delivery")
+        # A read never recovers or creates a journal. A legacy directory
+        # without a lock cannot prove a consistent snapshot.
+        try:
+            lock_fd = os.open(".journal.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=delivery_fd)
+        except FileNotFoundError as exc:
+            raise DeliveryReadError("journal_lock_missing") from exc
+        locked = os.fstat(lock_fd)
+        if not stat.S_ISREG(locked.st_mode) or locked.st_nlink != 1 or locked.st_uid != os.getuid() or locked.st_mode & 0o022:
+            raise DeliveryReadError("journal_lock_unsafe")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise DeliveryReadError("journal_busy") from exc
+        try:
+            lstat_at(delivery_fd, ".journal.pending.json")
+        except FileNotFoundError:
+            pass
+        else:
+            raise DeliveryReadError("journal_recovery_pending")
         try:
             folder = lstat_at(delivery_fd, "task")
         except FileNotFoundError:
@@ -104,6 +125,8 @@ def query_tasks(root: Path, *, repo_id: str, app_id: str, task_ids: set[str], li
     finally:
         if task_fd is not None:
             os.close(task_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
         if delivery_fd is not None:
             os.close(delivery_fd)
         if root_fd is not None:
