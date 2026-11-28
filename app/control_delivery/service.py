@@ -1240,6 +1240,7 @@ class DeliveryService:
                 "completion": report,
                 "feedback_closed": False,
             })
+        prior_phase = task["phase"]
         task["phase"] = "close"
         task["revision"] = task["revision"] + 1
         closed_ids = []
@@ -1247,7 +1248,7 @@ class DeliveryService:
         for feedback_id in task.get("feedback_ids") or []:
             row = self.store.read("feedback", feedback_id)
             if not self._linked_feedback(task, row, feedback_id):
-                return _denied(409, "EVIDENCE_MISSING", begun["doc"]["phase"],
+                return _denied(409, "EVIDENCE_MISSING", prior_phase,
                                {"reason": "feedback_binding_invalid", "feedback_closed": False})
             old = row["revision"]
             row["closed"] = True
@@ -2114,6 +2115,11 @@ class DeliveryService:
         def mutator(view):
             owner = begun.get("event_id")
             if chain_snapshot is not None:
+                current_chains = [row for row in view.list("chain")
+                                  if isinstance(row, dict) and row.get("task_id") == begun["scope"]["task_id"]]
+                if sorted(map(_hash, current_chains)) != sorted(map(_hash, chain_snapshot)):
+                    view.abort()
+                    return "conflict"
                 for chain in chain_snapshot:
                     key = chain["task_id"] + "__" + chain["chain_id"]
                     fence = view.read("fence", _fence_key("chain", key))
