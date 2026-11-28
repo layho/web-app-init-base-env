@@ -2147,6 +2147,8 @@ class DeliveryService:
         if business_auth is not None:
             begun["business_auth"] = business_auth
             begun["business_proof"] = actor
+            begun["business_payload"] = payload
+            begun["business_idempotency_key"] = idempotency_key
         if stop_before_idempotency:
             return begun
         idem_key = _hash({
@@ -2250,9 +2252,7 @@ class DeliveryService:
                         reservation = view.read("business-nonce", business_auth["nonce_key"])
                         proof_record = view.read("business-proof", owner)
                         if (reservation != {"event_id": owner, "authorization_digest": business_auth["authorization_digest"]}
-                                or not isinstance(proof_record, dict)
-                                or proof_record.get("event_id") != owner
-                                or proof_record.get("business_auth") != business_auth):
+                                or not self._business_proof_matches(begun, proof_record, owner)):
                             view.abort()
                             return "conflict"
                     outbox["receipt"] = begun["receipt"]
@@ -2299,6 +2299,23 @@ class DeliveryService:
             return _denied(409, "CONFLICT_REVISION", state, {"reason": "cas"})
         return None
 
+    def _business_proof_matches(self, begun, record, event_id):
+        """Recheck the saved signature, not just its mutable metadata."""
+        from app.control_joint.w05_issue import verify_feedback_submit
+
+        if (not isinstance(record, dict) or record.get("event_id") != event_id
+                or record.get("business_auth") != begun.get("business_auth")):
+            return False
+        if _hash(begun["business_payload"]) != begun["payload_hash"]:
+            return False
+        verified = verify_feedback_submit(
+            self._intent_engine, signed=record.get("signed"), scope=begun["scope"],
+            payload=begun["business_payload"],
+            idempotency_key=begun["business_idempotency_key"],
+            expected_revision=begun["observed_revision"],
+        )
+        return verified is not None and verified == begun["business_auth"]
+
     def _stage_outbox(self, begun, event):
         event_id = event["event_id"]
         kind = begun["object_kind"]
@@ -2316,20 +2333,21 @@ class DeliveryService:
                 proof_record = view.read("business-proof", event_id)
                 reservation = {"event_id": event_id, "authorization_digest": business_auth["authorization_digest"]}
                 if existing is not None:
-                    if (nonce != reservation or not isinstance(proof_record, dict)
-                            or proof_record.get("business_auth") != business_auth
-                            or proof_record.get("event_id") != event_id):
+                    if (nonce != reservation
+                            or not self._business_proof_matches(begun, proof_record, event_id)):
                         view.abort()
                         return "conflict"
                 else:
                     if nonce is not None or proof_record is not None:
                         view.abort()
                         return "conflict"
+                    proof_record = {"event_id": event_id, "business_auth": business_auth,
+                                    "signed": begun["business_proof"]}
+                    if not self._business_proof_matches(begun, proof_record, event_id):
+                        view.abort()
+                        return "conflict"
                     view.stage("business-nonce", nonce_key, reservation)
-                    view.stage("business-proof", event_id, {
-                        "event_id": event_id, "business_auth": business_auth,
-                        "signed": begun["business_proof"],
-                    })
+                    view.stage("business-proof", event_id, proof_record)
             if isinstance(existing, dict):
                 if existing.get("business_auth") != business_auth:
                     view.abort()
