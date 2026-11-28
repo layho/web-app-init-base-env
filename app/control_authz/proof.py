@@ -28,6 +28,9 @@ ECHO_FIELDS = (
     "scope",
     "payload_hash",
     "alg",
+    "declared_kind",
+    "declared_id",
+    "declared_proof_ref",
 )
 
 
