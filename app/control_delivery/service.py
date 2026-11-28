@@ -73,6 +73,24 @@ def _fence_key(kind, key):
     return kind + "__" + key
 
 
+def _unique_change_targets(pairs):
+    targets = [(kind, key) for kind, key, _doc, _expected in pairs]
+    return len(targets) == len(set(targets))
+
+
+def _same_staged_event(actual, expected):
+    """Allocation fields are stable on recovery, not regenerated from the clock."""
+    if not isinstance(actual, dict):
+        return False
+    if (type(actual.get("producer_seq")) is not int or actual["producer_seq"] < 1
+            or type(actual.get("stream_epoch")) is not int or actual["stream_epoch"] < 1
+            or type(actual.get("occurred_at")) is not int or actual["occurred_at"] < 0):
+        return False
+    allocated = {"producer_seq", "stream_epoch", "occurred_at"}
+    return (_hash({k: v for k, v in actual.items() if k not in allocated})
+            == _hash({k: v for k, v in expected.items() if k not in allocated}))
+
+
 def _binding_holds(observed, expected):
     author = observed.get("author_id")
     scope = observed.get("scope")
@@ -476,7 +494,16 @@ class DeliveryService:
         return _ok(row["state"], public)
 
     def claim_task(self, *, actor, scope, task_id, feedback_ids, chains, idempotency_key, expected_revision=0):
-        payload = {"task_id": task_id, "feedback_ids": list(feedback_ids), "chains": chains}
+        if not isinstance(feedback_ids, (list, tuple)) or not isinstance(chains, (list, tuple)):
+            return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "claim_shape"})
+        feedback_ids = list(feedback_ids)
+        chains = list(chains)
+        if any(not isinstance(spec, dict) or not isinstance(spec.get("chain_id"), str)
+               or not spec["chain_id"] or "pr_number" not in spec for spec in chains):
+            return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "chain_shape"})
+        if len({spec["chain_id"] for spec in chains}) != len(chains):
+            return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "duplicate_chain_id"})
+        payload = {"task_id": task_id, "feedback_ids": feedback_ids, "chains": chains}
         begun = self._begin(
             actor=actor, scope=scope, operation="task.claim", candidate_id=None,
             idempotency_key=idempotency_key, payload=payload, expected_revision=expected_revision,
@@ -2195,6 +2222,8 @@ class DeliveryService:
         })
 
     def _commit_local(self, begun, pairs, public, state, *, chain_snapshot=None):
+        if not _unique_change_targets(pairs):
+            return _denied(409, "CONFLICT_REVISION", state, {"reason": "duplicate_change_target"})
         idem_body = {
             "payload_hash": begun["payload_hash"],
             "state": state,
@@ -2520,6 +2549,8 @@ class DeliveryService:
         })[:40]
 
     def _commit_event(self, begun, event_type, pairs, public, state, **fields):
+        if not _unique_change_targets(pairs):
+            return _denied(409, "CONFLICT_REVISION", state, {"reason": "duplicate_change_target"})
         event_id = self._event_id(begun, event_type)
         event = {
             "event_id": event_id,
@@ -2576,8 +2607,10 @@ class DeliveryService:
             self._trace("event.pending", event_type=event_type, applied=False)
             return False
         staged_event = staged.get("event")
-        if (not isinstance(staged_event, dict) or staged_event.get("event_id") != event_id
-                or staged_event.get("note") != event["note"]
+        if (not _same_staged_event(staged_event, event)
+                or staged.get("event_id") != event_id
+                or staged.get("scope") != begun["scope"]
+                or staged.get("delivery_state") != "PENDING"
                 or staged.get("request_digest") != begun["payload_hash"]
                 or staged.get("intent_mode", "fixture") != self._intent_mode
                 or staged.get("business_auth") != begun.get("business_auth")
