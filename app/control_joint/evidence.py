@@ -1,7 +1,7 @@
 """74-item evidence against the entries this process actually ran.
 
-A package that was not called is blocked. MacCI, a public running SHA, and
-branch protection are never inferred from a local call.
+Package-level invocation is not capability evidence. Until per-item assertions
+are wired, all capability rows remain blocked.
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ UNCONNECTED_ENTRIES = (
 def evidence_matrix(exercised: dict[str, str]) -> dict:
     """Build one row per capability item.
 
-    ``exercised`` maps a package id such as ``W05`` to the runtime entry
-    that returned in this process. Packages that are absent stay blocked.
+    ``exercised`` is diagnostic only, mapping package ids to invoked entries.
+    No capability is promoted by a package-level invocation.
     """
 
     payload = json.loads(_ITEMS.read_text(encoding="utf-8"))
@@ -41,14 +41,16 @@ def evidence_matrix(exercised: dict[str, str]) -> dict:
     connected = []
     for item in payload["items"]:
         package = item["package"]
-        entry = exercised.get(package)
-        blocked = item["id"] in ENVIRONMENT_BLOCKED or not entry
+        # A diagnostic entry only proves a package was invoked. It does not
+        # prove the specific capability or the same-candidate workflow.
+        entry = None
+        blocked = True
         if item["id"] == "A11":
             reason = "branch protection was not read in this run"
         elif item["id"] in ENVIRONMENT_BLOCKED:
             reason = "MacCI, two-platform host evidence, or a public running SHA is not available"
         elif not entry:
-            reason = "runtime entry was not connected in the isolated loop"
+            reason = "no independently asserted per-item runtime evidence"
         else:
             reason = "isolated entry returned; this is not a MacCI receipt or a public running SHA"
         row = {
@@ -66,7 +68,7 @@ def evidence_matrix(exercised: dict[str, str]) -> dict:
             connected.append(package)
     unconnected = tuple(
         package for package in sorted({item["package"] for item in payload["items"]})
-        if package not in exercised or package == "W11"
+        if package not in connected
     )
     return {
         "items": items,
