@@ -22,7 +22,7 @@ from app.control_delivery.flags import (
     PRODUCTION_ENABLEMENT,
     PRODUCTION_VERIFICATION_ENABLED,
 )
-from app.control_delivery.ports import event_identity_digest
+from app.control_delivery.ports import event_identity_digest, event_payload_digest
 from app.control_delivery.store import Journal
 
 _ISOLATED_APP = "base"  # Existing W05 event authority is base-only.
@@ -2286,15 +2286,21 @@ class DeliveryService:
         return self.store.mutate(mutator)
 
     def _exact_receipt(self, event, response):
-        if not isinstance(response, dict) or response.get("applied") is not True:
+        if (not isinstance(response, dict) or response.get("applied") is not True
+                or response.get("ok") is not True or response.get("authority") != "W01"
+                or response.get("test_double") is not True or response.get("w01_proof") is not False):
             return None
-        if response.get("blocked") or response.get("fact_state") != "ACCEPTED":
+        if response.get("blocked") is not False or response.get("fact_state") != "ACCEPTED":
             return None
         receipt = response.get("receipt")
         if not isinstance(receipt, dict):
             return None
         if (
-            receipt.get("event_id") != event.get("event_id")
+            receipt.get("authority") != "W01"
+            or receipt.get("fact_state") != "ACCEPTED"
+            or receipt.get("test_double") is not True or receipt.get("w01_proof") is not False
+            or receipt.get("event_digest") != event_payload_digest(event)
+            or receipt.get("event_id") != event.get("event_id")
             or receipt.get("producer_seq") != event.get("producer_seq")
             or receipt.get("stream_id") != event.get("stream_id")
             or receipt.get("stream_epoch") != event.get("stream_epoch")
@@ -2310,7 +2316,8 @@ class DeliveryService:
     def _receipt_from_query(self, event, queried):
         if (not isinstance(queried, dict) or queried.get("ok") is not True
                 or queried.get("blocked") is not False or queried.get("classification") != "present"
-                or queried.get("event_id") != event["event_id"] or queried.get("authority") != "W01"):
+                or queried.get("event_id") != event["event_id"] or queried.get("authority") != "W01"
+                or queried.get("test_double") is not True or queried.get("w01_proof") is not False):
             return None
         items = queried.get("items")
         if not isinstance(items, list) or len(items) != 1 or _hash(items[0]) != _hash(event):
@@ -2321,12 +2328,17 @@ class DeliveryService:
             "stream_id": event["stream_id"],
             "stream_epoch": event["stream_epoch"],
             "producer_seq": event["producer_seq"],
+            "event_digest": event_payload_digest(event),
             "fact_state": "ACCEPTED",
             "test_double": True,
             "w01_proof": False,
         }
 
     def _dispatch(self, event):
+        # This path has no W01/W02 production signer. Never relabel a real
+        # or unclassified port response as an accepted isolated receipt.
+        if getattr(self.events, "is_test_double", False) is not True:
+            return None
         queried = self.events.query(
             stream_id=event["stream_id"],
             stream_epoch=event["stream_epoch"],
@@ -2339,6 +2351,7 @@ class DeliveryService:
             idempotency_key=event.get("idempotency_key"),
             state=event.get("state"),
             operation=event.get("operation"),
+            expected_event=event,
         )
         receipt = self._receipt_from_query(event, queried)
         if receipt is not None:
@@ -2461,7 +2474,10 @@ def _absence_proven(event, queried):
         return False
     if proof.get("stream_id") != event.get("stream_id") or proof.get("stream_epoch") != event.get("stream_epoch"):
         return False
-    return proof.get("payload_digest") == event_identity_digest(event)
+    return (queried.get("test_double") is True and queried.get("w01_proof") is False
+            and proof.get("test_double") is True and proof.get("w01_proof") is False
+            and proof.get("payload_digest") == event_identity_digest(event)
+            and proof.get("event_digest") == event_payload_digest(event))
 
 
 def _tuple_diff(chain, head, base, merge, tree):
