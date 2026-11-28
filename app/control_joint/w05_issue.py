@@ -160,8 +160,12 @@ def record_isolated_intent(engine, *, event: dict, sign_request) -> dict:
         expected = split_request({**body, "actor": {"id": "w05"}})
         expected_digest = event_business_digest(expected)
         # The signing callback may add only the actor/proof envelope.
-        signed = sign_request(dict(body))
-        if event_business_digest(split_request(signed)) != expected_digest:
+        # Give it a deep copy so mutation of scope cannot alter the reference.
+        from copy import deepcopy
+        signed = sign_request(deepcopy(body))
+        if (not isinstance(signed, dict)
+                or {key: value for key, value in signed.items() if key not in {"actor", "proof"}} != body
+                or event_business_digest(split_request(signed)) != expected_digest):
             return unknown
         response = engine.append(signed)
         if response.get("http") != 200:
