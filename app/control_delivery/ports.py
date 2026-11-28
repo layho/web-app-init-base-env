@@ -39,6 +39,9 @@ class BlockedAuth:
     def preauthorization(self, scope, operation, candidate_id):
         return _blocked("preauthorization")
 
+    def acceptance(self, principal_id, binding):
+        return _blocked("acceptance")
+
 
 class BlockedEvents:
     """W01 is not in this tree."""
@@ -48,7 +51,7 @@ class BlockedEvents:
     def append(self, event):
         return _blocked("event.append")
 
-    def query(self, *, stream_id, stream_epoch, after_seq=0, limit=100):
+    def query(self, *, stream_id, stream_epoch, after_seq=0, limit=100, event_id=None):
         return _blocked("event.query")
 
 
@@ -126,15 +129,20 @@ class FixtureAuth:
         self.denied = set()
         self.preauth = {}
         self.allow_publish = False
+        self.acceptances = {}
+        self.bound_principal = None
 
     def authenticate(self, actor):
         self.calls.append(("authenticate", (actor or {}).get("id")))
         if not self.authenticated:
             return {"ok": False, "blocked": False, "code": "NOT_AUTHORIZED"}
+        principal = self.bound_principal
+        if not isinstance(principal, str) or not principal:
+            principal = (actor or {}).get("id")
         return {
             "ok": True,
             "blocked": False,
-            "principal_id": (actor or {}).get("id"),
+            "principal_id": principal,
             "test_double": True,
         }
 
@@ -153,6 +161,42 @@ class FixtureAuth:
             return {"ok": True, "allow": False, "blocked": False, "test_double": True}
         return {"ok": True, "allow": True, "blocked": False, "test_double": True, "grant": grant}
 
+    def acceptance(self, principal_id, binding):
+        self.calls.append(("acceptance", (binding or {}).get("candidate_id")))
+        grant = self.acceptances.get((binding or {}).get("candidate_id"))
+        if not grant:
+            return {
+                "ok": True,
+                "allow": False,
+                "blocked": False,
+                "test_double": True,
+                "code": "EVIDENCE_MISSING",
+            }
+        keys = ("repo", "task_id", "chain_id", "candidate_id", "head", "base", "merge", "tree", "decision")
+        if grant.get("principal_id") != principal_id or any(grant.get(key) != (binding or {}).get(key) for key in keys):
+            return {
+                "ok": True,
+                "allow": False,
+                "blocked": False,
+                "test_double": True,
+                "reason": "tuple_mismatch",
+            }
+        body = {
+            "ok": True,
+            "allow": True,
+            "blocked": False,
+            "test_double": True,
+            "decision": grant["decision"],
+            "signer_kind": "user_acceptance",
+            "runtime_acceptance": False,
+            "github_proof": False,
+            "macci_proof": False,
+            "counts_as_runtime_user_acceptance": False,
+        }
+        for key in keys:
+            body[key] = grant[key]
+        return body
+
 
 class FixtureEvents:
     """Records event intents. ``applied`` here is not a W01 receipt."""
@@ -161,14 +205,10 @@ class FixtureEvents:
 
     def __init__(self):
         self.events = []
+        self.by_id = {}
         self.fail = False
 
-    def append(self, event):
-        if "received_at" in event:
-            return {"ok": False, "applied": False, "blocked": False, "code": "SCHEMA_UNSUPPORTED"}
-        if self.fail:
-            return {"ok": False, "applied": False, "blocked": False, "code": "SIDE_EFFECT_UNKNOWN", "status": "unknown"}
-        self.events.append(dict(event))
+    def _receipt(self, event):
         return {
             "ok": True,
             "applied": True,
@@ -177,10 +217,89 @@ class FixtureEvents:
             "delivery_state": "DURABLE_LOCAL",
             "test_double": True,
             "w01_proof": False,
+            "authority": "W01",
+            "receipt": {
+                "authority": "W01",
+                "event_id": event["event_id"],
+                "stream_id": event["stream_id"],
+                "stream_epoch": event["stream_epoch"],
+                "producer_seq": event["producer_seq"],
+                "fact_state": "ACCEPTED",
+                "test_double": True,
+                "w01_proof": False,
+            },
         }
 
-    def query(self, *, stream_id, stream_epoch, after_seq=0, limit=100):
-        return {"ok": True, "blocked": False, "items": [], "side_effect": False, "test_double": True}
+    def append(self, event):
+        if "received_at" in event:
+            return {"ok": False, "applied": False, "blocked": False, "code": "SCHEMA_UNSUPPORTED"}
+        if self.fail:
+            return {
+                "ok": False,
+                "applied": False,
+                "blocked": False,
+                "code": "SIDE_EFFECT_UNKNOWN",
+                "status": "unknown",
+                "classification": "unknown",
+            }
+        event_id = event.get("event_id")
+        if event_id in self.by_id:
+            return self._receipt(self.by_id[event_id])
+        stored = dict(event)
+        self.by_id[event_id] = stored
+        self.events.append(stored)
+        return self._receipt(stored)
+
+    def query(self, *, stream_id, stream_epoch, after_seq=0, limit=100, event_id=None):
+        if self.fail:
+            return {
+                "ok": False,
+                "blocked": False,
+                "classification": "unknown",
+                "items": [],
+                "test_double": True,
+                "w01_proof": False,
+            }
+        if event_id is not None:
+            found = self.by_id.get(event_id)
+            if found is None or found.get("stream_id") != stream_id or found.get("stream_epoch") != stream_epoch:
+                return {
+                    "ok": True,
+                    "blocked": False,
+                    "classification": "absent",
+                    "event_id": event_id,
+                    "items": [],
+                    "side_effect": False,
+                    "test_double": True,
+                    "w01_proof": False,
+                }
+            return {
+                "ok": True,
+                "blocked": False,
+                "classification": "present",
+                "event_id": event_id,
+                "items": [dict(found)],
+                "side_effect": False,
+                "test_double": True,
+                "w01_proof": False,
+                "authority": "W01",
+            }
+        items = [
+            dict(event)
+            for event in self.events
+            if event.get("stream_id") == stream_id
+            and event.get("stream_epoch") == stream_epoch
+            and int(event.get("producer_seq") or 0) > after_seq
+        ]
+        return {
+            "ok": True,
+            "blocked": False,
+            "classification": "present" if items else "absent",
+            "items": items[:limit],
+            "side_effect": False,
+            "test_double": True,
+            "w01_proof": False,
+        }
 
 
 class FixtureSchedule:
@@ -272,6 +391,8 @@ class FixtureRemote:
         self._next = 1
         self.fail_create = set()
         self.unknown_create = set()
+        self.unknown_ops = set()
+        self.applied = {}
 
     def lookup_issue(self, feedback_id):
         self.calls.append(("lookup", feedback_id))
@@ -286,6 +407,7 @@ class FixtureRemote:
         feedback_id = payload["feedback_id"]
         self.calls.append(("create", feedback_id))
         if feedback_id in self.unknown_create:
+            self.unknown_ops.add(payload.get("operation_id"))
             return {
                 "ok": False,
                 "blocked": False,
@@ -315,6 +437,15 @@ class FixtureRemote:
             "feedback_id": feedback_id,
         }
         self.issues[feedback_id] = record
+        operation_id = payload.get("operation_id")
+        if operation_id:
+            self.applied[operation_id] = {
+                "classification": "succeeded",
+                "operation_id": operation_id,
+                "issue_number": number,
+                "author_id": payload["author_id"],
+                "feedback_id": feedback_id,
+            }
         body = dict(record)
         body.update({"ok": True, "blocked": False, "status": "created", "test_double": True, "github_proof": False})
         return body
@@ -337,7 +468,12 @@ class FixtureRemote:
     def reconcile(self, operation_id):
         self.calls.append(("reconcile", operation_id))
         found = self.reconcile_result.get(operation_id)
-        if not found:
+        if found:
+            body = dict(found)
+            body.setdefault("operation_id", operation_id)
+            body.update({"ok": True, "blocked": False, "test_double": True, "github_proof": False})
+            return body
+        if operation_id in self.unknown_ops:
             return {
                 "ok": True,
                 "blocked": False,
@@ -346,10 +482,19 @@ class FixtureRemote:
                 "test_double": True,
                 "github_proof": False,
             }
-        body = dict(found)
-        body.setdefault("operation_id", operation_id)
-        body.update({"ok": True, "blocked": False, "test_double": True, "github_proof": False})
-        return body
+        applied = self.applied.get(operation_id)
+        if applied:
+            body = dict(applied)
+            body.update({"ok": True, "blocked": False, "test_double": True, "github_proof": False})
+            return body
+        return {
+            "ok": True,
+            "blocked": False,
+            "classification": "absent",
+            "operation_id": operation_id,
+            "test_double": True,
+            "github_proof": False,
+        }
 
     def observe_pr(self, number):
         return {"ok": True, "blocked": False, "number": number, "test_double": True, "github_proof": False}

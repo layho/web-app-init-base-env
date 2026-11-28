@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import threading
 
 from app.control_delivery.candidate import candidate_id, valid_sha
 from app.control_delivery.errors import Result
@@ -54,6 +55,22 @@ def _pending(code="INTERFACE_PENDING", state="BLOCKED", body=None):
     )
 
 
+def operation_id_for(scope, kind, request):
+    scope_exact = {"repo": scope["repo"], "task_id": scope["task_id"]}
+    digest = _hash({"scope": scope_exact, "kind": kind, "request": request})
+    return "op_" + digest[:32], digest, scope_exact
+
+
+def _fence_key(kind, key):
+    return kind + "__" + key
+
+
+def _revision(doc):
+    if not isinstance(doc, dict):
+        return 0
+    return int(doc.get("revision") or 0)
+
+
 def _limits():
     return {
         "production_enablement": PRODUCTION_ENABLEMENT,
@@ -78,6 +95,9 @@ class DeliveryService:
         self.deploy = deploy
         self.remote = remote
         self.clock = clock
+        self._local = threading.local()
+        self._locks_guard = threading.Lock()
+        self._operation_locks = {}
 
     def submit_feedback(self, *, actor, scope, author_id, feedback_id, category, body, idempotency_key, expected_revision=0):
         payload = {
@@ -93,14 +113,14 @@ class DeliveryService:
         )
         if isinstance(begun, Result):
             return begun
-        existing = self.store.read("feedback", feedback_id)
+        existing = begun["doc"]
         if existing is not None:
             if existing["author_id"] != author_id:
                 self._trace("feedback.hijack", feedback_id=feedback_id, actor=actor.get("id"))
                 return _denied(403, "NOT_AUTHORIZED", existing["state"], {"reason": "cross_author"})
             return _denied(409, "CONFLICT_REVISION", existing["state"], {"reason": "feedback_exists"})
-        if author_id != actor.get("id"):
-            return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "cross_author"})
+        if author_id != begun["principal"]:
+            return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "principal"})
         doc = {
             "feedback_id": feedback_id,
             "author_id": author_id,
@@ -121,12 +141,17 @@ class DeliveryService:
             "closed": False,
             "close_evidence": None,
             "repo_id": scope["repo"],
+            "scope_task_id": scope["task_id"],
         }
-        if not self._commit_event(begun, "feedback.submitted", doc, feedback_id=feedback_id):
-            return _pending(body={"feedback_id": feedback_id})
-        self.store.write("feedback", feedback_id, doc)
         public = {"feedback_id": feedback_id, "state": "PENDING", "revision": 1}
-        self._remember(begun, public, "PENDING")
+        outcome = self._commit_event(
+            begun, "feedback.submitted", [("feedback", feedback_id, doc, 0)], public, "PENDING",
+            feedback_id=feedback_id,
+        )
+        if isinstance(outcome, Result):
+            return outcome
+        if not outcome:
+            return _pending(body={"feedback_id": feedback_id})
         self._trace("feedback.submit", feedback_id=feedback_id, state="PENDING")
         return _ok("PENDING", public)
 
@@ -142,38 +167,44 @@ class DeliveryService:
         row = begun["doc"]
         if row is None:
             return _denied(409, "EVIDENCE_MISSING", "ABSENT", {"feedback_id": feedback_id})
-        if row["author_id"] != actor.get("id"):
+        principal = begun["principal"]
+        if row["author_id"] != principal:
             self._trace("feedback.hijack", feedback_id=feedback_id, actor=actor.get("id"))
             return _denied(403, "NOT_AUTHORIZED", row["state"], {"reason": "cross_author"})
         if row["state"] == "UNKNOWN":
             return _denied(409, "SIDE_EFFECT_UNKNOWN", "UNKNOWN", {"feedback_id": feedback_id, "retry_allowed": False})
         lease = row.get("lease")
-        if lease and lease["expires_at"] > self.clock() and lease["principal_id"] != actor.get("id"):
+        if lease and lease["expires_at"] > self.clock() and lease["principal_id"] != principal:
             return _denied(409, "LEASE_FENCE_REJECTED", row["state"], {"changed": False})
         generation = 1 if not lease else lease["generation"] + 1
         token = "opaque-" + secrets.token_hex(16)
+        expected = row["revision"]
         row["lease"] = {
-            "principal_id": actor.get("id"),
+            "principal_id": principal,
             "generation": generation,
             "token": token,
             "expires_at": self.clock() + 60,
         }
         row["state"] = "CLAIMED"
-        row["revision"] = row["revision"] + 1
-        if not self._commit_event(begun, "feedback.claimed", row, feedback_id=feedback_id):
-            return _pending(body={"feedback_id": feedback_id})
-        self.store.write("feedback", feedback_id, row)
+        row["revision"] = expected + 1
         public = {
             "feedback_id": feedback_id,
             "state": "CLAIMED",
             "revision": row["revision"],
             "lease_generation": generation,
         }
-        self._remember(begun, public, "CLAIMED")
+        outcome = self._commit_event(
+            begun, "feedback.claimed", [("feedback", feedback_id, row, expected)], public, "CLAIMED",
+            feedback_id=feedback_id,
+        )
+        if isinstance(outcome, Result):
+            return outcome
+        if not outcome:
+            return _pending(body={"feedback_id": feedback_id})
         self._trace("feedback.claim", feedback_id=feedback_id, state="CLAIMED", token_issued=True)
-        public = dict(public)
-        public["lease_token"] = token
-        return _ok("CLAIMED", public)
+        shown = dict(public)
+        shown["lease_token"] = token
+        return _ok("CLAIMED", shown)
 
     def push_claimed(self, *, actor, scope, feedback_id, token, idempotency_key, expected_revision, credential_present):
         payload = {"feedback_id": feedback_id, "credential_present": bool(credential_present)}
@@ -185,14 +216,15 @@ class DeliveryService:
         if isinstance(begun, Result):
             return begun
         row = begun["doc"]
-        if row["author_id"] != actor.get("id"):
+        principal = begun["principal"]
+        if row["author_id"] != principal:
             self._trace("feedback.hijack", feedback_id=feedback_id, actor=actor.get("id"))
             return _denied(403, "NOT_AUTHORIZED", row["state"], {"reason": "cross_author"})
         lease = row.get("lease") or {}
         if (
             row["state"] != "CLAIMED"
             or lease.get("token") != token
-            or lease.get("principal_id") != actor.get("id")
+            or lease.get("principal_id") != principal
             or lease.get("expires_at", 0) <= self.clock()
         ):
             self._trace("feedback.fence", feedback_id=feedback_id, state=row["state"])
@@ -200,7 +232,7 @@ class DeliveryService:
         if not credential_present:
             return _denied(403, "CREDENTIAL_ABSENT", row["state"], {"remote_called": False})
         before = len(self.remote.calls)
-        outcome = self._push_row(actor, row)
+        outcome = self._push_row(principal, scope, row)
         if outcome.get("code") == "LEASE_FENCE_REJECTED":
             return _denied(409, "LEASE_FENCE_REJECTED", row["state"])
         public = {**_limits(), **outcome, "remote_calls_added": len(self.remote.calls) - before}
@@ -226,11 +258,16 @@ class DeliveryService:
                 "synced": [],
                 "remote_called": False,
             }
-            self._remember(begun, public, "BLOCKED")
-            cursor = begun["doc"] or {"revision": 0, "cursor": None}
-            cursor["revision"] = cursor.get("revision", 0) + 1
+            cursor = dict(begun["doc"] or {"revision": 0, "cursor": None})
+            cursor["revision"] = begun["observed_revision"] + 1
             cursor["state"] = "BLOCKED"
-            self.store.write("cursor", "outbound", cursor)
+            cursor["repo_id"] = scope["repo"]
+            cursor["scope_task_id"] = scope["task_id"]
+            failed = self._commit_local(
+                begun, [("cursor", "outbound", cursor, begun["observed_revision"])], public, "BLOCKED",
+            )
+            if isinstance(failed, Result):
+                return failed
             return Result(
                 ok=False, http=403, code="CREDENTIAL_ABSENT", state="BLOCKED",
                 changed=False, body=public, blocked=True,
@@ -238,7 +275,10 @@ class DeliveryService:
 
         rows = [
             row for row in self.store.list("feedback")
-            if row["state"] in {"PENDING", "FAILED"} and row["author_id"] == actor.get("id")
+            if row["state"] in {"PENDING", "FAILED"}
+            and row.get("author_id") == begun["principal"]
+            and row.get("repo_id") == scope["repo"]
+            and row.get("scope_task_id") == scope["task_id"]
         ]
         rows.sort(key=lambda row: row["feedback_id"])
         results = []
@@ -248,7 +288,7 @@ class DeliveryService:
             if batch_limit is not None and processed >= batch_limit:
                 remainder = row["feedback_id"]
                 break
-            outcome = self._push_row(actor, row)
+            outcome = self._push_row(begun["principal"], scope, row)
             results.append(outcome)
             processed += 1
         left = [
@@ -263,13 +303,18 @@ class DeliveryService:
             "truncated_as_complete": False,
             "remote_called": True,
         }
-        cursor = begun["doc"] or {"revision": 0}
-        cursor["revision"] = cursor.get("revision", 0) + 1
+        cursor = dict(begun["doc"] or {"revision": 0})
+        cursor["revision"] = begun["observed_revision"] + 1
         cursor["cursor"] = remainder
         cursor["state"] = "SYNCED"
         cursor["retained_ids"] = sorted(row["feedback_id"] for row in self.store.list("feedback"))
-        self.store.write("cursor", "outbound", cursor)
-        self._remember(begun, public, "SYNCED")
+        cursor["repo_id"] = scope["repo"]
+        cursor["scope_task_id"] = scope["task_id"]
+        failed = self._commit_local(
+            begun, [("cursor", "outbound", cursor, begun["observed_revision"])], public, "SYNCED",
+        )
+        if isinstance(failed, Result):
+            return failed
         self._trace("feedback.sync_out", state="SYNCED", continuation=remainder, count=processed)
         return _ok("SYNCED", public)
 
@@ -285,7 +330,7 @@ class DeliveryService:
         row = begun["doc"]
         if row is None:
             return _denied(409, "EVIDENCE_MISSING", "ABSENT")
-        if row["author_id"] != actor.get("id"):
+        if row["author_id"] != begun["principal"]:
             self._trace("feedback.hijack", feedback_id=feedback_id, actor=actor.get("id"))
             return _denied(403, "NOT_AUTHORIZED", row["state"], {"reason": "cross_author"})
         if not row.get("issue_number"):
@@ -295,9 +340,9 @@ class DeliveryService:
         applied = 0
         while True:
             if page_budget is not None and page > page_budget:
+                expected = begun["observed_revision"]
                 row["inbound_complete"] = False
-                row["revision"] = row["revision"] + 1
-                self.store.write("feedback", feedback_id, row)
+                row["revision"] = expected + 1
                 public = {
                     "feedback_id": feedback_id,
                     "state": row["state"],
@@ -306,7 +351,11 @@ class DeliveryService:
                     "complete": False,
                     "retained_ids": before,
                 }
-                self._remember(begun, public, row["state"])
+                failed = self._commit_local(
+                    begun, [("feedback", feedback_id, row, expected)], public, row["state"],
+                )
+                if isinstance(failed, Result):
+                    return failed
                 self._trace("feedback.sync_in", feedback_id=feedback_id, complete=False)
                 return Result(
                     ok=False, http=409, code="INCOMPLETE_PAGE", state=row["state"],
@@ -322,8 +371,8 @@ class DeliveryService:
                 row["inbound_complete"] = True
                 break
             page += 1
-        row["revision"] = row["revision"] + 1
-        self.store.write("feedback", feedback_id, row)
+        expected = begun["observed_revision"]
+        row["revision"] = expected + 1
         after = sorted(item["feedback_id"] for item in self.store.list("feedback"))
         public = {
             "feedback_id": feedback_id,
@@ -338,7 +387,11 @@ class DeliveryService:
             "applied": applied,
             "retained_ids": after,
         }
-        self._remember(begun, public, row["state"])
+        failed = self._commit_local(
+            begun, [("feedback", feedback_id, row, expected)], public, row["state"],
+        )
+        if isinstance(failed, Result):
+            return failed
         self._trace("feedback.sync_in", feedback_id=feedback_id, complete=True, progress_seq=row["progress_seq"])
         return _ok(row["state"], public)
 
@@ -394,24 +447,25 @@ class DeliveryService:
             "task_acceptance": None,
             "acceptance_issue_closed": False,
             "repo_id": scope["repo"],
-            "actor_id": actor.get("id"),
+            "actor_id": begun["principal"],
             "completion_condition": (
                 "every required chain is PUBLISHED and each chain has publish_evidence "
                 "and task_acceptance is recorded"
             ),
         }
-        if not self._commit_event(begun, "task.claimed", task, task_id=task_id, run_id=run_id):
-            return _pending(body={"task_id": task_id})
+        pairs = [("task", task_id, task, 0)]
         for chain in built:
             chain["run_id"] = run_id
-            self.store.write("chain", task_id + "__" + chain["chain_id"], chain)
+            pairs.append(("chain", task_id + "__" + chain["chain_id"], chain, 0))
         for feedback_id in feedback_ids:
             row = self.store.read("feedback", feedback_id)
-            if row is not None:
-                row["task_id"] = task_id
-                row["revision"] = row["revision"] + 1
-                self.store.write("feedback", feedback_id, row)
-        self.store.write("task", task_id, task)
+            if row is None:
+                continue
+            old = row["revision"]
+            row = dict(row)
+            row["task_id"] = task_id
+            row["revision"] = old + 1
+            pairs.append(("feedback", feedback_id, row, old))
         public = {
             "task_id": task_id,
             "state": "claim",
@@ -421,7 +475,13 @@ class DeliveryService:
             "candidate_ids": [chain["candidate_id"] for chain in built],
             "completion_condition": task["completion_condition"],
         }
-        self._remember(begun, public, "claim")
+        outcome = self._commit_event(
+            begun, "task.claimed", pairs, public, "claim", task_id=task_id, run_id=run_id,
+        )
+        if isinstance(outcome, Result):
+            return outcome
+        if not outcome:
+            return _pending(body={"task_id": task_id})
         self._trace("task.claim", task_id=task_id, run_id=run_id, chains=public["chain_ids"])
         return _ok("claim", public)
 
@@ -477,13 +537,11 @@ class DeliveryService:
         chain["test_evidence"] = evidence
         chain["recorded_steps"]["tests"] = True
         chain["run_id"] = run_id
-        chain["revision"] = chain["revision"] + 1
-        if not self._commit_event(
-            begun, "evidence.bound", chain, task_id=task_id, run_id=run_id, candidate_id=cid,
-        ):
-            return _pending(body={"candidate_id": cid})
-        self.store.write("evidence", cid, evidence)
-        self.store.write("chain", key, chain)
+        expected = begun["observed_revision"]
+        chain["revision"] = expected + 1
+        stored_evidence = self.store.read("evidence", cid)
+        evidence_expected = 0 if stored_evidence is None else _revision(stored_evidence)
+        evidence["revision"] = evidence_expected + 1
         public = {
             "task_id": task_id,
             "chain_id": chain_id,
@@ -493,7 +551,15 @@ class DeliveryService:
             "evidence_valid": chain["evidence_valid"],
             "proof_class": "test_double",
         }
-        self._remember(begun, public, chain["state"])
+        outcome = self._commit_event(
+            begun, "evidence.bound",
+            [("chain", key, chain, expected), ("evidence", cid, evidence, evidence_expected)],
+            public, chain["state"], task_id=task_id, run_id=run_id, candidate_id=cid,
+        )
+        if isinstance(outcome, Result):
+            return outcome
+        if not outcome:
+            return _pending(body={"candidate_id": cid})
         self._trace("evidence.bind", task_id=task_id, run_id=run_id, candidate_id=cid, state=chain["state"])
         return _ok(chain["state"], public)
 
@@ -513,7 +579,9 @@ class DeliveryService:
         changed_field = _tuple_diff(chain, head, base, merge, tree)
         if changed_field is None:
             public = {"state": chain["state"], "evidence_valid": chain["evidence_valid"], "changed_field": None}
-            self._remember(begun, public, chain["state"])
+            failed = self._commit_local(begun, [], public, chain["state"])
+            if isinstance(failed, Result):
+                return failed
             return _ok(chain["state"], public, changed=False)
         evidence = chain.get("test_evidence")
         if evidence is not None:
@@ -525,14 +593,12 @@ class DeliveryService:
         if chain["state"] in _SUPERSEDE_FROM and allows(chain["state"], "SUPERSEDED", "candidate_updated"):
             chain["state"] = "SUPERSEDED"
             chain["closed_superseded"] = True
-        chain["revision"] = chain["revision"] + 1
-        if not self._commit_event(
-            begun, "candidate.stale", chain, task_id=task_id, candidate_id=chain["candidate_id"],
-        ):
-            return _pending(body={"candidate_id": chain["candidate_id"]})
+        expected = begun["observed_revision"]
+        chain["revision"] = expected + 1
+        pairs = [("chain", key, chain, expected)]
         if evidence is not None:
-            self.store.write("evidence", chain["candidate_id"], evidence)
-        self.store.write("chain", key, chain)
+            evidence["revision"] = int(evidence.get("revision") or 1) + 1
+            pairs.append(("evidence", chain["candidate_id"], evidence, int(evidence["revision"]) - 1))
         public = {
             **_limits(),
             "state": chain["state"],
@@ -542,7 +608,14 @@ class DeliveryService:
             "candidate_id": chain["candidate_id"],
             "prior_evidence_reused": False,
         }
-        self._remember(begun, public, chain["state"])
+        outcome = self._commit_event(
+            begun, "candidate.stale", pairs, public, chain["state"],
+            task_id=task_id, candidate_id=chain["candidate_id"],
+        )
+        if isinstance(outcome, Result):
+            return outcome
+        if not outcome:
+            return _pending(body={"candidate_id": chain["candidate_id"]})
         self._trace(
             "candidate.observe", task_id=task_id, candidate_id=chain["candidate_id"],
             state=chain["state"], changed_field=changed_field,
@@ -635,31 +708,53 @@ class DeliveryService:
             })
         if chain["state"] != "ACCEPTING":
             return _denied(409, "DEPENDENCY_UNSATISFIED", chain["state"], {"reason": "not_accepting"})
-        guard = "user_acceptance" if decision == "accepted" else "user_rejection"
-        target = "SATISFIED" if decision == "accepted" else "REJECTED"
+        grant = self._acceptance_grant(begun["principal"], chain, signer_kind, decision)
+        if isinstance(grant, Result):
+            return grant
+        guard = "user_acceptance" if grant["decision"] == "accepted" else "user_rejection"
+        target = "SATISFIED" if grant["decision"] == "accepted" else "REJECTED"
         if not allows("ACCEPTING", target, guard):
             return _denied(409, "DEPENDENCY_UNSATISFIED", chain["state"])
+        expected = begun["observed_revision"]
         chain["state"] = target
-        chain["acceptance_decision"] = decision
+        chain["acceptance_decision"] = grant["decision"]
         chain["acceptance_proof_class"] = "test_double"
+        chain["acceptance_binding"] = {
+            "candidate_id": chain["candidate_id"],
+            "head": chain["head"],
+            "base": chain["base"],
+            "merge": chain["merge"],
+            "tree": chain["tree"],
+            "decision": grant["decision"],
+            "principal_id": begun["principal"],
+            "proof_class": "test_double",
+            "runtime_acceptance": False,
+        }
         chain["recorded_steps"]["accept"] = True
-        chain["revision"] = chain["revision"] + 1
-        if not self._commit_event(
-            begun, "acceptance.recorded", chain, task_id=task_id, candidate_id=chain["candidate_id"],
-        ):
-            return _pending(body={"candidate_id": chain["candidate_id"]})
-        self.store.write("chain", key, chain)
+        chain["revision"] = expected + 1
         public = {
             "state": chain["state"],
             "revision": chain["revision"],
-            "acceptance_decision": decision,
+            "acceptance_decision": grant["decision"],
             "acceptance_proof_class": "test_double",
             "counts_as_runtime_user_acceptance": False,
             "forged_user_acceptance": False,
             "production_publish_authorized": False,
+            "github_proof": False,
+            "macci_proof": False,
         }
-        self._remember(begun, public, chain["state"])
-        self._trace("acceptance.record", task_id=task_id, chain_id=chain_id, decision=decision, state=chain["state"])
+        outcome = self._commit_event(
+            begun, "acceptance.recorded", [("chain", key, chain, expected)], public, chain["state"],
+            task_id=task_id, candidate_id=chain["candidate_id"],
+        )
+        if isinstance(outcome, Result):
+            return outcome
+        if not outcome:
+            return _pending(body={"candidate_id": chain["candidate_id"]})
+        self._trace(
+            "acceptance.record", task_id=task_id, chain_id=chain_id,
+            decision=grant["decision"], state=chain["state"],
+        )
         return _ok(chain["state"], public)
 
     def record_task_acceptance(self, *, actor, scope, task_id, signer_kind, idempotency_key, expected_revision):
@@ -689,21 +784,30 @@ class DeliveryService:
             return _denied(409, "DEPENDENCY_UNSATISFIED", task["phase"], {"reason": "chains_not_accepted"})
         if any(chain.get("acceptance_decision") == "rejected" for chain in chains):
             return _denied(409, "FREEZE_ACTIVE", task["phase"], {"reason": "acceptance_rejection"})
+        for chain in required:
+            confirmed = self._acceptance_grant(begun["principal"], chain, "user_acceptance", "accepted")
+            if isinstance(confirmed, Result):
+                return confirmed
+            if confirmed["decision"] != "accepted":
+                return _denied(409, "DEPENDENCY_UNSATISFIED", task["phase"], {"reason": "chains_not_accepted"})
+        expected = begun["observed_revision"]
         task["task_acceptance"] = {
             "proof_class": "test_double",
             "counts_as_runtime_user_acceptance": False,
             "recorded_at": self.clock(),
             "signer_kind": "user_acceptance",
+            "runtime_acceptance": False,
         }
-        task["revision"] = task["revision"] + 1
-        self.store.write("task", task_id, task)
+        task["revision"] = expected + 1
         public = {
             "state": task["phase"],
             "revision": task["revision"],
             "task_acceptance": task["task_acceptance"],
             "counts_as_runtime_user_acceptance": False,
         }
-        self._remember(begun, public, task["phase"])
+        failed = self._commit_local(begun, [("task", task_id, task, expected)], public, task["phase"])
+        if isinstance(failed, Result):
+            return failed
         self._trace("task.accept", task_id=task_id, run_id=task.get("run_id"))
         return _ok(task["phase"], public)
 
@@ -959,7 +1063,7 @@ class DeliveryService:
         row["delivery_run_id"] = "run_" + feedback_id + "_" + str(attempt)
         row["revision"] = row["revision"] + 1
         self.store.write("feedback", feedback_id, row)
-        outcome = self._push_row(actor, self.store.read("feedback", feedback_id))
+        outcome = self._push_row(begun["principal"], scope, self.store.read("feedback", feedback_id))
         public = {
             **_limits(),
             **outcome,
@@ -1207,24 +1311,52 @@ class DeliveryService:
         self._trace("repair.authorize", task_id=task_id, candidate_id=cid, old=chain["candidate_id"])
         return _ok("SUPERSEDED", public)
 
-    def project(self, *, actor, task_id):
+    def project(self, *, actor, task_id, scope=None):
+        if not isinstance(scope, dict) or not scope.get("repo") or not scope.get("task_id"):
+            return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "scope"})
         authn = self.auth.authenticate(actor)
-        if authn.get("blocked"):
+        if not isinstance(authn, dict) or authn.get("blocked"):
             return _pending()
-        if not authn.get("ok") or actor.get("kind") != "test":
+        principal = authn.get("principal_id")
+        proof = str((actor or {}).get("proof_ref", ""))
+        if (
+            not authn.get("ok")
+            or (actor or {}).get("kind") != "test"
+            or not proof.startswith("test-proof://")
+            or not isinstance(principal, str)
+            or not principal
+        ):
             return _denied(403, "NOT_AUTHORIZED", "REJECTED")
         task = self.store.read("task", task_id)
         if task is None:
             return _denied(409, "EVIDENCE_MISSING", "ABSENT")
+        if task.get("repo_id") != scope["repo"] or task.get("task_id") != scope["task_id"]:
+            return _denied(403, "NOT_AUTHORIZED", task.get("phase", "REJECTED"), {"reason": "object_scope"})
+        authz = self.auth.authorize(
+            actor, {"repo": task["repo_id"], "task_id": task["task_id"]}, "task.project", None,
+        )
+        if not isinstance(authz, dict) or authz.get("blocked"):
+            return _pending()
+        if authz.get("ok") is not True or authz.get("allow") is not True:
+            return _denied(403, authz.get("code") or "NOT_AUTHORIZED", task.get("phase", "REJECTED"))
         view = project_task(task, self._chains(task_id))
         view["completion"] = completion(task, self._chains(task_id))
         return _ok(task["phase"], view, changed=False)
 
-    def feedback(self, feedback_id):
+    def feedback(self, feedback_id, *, actor=None, scope=None):
+        if not self._read_allowed(actor, scope, "feedback", feedback_id):
+            return None
         return self.store.read("feedback", feedback_id)
 
-    def traces(self):
-        return self.store.traces()
+    def traces(self, *, actor=None, scope=None):
+        if not self._read_allowed(actor, scope, "trace", None):
+            return []
+        rows = []
+        for row in self.store.traces():
+            if row.get("repo_id") not in (None, scope["repo"]):
+                continue
+            rows.append(row)
+        return rows
 
     def _chains(self, task_id):
         rows = [
@@ -1234,70 +1366,424 @@ class DeliveryService:
         rows.sort(key=lambda row: row["chain_id"])
         return rows
 
-    def _push_row(self, actor, row):
-        feedback_id = row["feedback_id"]
-        if row["author_id"] != actor.get("id"):
-            self._trace("feedback.hijack", feedback_id=feedback_id, actor=actor.get("id"))
-            return {"feedback_id": feedback_id, "state": row["state"], "code": "NOT_AUTHORIZED", "reason": "cross_author"}
-        if row["state"] == "UNKNOWN":
-            return {"feedback_id": feedback_id, "state": "UNKNOWN", "code": "SIDE_EFFECT_UNKNOWN", "retry_allowed": False}
-        looked = self.remote.lookup_issue(feedback_id)
-        if looked.get("blocked"):
-            return {"feedback_id": feedback_id, "state": row["state"], "code": "INTERFACE_PENDING", "blocked": True}
-        if looked.get("found"):
-            if looked.get("author_id") != row["author_id"]:
-                self._trace("feedback.hijack", feedback_id=feedback_id, issue_author=looked.get("author_id"))
-                return {
-                    "feedback_id": feedback_id,
-                    "state": row["state"],
-                    "code": "NOT_AUTHORIZED",
-                    "reason": "cross_author",
-                    "issue_number": None,
-                }
-            row["issue_number"] = looked["number"]
-            row["state"] = "SYNCED"
-            row["lease"] = None
-            row["revision"] = row["revision"] + 1
-            self.store.write("feedback", feedback_id, row)
-            return {"feedback_id": feedback_id, "state": "SYNCED", "issue_number": looked["number"], "created": False}
-        operation_id = "op-" + feedback_id
-        created = self.remote.create_issue({
-            "feedback_id": feedback_id,
+    def _operation_lock(self, operation_id):
+        with self._locks_guard:
+            lock = self._operation_locks.get(operation_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._operation_locks[operation_id] = lock
+            return lock
+
+    def _read_allowed(self, actor, scope, kind, object_id):
+        if not isinstance(actor, dict) or not isinstance(scope, dict):
+            return False
+        if not scope.get("repo") or not scope.get("task_id"):
+            return False
+        authn = self.auth.authenticate(actor)
+        if not isinstance(authn, dict) or authn.get("blocked") or not authn.get("ok"):
+            return False
+        principal = authn.get("principal_id")
+        proof = str(actor.get("proof_ref", ""))
+        if (
+            actor.get("kind") != "test"
+            or not proof.startswith("test-proof://")
+            or not isinstance(principal, str)
+            or not principal
+        ):
+            return False
+        doc = None if object_id is None else self.store.read(kind, object_id)
+        if isinstance(doc, dict):
+            if doc.get("repo_id") and doc.get("repo_id") != scope["repo"]:
+                return False
+            if doc.get("scope_task_id") and doc.get("scope_task_id") != scope["task_id"]:
+                return False
+            if kind != "feedback" and doc.get("task_id") and doc.get("task_id") != scope["task_id"]:
+                return False
+        authz = self.auth.authorize(
+            actor, {"repo": scope["repo"], "task_id": scope["task_id"]}, "read." + kind, None,
+        )
+        if not isinstance(authz, dict) or authz.get("blocked"):
+            return False
+        return authz.get("ok") is True and authz.get("allow") is True
+
+    def _object_mismatch(self, scope, kind, doc, payload):
+        payload = payload or {}
+        if payload.get("task_id") and payload["task_id"] != scope["task_id"]:
+            if kind in {"task", "chain", "snapshot", "feedback", "cursor"}:
+                return "forged_scope"
+        if payload.get("chain_id") and kind == "chain" and isinstance(doc, dict):
+            if doc.get("chain_id") and payload["chain_id"] != doc["chain_id"]:
+                return "forged_scope"
+        if not isinstance(doc, dict):
+            return None
+        if doc.get("repo_id") and doc.get("repo_id") != scope["repo"]:
+            return "cross_repo"
+        if kind in {"task", "chain", "snapshot"} and doc.get("task_id") and doc["task_id"] != scope["task_id"]:
+            return "forged_scope"
+        if kind == "feedback" and doc.get("scope_task_id") and doc["scope_task_id"] != scope["task_id"]:
+            return "forged_scope"
+        if kind == "cursor":
+            if doc.get("scope_task_id") and doc["scope_task_id"] != scope["task_id"]:
+                return "forged_scope"
+        if kind == "operation":
+            op_scope = doc.get("scope") or {}
+            if op_scope.get("repo") and op_scope.get("repo") != scope["repo"]:
+                return "cross_repo"
+            if op_scope.get("task_id") and op_scope.get("task_id") != scope["task_id"]:
+                return "forged_scope"
+        return None
+
+    def _acceptance_grant(self, principal, chain, signer_kind, caller_decision):
+        denied_body = {
+            "reason": "stand_in_not_real_authorization",
+            "forged_user_acceptance": False,
+            "counts_as_runtime_user_acceptance": False,
+            "github_proof": False,
+            "macci_proof": False,
+            "production_publish_authorized": False,
+        }
+        if getattr(self.auth, "is_test_double", False) is not True:
+            return _denied(403, "POLICY_DENIED", chain["state"], denied_body)
+        status = self.schedule.evidence(chain["candidate_id"])
+        if not isinstance(status, dict) or status.get("blocked"):
+            return _pending(body={"candidate_id": chain["candidate_id"]})
+        if status.get("macci_proof") or status.get("runtime_evidence"):
+            return _denied(403, "POLICY_DENIED", chain["state"], denied_body)
+        local = chain.get("test_evidence") or {}
+        tuple_ok = (
+            status.get("known") is True
+            and status.get("valid") is True
+            and status.get("candidate_id") == chain["candidate_id"]
+            and status.get("head") == chain["head"]
+            and status.get("base") == chain["base"]
+            and status.get("merge") == chain["merge"]
+            and status.get("tree") == chain["tree"]
+            and chain.get("evidence_valid") is True
+            and local.get("candidate_id") == chain["candidate_id"]
+            and local.get("head") == chain["head"]
+            and local.get("base") == chain["base"]
+            and local.get("merge") == chain["merge"]
+            and local.get("tree") == chain["tree"]
+            and local.get("valid") is not False
+        )
+        if not tuple_ok:
+            return _denied(409, "EVIDENCE_MISSING", chain["state"], {
+                "reason": "acceptance_tuple",
+                "candidate_id": chain["candidate_id"],
+                "forged_user_acceptance": False,
+            })
+        binding = {
+            "repo": chain.get("repo_id"),
+            "task_id": chain.get("task_id"),
+            "chain_id": chain.get("chain_id"),
+            "candidate_id": chain["candidate_id"],
+            "head": chain["head"],
+            "base": chain["base"],
+            "merge": chain["merge"],
+            "tree": chain["tree"],
+            "decision": caller_decision,
+        }
+        grant = self.auth.acceptance(principal, binding)
+        if not isinstance(grant, dict) or grant.get("blocked"):
+            return _pending(body={"candidate_id": chain["candidate_id"]})
+        promoted = (
+            grant.get("test_double") is not True
+            or grant.get("allow") is not True
+            or grant.get("ok") is not True
+            or grant.get("runtime_acceptance")
+            or grant.get("github_proof")
+            or grant.get("macci_proof")
+            or grant.get("counts_as_runtime_user_acceptance")
+            or grant.get("signer_kind") != "user_acceptance"
+            or grant.get("decision") not in {"accepted", "rejected"}
+            or signer_kind != "user_acceptance"
+            or caller_decision != grant.get("decision")
+        )
+        if promoted:
+            return _denied(403, "POLICY_DENIED", chain["state"], denied_body)
+        for field in ("repo", "task_id", "chain_id", "candidate_id", "head", "base", "merge", "tree"):
+            if grant.get(field) != binding[field]:
+                return _denied(409, "EVIDENCE_MISSING", chain["state"], {
+                    "reason": "acceptance_tuple",
+                    "candidate_id": chain["candidate_id"],
+                })
+        return grant
+
+    def _trusted_reconcile(self, operation_id):
+        observed = self.remote.reconcile(operation_id)
+        if not isinstance(observed, dict) or observed.get("blocked"):
+            return {"classification": "unknown", "blocked": bool(isinstance(observed, dict) and observed.get("blocked"))}
+        if observed.get("operation_id") != operation_id:
+            return {"classification": "unknown"}
+        classification = observed.get("classification")
+        if classification not in {"succeeded", "failed", "absent", "unknown"}:
+            return {"classification": "unknown"}
+        return {
+            "classification": classification,
+            "issue_number": observed.get("issue_number"),
+            "feedback_id": observed.get("feedback_id"),
+            "author_id": observed.get("author_id"),
+            "github_proof": False,
+            "test_double": True,
+        }
+
+    def _push_request(self, scope, row):
+        return {
+            "feedback_id": row["feedback_id"],
             "author_id": row["author_id"],
             "body": row["body"],
-            "operation_id": operation_id,
-        })
-        if created.get("status") == "unknown":
-            row["state"] = "UNKNOWN"
-            row["operation_id"] = created.get("operation_id") or operation_id
-            row["revision"] = row["revision"] + 1
-            self.store.write("feedback", feedback_id, row)
-            self._mark_unknown(row["operation_id"], "feedback.create_issue", row.get("task_id"), {
+            "attempt": int(row.get("attempt") or 1),
+        }
+
+    def _intent_document(self, op_id, digest, scope_exact, principal, row, request):
+        return {
+            "operation_id": op_id,
+            "kind": "feedback.create_issue",
+            "state": "INTENT",
+            "scope": scope_exact,
+            "request_digest": digest,
+            "feedback_id": row["feedback_id"],
+            "author_id": row["author_id"],
+            "attempt": request["attempt"],
+            "revision": 1,
+            "generation": 1,
+            "reconciled": False,
+            "principal_id": principal,
+            "github_proof": False,
+            "test_double": True,
+        }
+
+    def _mutate_effect(self, feedback_id, op_doc, expected_generation, feedback_state, issue_number):
+        def mutator(view):
+            current = view.read("feedback", feedback_id)
+            if not isinstance(current, dict):
+                view.abort()
+                return None
+            stored = view.read("operation", op_doc["operation_id"])
+            generation = 0 if stored is None else int(stored.get("generation") or 0)
+            if generation != expected_generation:
+                view.abort()
+                return "conflict"
+            updated = dict(current)
+            updated["state"] = feedback_state
+            updated["operation_id"] = op_doc["operation_id"]
+            updated["lease"] = None
+            if issue_number is not None:
+                updated["issue_number"] = issue_number
+            updated["revision"] = _revision(current) + 1
+            op_doc["generation"] = generation + 1
+            op_doc["github_proof"] = False
+            view.stage("feedback", feedback_id, updated)
+            view.stage("operation", op_doc["operation_id"], dict(op_doc))
+            return updated
+
+        return self.store.mutate(mutator)
+
+    def _synced_result(self, feedback_id, issue_number, created):
+        return {
+            "feedback_id": feedback_id,
+            "state": "SYNCED",
+            "issue_number": issue_number,
+            "created": created,
+        }
+
+    def _push_row(self, principal, scope, row):
+        feedback_id = row["feedback_id"]
+        if row.get("author_id") != principal or row.get("repo_id") != scope["repo"] or row.get("scope_task_id") != scope["task_id"]:
+            self._trace("feedback.hijack", feedback_id=feedback_id, actor=principal)
+            return {
                 "feedback_id": feedback_id,
-                "run_id": None,
-                "candidate_id": None,
-            })
+                "state": row.get("state"),
+                "code": "NOT_AUTHORIZED",
+                "reason": "cross_author" if row.get("author_id") != principal else "object_scope",
+            }
+        if row.get("state") == "UNKNOWN":
             return {
                 "feedback_id": feedback_id,
                 "state": "UNKNOWN",
                 "code": "SIDE_EFFECT_UNKNOWN",
-                "operation_id": row["operation_id"],
+                "operation_id": row.get("operation_id"),
                 "retry_allowed": False,
             }
-        if created.get("status") == "failed" or not created.get("ok", True):
-            row["state"] = "FAILED"
-            row["lease"] = None
-            row["revision"] = row["revision"] + 1
-            self.store.write("feedback", feedback_id, row)
+        request = self._push_request(scope, row)
+        op_id, digest, scope_exact = operation_id_for(scope, "feedback.create_issue", request)
+        with self._operation_lock(op_id):
+            existing = self.store.read("operation", op_id)
+            if isinstance(existing, dict) and existing.get("state") == "SUCCEEDED" and existing.get("issue_number") is not None:
+                self._mutate_effect(feedback_id, dict(existing), int(existing.get("generation") or 0), "SYNCED", existing["issue_number"])
+                return self._synced_result(feedback_id, existing["issue_number"], False)
+            if isinstance(existing, dict) and existing.get("state") in {"INTENT", "UNKNOWN"}:
+                return self._recover_push(row, existing)
+            if isinstance(existing, dict) and existing.get("state") == "FAILED":
+                return {"feedback_id": feedback_id, "state": "FAILED", "code": "FAILED", "continued": True}
+            if isinstance(existing, dict) and existing.get("state") == "RETRY_WAIT":
+                return {
+                    "feedback_id": feedback_id,
+                    "state": row.get("state"),
+                    "code": "SIDE_EFFECT_UNKNOWN",
+                    "retry_allowed": False,
+                    "operation_id": op_id,
+                }
+            if existing is None:
+                observed = self._trusted_reconcile(op_id)
+                if observed.get("classification") == "succeeded" and observed.get("issue_number") is not None:
+                    if observed.get("author_id") not in (None, row["author_id"]):
+                        return {
+                            "feedback_id": feedback_id,
+                            "state": row.get("state"),
+                            "code": "NOT_AUTHORIZED",
+                            "reason": "cross_author",
+                        }
+                    op_doc = self._intent_document(op_id, digest, scope_exact, principal, row, request)
+                    op_doc["state"] = "SUCCEEDED"
+                    op_doc["reconciled"] = True
+                    op_doc["classification"] = "succeeded"
+                    op_doc["issue_number"] = observed["issue_number"]
+                    op_doc["revision"] = 1
+                    self._mutate_effect(feedback_id, op_doc, 0, "SYNCED", observed["issue_number"])
+                    return self._synced_result(feedback_id, observed["issue_number"], False)
+                if observed.get("classification") == "unknown":
+                    op_doc = self._intent_document(op_id, digest, scope_exact, principal, row, request)
+                    op_doc["state"] = "UNKNOWN"
+                    op_doc["classification"] = "unknown"
+                    self._mutate_effect(feedback_id, op_doc, 0, "UNKNOWN", None)
+                    return {
+                        "feedback_id": feedback_id,
+                        "state": "UNKNOWN",
+                        "code": "SIDE_EFFECT_UNKNOWN",
+                        "operation_id": op_id,
+                        "retry_allowed": False,
+                    }
+                if observed.get("classification") == "failed":
+                    op_doc = self._intent_document(op_id, digest, scope_exact, principal, row, request)
+                    op_doc["state"] = "FAILED"
+                    op_doc["reconciled"] = True
+                    op_doc["classification"] = "failed"
+                    self._mutate_effect(feedback_id, op_doc, 0, "FAILED", None)
+                    return {"feedback_id": feedback_id, "state": "FAILED", "code": "FAILED", "continued": True}
+            looked = self.remote.lookup_issue(feedback_id)
+            if isinstance(looked, dict) and looked.get("blocked"):
+                return {"feedback_id": feedback_id, "state": row.get("state"), "code": "INTERFACE_PENDING", "blocked": True}
+            if isinstance(looked, dict) and looked.get("found"):
+                if looked.get("author_id") != row["author_id"]:
+                    self._trace("feedback.hijack", feedback_id=feedback_id, issue_author=looked.get("author_id"))
+                    return {
+                        "feedback_id": feedback_id,
+                        "state": row.get("state"),
+                        "code": "NOT_AUTHORIZED",
+                        "reason": "cross_author",
+                        "issue_number": None,
+                    }
+                op_doc = self._intent_document(op_id, digest, scope_exact, principal, row, request)
+                op_doc["state"] = "SUCCEEDED"
+                op_doc["reconciled"] = True
+                op_doc["classification"] = "succeeded"
+                op_doc["issue_number"] = looked["number"]
+                self._mutate_effect(feedback_id, op_doc, 0, "SYNCED", looked["number"])
+                return self._synced_result(feedback_id, looked["number"], False)
+            op_doc = self._intent_document(op_id, digest, scope_exact, principal, row, request)
+
+            def stage_intent(view):
+                current = view.read("operation", op_id)
+                if current is not None:
+                    view.abort()
+                    return current
+                view.stage("operation", op_id, op_doc)
+                return op_doc
+
+            staged = self.store.mutate(stage_intent)
+            if not isinstance(staged, dict) or staged.get("state") != "INTENT":
+                current = self.store.read("operation", op_id)
+                if isinstance(current, dict):
+                    return self._recover_push(row, current)
+                return {"feedback_id": feedback_id, "state": row.get("state"), "code": "CONFLICT_REVISION"}
+            created = self.remote.create_issue({
+                "feedback_id": feedback_id,
+                "author_id": row["author_id"],
+                "body": row["body"],
+                "operation_id": op_id,
+                "request_digest": digest,
+                "scope": scope_exact,
+            })
+            if not isinstance(created, dict) or created.get("status") == "unknown":
+                observed = self._trusted_reconcile(op_id)
+                return self._apply_push_classification(row, op_doc, observed)
+            if created.get("status") == "failed" or not created.get("ok", True):
+                op_doc["state"] = "FAILED"
+                op_doc["reconciled"] = True
+                op_doc["classification"] = "failed"
+                self._mutate_effect(feedback_id, op_doc, 1, "FAILED", None)
+                return {"feedback_id": feedback_id, "state": "FAILED", "code": "FAILED", "continued": True}
+            if created.get("author_id") != row["author_id"]:
+                return {
+                    "feedback_id": feedback_id,
+                    "state": row.get("state"),
+                    "code": "NOT_AUTHORIZED",
+                    "reason": "cross_author",
+                }
+            op_doc["state"] = "SUCCEEDED"
+            op_doc["reconciled"] = True
+            op_doc["classification"] = "succeeded"
+            op_doc["issue_number"] = created["number"]
+            self._mutate_effect(feedback_id, op_doc, 1, "SYNCED", created["number"])
+            return self._synced_result(feedback_id, created["number"], created.get("status") == "created")
+
+    def _recover_push(self, row, existing):
+        feedback_id = row["feedback_id"]
+        observed = self._trusted_reconcile(existing["operation_id"])
+        return self._apply_push_classification(row, dict(existing), observed)
+
+    def _apply_push_classification(self, row, op_doc, observed):
+        feedback_id = row["feedback_id"]
+        classification = observed.get("classification")
+        generation = int(op_doc.get("generation") or 1)
+        if classification == "succeeded" and observed.get("issue_number") is not None:
+            if observed.get("author_id") not in (None, row.get("author_id")):
+                return {
+                    "feedback_id": feedback_id,
+                    "state": row.get("state"),
+                    "code": "NOT_AUTHORIZED",
+                    "reason": "cross_author",
+                }
+            op_doc["state"] = "SUCCEEDED"
+            op_doc["reconciled"] = True
+            op_doc["classification"] = "succeeded"
+            op_doc["issue_number"] = observed["issue_number"]
+            op_doc["revision"] = int(op_doc.get("revision") or 1)
+            self._mutate_effect(feedback_id, op_doc, generation, "SYNCED", observed["issue_number"])
+            return self._synced_result(feedback_id, observed["issue_number"], False)
+        if classification == "failed":
+            op_doc["state"] = "FAILED"
+            op_doc["reconciled"] = True
+            op_doc["classification"] = "failed"
+            op_doc["revision"] = int(op_doc.get("revision") or 1)
+            self._mutate_effect(feedback_id, op_doc, generation, "FAILED", None)
             return {"feedback_id": feedback_id, "state": "FAILED", "code": "FAILED", "continued": True}
-        if created.get("author_id") != row["author_id"]:
-            return {"feedback_id": feedback_id, "state": row["state"], "code": "NOT_AUTHORIZED", "reason": "cross_author"}
-        row["issue_number"] = created["number"]
-        row["state"] = "SYNCED"
-        row["lease"] = None
-        row["revision"] = row["revision"] + 1
-        self.store.write("feedback", feedback_id, row)
-        return {"feedback_id": feedback_id, "state": "SYNCED", "issue_number": created["number"], "created": True}
+        if classification == "absent":
+            op_doc["state"] = "RETRY_WAIT"
+            op_doc["reconciled"] = True
+            op_doc["classification"] = "absent"
+            op_doc["revision"] = int(op_doc.get("revision") or 1)
+            self._mutate_effect(feedback_id, op_doc, generation, "RETRY_WAIT", None)
+            return {
+                "feedback_id": feedback_id,
+                "state": "RETRY_WAIT",
+                "code": "SIDE_EFFECT_UNKNOWN",
+                "operation_id": op_doc["operation_id"],
+                "retry_allowed": False,
+            }
+        op_doc["state"] = "UNKNOWN"
+        op_doc["reconciled"] = False
+        op_doc["classification"] = "unknown"
+        op_doc["revision"] = 1
+        self._mutate_effect(feedback_id, op_doc, generation, "UNKNOWN", None)
+        return {
+            "feedback_id": feedback_id,
+            "state": "UNKNOWN",
+            "code": "SIDE_EFFECT_UNKNOWN",
+            "operation_id": op_doc["operation_id"],
+            "retry_allowed": False,
+        }
 
     def _apply_comment(self, row, comment):
         comment_id = comment.get("comment_id")
@@ -1406,15 +1892,49 @@ class DeliveryService:
             return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "scope"})
         if not isinstance(expected_revision, int) or expected_revision < 0:
             return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "expected_revision"})
+        self._local.repo = scope["repo"]
+        self._local.task = scope["task_id"]
         authn = self.auth.authenticate(actor)
         if not isinstance(authn, dict) or authn.get("blocked"):
             return _pending(body={"operation": operation})
+        principal = authn.get("principal_id")
         proof = str((actor or {}).get("proof_ref", ""))
-        if not authn.get("ok") or (actor or {}).get("kind") != "test" or not proof.startswith("test-proof://"):
+        if (
+            not authn.get("ok")
+            or (actor or {}).get("kind") != "test"
+            or not proof.startswith("test-proof://")
+            or not isinstance(principal, str)
+            or not principal
+        ):
             self._trace("auth.denied", operation=operation, stage="authenticate")
             return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"operation": operation})
+        doc = self.store.read(kind, object_id)
+        mismatch = self._object_mismatch(scope, kind, doc, payload)
+        if mismatch:
+            self._trace("auth.denied", operation=operation, stage="object", reason=mismatch)
+            state = "REJECTED" if not isinstance(doc, dict) else doc.get("state", doc.get("phase", "REJECTED"))
+            return _denied(403, "NOT_AUTHORIZED", state, {"reason": mismatch, "operation": operation})
+        if payload.get("author_id") and payload["author_id"] != principal:
+            return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "principal", "operation": operation})
+        if (
+            isinstance(doc, dict)
+            and payload.get("author_id")
+            and doc.get("author_id")
+            and payload["author_id"] != doc["author_id"]
+        ):
+            self._trace("feedback.hijack", feedback_id=doc.get("feedback_id"), actor=(actor or {}).get("id"))
+            return _denied(403, "NOT_AUTHORIZED", doc.get("state", "REJECTED"), {"reason": "cross_author"})
+        object_scope = {"repo": scope["repo"], "task_id": scope["task_id"]}
+        if isinstance(doc, dict):
+            if doc.get("chain_id"):
+                object_scope["chain_id"] = doc["chain_id"]
+            if doc.get("candidate_id"):
+                object_scope["candidate_id"] = doc["candidate_id"]
+        elif payload.get("chain_id"):
+            object_scope["chain_id"] = payload["chain_id"]
+        bound_candidate = candidate_id or object_scope.get("candidate_id")
         if operation == "release.publish":
-            self.auth.authorize(actor, scope, operation, candidate_id)
+            self.auth.authorize(actor, object_scope, operation, bound_candidate)
             self._trace("publish.denied", operation=operation)
             return _denied(403, "POLICY_DENIED", "REJECTED", {
                 "allow": False,
@@ -1422,32 +1942,35 @@ class DeliveryService:
                 "production_publish_authorized": False,
                 "reason": "publish_not_authorized",
             })
-        authz = self.auth.authorize(actor, scope, operation, candidate_id)
+        authz = self.auth.authorize(actor, object_scope, operation, bound_candidate)
         if not isinstance(authz, dict) or authz.get("blocked"):
             return _pending(body={"operation": operation})
-        if not authz.get("ok") or authz.get("allow") is False:
+        if authz.get("ok") is not True or authz.get("allow") is not True:
             code = authz.get("code") or "POLICY_DENIED"
             self._trace("auth.denied", operation=operation, stage="authorize", code=code)
             return _denied(403, code, "REJECTED", {"operation": operation})
+        current = 0 if doc is None else doc["revision"]
+        begun = {
+            "principal": principal,
+            "doc": doc,
+            "operation": operation,
+            "observed_revision": current,
+            "observed_generation": 0 if doc is None else int(doc.get("generation") or current or 0),
+            "scope": {"repo": scope["repo"], "task_id": scope["task_id"]},
+            "object_kind": kind,
+            "object_id": object_id,
+        }
         if stop_before_idempotency:
-            return {"principal": authn.get("principal_id"), "doc": self.store.read(kind, object_id)}
-        idem_key = _hash(json.dumps({
-            "principal": authn.get("principal_id"),
+            return begun
+        idem_key = _hash({
+            "principal": principal,
             "repo": scope["repo"],
+            "task_id": scope["task_id"],
             "operation": operation,
             "key": idempotency_key,
-        }, sort_keys=True))
+        })
         payload_hash = _hash(payload)
         existing = self.store.read("idem", idem_key)
-        doc = self.store.read(kind, object_id)
-        if (
-            doc is not None
-            and payload.get("author_id")
-            and doc.get("author_id")
-            and payload["author_id"] != doc["author_id"]
-        ):
-            self._trace("feedback.hijack", feedback_id=doc.get("feedback_id"), actor=(actor or {}).get("id"))
-            return _denied(403, "NOT_AUTHORIZED", doc.get("state", "REJECTED"), {"reason": "cross_author"})
         if existing is not None:
             if existing["payload_hash"] != payload_hash:
                 return _denied(409, "IDEMPOTENCY_PAYLOAD_MISMATCH", existing.get("state", "REJECTED"))
@@ -1456,7 +1979,6 @@ class DeliveryService:
             body["lease_token"] = None
             body["current_state"] = None if doc is None else doc.get("state", doc.get("phase"))
             return _ok(body.get("state", existing.get("state")), body, changed=False, code="IDEMPOTENCY_REPLAY", replayed=True)
-        current = 0 if doc is None else doc["revision"]
         if create and doc is not None and kind != "cursor" and kind != "snapshot":
             current = doc["revision"]
         if not create and doc is None:
@@ -1467,13 +1989,10 @@ class DeliveryService:
                     "expected_revision": expected_revision,
                     "revision": current,
                 })
-        return {
-            "principal": authn.get("principal_id"),
-            "idem_key": idem_key,
-            "payload_hash": payload_hash,
-            "doc": doc,
-            "operation": operation,
-        }
+        begun["idem_key"] = idem_key
+        begun["payload_hash"] = payload_hash
+        begun["observed_revision"] = current
+        return begun
 
     def _remember(self, begun, public, state):
         self.store.write("idem", begun["idem_key"], {
@@ -1482,23 +2001,223 @@ class DeliveryService:
             "public": {key: value for key, value in public.items() if key != "lease_token"},
         })
 
-    def _commit_event(self, begun, event_type, doc, **fields):
+    def _commit_local(self, begun, pairs, public, state):
+        idem_body = {
+            "payload_hash": begun["payload_hash"],
+            "state": state,
+            "public": {key: value for key, value in public.items() if key != "lease_token"},
+        }
+
+        def mutator(view):
+            owner = begun.get("event_id")
+            for kind, key, doc, expected in pairs:
+                current = view.read(kind, key)
+                if _revision(current) != expected:
+                    view.abort()
+                    return "conflict"
+                fence = view.read("fence", _fence_key(kind, key))
+                if isinstance(fence, dict) and fence.get("state") == "open" and fence.get("event_id") != owner:
+                    view.abort()
+                    return "conflict"
+            for kind, key, doc, expected in pairs:
+                view.stage(kind, key, doc)
+            if begun.get("idem_key"):
+                view.stage("idem", begun["idem_key"], idem_body)
+            if begun.get("event_id") and begun.get("receipt"):
+                outbox = view.read("outbox", begun["event_id"])
+                if isinstance(outbox, dict):
+                    outbox = dict(outbox)
+                    outbox["receipt"] = begun["receipt"]
+                    outbox["delivery_state"] = "RECEIPT_RECORDED"
+                    outbox["authority"] = "W01"
+                    outbox["local_is_authority"] = False
+                    view.stage("outbox", begun["event_id"], outbox)
+                for kind, key, doc, expected in pairs:
+                    view.stage("fence", _fence_key(kind, key), {
+                        "state": "closed",
+                        "event_id": begun["event_id"],
+                        "revision": 1,
+                    })
+            return "ok"
+
+        result = self.store.mutate(mutator)
+        if result != "ok":
+            return _denied(409, "CONFLICT_REVISION", state, {"reason": "cas"})
+        return None
+
+    def _stage_outbox(self, begun, event):
+        event_id = event["event_id"]
+        kind = begun["object_kind"]
+        key = begun["object_id"]
+
+        def mutator(view):
+            existing = view.read("outbox", event_id)
+            if isinstance(existing, dict):
+                return existing
+            current = view.read(kind, key)
+            if _revision(current) != begun["observed_revision"]:
+                view.abort()
+                return "conflict"
+            fence_id = _fence_key(kind, key)
+            fence = view.read("fence", fence_id)
+            if isinstance(fence, dict) and fence.get("state") == "open" and fence.get("event_id") != event_id:
+                view.abort()
+                return "conflict"
+            counter_key = "w05_task"
+            counter = view.read("producer", counter_key) or {"revision": 0, "next_seq": 1, "epoch": 1}
+            seq = int(counter.get("next_seq") or 1)
+            epoch = int(counter.get("epoch") or 1)
+            event["producer_seq"] = seq
+            event["stream_epoch"] = epoch
+            event["stream_id"] = "w05:task"
+            outbox = {
+                "event_id": event_id,
+                "revision": 1,
+                "delivery_state": "PENDING",
+                "authority": "W01",
+                "local_is_authority": False,
+                "event": event,
+                "receipt": None,
+                "scope": {"repo": begun["scope"]["repo"], "task_id": begun["scope"]["task_id"]},
+                "request_digest": begun["payload_hash"],
+                "operation_id": event_id,
+            }
+            view.stage("producer", counter_key, {
+                "revision": _revision(counter) + 1,
+                "next_seq": seq + 1,
+                "epoch": epoch,
+                "stream_id": "w05:task",
+            })
+            view.stage("outbox", event_id, outbox)
+            view.stage("fence", fence_id, {
+                "state": "open",
+                "event_id": event_id,
+                "revision": 1,
+                "object_revision": _revision(current),
+            })
+            return outbox
+
+        return self.store.mutate(mutator)
+
+    def _exact_receipt(self, event, response):
+        if not isinstance(response, dict) or response.get("applied") is not True:
+            return None
+        if response.get("blocked") or response.get("fact_state") != "ACCEPTED":
+            return None
+        receipt = response.get("receipt")
+        if not isinstance(receipt, dict):
+            return None
+        if (
+            receipt.get("event_id") != event.get("event_id")
+            or receipt.get("producer_seq") != event.get("producer_seq")
+            or receipt.get("stream_id") != event.get("stream_id")
+            or receipt.get("stream_epoch") != event.get("stream_epoch")
+        ):
+            return None
+        body = dict(receipt)
+        body["authority"] = "W01"
+        body["w01_proof"] = False
+        body["test_double"] = True
+        body["fact_state"] = "ACCEPTED"
+        return body
+
+    def _receipt_from_query(self, event, queried):
+        if not isinstance(queried, dict) or queried.get("blocked") or queried.get("classification") == "unknown":
+            return None
+        for item in queried.get("items") or []:
+            if item.get("event_id") != event.get("event_id"):
+                continue
+            if (
+                item.get("producer_seq") != event.get("producer_seq")
+                or item.get("stream_id") != event.get("stream_id")
+                or item.get("stream_epoch") != event.get("stream_epoch")
+            ):
+                return None
+            return {
+                "authority": "W01",
+                "event_id": item["event_id"],
+                "stream_id": item["stream_id"],
+                "stream_epoch": item["stream_epoch"],
+                "producer_seq": item["producer_seq"],
+                "fact_state": "ACCEPTED",
+                "test_double": True,
+                "w01_proof": False,
+            }
+        return None
+
+    def _dispatch(self, event):
+        queried = self.events.query(
+            stream_id=event["stream_id"],
+            stream_epoch=event["stream_epoch"],
+            after_seq=0,
+            limit=10,
+            event_id=event["event_id"],
+        )
+        receipt = self._receipt_from_query(event, queried)
+        if receipt is not None:
+            return receipt
+        if not isinstance(queried, dict) or queried.get("classification") != "absent":
+            return None
+        appended = self.events.append(event)
+        return self._exact_receipt(event, appended)
+
+    def _commit_event(self, begun, event_type, pairs, public, state, **fields):
+        event_id = "evt_" + _hash({
+            "idem": begun["idem_key"],
+            "event_type": event_type,
+            "payload": begun["payload_hash"],
+            "object": begun["object_id"],
+            "kind": begun["object_kind"],
+        })[:40]
         event = {
+            "event_id": event_id,
+            "schema_version": 2,
             "event_type": event_type,
             "event_class": "task",
+            "repo_id": begun["scope"]["repo"],
+            "producer_id": "w05",
+            "stream_id": "w05:task",
+            "stream_epoch": 1,
+            "occurred_at": self.clock(),
+            "idempotency_key": begun["idem_key"],
             "operation": begun["operation"],
-            "state": doc.get("state", doc.get("phase")),
+            "state": state,
+            "task_id": begun["scope"]["task_id"],
+            "run_id": fields.get("run_id") or ("run_" + str(begun["object_id"])),
+            "attempt": 1,
+            "revision": pairs[0][2].get("revision", 1) if pairs and isinstance(pairs[0][2], dict) else 1,
+            "stage": state,
+            "app_id": "base",
+            "host_id": None,
             "test_double": True,
             "w01_proof": False,
         }
-        event.update(fields)
-        appended = self.events.append(event)
-        if not isinstance(appended, dict) or appended.get("blocked") or not appended.get("applied"):
+        event.update({key: value for key, value in fields.items() if key != "received_at"})
+        staged = self._stage_outbox(begun, event)
+        if staged == "conflict":
+            return _denied(409, "CONFLICT_REVISION", state, {"reason": "cas"})
+        if not isinstance(staged, dict):
             self._trace("event.pending", event_type=event_type, applied=False)
             return False
+        receipt = self._dispatch(staged["event"])
+        if receipt is None:
+            self._trace("event.pending", event_type=event_type, applied=False)
+            return False
+        committed = dict(begun)
+        committed["event_id"] = event_id
+        committed["receipt"] = receipt
+        failed = self._commit_local(committed, pairs, public, state)
+        if failed is not None:
+            return failed
         return True
 
     def _trace(self, action, **fields):
+        repo = getattr(self._local, "repo", None)
+        task = getattr(self._local, "task", None)
+        if repo and "repo_id" not in fields:
+            fields["repo_id"] = repo
+        if task and "task_id" not in fields:
+            fields["task_id"] = task
         fields["action"] = action
         fields["at"] = self.clock()
         fields["production"] = False

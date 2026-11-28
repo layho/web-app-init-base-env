@@ -6,6 +6,8 @@ proof, and they do not authorize production publish or runtime user acceptance.
 
 import ast
 import json
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -62,6 +64,42 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.actor = {"kind": "test", "id": "fixture", "proof_ref": "test-proof://w05/fixture"}
         self.scope = {"repo": "layho/web-app-init-base-env", "task_id": "tsk_w05"}
 
+    def _scope(self, task_id=None):
+        scope = dict(self.scope)
+        if task_id is not None:
+            scope["task_id"] = task_id
+        return scope
+
+    def _feedback(self, feedback_id):
+        return self.svc.feedback(feedback_id, actor=self.actor, scope=self.scope)
+
+    def _arm_acceptance(self, task_id, chain_id, decision):
+        chain = self._read_chain(task_id, chain_id)
+        self.schedule.evidence_state[chain["candidate_id"]] = {
+            "valid": True,
+            "known": True,
+            "candidate_id": chain["candidate_id"],
+            "head": chain["head"],
+            "base": chain["base"],
+            "merge": chain["merge"],
+            "tree": chain["tree"],
+            "passed": decision == "accepted",
+        }
+        self.auth.acceptances[chain["candidate_id"]] = {
+            "decision": decision,
+            "candidate_id": chain["candidate_id"],
+            "task_id": task_id,
+            "chain_id": chain_id,
+            "repo": chain["repo_id"],
+            "head": chain["head"],
+            "base": chain["base"],
+            "merge": chain["merge"],
+            "tree": chain["tree"],
+            "principal_id": self.actor["id"],
+            "test_double": True,
+        }
+        return chain
+
     def _service(self, **ports):
         values = {
             "auth": self.auth,
@@ -114,7 +152,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
     def _claim_task(self, task_id="tsk_w05", chains=None, feedback_ids=None, key="claim-task"):
         result = self.svc.claim_task(
             actor=self.actor,
-            scope=self.scope,
+            scope=self._scope(task_id),
             task_id=task_id,
             feedback_ids=feedback_ids or [],
             chains=chains if chains is not None else [self._chain("ch_a", "a", pr_number=11)],
@@ -131,7 +169,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         chain = self._read_chain(task_id, chain_id)
         result = self.svc.bind_test_evidence(
             actor=self.actor,
-            scope=self.scope,
+            scope=self._scope(task_id),
             task_id=task_id,
             chain_id=chain_id,
             head=chain["head"],
@@ -159,7 +197,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         }
         result = self.svc.apply_observation(
             actor=self.actor,
-            scope=self.scope,
+            scope=self._scope(task_id),
             task_id=task_id,
             chain_id=chain_id,
             idempotency_key=key,
@@ -180,9 +218,10 @@ class IsolatedDeliveryTest(unittest.TestCase):
 
     def _to_published(self, task_id, chain_id, decision="accepted"):
         chain = self._to_accepting(task_id, chain_id)
+        self._arm_acceptance(task_id, chain_id, decision)
         recorded = self.svc.record_acceptance(
             actor=self.actor,
-            scope=self.scope,
+            scope=self._scope(task_id),
             task_id=task_id,
             chain_id=chain_id,
             signer_kind="user_acceptance",
@@ -209,7 +248,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertFalse(missing.ok)
         self.assertEqual(missing.code, "CREDENTIAL_ABSENT")
         self.assertEqual(self.remote.calls, [])
-        self.assertIsNone(self.svc.feedback("fb_ok")["issue_number"])
+        self.assertIsNone(self._feedback("fb_ok")["issue_number"])
 
         synced = self._sync(key="sync-rows", expected_revision=1)
         self.assertTrue(synced.ok, synced.as_dict())
@@ -217,8 +256,8 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertEqual(by_id["fb_fail"]["state"], "FAILED")
         self.assertEqual(by_id["fb_ok"]["state"], "SYNCED")
         self.assertTrue(by_id["fb_ok"]["created"])
-        self.assertIsNotNone(self.svc.feedback("fb_ok")["issue_number"])
-        self.assertIsNone(self.svc.feedback("fb_fail")["issue_number"])
+        self.assertIsNotNone(self._feedback("fb_ok")["issue_number"])
+        self.assertIsNone(self._feedback("fb_fail")["issue_number"])
         creates = [call for call in self.remote.calls if call[0] == "create"]
         self.assertEqual(creates, [("create", "fb_fail"), ("create", "fb_ok")])
 
@@ -226,15 +265,15 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self._submit("fb_dup")
         first = self._sync(key="sync-dup")
         self.assertTrue(first.ok, first.as_dict())
-        number = self.svc.feedback("fb_dup")["issue_number"]
-        row = self.svc.feedback("fb_dup")
+        number = self._feedback("fb_dup")["issue_number"]
+        row = self._feedback("fb_dup")
         row["state"] = "PENDING"
         self.svc.store.write("feedback", "fb_dup", row)
         cursor = self.svc.store.read("cursor", "outbound")
         second = self._sync(key="sync-dup-2", expected_revision=cursor["revision"])
         self.assertTrue(second.ok, second.as_dict())
         self.assertFalse(second.body["results"][0]["created"])
-        self.assertEqual(self.svc.feedback("fb_dup")["issue_number"], number)
+        self.assertEqual(self._feedback("fb_dup")["issue_number"], number)
         self.assertEqual([call for call in self.remote.calls if call[0] == "create"], [("create", "fb_dup")])
 
         other = {"kind": "test", "id": "other", "proof_ref": "test-proof://w05/other"}
@@ -251,7 +290,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertFalse(hijack.ok)
         self.assertEqual(hijack.code, "NOT_AUTHORIZED")
         self.assertEqual(hijack.body["reason"], "cross_author")
-        self.assertEqual(self.svc.feedback("fb_dup")["body"], "body-fb_dup")
+        self.assertEqual(self._feedback("fb_dup")["body"], "body-fb_dup")
 
         self._submit("fb_owned")
         self.remote.issues["fb_owned"] = {
@@ -264,7 +303,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         owned = self._sync(key="sync-owned", expected_revision=cursor["revision"])
         owned_row = {row["feedback_id"]: row for row in owned.body["results"]}["fb_owned"]
         self.assertEqual(owned_row["reason"], "cross_author")
-        self.assertIsNone(self.svc.feedback("fb_owned")["issue_number"])
+        self.assertIsNone(self._feedback("fb_owned")["issue_number"])
         self.assertNotIn(("create", "fb_owned"), self.remote.calls)
 
     def test_f02_row_claim_fence(self):
@@ -308,7 +347,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self._submit("fb_notes")
         synced = self._sync(key="sync-notes")
         self.assertTrue(synced.ok, synced.as_dict())
-        number = self.svc.feedback("fb_notes")["issue_number"]
+        number = self._feedback("fb_notes")["issue_number"]
         self.remote.comments[number] = [
             {"comment_id": "c2", "seq": 2, "author_id": "fixture", "body": "new", "status": "coding"},
             {"comment_id": "c1", "seq": 1, "author_id": "fixture", "body": "old", "status": "stale"},
@@ -327,7 +366,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         reasons = {item["comment_id"]: item["reason"] for item in inbound.body["rejected_comments"]}
         self.assertEqual(reasons["c2"], "payload_mismatch")
         self.assertEqual(reasons["c9"], "cross_author")
-        self.assertNotEqual(self.svc.feedback("fb_notes")["progress_status"], "accepted")
+        self.assertNotEqual(self._feedback("fb_notes")["progress_status"], "accepted")
 
     def test_f03_batch_and_page_budget_do_not_drop_or_pretend_complete(self):
         for feedback_id in ("fb_a", "fb_b", "fb_c"):
@@ -345,14 +384,14 @@ class IsolatedDeliveryTest(unittest.TestCase):
         rest = self._sync(key="sync-rest", expected_revision=cursor["revision"])
         self.assertTrue(rest.ok, rest.as_dict())
         self.assertIsNone(rest.body["continuation"])
-        number = self.svc.feedback("fb_a")["issue_number"]
+        number = self._feedback("fb_a")["issue_number"]
         self.remote.comments[number] = [
             {"comment_id": "p1", "seq": 1, "author_id": "fixture", "body": "one", "status": "noted"},
             {"comment_id": "p2", "seq": 2, "author_id": "fixture", "body": "two", "status": "later"},
         ]
         partial = self.svc.sync_inbound(
             actor=self.actor, scope=self.scope, feedback_id="fb_a",
-            idempotency_key="in-partial", expected_revision=self.svc.feedback("fb_a")["revision"],
+            idempotency_key="in-partial", expected_revision=self._feedback("fb_a")["revision"],
             page_budget=1, per_page=1,
         )
         self.assertFalse(partial.ok)
@@ -409,8 +448,8 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertEqual(closed.body["state"], "close")
         self.assertFalse(closed.body["runtime_closed"])
         self.assertFalse(closed.body["production_publish_authorized"])
-        self.assertTrue(self.svc.feedback("fb_multi")["closed"])
-        view = self.svc.project(actor=self.actor, task_id="tsk_w05")
+        self.assertTrue(self._feedback("fb_multi")["closed"])
+        view = self.svc.project(actor=self.actor, scope=self.scope, task_id="tsk_w05")
         self.assertEqual(view.body["milestone_source"], "required_chains")
         self.assertFalse(view.body["single_developer_pr_decides_task"])
         self.assertEqual(len(view.body["chains"]), 2)
@@ -422,7 +461,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         ], key="claim-fail")
         self._bind("tsk_w05", "ch_live", passed=False, key="bind-live-fail")
         self._bind("tsk_w05", "ch_old", passed=False, key="bind-old-fail")
-        view = self.svc.project(actor=self.actor, task_id="tsk_w05")
+        view = self.svc.project(actor=self.actor, scope=self.scope, task_id="tsk_w05")
         self.assertEqual([row["chain_id"] for row in view.body["failures"]], ["ch_live"])
 
     def test_f07_tuple_change_invalidates_evidence(self):
@@ -486,7 +525,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self._claim_task(chains=[self._chain(
             "ch_a", "a", legacy_overall_status="accepted", historical_blocked=True,
         )], key="claim-legacy")
-        view = self.svc.project(actor=self.actor, task_id="tsk_w05")
+        view = self.svc.project(actor=self.actor, scope=self.scope, task_id="tsk_w05")
         chain = view.body["chains"][0]
         self.assertIsNone(chain["acceptance_decision"])
         self.assertFalse(chain["fell_back_to_legacy_accepted"])
@@ -514,7 +553,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
     def test_f07_rejection_stays_rejected(self):
         self._claim_task(key="claim-reject")
         self._to_accepting("tsk_w05", "ch_a")
-        chain = self._read_chain("tsk_w05", "ch_a")
+        chain = self._arm_acceptance("tsk_w05", "ch_a", "rejected")
         rejected = self.svc.record_acceptance(
             actor=self.actor, scope=self.scope, task_id="tsk_w05", chain_id="ch_a",
             signer_kind="user_acceptance", decision="rejected",
@@ -629,7 +668,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
             idempotency_key="reconcile-missing", expected_revision=1,
         )
         self.assertEqual(guessed.code, "SIDE_EFFECT_UNKNOWN")
-        self.assertEqual(self.svc.feedback("fb_unknown")["state"], "UNKNOWN")
+        self.assertEqual(self._feedback("fb_unknown")["state"], "UNKNOWN")
         self.remote.reconcile_result[operation_id] = {"classification": "absent", "operation_id": operation_id}
         reconciled = self.svc.reconcile_operation(
             actor=self.actor, scope=self.scope, operation_id=operation_id,
@@ -638,7 +677,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertTrue(reconciled.ok, reconciled.as_dict())
         self.assertEqual(reconciled.body["state"], "RETRY_WAIT")
         self.assertFalse(reconciled.body["same_run_resumed"])
-        self.assertEqual(self.svc.feedback("fb_unknown")["state"], "RETRY_WAIT")
+        self.assertEqual(self._feedback("fb_unknown")["state"], "RETRY_WAIT")
         same_run = self.svc.retry_operation(
             actor=self.actor, scope=self.scope, operation_id=operation_id,
             idempotency_key="retry-same-run", expected_revision=reconciled.body["revision"],
@@ -649,7 +688,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
         continued = self.svc.continue_after_absent(
             actor=self.actor, scope=self.scope, feedback_id="fb_unknown",
             idempotency_key="continue-new-run",
-            expected_revision=self.svc.feedback("fb_unknown")["revision"],
+            expected_revision=self._feedback("fb_unknown")["revision"],
             credential_present=True,
         )
         self.assertTrue(continued.ok, continued.as_dict())
@@ -661,7 +700,7 @@ class IsolatedDeliveryTest(unittest.TestCase):
             [call for call in self.remote.calls if call[0] == "create"],
             [("create", "fb_unknown"), ("create", "fb_unknown")],
         )
-        actions = [item["action"] for item in self.svc.traces()]
+        actions = [item["action"] for item in self.svc.traces(actor=self.actor, scope=self.scope)]
         self.assertIn("operation.reconcile", actions)
         self.assertIn("feedback.continue", actions)
 
@@ -688,13 +727,13 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertTrue(ack.body["acceptance_issue_closed"])
         self.assertFalse(ack.body["feedback_closed"])
         self.assertFalse(ack.body["business_feedback_closed_by_acknowledge"])
-        self.assertFalse(self.svc.feedback("fb_ack")["closed"])
+        self.assertFalse(self._feedback("fb_ack")["closed"])
         self.assertEqual(self.svc.store.read("task", "tsk_w05")["phase"], "claim")
 
     def test_r08_repair_does_not_forge_acceptance(self):
         self._claim_task(chains=[self._chain("ch_a", "a", draft=True)], key="claim-repair")
         self._to_accepting("tsk_w05", "ch_a")
-        chain = self._read_chain("tsk_w05", "ch_a")
+        chain = self._arm_acceptance("tsk_w05", "ch_a", "rejected")
         rejected = self.svc.record_acceptance(
             actor=self.actor, scope=self.scope, task_id="tsk_w05", chain_id="ch_a",
             signer_kind="user_acceptance", decision="rejected",
@@ -820,6 +859,342 @@ class IsolatedDeliveryTest(unittest.TestCase):
                 for name in names:
                     for item in banned:
                         self.assertNotIn(item, name)
+
+    def test_p0_intent_before_create_and_missing_local_is_not_absence(self):
+        self._submit("fb_intent")
+        seen = {}
+
+        def create_issue(payload):
+            seen["record"] = self.svc.store.read("operation", payload["operation_id"])
+            seen["payload"] = dict(payload)
+            return FixtureRemote.create_issue(self.remote, payload)
+
+        self.remote.create_issue = create_issue
+        synced = self._sync(key="sync-intent")
+        self.assertTrue(synced.ok, synced.as_dict())
+        record = seen["record"]
+        self.assertIsNotNone(record)
+        self.assertEqual(record["state"], "INTENT")
+        self.assertEqual(record["scope"], {"repo": self.scope["repo"], "task_id": self.scope["task_id"]})
+        self.assertTrue(record.get("request_digest"))
+        self.assertEqual(seen["payload"].get("request_digest"), record["request_digest"])
+        self.assertFalse(record.get("github_proof", False))
+
+        self._submit("fb_gap")
+        adopted = {}
+
+        def reconcile(operation_id):
+            adopted["operation_id"] = operation_id
+            return {
+                "ok": True,
+                "blocked": False,
+                "classification": "succeeded",
+                "operation_id": operation_id,
+                "issue_number": 77,
+                "author_id": "fixture",
+                "feedback_id": "fb_gap",
+                "test_double": True,
+                "github_proof": False,
+            }
+
+        self.remote.reconcile = reconcile
+        self.remote.calls.clear()
+        cursor = self.svc.store.read("cursor", "outbound")
+        gap = self._sync(key="sync-gap", expected_revision=cursor["revision"])
+        self.assertTrue(gap.ok, gap.as_dict())
+        self.assertEqual([call for call in self.remote.calls if call[0] == "create"], [])
+        self.assertTrue(adopted.get("operation_id"))
+        stored = self.svc.store.read("feedback", "fb_gap")
+        self.assertEqual(stored["state"], "SYNCED")
+        self.assertEqual(stored["issue_number"], 77)
+        self.assertFalse(stored.get("github_proof", False))
+
+    def test_p0_crash_after_remote_success_does_not_create_again(self):
+        self._submit("fb_crash")
+        numbers = {}
+
+        def create_issue(payload):
+            result = FixtureRemote.create_issue(self.remote, payload)
+            self.remote.issues.pop(payload["feedback_id"], None)
+            numbers["issue"] = result["number"]
+            self.remote.reconcile_result[payload["operation_id"]] = {
+                "classification": "succeeded",
+                "operation_id": payload["operation_id"],
+                "issue_number": result["number"],
+                "author_id": payload["author_id"],
+                "feedback_id": payload["feedback_id"],
+            }
+            raise RuntimeError("crash before local result")
+
+        self.remote.create_issue = create_issue
+        with self.assertRaises(RuntimeError):
+            self._sync(key="sync-crash")
+        self.assertEqual(self.svc.store.read("feedback", "fb_crash")["state"], "PENDING")
+        self.assertIsNotNone(self.svc.store.read("operation", list(self.remote.reconcile_result)[0]))
+        self.remote.create_issue = lambda payload: FixtureRemote.create_issue(self.remote, payload)
+        self.remote.calls.clear()
+        cursor = self.svc.store.read("cursor", "outbound")
+        expected = 0 if cursor is None else cursor["revision"]
+        recovered = self._sync(key="sync-crash-recover", expected_revision=expected)
+        self.assertTrue(recovered.ok, recovered.as_dict())
+        self.assertEqual([call for call in self.remote.calls if call[0] == "create"], [])
+        stored = self.svc.store.read("feedback", "fb_crash")
+        self.assertEqual(stored["state"], "SYNCED")
+        self.assertEqual(stored["issue_number"], numbers["issue"])
+
+    def test_p0_concurrent_push_creates_once(self):
+        self._submit("fb_once")
+        row = self.svc.store.read("feedback", "fb_once")
+        row["state"] = "PENDING"
+        row["lease"] = None
+        self.svc.store.write("feedback", "fb_once", row)
+        entered = []
+        release = threading.Event()
+
+        def create_issue(payload):
+            entered.append(payload["feedback_id"])
+            if len(entered) == 1:
+                release.wait(2)
+            return FixtureRemote.create_issue(self.remote, payload)
+
+        self.remote.create_issue = create_issue
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def worker(key):
+            try:
+                barrier.wait(2)
+                self.svc.sync_outbound(
+                    actor=self.actor, scope=self.scope, idempotency_key=key,
+                    credential_present=True, expected_revision=0,
+                )
+            except Exception as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=("sync-race-%s" % index,)) for index in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        release.set()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(entered, ["fb_once"])
+        self.assertEqual(self.svc.store.read("feedback", "fb_once")["state"], "SYNCED")
+
+    def test_p0_outbox_crash_recovers_exact_receipt_once(self):
+        class CrashEvents(FixtureEvents):
+            def __init__(self):
+                super().__init__()
+                self.crash = True
+                self.calls = 0
+
+            def append(self, event):
+                self.calls += 1
+                result = super().append(event)
+                if self.crash:
+                    raise RuntimeError("crash before local receipt")
+                return result
+
+        self.events = CrashEvents()
+        self.svc = self._service()
+        with self.assertRaises(RuntimeError):
+            self._submit("fb_evt")
+        self.assertIsNone(self.svc.store.read("feedback", "fb_evt"))
+        self.assertEqual(self.events.calls, 1)
+        self.events.crash = False
+        again = self._submit("fb_evt")
+        self.assertTrue(again.ok, again.as_dict())
+        self.assertEqual(self.events.calls, 1)
+        self.assertEqual(self.svc.store.read("feedback", "fb_evt")["state"], "PENDING")
+        receipts = [
+            item for item in self.svc.store.list("outbox")
+            if item.get("receipt") and item["receipt"].get("authority") == "W01"
+        ]
+        self.assertEqual(len(receipts), 1)
+        self.assertFalse(receipts[0].get("local_is_authority", False))
+        self.assertFalse(receipts[0]["receipt"].get("w01_proof", False))
+
+    def test_p0_concurrent_claim_is_cas_and_does_not_duplicate_events(self):
+        self._submit("fb_cas")
+        original = self.svc.store.read
+        reads = {"n": 0}
+
+        def slow_read(kind, key):
+            value = original(kind, key)
+            if kind == "feedback" and key == "fb_cas":
+                reads["n"] += 1
+                if reads["n"] <= 2:
+                    time.sleep(0.2)
+            return value
+
+        self.svc.store.read = slow_read
+        barrier = threading.Barrier(2)
+        results = []
+
+        def worker(key):
+            barrier.wait(2)
+            results.append(self.svc.claim_feedback_row(
+                actor=self.actor, scope=self.scope, feedback_id="fb_cas",
+                idempotency_key=key, expected_revision=1,
+            ))
+
+        threads = [threading.Thread(target=worker, args=("cas-%s" % index,)) for index in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(1 for result in results if result.ok and not result.replayed), 1)
+        self.assertEqual(sum(1 for result in results if result.code == "CONFLICT_REVISION"), 1)
+        self.assertEqual(self.svc.store.read("feedback", "fb_cas")["revision"], 2)
+        claimed = [
+            event for event in self.events.events
+            if event.get("event_type") == "feedback.claimed"
+        ]
+        self.assertEqual(len(claimed), 1)
+
+    def test_p0_local_commit_is_atomic(self):
+        self.svc.store.crash_before_commit = True
+        with self.assertRaises(RuntimeError):
+            self._submit("fb_atomic")
+        self.assertIsNone(self.svc.store.read("feedback", "fb_atomic"))
+        self.assertEqual(self.svc.store.list("idem"), [])
+        self.assertEqual(self.svc.store.list("outbox"), [])
+        self.svc.store.crash_before_commit = False
+        created = self._submit("fb_atomic")
+        self.assertTrue(created.ok, created.as_dict())
+        self.assertEqual(self.svc.store.read("feedback", "fb_atomic")["revision"], 1)
+
+    def test_p0_cross_repo_forged_scope_batch_and_unauthenticated_reads(self):
+        self._claim_task(key="claim-bind-scope")
+        self._bind("tsk_w05", "ch_a", key="bind-scope")
+        forged_task = dict(self.scope)
+        forged_task["task_id"] = "tsk_other"
+        forged = self.svc.coordinate(
+            actor=self.actor, scope=forged_task, task_id="tsk_w05", chain_id="ch_a",
+            action="merge", idempotency_key="forged-scope",
+            expected_revision=self._read_chain("tsk_w05", "ch_a")["revision"],
+        )
+        self.assertEqual(forged.code, "NOT_AUTHORIZED")
+        self.assertEqual(self.schedule.reservations, [])
+        self.assertEqual(self._read_chain("tsk_w05", "ch_a")["state"], "INTEGRATING")
+        forged_repo = dict(self.scope)
+        forged_repo["repo"] = "other/repo"
+        cross = self.svc.coordinate(
+            actor=self.actor, scope=forged_repo, task_id="tsk_w05", chain_id="ch_a",
+            action="deploy", idempotency_key="cross-repo",
+            expected_revision=self._read_chain("tsk_w05", "ch_a")["revision"],
+        )
+        self.assertEqual(cross.code, "NOT_AUTHORIZED")
+        self.assertEqual(self.deploy.plans, [])
+
+        self._submit("fb_local")
+        local = self.svc.store.read("feedback", "fb_local")
+        foreign = dict(local)
+        foreign["feedback_id"] = "fb_foreign"
+        foreign["repo_id"] = "other/repo"
+        foreign["body"] = "foreign-body"
+        foreign["scope_task_id"] = "tsk_other"
+        self.svc.store.write("feedback", "fb_foreign", foreign)
+        cursor = self.svc.store.read("cursor", "outbound")
+        expected = 0 if cursor is None else cursor["revision"]
+        synced = self._sync(key="sync-batch-iso", expected_revision=expected)
+        self.assertTrue(synced.ok, synced.as_dict())
+        created = [call for call in self.remote.calls if call[0] == "create"]
+        self.assertIn(("create", "fb_local"), created)
+        self.assertNotIn(("create", "fb_foreign"), created)
+        self.assertEqual(self.svc.store.read("feedback", "fb_foreign")["state"], "PENDING")
+        self.assertIsNone(getattr(self.svc, "feedback")("fb_local"))
+        self.assertEqual(getattr(self.svc, "traces")(), [])
+        hidden = getattr(self.svc, "project")(actor=self.actor, task_id="tsk_w05")
+        self.assertEqual(hidden.code, "NOT_AUTHORIZED")
+
+    def test_p0_author_binds_server_principal_not_actor_id(self):
+        class BoundAuth(FixtureAuth):
+            def authenticate(self, actor):
+                result = super().authenticate(actor)
+                result["principal_id"] = "server-principal"
+                return result
+
+        self.auth = BoundAuth()
+        self.svc = self._service()
+        denied = self.svc.submit_feedback(
+            actor=self.actor, scope=self.scope, author_id="fixture", feedback_id="fb_actor",
+            category="bug", body="actor-id", idempotency_key="principal-deny", expected_revision=0,
+        )
+        self.assertEqual(denied.code, "NOT_AUTHORIZED")
+        self.assertIsNone(self.svc.store.read("feedback", "fb_actor"))
+        allowed = self.svc.submit_feedback(
+            actor=self.actor, scope=self.scope, author_id="server-principal", feedback_id="fb_principal",
+            category="bug", body="server", idempotency_key="principal-allow", expected_revision=0,
+        )
+        self.assertTrue(allowed.ok, allowed.as_dict())
+        self.assertEqual(self.svc.store.read("feedback", "fb_principal")["author_id"], "server-principal")
+
+    def test_p0_acceptance_ignores_caller_decision_and_rejects_promotion(self):
+        self._claim_task(key="claim-accept-p0")
+        self._to_accepting("tsk_w05", "ch_a")
+        chain = self._read_chain("tsk_w05", "ch_a")
+        caller = self.svc.record_acceptance(
+            actor=self.actor, scope=self.scope, task_id="tsk_w05", chain_id="ch_a",
+            signer_kind="user_acceptance", decision="accepted",
+            idempotency_key="caller-only", expected_revision=chain["revision"],
+        )
+        self.assertFalse(caller.ok)
+        self.assertEqual(self._read_chain("tsk_w05", "ch_a")["state"], "ACCEPTING")
+        self.assertIsNone(self._read_chain("tsk_w05", "ch_a")["acceptance_decision"])
+
+        self.tmp.cleanup()
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.events = FixtureEvents()
+        self.schedule = FixtureSchedule()
+        self.deploy = FixtureDeploy()
+        self.remote = FixtureRemote()
+
+        class PromotingAuth(FixtureAuth):
+            def acceptance(self, principal_id, binding):
+                return {
+                    "ok": True,
+                    "allow": True,
+                    "blocked": False,
+                    "decision": "accepted",
+                    "signer_kind": "user_acceptance",
+                    "test_double": False,
+                    "runtime_acceptance": True,
+                    "github_proof": True,
+                    "macci_proof": True,
+                    "counts_as_runtime_user_acceptance": True,
+                    "candidate_id": binding.get("candidate_id"),
+                }
+
+        self.auth = PromotingAuth()
+        self.svc = self._service()
+        self._claim_task(key="claim-promote")
+        self._to_accepting("tsk_w05", "ch_a")
+        chain = self._read_chain("tsk_w05", "ch_a")
+        self.schedule.evidence_state[chain["candidate_id"]] = {
+            "valid": True,
+            "known": True,
+            "candidate_id": chain["candidate_id"],
+            "head": chain["head"],
+            "base": chain["base"],
+            "merge": chain["merge"],
+            "tree": chain["tree"],
+        }
+        promoted = self.svc.record_acceptance(
+            actor=self.actor, scope=self.scope, task_id="tsk_w05", chain_id="ch_a",
+            signer_kind="user_acceptance", decision="accepted",
+            idempotency_key="promote", expected_revision=chain["revision"],
+        )
+        self.assertFalse(promoted.ok)
+        self.assertFalse(promoted.body.get("counts_as_runtime_user_acceptance", False))
+        self.assertFalse(promoted.body.get("github_proof", False))
+        self.assertEqual(self._read_chain("tsk_w05", "ch_a")["state"], "ACCEPTING")
+        self.assertIsNone(self._read_chain("tsk_w05", "ch_a")["acceptance_decision"])
 
 
 if __name__ == "__main__":
