@@ -84,6 +84,46 @@ def _login(client):
     return response.json()["csrf_token"]
 
 
+class DeliveryReadTests(unittest.TestCase):
+    def test_task_identity_and_invalid_shape_are_not_projected(self):
+        from app.control_delivery.store import Journal
+        from app.control_joint.delivery_read import query_tasks
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            journal = Journal(root / "delivery")
+            base = {"repo_id": "repo", "app_id": "base", "phase": "claim", "revision": 1}
+            long_id = "tsk_" + "a" * 100
+            journal.write("task", long_id, {**base, "task_id": long_id})
+            journal.write("task", "spoof", {**base, "task_id": long_id})
+            journal.write("task", "invalid", {**base, "task_id": ["invalid"]})
+            journal.write("task", "bad_revision", {**base, "task_id": "bad_revision", "revision": False})
+            page = query_tasks(root, repo_id="repo", app_id="base",
+                               task_ids={long_id, "bad_revision"})
+            self.assertEqual(set(page["items"]), {long_id})
+            self.assertEqual(page["bad"], 3)
+            self.assertFalse(page["items"][long_id]["authoritative"])
+
+    def test_sparse_page_has_continuation_even_without_visible_rows(self):
+        from app.control_delivery.store import Journal
+        from app.control_joint.delivery_read import query_tasks
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            journal = Journal(root / "delivery")
+            for index in range(201):
+                key = f"tsk_{index:03}"
+                journal.write("task", key, {"task_id": key, "repo_id": "repo",
+                                          "app_id": "base", "phase": "claim", "revision": 1})
+            args = dict(repo_id="repo", app_id="base", task_ids={"tsk_200"})
+            first = query_tasks(root, **args)
+            self.assertEqual(first["items"], {})
+            self.assertTrue(first["truncated"])
+            second = query_tasks(root, after=first["next_cursor"], **args)
+            self.assertEqual(set(second["items"]), {"tsk_200"})
+            self.assertFalse(second["truncated"])
+
+
 class SurfaceTests(unittest.TestCase):
     def tearDown(self):
         app.dependency_overrides.clear()
