@@ -211,6 +211,37 @@ def report(eng, run_id, *, outcome, phase, note=None, **fields):
     return sign_report(eng, payload)
 
 
+def test_trusted_event_page_rejects_mismatched_physical_coordinates(tmp_path):
+    import sqlite3
+    from app.control_events.trusted_read import query_applied, query_exact_event
+
+    eng = engine(tmp_path)
+    appended = eng.append(task(eng))
+    assert appended["applied"] is True
+    args = dict(repo_id=eng.repo_id, app_id="base", task_ids={"tsk_w01"},
+                stream_id=None)
+    assert len(query_applied(eng.root, **args)["items"]) == 1
+    # Change a row coordinate without changing its signed payload or receipt.
+    with sqlite3.connect(eng.root / "events.sqlite3") as connection:
+        connection.execute("UPDATE events SET producer_seq=2 WHERE event_id='evt_task'")
+    page = query_applied(eng.root, **args)
+    assert page["items"] == []
+    assert page["bad"] == 1
+    assert query_exact_event(eng.root, event_id="evt_task", repo_id=eng.repo_id,
+                             app_id="base", task_id="tsk_w01") is None
+
+
+def test_trusted_event_page_rejects_dangling_database_symlink(tmp_path):
+    from app.control_events.trusted_read import query_applied, TrustedReadError
+
+    root = tmp_path.resolve()
+    args = dict(repo_id="repo", app_id="base", task_ids={"tsk_w01"}, stream_id=None)
+    assert query_applied(root, **args)["missing"] is True
+    (root / "events.sqlite3").symlink_to(root / "missing.sqlite3")
+    with pytest.raises(TrustedReadError):
+        query_applied(root, **args)
+
+
 def test_w05_intent_bridge_uses_signed_w01_evidence_without_business_commit(tmp_path):
     from app.control_joint.w05_issue import record_isolated_intent
 
