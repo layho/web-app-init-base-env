@@ -57,6 +57,12 @@ def _pending(code="INTERFACE_PENDING", state="BLOCKED", body=None):
     )
 
 
+def outbound_cursor_key(scope, principal):
+    """A cursor belongs to one authenticated subject and exact task scope."""
+    return "outbound_" + _hash({"repo": scope["repo"], "app_id": _ISOLATED_APP,
+                                "task_id": scope["task_id"], "principal": principal})
+
+
 def operation_id_for(scope, kind, request):
     scope_exact = {"repo": scope["repo"], "task_id": scope["task_id"]}
     digest = _hash({"scope": scope_exact, "kind": kind, "request": request})
@@ -292,6 +298,7 @@ class DeliveryService:
         )
         if isinstance(begun, Result):
             return begun
+        cursor_key = begun["object_id"]
         if not credential_present:
             self._trace("feedback.sync_out", state="BLOCKED", reason="credential_absent")
             public = {
@@ -306,8 +313,11 @@ class DeliveryService:
             cursor["state"] = "BLOCKED"
             cursor["repo_id"] = scope["repo"]
             cursor["scope_task_id"] = scope["task_id"]
+            cursor["app_id"] = _ISOLATED_APP
+            cursor["principal_id"] = begun["principal"]
+            public["cursor_revision"] = cursor["revision"]
             failed = self._commit_local(
-                begun, [("cursor", "outbound", cursor, begun["observed_revision"])], public, "BLOCKED",
+                begun, [("cursor", cursor_key, cursor, begun["observed_revision"])], public, "BLOCKED",
             )
             if isinstance(failed, Result):
                 return failed
@@ -348,8 +358,11 @@ class DeliveryService:
         cursor["retained_ids"] = sorted(row["feedback_id"] for row in self._scoped_feedback(scope, begun["principal"]))
         cursor["repo_id"] = scope["repo"]
         cursor["scope_task_id"] = scope["task_id"]
+        cursor["app_id"] = _ISOLATED_APP
+        cursor["principal_id"] = begun["principal"]
+        public["cursor_revision"] = cursor["revision"]
         failed = self._commit_local(
-            begun, [("cursor", "outbound", cursor, begun["observed_revision"])], public, "SYNCED",
+            begun, [("cursor", cursor_key, cursor, begun["observed_revision"])], public, "SYNCED",
         )
         if isinstance(failed, Result):
             return failed
@@ -2022,7 +2035,16 @@ class DeliveryService:
         ):
             self._trace("auth.denied", operation=operation, stage="authenticate")
             return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"operation": operation})
+        if kind == "cursor":
+            if object_id != "outbound":
+                return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "cursor_kind"})
+            object_id = outbound_cursor_key(scope, principal)
         doc = self.store.read(kind, object_id)
+        if kind == "cursor" and doc is not None:
+            if (not isinstance(doc, dict) or doc.get("principal_id") != principal
+                    or doc.get("repo_id") != scope["repo"] or doc.get("scope_task_id") != scope["task_id"]
+                    or doc.get("app_id") != _ISOLATED_APP):
+                return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "cursor_binding"})
         mismatch = self._object_mismatch(scope, kind, doc, payload)
         if mismatch:
             self._trace("auth.denied", operation=operation, stage="object", reason=mismatch)
