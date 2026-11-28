@@ -11,10 +11,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 import stat
 from contextlib import contextmanager
 from pathlib import Path
+
+from app.control_diagnostics.safe_io import open_root, open_directory, replace_bytes
 
 try:
     import fcntl
@@ -40,10 +41,50 @@ class Journal:
             raise ValueError("unsafe key")
         if kind in {".", ".."} or key in {".", ".."}:
             raise ValueError("unsafe journal name")
-        path = (self.root / kind / (key + ".json")).resolve()
-        if path.parent != (self.root / kind).resolve():
-            raise ValueError("path escape")
+        folder = self.root / kind
+        try:
+            info = folder.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("unsafe journal directory")
+        path = folder / (key + ".json")
+        try:
+            self._check_record(path.lstat())
+        except FileNotFoundError:
+            pass
         return path
+
+    @staticmethod
+    def _check_record(info):
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.getuid() or info.st_mode & 0o022):
+            raise ValueError("unsafe journal record")
+
+    @contextmanager
+    def _parent_fd(self, path, *, create=False):
+        root_fd = open_root(self.root)
+        folder_fd = None
+        try:
+            if path.parent == self.root:
+                yield root_fd
+                return
+            if path.parent.parent != self.root:
+                raise ValueError("unsafe journal parent")
+            kind = path.parent.name
+            if create:
+                try:
+                    os.mkdir(kind, mode=0o700, dir_fd=root_fd)
+                    os.fsync(root_fd)
+                except FileExistsError:
+                    pass
+            folder_fd = open_directory(root_fd, kind)
+            yield folder_fd
+        finally:
+            if folder_fd is not None:
+                os.close(folder_fd)
+            os.close(root_fd)
 
     @contextmanager
     def _locked(self):
@@ -60,22 +101,15 @@ class Journal:
             os.close(fd)
 
     def _replace_durable(self, path, payload):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._sync_dir(path.parent.parent if path.parent != self.root else self.root)
-        fd, temporary = tempfile.mkstemp(prefix=".journal-", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            self._sync_dir(path.parent)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        with self._parent_fd(path, create=True) as fd:
+            try:
+                self._check_record(os.lstat(path.name, dir_fd=fd))
+            except FileNotFoundError:
+                pass
+            replace_bytes(fd, path.name, payload.encode("utf-8"))
 
     def _recover_pending(self, *, inject=False):
-        if not self._pending_path.exists():
+        if not os.path.lexists(self._pending_path):
             return
         pending = self._read_path(self._pending_path)
         if not isinstance(pending, dict) or pending.get("version") != 1 or not isinstance(pending.get("writes"), list):
@@ -129,28 +163,29 @@ class Journal:
             return result
 
     def _read_path(self, path):
-        if not path.exists():
+        try:
+            with self._parent_fd(path) as parent:
+                fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                             dir_fd=parent)
+                try:
+                    self._check_record(os.fstat(fd))
+                    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                        fd = None
+                        return json.load(handle)
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+        except FileNotFoundError:
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
 
     def write(self, kind, key, doc):
-        path = self._path(kind, key)
         payload = json.dumps(doc, sort_keys=True, indent=2) + "\n"
         with self._locked():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(payload, encoding="utf-8")
-            os.replace(temporary, path)
+            self._replace_durable(self._path(kind, key), payload)
 
     def list(self, kind):
-        folder = self.root / kind
         with self._locked():
-            if not folder.is_dir():
-                return []
-            docs = []
-            for path in sorted(folder.glob("*.json")):
-                docs.append(json.loads(path.read_text(encoding="utf-8")))
-            return docs
+            return _View(self).list(kind)
 
     def append_trace(self, entry):
         path = self.root / "trace.jsonl"
