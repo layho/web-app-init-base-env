@@ -282,7 +282,8 @@ def test_w05_signed_business_actor_is_independent_of_event_signer(tmp_path):
                    schedule=BlockedSchedule(), deploy=BlockedDeploy(), clock=ServerClock(),
                    intent_engine=eng, intent_signer=lambda body: sign_event(eng, body, signer="w05"),
                    require_business_signature=True)
-    root = tmp_path / "signed-business"
+    receipt_root = tmp_path / "signed-business"
+    root = receipt_root / "delivery"
     svc = DeliveryService(root, **options)
 
     def submit(feedback_id, key, *, signer="fixture", nonce="business-nonce", task_id="tsk_w01",
@@ -320,12 +321,40 @@ def test_w05_signed_business_actor_is_independent_of_event_signer(tmp_path):
     assert outbox["business_auth"]["principal_id"] == "fixture"
     assert outbox["receipt"]["isolated_signature_verified"] is True
     assert outbox["receipt"]["production_effective"] is False
+    from app.control_joint.receipts import verify_isolated_business_commit
+
+    event_id = outbox["event_id"]
+    witness = svc.store.read("business-commit", event_id)
+    auth = outbox["business_auth"]
+    args = dict(events_root=eng.root.resolve(), event_id=event_id,
+                repo_id=eng.repo_id, app_id="base", task_id="tsk_w01",
+                request_digest=witness["request_digest"], expected_revision=0)
+
+    def verify():
+        return verify_isolated_business_commit(receipt_root.resolve(), **args)
+
+    verified = verify()
+    assert verified["status"] == "verified_isolated", verified
+    assert verified["business_signature_verified"] is True
+    original = svc.store.read("business-proof", event_id)
+    forged = {**original, "signed": {**original["signed"],
+              "proof": {**original["signed"]["proof"], "signature": "00" * 64}}}
+    svc.store.write("business-proof", event_id, forged)
+    assert verify()["status"] == "unknown"
+    svc.store.write("business-proof", event_id, original)
+    nonce_path = root / "business-nonce" / (auth["nonce_key"] + ".json")
+    reservation = svc.store.read("business-nonce", auth["nonce_key"])
+    nonce_path.unlink()
+    assert verify()["status"] == "unknown"
+    svc.store.write("business-nonce", auth["nonce_key"], reservation)
+    assert verify()["status"] == "verified_isolated"
     with pytest.raises(ValueError, match="dedicated journal"):
         DeliveryService(root, **{**options, "require_business_signature": False})
     registry = load_state(eng.auth_path)
     registry["revoked_signers"].append("fixture")
     save_state(eng.auth_path, registry)
     assert not submit("fb_business", "business").ok
+    assert verify()["status"] == "unknown"
     assert eng.store.count("events") == 1
 
 
