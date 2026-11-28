@@ -130,7 +130,10 @@ def _limits():
 
 class DeliveryService:
     def __init__(self, root, *, auth, events, schedule, deploy, remote, clock,
-                 intent_engine=None, intent_signer=None):
+                 intent_engine=None, intent_signer=None, require_business_signature=False):
+        if type(require_business_signature) is not bool or (require_business_signature and intent_engine is None):
+            raise ValueError("signed business mode requires an isolated W01 engine")
+        self._require_business_signature = require_business_signature
         if (intent_engine is None) != (intent_signer is None):
             raise ValueError("isolated intent engine and signer must be configured together")
         if intent_engine is not None:
@@ -140,7 +143,8 @@ class DeliveryService:
                 raise ValueError("only a server-configured isolated W01 engine is supported")
         self._intent_engine = intent_engine
         self._intent_signer = intent_signer
-        self._intent_mode = "signed-isolated-v1" if intent_engine is not None else "fixture"
+        self._intent_mode = ("signed-business-v1" if require_business_signature else
+                             "signed-isolated-v1" if intent_engine is not None else "fixture")
         self.store = Journal(root)
         self.auth = auth
         self.events = events
@@ -1399,6 +1403,8 @@ class DeliveryService:
         return _ok("SUPERSEDED", public)
 
     def project(self, *, actor, task_id, scope=None):
+        if self._require_business_signature:
+            return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "business_read_unmapped"})
         if not isinstance(scope, dict) or not scope.get("repo") or not scope.get("task_id"):
             return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "scope"})
         authn = self.auth.authenticate(actor)
@@ -1490,6 +1496,8 @@ class DeliveryService:
             return lock
 
     def _read_allowed(self, actor, scope, kind, object_id, *, return_document=False):
+        if self._require_business_signature:
+            return False  # No signed business read mapping yet.
         if not isinstance(actor, dict) or not isinstance(scope, dict):
             return False
         if (not scope.get("repo") or not scope.get("task_id")
@@ -2028,24 +2036,36 @@ class DeliveryService:
             return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "scope"})
         if scope.get("app_id", _ISOLATED_APP) != _ISOLATED_APP:
             return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "cross_app"})
-        if not isinstance(expected_revision, int) or expected_revision < 0:
+        if type(expected_revision) is not int or expected_revision < 0:
             return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "expected_revision"})
         self._local.repo = scope["repo"]
         self._local.task = scope["task_id"]
-        authn = self.auth.authenticate(actor)
-        if not isinstance(authn, dict) or authn.get("blocked"):
-            return _pending(body={"operation": operation})
-        principal = authn.get("principal_id")
-        proof = str((actor or {}).get("proof_ref", ""))
-        if (
-            not authn.get("ok")
-            or (actor or {}).get("kind") != "test"
-            or not proof.startswith("test-proof://")
-            or not isinstance(principal, str)
-            or not principal
-        ):
-            self._trace("auth.denied", operation=operation, stage="authenticate")
-            return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"operation": operation})
+        business_auth = None
+        if self._require_business_signature:
+            if operation != "feedback.submit":
+                return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "business_operation_unmapped"})
+            from app.control_joint.w05_issue import verify_feedback_submit
+            business_auth = verify_feedback_submit(
+                self._intent_engine, signed=actor, scope=scope, payload=payload,
+                idempotency_key=idempotency_key, expected_revision=expected_revision)
+            if business_auth is None:
+                return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "business_signature"})
+            principal = business_auth["principal_id"]
+        else:
+            authn = self.auth.authenticate(actor)
+            if not isinstance(authn, dict) or authn.get("blocked"):
+                return _pending(body={"operation": operation})
+            principal = authn.get("principal_id")
+            proof = str((actor or {}).get("proof_ref", ""))
+            if (
+                not authn.get("ok")
+                or (actor or {}).get("kind") != "test"
+                or not proof.startswith("test-proof://")
+                or not isinstance(principal, str)
+                or not principal
+            ):
+                self._trace("auth.denied", operation=operation, stage="authenticate")
+                return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"operation": operation})
         if kind == "cursor":
             if object_id != "outbound":
                 return _denied(422, "SCHEMA_UNSUPPORTED", "REJECTED", {"reason": "cursor_kind"})
@@ -2089,7 +2109,8 @@ class DeliveryService:
                 "production_publish_authorized": False,
                 "reason": "publish_not_authorized",
             })
-        authz = self.auth.authorize(actor, object_scope, operation, bound_candidate)
+        authz = ({"ok": True, "allow": True} if business_auth is not None else
+                 self.auth.authorize(actor, object_scope, operation, bound_candidate))
         if not isinstance(authz, dict) or authz.get("blocked"):
             return _pending(body={"operation": operation})
         if authz.get("ok") is not True or authz.get("allow") is not True:
@@ -2107,6 +2128,8 @@ class DeliveryService:
             "object_kind": kind,
             "object_id": object_id,
         }
+        if business_auth is not None:
+            begun["business_auth"] = business_auth
         if stop_before_idempotency:
             return begun
         idem_key = _hash({
@@ -2119,6 +2142,10 @@ class DeliveryService:
         payload_hash = _hash(payload)
         existing = self.store.read("idem", idem_key)
         if existing is not None:
+            if (existing.get("intent_mode") == "signed-business-v1" or business_auth is not None):
+                if (business_auth is None or existing.get("intent_mode") != self._intent_mode
+                        or existing.get("business_auth") != business_auth):
+                    return _denied(403, "NOT_AUTHORIZED", "REJECTED", {"reason": "business_replay_binding"})
             if existing["payload_hash"] != payload_hash:
                 return _denied(409, "IDEMPOTENCY_PAYLOAD_MISMATCH", existing.get("state", "REJECTED"))
             body = dict(existing["public"])
@@ -2155,6 +2182,10 @@ class DeliveryService:
             "public": {key: value for key, value in public.items() if key != "lease_token"},
         }
 
+        if begun.get("business_auth") is not None:
+            idem_body["intent_mode"] = self._intent_mode
+            idem_body["business_auth"] = begun["business_auth"]
+
         def mutator(view):
             owner = begun.get("event_id")
             if chain_snapshot is not None:
@@ -2190,7 +2221,8 @@ class DeliveryService:
                 if isinstance(outbox, dict):
                     outbox = dict(outbox)
                     outbox.pop("pending_lease", None)
-                    if outbox.get("intent_mode", "fixture") != self._intent_mode:
+                    if (outbox.get("intent_mode", "fixture") != self._intent_mode
+                            or outbox.get("business_auth") != begun.get("business_auth")):
                         view.abort()
                         return "conflict"
                     outbox["receipt"] = begun["receipt"]
@@ -2242,8 +2274,20 @@ class DeliveryService:
         key = begun["object_id"]
 
         def mutator(view):
+            business_auth = begun.get("business_auth")
+            if business_auth is not None:
+                nonce_key = business_auth["nonce_key"]
+                nonce = view.read("business-nonce", nonce_key)
+                reservation = {"event_id": event_id, "authorization_digest": business_auth["authorization_digest"]}
+                if nonce is not None and nonce != reservation:
+                    view.abort()
+                    return "conflict"
+                view.stage("business-nonce", nonce_key, reservation)
             existing = view.read("outbox", event_id)
             if isinstance(existing, dict):
+                if existing.get("business_auth") != business_auth:
+                    view.abort()
+                    return "conflict"
                 return existing
             plan = begun.get("change_plan")
             if not isinstance(plan, list) or not plan:
@@ -2280,6 +2324,8 @@ class DeliveryService:
                 "operation_id": event_id,
                 "change_plan": plan,
             }
+            if business_auth is not None:
+                outbox["business_auth"] = business_auth
             if "pending_lease" in begun:
                 outbox["pending_lease"] = begun["pending_lease"]
             view.stage("producer", counter_key, {
@@ -2351,7 +2397,7 @@ class DeliveryService:
         }
 
     def _dispatch(self, event):
-        if self._intent_mode == "signed-isolated-v1":
+        if self._intent_mode in {"signed-isolated-v1", "signed-business-v1"}:
             from app.control_joint.w05_issue import record_isolated_intent
             verified = record_isolated_intent(self._intent_engine, event=event,
                                               sign_request=self._intent_signer)
@@ -2467,6 +2513,7 @@ class DeliveryService:
                 or staged_event.get("note") != event["note"]
                 or staged.get("request_digest") != begun["payload_hash"]
                 or staged.get("intent_mode", "fixture") != self._intent_mode
+                or staged.get("business_auth") != begun.get("business_auth")
                 or staged.get("change_plan") != planned["change_plan"]):
             return _denied(409, "CONFLICT_REVISION", state, {"reason": "outbox_intent_mismatch"})
         event_digest = _hash(staged_event)
