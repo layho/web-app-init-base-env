@@ -25,7 +25,7 @@ test('rows keep the owner, time, and authority returned by the server', () => {
     history: [{event_id: 'evt_task', occurred_at: '2026-11-28T01:00:00Z', state: 'PENDING', authoritative: false}],
     failures: [{display: '日志失败', authoritative: false, at: '2026-11-28T01:02:00Z'}],
     actions: [
-      {id: 'unblock', enabled: true, calls_authority: true, task_id: 'tsk_w01'},
+      {id: 'unblock', enabled: true, calls_authority: true, connected_executor: true, task_id: 'tsk_w01'},
       {id: 'merge', enabled: false, calls_authority: true, code: 'NOT_AUTHORIZED'},
     ],
   }

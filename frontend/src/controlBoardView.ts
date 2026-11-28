@@ -12,7 +12,7 @@ type BoardBody = {
   history?: Array<{ event_id?: string; occurred_at?: string; state?: string; authoritative?: boolean }>
   failures?: Array<{ display?: string; text?: string; at?: string; authoritative?: boolean }>
   tests?: Array<{ task_id?: string; state?: string; authoritative?: boolean }>
-  actions?: Array<{ id?: string; label?: string; task_id?: string; enabled?: boolean; calls_authority?: boolean } | null>
+  actions?: Array<{ id?: string; label?: string; task_id?: string; enabled?: boolean; calls_authority?: boolean; connected_executor?: boolean } | null>
 } | null | undefined
 
 export type BoardTaskRow = {
@@ -80,7 +80,9 @@ export function testRows(body: unknown) {
 export function enabledActions(body: unknown) {
   const source = board(body)
   const actions = Array.isArray(source?.actions) ? source.actions : []
-  return actions.filter((action): action is NonNullable<typeof action> => Boolean(action && action.enabled === true && action.calls_authority === true))
+  return actions.filter((action): action is NonNullable<typeof action> => Boolean(
+    action && action.enabled === true && action.calls_authority === true && action.connected_executor === true
+  ))
 }
 
 export function emptyBecauseNoRows(body: unknown) {

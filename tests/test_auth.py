@@ -6,13 +6,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from app.db import Base, get_db
+from app.db import Base, get_db, serialize_sqlite
 from app.main import app
 from app.auth import COOKIE_NAME, hash_password
 
 @pytest.fixture
 def client(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    serialize_sqlite(engine)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     def db_override():
@@ -40,8 +41,15 @@ def test_login_and_csrf(client):
     assert client.get("/api/v1/feedback").status_code==200
     assert client.post("/api/v1/feedback",json={"category":"bug","message":"Auth regression feedback"},headers={"Origin":"https://webapp.example"}).status_code==403
     token = client.cookies[COOKIE_NAME]
+    # Starlette's TestClient keeps one cookie jar and one portal. Sharing that
+    # client across threads can send a request with no session cookie, and the
+    # server correctly answers 401. Two tabs are two clients with the same cookie.
+    def session_from(copy):
+        with TestClient(app, base_url="https://webapp.example") as tab:
+            tab.cookies.set(COOKIE_NAME, token, path="/api")
+            return tab.get("/api/session")
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first_tab, refreshed = pool.map(client.get, ["/api/session", "/api/session"])
+        first_tab, refreshed = pool.map(session_from, (1, 2))
     assert first_tab.status_code == 200
     assert first_tab.json()["csrf_token"] == response.json()["csrf_token"]
     assert refreshed.status_code == 200

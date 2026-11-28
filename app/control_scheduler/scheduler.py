@@ -109,6 +109,7 @@ class Scheduler:
         self.producer_id = producer_id
         self.stream_id = stream_id
         self.store = Store(self.root)
+        self._bind_repo()
 
     @classmethod
     def open(cls, root, auth, events, **kwargs) -> "Scheduler":
@@ -786,6 +787,115 @@ class Scheduler:
                     if record.get("candidate_id") and recorded != tuple_now:
                         found.append({"chain_id": chain["chain_id"], "phase": phase, "reason": "tuple"})
         return found
+
+    def _bind_repo(self) -> None:
+        with self.store.transaction() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS repo_binding (repo_id TEXT PRIMARY KEY)")
+            rows = db.execute("SELECT repo_id FROM repo_binding").fetchall()
+            if not rows:
+                db.execute("INSERT INTO repo_binding(repo_id) VALUES(?)", (self.repo_id,))
+                return
+            bound = {row["repo_id"] for row in rows}
+            if bound != {self.repo_id}:
+                raise ValueError("scheduler repo binding does not match this repository")
+
+    def query_board(self, *, app_id: str, task_ids: set[str], limit: int = 50, after: str | None = None) -> dict:
+        """Read this repository's tasks and chains. SQL errors propagate."""
+
+        if not isinstance(app_id, str) or not app_id:
+            raise SchedulerError("SCHEMA_UNSUPPORTED", "app_id is required", status=422)
+        if type(limit) is not int or isinstance(limit, bool) or limit < 1 or limit > 100:
+            raise SchedulerError("SCHEMA_UNSUPPORTED", "page limit is invalid", status=422)
+        if after is not None and not isinstance(after, str):
+            raise SchedulerError("SCHEMA_UNSUPPORTED", "page cursor is invalid", status=422)
+        with self.store.transaction() as db:
+            task_rows = db.execute(
+                """
+                SELECT task_id, app_id, version, closed
+                FROM tasks
+                WHERE app_id=?
+                ORDER BY task_id
+                """,
+                (app_id,),
+            ).fetchall()
+            visible = []
+            allowed = set()
+            for row in task_rows:
+                if row["task_id"] not in task_ids:
+                    continue
+                allowed.add(row["task_id"])
+                visible.append({
+                    "task_id": row["task_id"],
+                    "app_id": row["app_id"],
+                    "version": row["version"],
+                    "closed": bool(row["closed"]),
+                })
+            chain_rows = db.execute(
+                """
+                SELECT chain_id, task_id, candidate_id, state, priority, head, base, merge_sha, tree,
+                       revision, queue
+                FROM chains
+                WHERE task_id IN (SELECT task_id FROM tasks WHERE app_id=?)
+                ORDER BY chain_id
+                """,
+                (app_id,),
+            ).fetchall()
+            round_rows = db.execute(
+                """
+                SELECT round_id, task_id, chain_id, candidate_id, auth_state, revision, phase
+                FROM rounds
+                ORDER BY round_id
+                """
+            ).fetchall()
+        chains = []
+        for row in chain_rows:
+            if row["task_id"] not in allowed:
+                continue
+            if after is not None and row["chain_id"] <= after:
+                continue
+            chains.append({
+                "chain_id": row["chain_id"],
+                "task_id": row["task_id"],
+                "app_id": app_id,
+                "repo_id": self.repo_id,
+                "candidate_id": row["candidate_id"],
+                "state": row["state"],
+                "queue": row["queue"],
+                "priority": row["priority"],
+                "head": row["head"],
+                "base": row["base"],
+                "merge": row["merge_sha"],
+                "tree": row["tree"],
+                "revision": row["revision"],
+            })
+        truncated = len(chains) > limit
+        page = chains[:limit]
+        rounds = []
+        for row in round_rows:
+            if row["task_id"] not in allowed:
+                continue
+            rounds.append({
+                "round_id": row["round_id"],
+                "task_id": row["task_id"],
+                "chain_id": row["chain_id"],
+                "candidate_id": row["candidate_id"],
+                "auth_state": row["auth_state"],
+                "revision": row["revision"],
+                "phase": row["phase"],
+                "repo_id": self.repo_id,
+                "app_id": app_id,
+            })
+        return {
+            "tasks": visible,
+            "chains": page,
+            "rounds": rounds,
+            "runtime_evidence": False,
+            "test_double": False,
+            "truncated": truncated,
+            "next_cursor": page[-1]["chain_id"] if truncated and page else None,
+            "repo_id": self.repo_id,
+            "app_id": app_id,
+        }
 
     def snapshot(self, version: str) -> dict:
         with self.store.transaction() as db:

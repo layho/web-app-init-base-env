@@ -14,7 +14,7 @@ class Journal:
         self.idem_reads = 0
         self.flushes = 0
         self._thread = threading.Lock()
-        self._state = {"plans": {}, "idempotency": {}, "cache": {}}
+        self._state = {"plans": {}, "idempotency": {}, "cache": {}, "plan_sequence": 0}
         if self.root is not None:
             self._load()
 
@@ -96,6 +96,8 @@ class Journal:
         self._state["plans"] = data.get("plans") or {}
         self._state["idempotency"] = data.get("idempotency") or {}
         self._state["cache"] = data.get("cache") or {}
+        sequence = data.get("plan_sequence") or 0
+        self._state["plan_sequence"] = sequence if type(sequence) is int and sequence >= 0 else 0
 
     def _flush(self):
         if self.root is None:

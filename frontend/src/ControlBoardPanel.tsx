@@ -13,7 +13,20 @@ type BoardStatus = {
   history?: unknown[]
   failures?: unknown[]
   tests?: unknown[]
-  actions?: { id?: string; label?: string; task_id?: string; enabled?: boolean; code?: string | null; calls_authority?: boolean }[]
+  actions?: {
+    id?: string
+    label?: string
+    task_id?: string
+    enabled?: boolean
+    code?: string | null
+    calls_authority?: boolean
+    connected_executor?: boolean
+    chain_id?: string
+    candidate_id?: string
+    revision?: number
+    digest?: string
+    round_id?: string
+  }[]
   macci?: { status?: string; missing?: string[]; system?: string }
 }
 
@@ -58,8 +71,16 @@ export function ControlBoardPanel({ csrf }: { csrf: string }) {
     }
   }, [])
 
-  async function act(action: { id?: string; task_id?: string }) {
-    if (!action.id || !action.task_id) return
+  async function act(action: {
+    id?: string
+    task_id?: string
+    chain_id?: string
+    candidate_id?: string
+    revision?: number
+    digest?: string
+    round_id?: string
+  }) {
+    if (!action.id || !action.task_id || action.revision === undefined || !action.digest) return
     setBusy(true)
     setNotice(null)
     try {
@@ -75,8 +96,12 @@ export function ControlBoardPanel({ csrf }: { csrf: string }) {
         body: JSON.stringify({
           action: action.id,
           task_id: action.task_id,
-          idempotency_key: `${action.id}:${action.task_id}:${Date.now()}`,
-          expected_revision: 0,
+          chain_id: action.chain_id,
+          candidate_id: action.candidate_id,
+          round_id: action.round_id,
+          digest: action.digest,
+          idempotency_key: [action.id, action.task_id, action.chain_id, action.candidate_id, action.revision, action.digest].join(':'),
+          expected_revision: action.revision,
         }),
       })
       const body = await readJson(response)

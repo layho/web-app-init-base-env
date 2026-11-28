@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import secrets
 from datetime import datetime
 
 from app.control_upgrade.boundary import PRESERVE, allowlist_problem, case_collision, classify_path
@@ -99,7 +100,6 @@ class UpgradeService:
         self.principal = principal
         self.manifest = manifest
         self.journal = Journal(root)
-        self._sequence = 0
 
     def flags(self):
         return {
@@ -593,12 +593,42 @@ class UpgradeService:
             return plan["state"], False
         return "RECONCILE", False
 
+    def _fresh_plan_id(self, state, request, operation):
+        """Allocate an id inside the journal lock.
+
+        ``id(self)``, a frozen clock, and a truncated digest can repeat across
+        instances and then overwrite another plan. The nonce is random, the
+        hash is not truncated, and the caller must reject an id that already
+        exists instead of replacing that plan.
+        """
+
+        sequence = state.get("plan_sequence")
+        if type(sequence) is not int or isinstance(sequence, bool) or sequence < 0:
+            sequence = 0
+        sequence += 1
+        state["plan_sequence"] = sequence
+        scope = request.get("scope") if isinstance(request.get("scope"), dict) else {}
+        for _ in range(4):
+            raw = json.dumps(
+                {
+                    "app_id": request.get("app_id"),
+                    "nonce": secrets.token_hex(16),
+                    "operation": operation,
+                    "repo": scope.get("repo"),
+                    "sequence": sequence,
+                    "task_id": scope.get("task_id"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            plan_id = "upl_" + hashlib.sha256(raw).hexdigest()
+            if plan_id not in state["plans"]:
+                return plan_id
+        return None
+
     def _store_plan(self, request, operation, body, *, recovers_plan_id, previous_healthy_sha, caller_sha_ignored=False, source_plan_id=None, source_revision=None):
-        self._sequence += 1
-        raw = f"{id(self)}:{operation}:{request['app_id']}:{self.clock.now().isoformat()}:{self._sequence}".encode("utf-8")
-        plan_id = "upl_" + hashlib.sha256(raw).hexdigest()[:24]
         plan = {
-            "plan_id": plan_id,
+            "plan_id": None,
             "revision": 1,
             "state": body["state"],
             "repo": request["scope"]["repo"],
@@ -615,7 +645,7 @@ class UpgradeService:
             "previous_healthy_sha": previous_healthy_sha,
             "created_at": self.clock.now().isoformat(),
         }
-        original = {"state": plan["state"], "plan_id": plan_id, "http": 200, "code": None}
+        original = {"state": plan["state"], "plan_id": None, "http": 200, "code": None}
         outcome = self._cas_insert(
             request,
             operation,
@@ -628,6 +658,9 @@ class UpgradeService:
         replayed = self._cas_replay(outcome, request, operation)
         if replayed is not None:
             return replayed
+        plan_id = outcome.get("plan_id") if isinstance(outcome, dict) else None
+        if not isinstance(plan_id, str) or not plan_id:
+            return self._error(409, "PLAN_ID_COLLISION", "The plan id collided with an existing plan and was not written.")
         published = dict(body)
         published.update({
             "plan_id": plan_id,
@@ -689,16 +722,21 @@ class UpgradeService:
                     return False, {"frozen": True}
                 if source.get("revision") != source_revision:
                     return False, {"conflict": True}
-            state["plans"][plan["plan_id"]] = plan
+            plan_id = self._fresh_plan_id(state, request, operation)
+            if not isinstance(plan_id, str) or plan_id in state["plans"]:
+                return False, {"collision": True}
+            plan["plan_id"] = plan_id
+            original["plan_id"] = plan_id
+            state["plans"][plan_id] = plan
             state["idempotency"][key] = {
                 "hash": payload,
-                "plan_id": plan["plan_id"],
+                "plan_id": plan_id,
                 "operation": operation,
                 "original": original,
             }
             if observations is not None:
                 state["cache"][request["app_id"]] = observations
-            return True, {"applied": True}
+            return True, {"applied": True, "plan_id": plan_id}
 
         return self.journal.persist(mutate)
 
@@ -747,6 +785,8 @@ class UpgradeService:
             return self._error(403, "POLICY_DENIED", "SAFE_FROZEN cannot be rewritten.", reason="safe_frozen_no_rewrite")
         if outcome.get("conflict") is True:
             return self._error(409, "CONFLICT_REVISION", "The expected revision does not match.")
+        if outcome.get("collision") is True:
+            return self._error(409, "PLAN_ID_COLLISION", "The plan id collided with an existing plan and was not written.")
         return self._error(409, "EVIDENCE_MISSING", "The plan is not in this application journal.")
 
     def _replay(self, request, operation):

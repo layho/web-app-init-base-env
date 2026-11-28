@@ -146,6 +146,7 @@ _ALLOWED = frozenset({
     "rejected_outcome",
     "rejected_state",
     "release_id",
+    "repo_id",
     "repair_guidance",
     "required",
     "retained",

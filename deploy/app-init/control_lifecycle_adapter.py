@@ -1,65 +1,58 @@
 """Isolated lifecycle adapter.
 
-Default deny is the absence of an isolated temporary root. The commands below
-only read or append files inside that root. They do not install, uninstall,
-or switch a service.
+Default deny is the absence of an isolated temporary root. ``plan`` and
+``record`` drive the W09 lifecycle machine inside that root. They do not
+install, uninstall, or switch a service. Writes go through a directory file
+descriptor and refuse a symlink, hard link, or FIFO.
 """
 
 from __future__ import annotations
 
-import json
+import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[2]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from app.control_diagnostics.safe_io import UnsafePath
+from app.control_joint.root import temporary_root
+from app.control_joint.w09_driver import drive, read_status
 
 
 def main(argv=None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     command = arguments[0] if arguments else "status"
-    allowed = _temporary_root()
-    if not allowed["ok"]:
-        print("BLOCKED: " + allowed["reason"], file=sys.stderr)
+    if os.environ.get("V060_JOINT_EXECUTE") != "isolated":
+        print("BLOCKED: app-init lifecycle adapter is not authorized to install or remove anything", file=sys.stderr)
         return 2
     if command not in {"status", "plan", "record"}:
         print("BLOCKED: command is not in the isolated allowlist", file=sys.stderr)
         return 2
-    root = allowed["path"]
-    journal = root / "lifecycle-journal.tsv"
-    if command == "status":
-        if journal.is_file() and not journal.is_symlink():
-            sys.stdout.write(journal.read_text(encoding="utf-8"))
-        else:
-            print("journal-empty")
-        return 0
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with journal.open("a", encoding="utf-8") as handle:
-        handle.write(f"{stamp}\t{command}\tno-install\n")
-    if command == "plan":
-        plan = root / "lifecycle-plan.json"
-        plan.write_text(json.dumps({
-            "command": "plan",
-            "install": False,
-            "uninstall": False,
-            "privilege": False,
-            "service_switch": False,
-            "root": str(root),
-        }, sort_keys=True), encoding="utf-8")
-    print(command)
-    return 0
-
-
-def _temporary_root() -> dict:
-    import os
-    if os.environ.get("V060_JOINT_EXECUTE") != "isolated":
-        return {"ok": False, "reason": "app-init lifecycle adapter is not authorized to install or remove anything"}
-    repo = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(repo))
-    from app.control_joint.root import temporary_root
-
     checked = temporary_root()
     if not checked["ok"]:
-        return {"ok": False, "reason": checked["reason"]}
-    return checked
+        print("BLOCKED: " + checked["reason"], file=sys.stderr)
+        return 2
+    try:
+        if command == "status":
+            body = read_status(checked["path"])
+            if body is None:
+                print("journal-empty")
+            else:
+                sys.stdout.buffer.write(body)
+                if not body.endswith(b"\n"):
+                    sys.stdout.buffer.write(b"\n")
+            return 0
+        result = drive(checked["path"], command)
+    except (UnsafePath, OSError, ValueError):
+        print("BLOCKED: isolated lifecycle root was refused", file=sys.stderr)
+        return 2
+    if not result["ok"] or result["install"] or result["service_switch"] or result["host_side_effect"]:
+        print("BLOCKED: lifecycle machine did not stay closed", file=sys.stderr)
+        return 2
+    sys.stdout.write(command + "\n")
+    return 0
 
 
 if __name__ == "__main__":

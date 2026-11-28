@@ -111,7 +111,7 @@ class SurfaceTests(unittest.TestCase):
                 self.assertEqual(appended.get("http"), 200, appended)
                 self._insert_foreign_event(root / "events.sqlite3")
                 self._schedule(root, opened.repo_id)
-                self._diagnostic(root)
+                self._diagnostic(root, opened.repo_id)
                 (root / "authorization.json").write_text(json.dumps({
                     "reader_username": "admin",
                     "principal_id": "fixture",
@@ -129,15 +129,18 @@ class SurfaceTests(unittest.TestCase):
                 self.assertEqual(payload["state"], "available")
                 self.assertFalse(payload["side_effect"])
                 self.assertEqual([item["task_id"] for item in payload["items"]], ["tsk_w01"])
-                self.assertEqual(payload["items"][0]["owner"]["display"], "alice")
-                self.assertEqual(payload["items"][0]["owner"]["evidence"], "recorded")
+                self.assertEqual(payload["items"][0]["owner"]["evidence"], "missing")
                 self.assertEqual(payload["items"][0]["recorded_at"], "2026-11-27T10:00:00Z")
-                self.assertFalse(payload["history"][0]["authoritative"])
+                self.assertTrue(payload["history"][0]["authoritative"])
                 self.assertNotIn("evt_foreign", [row["event_id"] for row in payload["history"]])
                 self.assertTrue(any(item["display"] == "compile failed" for item in payload["failures"]))
                 enabled = [item["id"] for item in payload["actions"] if item["enabled"]]
+                connected = [item["id"] for item in payload["actions"] if item["connected_executor"]]
                 self.assertIn("unblock", enabled)
+                self.assertIn("unblock", connected)
                 self.assertNotIn("merge", enabled)
+                self.assertNotIn("nudge", enabled)
+                self.assertTrue(all(item["connected_executor"] for item in payload["actions"] if item["enabled"]))
 
                 blocked = client.post(
                     "/api/v1/control/board/actions",
@@ -184,6 +187,11 @@ class SurfaceTests(unittest.TestCase):
             self.assertFalse(first["accepted_as_success"])
             replay = actions.submit(principal, body)
             self.assertTrue(replay["replayed"])
+            self.assertEqual(calls, ["nudge"])
+            other_key = dict(body)
+            other_key["idempotency_key"] = "another-key"
+            blocked = actions.submit(principal, other_key)
+            self.assertEqual(blocked["code"], "SIDE_EFFECT_UNKNOWN")
             self.assertEqual(calls, ["nudge"])
 
     def test_closed_actions_do_not_switch_a_service(self):
@@ -389,6 +397,8 @@ class SurfaceTests(unittest.TestCase):
         payload["event_id"] = "evt_foreign"
         payload["app_id"] = "other"
         payload["producer_seq"] = 2
+        from app.control_events.engine import _identity
+        sealed = {key: value for key, value in payload.items() if key != "received_at"}
         connection.execute(
             """
             INSERT INTO events(
@@ -397,7 +407,7 @@ class SurfaceTests(unittest.TestCase):
             ) VALUES(?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                "evt_foreign", row["stream_id"], row["stream_epoch"], 2, "foreign",
+                "evt_foreign", row["stream_id"], row["stream_epoch"], 2, _identity(sealed),
                 json.dumps(payload), row["received_at"], 1, None, 0,
             ),
         )
@@ -415,8 +425,35 @@ class SurfaceTests(unittest.TestCase):
         scheduler.open_task(task_id="tsk_w01", version="v060", app_id="base", worktree="work/tree")
         with scheduler.store.transaction() as db:
             db.execute("UPDATE tasks SET acceptance_signer=? WHERE task_id=?", ("alice", "tsk_w01"))
+            db.execute(
+                """
+                INSERT INTO chains(
+                    chain_id, task_id, version, pr_line, worktree, files_json, dependencies_json,
+                    priority, created, state, queue, candidate_id, head, base, merge_sha, tree,
+                    revision, evidence_json, remote_status, remote_seq, spec_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "ch_w01", "tsk_w01", "v060", "pr_w01", "work/tree", "[]", "[]",
+                    0, 1, "OPEN", "HUMAN_HOLD", "cand_w01", SHA, SHA_B, "c" * 40, "d" * 40,
+                    0, "{}", "NONE", 0, "{}",
+                ),
+            )
+            db.execute(
+                """
+                INSERT INTO rounds(
+                    round_id, version, chain_id, task_id, phase, candidate_id, idempotency_key,
+                    intent_json, dispatch, run_id, attempt, generation, revision, auth_state,
+                    evidence_ref, created
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "rnd_w01", "v060", "ch_w01", "tsk_w01", "develop", "cand_w01", "idem-round",
+                    "{}", "CONFIRMED", "run_1", 1, 1, 0, "BLOCKED", "", 1,
+                ),
+            )
 
-    def _diagnostic(self, root):
+    def _diagnostic(self, root, repo_id):
         clock = ServerClock(datetime(2026, 11, 28, 1, tzinfo=timezone.utc))
         authz = FixtureAuthorizationPort([
             Grant("fixture-base", "base", "diagnostics.ingest"),
@@ -434,7 +471,7 @@ class SurfaceTests(unittest.TestCase):
         stored = service.ingest_event(
             {"kind": "test", "id": "fixture-base", "proof_ref": "test-proof://w06/base", "app_id": "base"},
             "base",
-            _diagnostic_event("diag-surface", "compile failed", severity="error"),
+            _diagnostic_event("diag-surface", "compile failed", severity="error", repo_id=repo_id),
         )
         self.assertEqual(stored["http"], 200, stored)
 
@@ -464,8 +501,8 @@ def _chain(chain_id, mark):
     }
 
 
-def _diagnostic_event(key, summary, severity="info"):
-    return {
+def _diagnostic_event(key, summary, severity="info", repo_id=None):
+    event = {
         "schema_version": 2,
         "event_class": "diagnostic",
         "channel": "diagnostic",
@@ -483,6 +520,9 @@ def _diagnostic_event(key, summary, severity="info"):
         "diagnostic_class": "log",
         "body": {"summary": summary},
     }
+    if repo_id is not None:
+        event["repo_id"] = repo_id
+    return event
 
 
 if __name__ == "__main__":

@@ -357,10 +357,40 @@ class DiagnosticService:
             "reason": "Diagnostic.subscribe is not provided. Poll with after_seq.",
         }
 
-    def list_records(self, principal, app_id, *, run_id=None, deployment_id=None, page_size=20, page_token=None):
+    def list_records(self, principal, app_id, *, run_id=None, deployment_id=None, page_size=20, page_token=None, repo_id=None, task_ids=None):
         decision = self._guard(principal, app_id, "diagnostics.read")
         if not decision["allowed"]:
             return self._denied(decision)
+        return self._page_records(
+            app_id,
+            run_id=run_id,
+            deployment_id=deployment_id,
+            page_size=page_size,
+            page_token=page_token,
+            repo_id=repo_id,
+            task_ids=task_ids,
+        )
+
+    def export_page(self, *, app_id, repo_id, task_ids, page_size=20, page_token=None):
+        """Return records for one repository and app.
+
+        The caller has already authorized each task. A missing repository,
+        a corrupt line, or a short page stays explicit. Journal errors propagate.
+        """
+
+        if not isinstance(app_id, str) or _APP.fullmatch(app_id) is None:
+            return self._reject("SCHEMA_UNSUPPORTED", "app_id is invalid.")
+        if not isinstance(repo_id, str) or not repo_id:
+            return self._reject("SCHEMA_UNSUPPORTED", "repo_id is required.")
+        return self._page_records(
+            app_id,
+            page_size=page_size,
+            page_token=page_token,
+            repo_id=repo_id,
+            task_ids=task_ids,
+        )
+
+    def _page_records(self, app_id, *, run_id=None, deployment_id=None, page_size=20, page_token=None, repo_id=None, task_ids=None):
         size = _page_size(page_size)
         if size is None:
             return self._reject("SCHEMA_UNSUPPORTED", "page_size is invalid.")
@@ -370,7 +400,20 @@ class DiagnosticService:
         records, missing_segments, corrupt = self._visible(app_id)
         classes = _classifications(records)
         filtered = []
+        unscoped = 0
+        allowed = None if task_ids is None else set(task_ids)
         for record in records:
+            if repo_id is not None:
+                stored_repo = record.get("repo_id")
+                if not isinstance(stored_repo, str) or not stored_repo:
+                    unscoped += 1
+                    continue
+                if stored_repo != repo_id:
+                    continue
+            if allowed is not None:
+                task_id = record.get("task_id") or record.get("subject_id")
+                if task_id not in allowed:
+                    continue
             if run_id is not None and record.get("run_id") != run_id:
                 continue
             if deployment_id is not None and record.get("deployment_id") != deployment_id:
@@ -392,7 +435,8 @@ class DiagnosticService:
             "next_page_token": next_token,
             "segment_gaps": missing_segments,
             "corrupt_lines": corrupt,
-            "gap": bool(missing_segments or corrupt),
+            "unscoped": unscoped,
+            "gap": bool(missing_segments or corrupt or unscoped),
             "runtime_evidence": False,
         }
 
@@ -487,6 +531,7 @@ class DiagnosticService:
             "candidate_id": envelope.get("candidate_id"),
             "release_id": envelope.get("release_id"),
             "deployment_id": envelope.get("deployment_id"),
+            "repo_id": envelope.get("repo_id") if isinstance(envelope.get("repo_id"), str) and envelope.get("repo_id") else None,
             "expires_at": envelope.get("expires_at"),
             "evidence_state": None if summary is None else summary["evidence_state"],
             "origin": "synthetic_fixture",

@@ -737,6 +737,22 @@ class IsolatedUpgradeTests(unittest.TestCase):
         self.assertEqual(allowed.journal.idem_reads, 0)
         self.assertEqual(allowed.journal.plans_for(APP), [])
 
+    def test_plan_id_collision_does_not_replace_the_existing_plan(self):
+        engine = service()
+        first = engine.plan(plan_request())
+        original = engine.journal.get_plan(first["plan_id"])
+        engine._fresh_plan_id = lambda state, request, operation: first["plan_id"]
+        collided = engine.plan(plan_request(idempotency_key="idem-w08-collide"))
+        self.assertEqual(collided["code"], "PLAN_ID_COLLISION")
+        self.assertEqual(collided["http"], 409)
+        stored = engine.journal.get_plan(first["plan_id"])
+        self.assertEqual(stored["state"], original["state"])
+        self.assertEqual(stored["revision"], original["revision"])
+        self.assertEqual(len(engine.journal.plans_for(APP)), 1)
+        minted = [service().plan(plan_request())["plan_id"] for _ in range(4)]
+        self.assertEqual(len(set(minted)), 4)
+        self.assertTrue(all(len(item) == 4 + 64 for item in minted))
+
     def test_reentry_replays_original_plan_and_rejects_payload_mismatch(self):
         engine = service()
         first = engine.plan(plan_request())
