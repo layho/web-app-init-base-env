@@ -242,6 +242,61 @@ def test_w05_intent_bridge_uses_signed_w01_evidence_without_business_commit(tmp_
     assert eng.store.count("events") == 1
 
 
+def test_w05_signed_intent_business_cas_recovers_without_fixture_fallback(tmp_path):
+    from app.control_delivery.ports import (
+        FixtureAuth, FixtureEvents, BlockedRemote, BlockedSchedule, BlockedDeploy, ServerClock,
+    )
+    from app.control_delivery.service import DeliveryService
+
+    eng = engine(tmp_path)
+    root = tmp_path / "delivery"
+    fixture_events = FixtureEvents()
+    options = dict(auth=FixtureAuth(), events=fixture_events, remote=BlockedRemote(),
+                   schedule=BlockedSchedule(), deploy=BlockedDeploy(), clock=ServerClock())
+    signer = lambda body: sign_event(eng, body, signer="w05")
+    svc = DeliveryService(root, **options, intent_engine=eng, intent_signer=signer)
+    request = dict(actor=actor(), scope={"repo": eng.repo_id, "task_id": "tsk_w01"},
+                   author_id="fixture", feedback_id="fb_signed", category="bug",
+                   body="signed transaction", idempotency_key="signed-submit")
+    def crash(*args, **kwargs):
+        raise RuntimeError("crash after W01 before W05 commit")
+
+    svc._commit_local = crash
+    with pytest.raises(RuntimeError, match="crash after W01"):
+        svc.submit_feedback(**request)
+    assert svc.store.read("feedback", "fb_signed") is None
+    assert eng.store.count("events") == 1
+    pending, = svc.store.list("outbox")
+    assert pending["intent_mode"] == "signed-isolated-v1"
+    assert pending["receipt"] is None
+    fixture = DeliveryService(root, **options)
+    assert not fixture.submit_feedback(**request).ok
+    assert not fixture_events.events
+    restarted = DeliveryService(root, **options, intent_engine=eng, intent_signer=signer)
+    result = restarted.submit_feedback(**request)
+    assert result.ok, result.as_dict()
+    assert eng.store.count("events") == 1
+    assert restarted.store.read("feedback", "fb_signed")["revision"] == 1
+    outbox = restarted.store.read("outbox", pending["event_id"])
+    assert outbox["receipt"]["isolated_signature_verified"] is True
+    assert outbox["receipt"]["w01_proof"] is False
+    witness = restarted.store.read("business-commit", pending["event_id"])
+    assert witness["intent_mode"] == "signed-isolated-v1"
+    assert witness["production_effective"] is False
+    assert restarted.submit_feedback(**request).ok
+    assert eng.store.count("events") == 1
+    assert not fixture_events.events
+
+    denied = DeliveryService(root, **options, intent_engine=eng,
+                             intent_signer=lambda body: sign_event(eng, body, signer="fixture"))
+    rejected = denied.submit_feedback(**{**request, "feedback_id": "fb_denied",
+                                         "idempotency_key": "denied-submit"})
+    assert not rejected.ok
+    assert denied.store.read("feedback", "fb_denied") is None
+    assert eng.store.count("events") == 1
+    assert not fixture_events.events
+
+
 def test_repo_identity_is_stable_and_not_reusable_after_rebuild(tmp_path):
     first = engine(tmp_path, "generation-1")
     again = Engine.open(tmp_path / "store", "generation-1")
