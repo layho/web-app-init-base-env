@@ -18,6 +18,7 @@ from app.control_diagnostics.safe_io import UnsafePath, lstat_at, open_directory
 
 _MAX = 65536
 _NAME = 205  # Journal keys allow 200 characters plus .json.
+_CURSOR_NAME = 255  # Cursor is an ordering marker, not a journal key.
 _KEY = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
 _SCAN_LIMIT = 200
 
@@ -31,7 +32,8 @@ class DeliveryReadError(Exception):
 def query_tasks(root: Path, *, repo_id: str, app_id: str, task_ids: set[str], limit: int = 50, after: str | None = None) -> dict:
     if type(limit) is not int or isinstance(limit, bool) or limit < 1 or limit > 100:
         raise DeliveryReadError("page")
-    if after is not None and (not isinstance(after, str) or len(after) > _NAME or not after.endswith(".json")):
+    if after is not None and (not isinstance(after, str) or len(after) > _CURSOR_NAME
+                              or "/" in after or "\x00" in after or not after.endswith(".json")):
         raise DeliveryReadError("cursor")
     root_fd = None
     delivery_fd = None
