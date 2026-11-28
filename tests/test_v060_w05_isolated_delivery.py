@@ -307,6 +307,38 @@ class IsolatedDeliveryTest(unittest.TestCase):
         self.assertIsNone(self._feedback("fb_owned")["issue_number"])
         self.assertNotIn(("create", "fb_owned"), self.remote.calls)
 
+    def test_claim_recovers_original_lease_after_lost_acknowledgement(self):
+        for elapsed in (3, 61):
+            with self.subTest(elapsed=elapsed):
+                feedback = f"fb_crash_{elapsed}"
+                self._submit(feedback)
+                args = dict(actor=self.actor, scope=self.scope, feedback_id=feedback,
+                            idempotency_key=feedback, expected_revision=1)
+                append = self.events.append
+
+                def lost_ack(event):
+                    append(event)
+                    raise RuntimeError("lost acknowledgement")
+
+                self.events.append = lost_ack
+                with self.assertRaisesRegex(RuntimeError, "lost acknowledgement"):
+                    self.svc.claim_feedback_row(**args)
+                self.events.append = append
+                pending, = [o for o in self.svc.store.list("outbox") if o.get("pending_lease")]
+                lease = pending["pending_lease"]
+                self.clock.advance(elapsed)
+                self.svc = self._service()
+                recovered = self.svc.claim_feedback_row(**args)
+                self.assertTrue(recovered.ok, recovered.as_dict())
+                self.assertEqual(self.svc.store.read("feedback", feedback)["lease"], lease)
+                self.assertNotIn("token", self._feedback(feedback)["lease"])
+                self.assertEqual(recovered.body["lease_token"], lease["token"] if elapsed < 60 else None)
+                self.assertNotIn("pending_lease", self.svc.store.read("outbox", pending["event_id"]))
+                self.assertTrue(self.svc.claim_feedback_row(**args).replayed)
+                events = [e for e in self.events.events if e["event_id"] == pending["event_id"]]
+                self.assertEqual(len(events), 1)
+                self.assertNotIn(lease["token"], str(events))
+
     def test_f02_row_claim_fence(self):
         self._submit("fb_lease")
         first = self.svc.claim_feedback_row(

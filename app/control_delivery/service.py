@@ -212,14 +212,20 @@ class DeliveryService:
         if lease and lease["expires_at"] > self.clock() and lease["principal_id"] != principal:
             return _denied(409, "LEASE_FENCE_REJECTED", row["state"], {"changed": False})
         generation = 1 if not lease else lease["generation"] + 1
-        token = "opaque-" + secrets.token_hex(16)
         expected = row["revision"]
-        row["lease"] = {
-            "principal_id": principal,
-            "generation": generation,
-            "token": token,
-            "expires_at": self.clock() + 60,
-        }
+        pending = self.store.read("outbox", self._event_id(begun, "feedback.claimed"))
+        if pending is None:
+            claim = {"principal_id": principal, "generation": generation,
+                     "token": "opaque-" + secrets.token_hex(16), "expires_at": self.clock() + 60}
+        else:
+            claim = pending.get("pending_lease")
+            if (not isinstance(claim, dict) or claim.get("principal_id") != principal
+                    or claim.get("generation") != generation or not isinstance(claim.get("token"), str)
+                    or type(claim.get("expires_at")) not in (int, float)):
+                return _denied(409, "SIDE_EFFECT_UNKNOWN", row["state"], {"reason": "missing_lease_intent"})
+        token = claim["token"]
+        row["lease"] = claim
+        begun["pending_lease"] = claim
         row["state"] = "CLAIMED"
         row["revision"] = expected + 1
         public = {
@@ -238,7 +244,7 @@ class DeliveryService:
             return _pending(body={"feedback_id": feedback_id})
         self._trace("feedback.claim", feedback_id=feedback_id, state="CLAIMED", token_issued=True)
         shown = dict(public)
-        shown["lease_token"] = token
+        shown["lease_token"] = token if claim["expires_at"] > self.clock() else None
         return _ok("CLAIMED", shown)
 
     def push_claimed(self, *, actor, scope, feedback_id, token, idempotency_key, expected_revision, credential_present):
@@ -1381,7 +1387,10 @@ class DeliveryService:
     def feedback(self, feedback_id, *, actor=None, scope=None):
         if not self._read_allowed(actor, scope, "feedback", feedback_id):
             return None
-        return self.store.read("feedback", feedback_id)
+        row = self.store.read("feedback", feedback_id)
+        if isinstance(row, dict) and isinstance(row.get("lease"), dict):
+            row["lease"] = {key: value for key, value in row["lease"].items() if key != "token"}
+        return row
 
     def traces(self, *, actor=None, scope=None):
         if not self._read_allowed(actor, scope, "trace", None):
@@ -2074,6 +2083,7 @@ class DeliveryService:
                     return "conflict"
                 if isinstance(outbox, dict):
                     outbox = dict(outbox)
+                    outbox.pop("pending_lease", None)
                     outbox["receipt"] = begun["receipt"]
                     outbox["delivery_state"] = "RECEIPT_RECORDED"
                     outbox["authority"] = "W01"
@@ -2159,6 +2169,8 @@ class DeliveryService:
                 "operation_id": event_id,
                 "change_plan": plan,
             }
+            if "pending_lease" in begun:
+                outbox["pending_lease"] = begun["pending_lease"]
             view.stage("producer", counter_key, {
                 "revision": _revision(counter) + 1,
                 "next_seq": seq + 1,
@@ -2246,14 +2258,18 @@ class DeliveryService:
         appended = self.events.append(event)
         return self._exact_receipt(event, appended)
 
-    def _commit_event(self, begun, event_type, pairs, public, state, **fields):
-        event_id = "evt_" + _hash({
+    @staticmethod
+    def _event_id(begun, event_type):
+        return "evt_" + _hash({
             "idem": begun["idem_key"],
             "event_type": event_type,
             "payload": begun["payload_hash"],
             "object": begun["object_id"],
             "kind": begun["object_kind"],
         })[:40]
+
+    def _commit_event(self, begun, event_type, pairs, public, state, **fields):
+        event_id = self._event_id(begun, event_type)
         event = {
             "event_id": event_id,
             "schema_version": 2,
