@@ -1421,8 +1421,8 @@ class DeliveryService:
                 and isinstance(row.get("state"), str)]
 
     def feedback(self, feedback_id, *, actor=None, scope=None):
-        row = self.store.read("feedback", feedback_id)
-        if not self._read_allowed(actor, scope, "feedback", feedback_id, document=row):
+        row = self._read_allowed(actor, scope, "feedback", feedback_id, return_document=True)
+        if not isinstance(row, dict):
             return None
         if isinstance(row, dict) and isinstance(row.get("lease"), dict):
             row["lease"] = {key: value for key, value in row["lease"].items() if key != "token"}
@@ -1465,7 +1465,7 @@ class DeliveryService:
                 self._operation_locks[operation_id] = lock
             return lock
 
-    def _read_allowed(self, actor, scope, kind, object_id, *, document=None):
+    def _read_allowed(self, actor, scope, kind, object_id, *, return_document=False):
         if not isinstance(actor, dict) or not isinstance(scope, dict):
             return False
         if (not scope.get("repo") or not scope.get("task_id")
@@ -1483,7 +1483,7 @@ class DeliveryService:
             or not principal
         ):
             return False
-        doc = document
+        doc = None if object_id is None else self.store.read(kind, object_id)
         if kind == "feedback" and (not isinstance(doc, dict)
                 or doc.get("feedback_id") != object_id or doc.get("author_id") != principal
                 or doc.get("repo_id") != scope["repo"] or doc.get("scope_task_id") != scope["task_id"]):
@@ -1502,7 +1502,9 @@ class DeliveryService:
         )
         if not isinstance(authz, dict) or authz.get("blocked"):
             return False
-        return authz.get("ok") is True and authz.get("allow") is True
+        if authz.get("ok") is not True or authz.get("allow") is not True:
+            return False
+        return doc if return_document else True
 
     def _object_mismatch(self, scope, kind, doc, payload):
         payload = payload or {}
