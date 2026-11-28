@@ -221,49 +221,51 @@ class SnapshotBudgetTests(unittest.TestCase):
 
 class HistoricalDecisionTests(unittest.TestCase):
     def test_flag_and_stale_signature_do_not_authorize(self):
-        flagged = historical_authorization([
-            {"event_type": "note", "authorized": True, "signature": "sig", "revision": 1, "producer_seq": 1},
-        ])
-        self.assertEqual(flagged["decision"], "unknown")
-        granted = historical_authorization([
-            {
-                "event_type": "authorization.granted",
-                "authorized": False,
-                "revision": 1,
-                "producer_seq": 1,
-                "event_id": "grant",
-            },
-        ])
-        self.assertEqual(granted["decision"], "authorized")
-        revoked = historical_authorization([
-            {
-                "event_type": "authorization.granted",
-                "revision": 1,
-                "producer_seq": 1,
-                "signature": "old",
-            },
-            {
-                "event_type": "authorization.revoked",
-                "authorized": True,
-                "revision": 2,
-                "producer_seq": 2,
-                "signature": "old",
-            },
-            {
-                "event_type": "authorization.granted",
-                "authorized": True,
-                "revision": 3,
-                "producer_seq": 3,
-                "signature": "old",
-            },
-        ])
-        self.assertEqual(revoked["decision"], "unknown")
-        self.assertEqual(revoked["reason"], "stale_signature")
-        same_revision = historical_authorization([
-            {"event_type": "authorization.granted", "revision": 4, "producer_seq": 4},
-            {"event_type": "authorization.revoked", "revision": 4, "producer_seq": 4},
-        ])
-        self.assertEqual(same_revision["decision"], "revoked")
+        scope = dict(repo_id="repo", app_id="base", task_id="task",
+                     candidate_id="candidate", operation="preview.merge",
+                     stream_id="policy:authorization", stream_epoch=1)
+        grant = dict(scope, event_type="authorization.granted", revision=1,
+                     producer_seq=1, event_id="grant", _authoritative=True, signature="sig-a")
+        unsigned = dict(grant)
+        unsigned.pop("signature")
+        self.assertEqual(historical_authorization([unsigned])["decision"], "unknown")
+        unverified = dict(grant)
+        unverified.pop("_authoritative")
+        self.assertEqual(historical_authorization([unverified])["decision"], "unknown")
+        self.assertEqual(historical_authorization([grant])["decision"], "authorized")
+        revoke = dict(grant, event_type="authorization.revoked", event_id="revoke",
+                      signature="sig-b", producer_seq=2)
+        later_grant = dict(grant, event_id="late", signature="sig-c", producer_seq=3)
+        self.assertEqual(historical_authorization([grant, revoke, later_grant])["decision"], "revoked")
+        other = dict(later_grant, app_id="other")
+        self.assertEqual(historical_authorization([grant, other])["reason"], "mixed_scope")
+        reused = dict(grant, revision=2, producer_seq=4, event_id="reused")
+        self.assertEqual(historical_authorization([grant, reused])["reason"], "stale_signature")
+
+    def test_signed_event_cannot_change_decision_after_signing(self):
+        from tests.test_v060_w01_events import authorization, engine
+        from app.control_events.errors import ControlError
+
+        with tempfile.TemporaryDirectory() as directory:
+            opened = engine(Path(directory))
+            payload = authorization(opened)
+            payload["event_type"] = "authorization.revoked"
+            with self.assertRaises(ControlError):
+                opened.append(payload)
+            self.assertEqual(opened.authorizations(), [])
+
+    def test_tampered_persisted_authorization_proof_fails_closed(self):
+        from tests.test_v060_w01_events import authorization, engine
+
+        with tempfile.TemporaryDirectory() as directory:
+            opened = engine(Path(directory))
+            self.assertTrue(opened.append(authorization(opened)).get("applied"))
+            self.assertEqual(opened.authorizations()[0]["historical_decision"], "authorized")
+            with opened.store.transaction() as connection:
+                connection.execute("UPDATE events SET authority_json='{}' WHERE event_id='evt_auth'")
+            result = opened.authorizations()[0]
+            self.assertEqual(result["historical_decision"], "unknown")
+            self.assertTrue(result["revoked"])
 
     def test_stored_revoked_column_does_not_override_the_event_sequence(self):
         from tests.test_v060_w01_events import authorization, engine
